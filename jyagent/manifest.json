@@ -1,0 +1,187 @@
+{
+  "modules": {
+    "registry": {
+      "exports": [
+        "ToolRegistry",
+        "get_registry"
+      ],
+      "evolvable": true
+    },
+    "tools": {
+      "exports": [
+        "_auto_discover_tools",
+        "_strip_unsupported_schema_keys",
+        "add_tool",
+        "evolve_self",
+        "list_directory",
+        "manage_memory",
+        "read_file",
+        "run_shell",
+        "set_client",
+        "write_file"
+      ],
+      "evolvable": true,
+      "version": 8,
+      "description": "v8: Core functions + tool_*.py auto-discovery + MCP dynamic registration"
+    },
+    "planner": {
+      "exports": [
+        "COLOR_CYAN",
+        "COLOR_DIM",
+        "COLOR_RESET",
+        "COLOR_YELLOW",
+        "DEFAULT_MAX_STEPS",
+        "DEFAULT_MAX_TOKENS",
+        "HONESTY_SYSTEM_ADDENDUM",
+        "LEFT_BORDER",
+        "MAX_TOKENS_CAP",
+        "TOOL_COLOR",
+        "_execute_tool",
+        "_inject_honesty_rules",
+        "_interrupted_msg",
+        "_is_truncated_tool_call",
+        "_stream_response",
+        "_stream_write",
+        "_tool_info",
+        "_tool_result_preview",
+        "plan_next_action"
+      ],
+      "evolvable": true,
+      "version": 17,
+      "description": "v17: Streaming, tool execution, Ctrl-C handling. Honesty enforced via system prompt only."
+    },
+    "evolution_strategy": {
+      "exports": [
+        "build_evaluation_prompt",
+        "build_evolution_prompt",
+        "parse_evaluation_result"
+      ],
+      "evolvable": true,
+      "version": 2,
+      "description": "v2: Removed skill-first violation checks"
+    },
+    "cli": {
+      "exports": [
+        "CLI",
+        "CUSTOM_THEME",
+        "PT_STYLE",
+        "_create_key_bindings"
+      ],
+      "evolvable": true,
+      "version": 3,
+      "description": "v3: prompt_toolkit interface with history, multiline, Ctrl-C support"
+    },
+    "agent": {
+      "exports": [
+        "COMMAND_TABLE",
+        "SYSTEM_PROMPT",
+        "_VERIFICATION_TRIGGER_PATTERNS",
+        "_build_verification_reminder",
+        "_classify_verification_type",
+        "_cmd_clear",
+        "_cmd_evolve",
+        "_cmd_forget",
+        "_cmd_help",
+        "_cmd_history",
+        "_cmd_markdown",
+        "_cmd_memory",
+        "_cmd_multi",
+        "_cmd_remember",
+        "_cmd_save",
+        "_cmd_skill",
+        "_cmd_skills",
+        "_cmd_tools",
+        "_graceful_exit",
+        "_needs_tool_verification",
+        "_run_evolution",
+        "_run_memory_extraction",
+        "run"
+      ],
+      "evolvable": true,
+      "version": 12,
+      "description": "v12: Command dispatch, memory extraction, self-evolution loop"
+    },
+    "self_memory": {
+      "exports": [
+        "CONTEXT_FILE",
+        "ConversationMemory",
+        "EXTRACTION_PROMPT",
+        "LEARNINGS_FILE",
+        "Learnings",
+        "MAX_CONTEXT_ITEMS",
+        "MAX_LEARNINGS",
+        "MAX_MEMORY_PROMPT_CHARS",
+        "MAX_SESSIONS",
+        "MEMORY_DIR",
+        "PROFILE_FILE",
+        "PersistentMemory",
+        "SESSIONS_FILE",
+        "SUMMARIZE_KEEP_RECENT",
+        "SUMMARIZE_THRESHOLD",
+        "SessionSummaries",
+        "UserProfile",
+        "WorkingContext",
+        "_atomic_write",
+        "_ensure_dirs",
+        "_load_json",
+        "apply_extracted_memories",
+        "build_memory_context",
+        "extract_memories",
+        "forget",
+        "on_session_end",
+        "on_session_start",
+        "remember",
+        "show_memory",
+        "summarize_if_needed"
+      ],
+      "evolvable": true,
+      "description": "Memory system: user profile, learnings, session history, working context"
+    },
+    "mcp_client": {
+      "exports": [
+        "MCPClient"
+      ],
+      "evolvable": true,
+      "version": 1,
+      "description": "Generic MCP client \u2014 JSON-RPC 2.0 over stdio transport"
+    },
+    "mcp_manager": {
+      "exports": [
+        "KEEPALIVE_INTERVAL_SECONDS",
+        "KEEPALIVE_MAX_FAILURES",
+        "MCPManager",
+        "_CONFIG_PATHS",
+        "_MODULE_VERSION",
+        "_PRE_CONNECT_HOOKS",
+        "_chrome_pre_connect",
+        "_extract_mcp_result",
+        "_find_config",
+        "_manager",
+        "_mcp_schema_to_agent_schema",
+        "get_manager",
+        "load_config",
+        "logger",
+        "reset_manager"
+      ],
+      "evolvable": true,
+      "version": 1,
+      "description": "MCP server lifecycle manager. Reads .mcp.json, connects servers, auto-registers tools."
+    },
+    "tool_web_fetch": {
+      "exports": [
+        "TOOL_SCHEMA",
+        "web_fetch"
+      ],
+      "evolvable": true,
+      "description": "5-tier web fetcher: curl_cffi \u2192 httpx \u2192 Jina Reader \u2192 Chrome MCP \u2192 error diagnostics"
+    },
+    "tool_mcp": {
+      "exports": [
+        "TOOL_SCHEMA",
+        "mcp"
+      ],
+      "evolvable": true,
+      "description": "MCP server connection management tool"
+    }
+  }
+}
