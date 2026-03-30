@@ -121,3 +121,6 @@ data/logs/
 
 # Package backups from evolution
 jyagent/backups/
+
+# Build artifacts
+*.egg-info/
