@@ -1,5 +1,5 @@
 # Planner — Streaming tool-use loop with structured results, concurrent execution, unified timeouts.
-# Honesty enforced via system prompt injection (HONESTY_SYSTEM_ADDENDUM).
+# Honesty rules are in the main SYSTEM_PROMPT (agent.py), not duplicated here.
 import os
 import sys
 import time
@@ -7,6 +7,11 @@ import inspect
 import traceback
 import concurrent.futures
 from .registry import get_registry
+from .config import (
+    DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
+    MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
+    MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT,
+)
 
 TOOL_COLOR = "\033[0;33m"  # yellow for tool info
 COLOR_RESET = "\033[0m"
@@ -14,35 +19,6 @@ COLOR_DIM = "\033[2m"
 COLOR_YELLOW = "\033[1;33m"
 COLOR_CYAN = "\033[1;36m"
 COLOR_RED = "\033[1;31m"
-
-# Configurable max_tokens via environment variable
-DEFAULT_MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16384"))
-MAX_TOKENS_CAP = int(os.environ.get("ANTHROPIC_MAX_TOKENS_CAP", "128000"))
-
-# Practical step limit
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "100"))
-
-# Tool result truncation — prevents working_messages from growing unboundedly
-MAX_TOOL_RESULT_CHARS = int(os.environ.get("AGENT_MAX_TOOL_RESULT_CHARS", "8000"))
-MAX_TOOL_USE_INPUT_CHARS = int(os.environ.get("AGENT_MAX_TOOL_USE_INPUT_CHARS", "4000"))
-MAX_WORKING_TOKENS = int(os.environ.get("AGENT_MAX_WORKING_TOKENS", "100000"))
-
-# Unified tool timeout (P2) — applies to all tool calls, not just run_shell
-DEFAULT_TOOL_TIMEOUT = int(os.environ.get("AGENT_TOOL_TIMEOUT", "120"))
-
-HONESTY_SYSTEM_ADDENDUM = """
-
-CRITICAL HONESTY RULES — You MUST follow these at all times:
-1. NEVER present information as if you fetched, retrieved, or verified it from external sources unless you actually used a tool (run_shell, read_file, etc.) to obtain that information in this conversation.
-2. If asked about recent events, changelogs, version numbers, release dates, or other rapidly-changing factual information, you MUST use tools to look it up. Do NOT fabricate or hallucinate this information.
-3. If you cannot verify information via tools, explicitly say so: "I don't have verified information about this. Let me try to look it up." Then use a tool.
-4. NEVER claim information was "sourced from", "fetched from", "pulled from", or "verified against" any external source unless you actually performed a tool call to access that source.
-5. If tools are unavailable or fail, clearly state that you were unable to verify the information rather than presenting unverified claims as facts.
-6. It is always better to say "I'm not sure" or "I'd need to look that up" than to fabricate detailed information.
-7. When presenting information from your training data, clearly distinguish it as such: "Based on my training data (which may be outdated)..." rather than implying it's freshly sourced.
-8. IMPORTANT: Using a tool to read one file does NOT verify claims about other files, URLs, APIs, or topics you did not explicitly check with tools. Each claim of verification must correspond to an actual tool call for that specific resource.
-9. When reporting findings from code review or file analysis, only make claims about content you actually read via tools. Do not extrapolate or invent issues in files/sections you did not examine.
-"""
 
 
 # ─── Structured Tool Result ──────────────────────────────────────────────────
@@ -182,7 +158,7 @@ def _compact_working_messages(messages: list, max_tokens: int = None) -> list:
     if max_tokens is None:
         max_tokens = MAX_WORKING_TOKENS
 
-    from .self_memory import estimate_conversation_tokens
+    from .memory import estimate_conversation_tokens
     estimated = estimate_conversation_tokens(messages)
     if estimated <= max_tokens:
         return messages
@@ -209,11 +185,6 @@ def _compact_working_messages(messages: list, max_tokens: int = None) -> list:
             compacted[i]["content"] = new_blocks
 
     return compacted
-
-
-def _inject_honesty_rules(system_prompt: str) -> str:
-    """Append honesty rules to the system prompt."""
-    return system_prompt + HONESTY_SYSTEM_ADDENDUM
 
 
 # ─── Tool execution ─────────────────────────────────────────────────────────
@@ -436,7 +407,7 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
         all_text = ""
         current_max_tokens = DEFAULT_MAX_TOKENS
 
-        augmented_system_prompt = _inject_honesty_rules(system_prompt)
+        augmented_system_prompt = system_prompt  # Honesty rules already in SYSTEM_PROMPT
 
         for step in range(max_steps):
             registry = get_registry()
