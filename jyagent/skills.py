@@ -3,7 +3,8 @@
 # Provides:
 #   - SkillManager: discovers, parses, and manages SKILL.md files
 #   - Progressive disclosure: advertise → load → read resources
-#   - System prompt injection: skill catalog + active skill instructions
+#   - System prompt injection: XML format per agentskills.io spec
+#   - LLM-based auto-activation: uses Haiku for smart skill routing
 #   - CLI integration: /skills command
 #
 # Directory layout:
@@ -18,6 +19,10 @@
 import os
 import re
 import glob
+import html
+import json
+import sys
+import time
 from typing import Optional
 
 
@@ -30,6 +35,11 @@ SKILL_FILENAME = "SKILL.md"
 MAX_CATALOG_TOKENS_PER_SKILL = 150   # ~name + description for advertising
 MAX_INSTRUCTIONS_CHARS = 20000       # loaded skill body limit
 MAX_RESOURCE_CHARS = 30000           # single reference file limit
+
+# LLM-based skill routing (改进2: 用轻量 LLM 替代关键词匹配)
+# Prefers haiku (cheapest), falls back to sonnet, then main model
+ROUTER_MODEL = os.environ.get("SKILL_ROUTER_MODEL", "claude-sonnet-4-20250514")
+ROUTER_TIMEOUT = int(os.environ.get("SKILL_ROUTER_TIMEOUT", "8"))  # seconds — fail fast, fallback to keyword matching
 
 
 # ─── SKILL.md Parser ─────────────────────────────────────────────────────────
@@ -388,34 +398,132 @@ class SkillManager:
                         resources.append(rel)
         return sorted(resources)
 
+    # ── 改进2: LLM-based skill routing ──────────────────────────────────────
+
     def auto_activate_for_query(self, query: str) -> list[str]:
         """
-        Automatically activate relevant skills based on a user query.
-        Uses keyword matching against skill descriptions.
+        Automatically activate relevant skills based on user query.
+        
+        Strategy:
+          1. Try LLM routing (Haiku — fast, cheap, smart)
+          2. Fallback to keyword matching if LLM fails or is unavailable
+        
         Returns list of newly activated skill names.
         """
         if not self._auto_activate:
             return []
 
+        # Filter to only inactive skills (no point routing already-active ones)
+        inactive = {n: s for n, s in self._skills.items() if n not in self._active}
+        if not inactive:
+            return []
+
+        # Try LLM routing first
+        newly_activated = self._auto_activate_llm(query, inactive)
+        if newly_activated is not None:
+            return newly_activated
+
+        # Fallback: keyword matching
+        return self._auto_activate_keywords(query, inactive)
+
+    def _auto_activate_llm(self, query: str, candidates: dict) -> Optional[list[str]]:
+        """
+        Use a fast LLM to decide which skills to activate.
+        
+        Returns list of skill names to activate, or None if LLM call fails
+        (caller should fallback to keywords).
+        
+        Design:
+          - Minimal prompt: just skill catalog + user query
+          - max_tokens=100 — fast response
+          - JSON output: ["skill-name-1", "skill-name-2"] or []
+          - Timeout: ROUTER_TIMEOUT seconds, fail fast to fallback
+        """
+        try:
+            from .tools import _client as client
+        except ImportError:
+            return None
+        if client is None:
+            return None
+
+        # Build skill catalog for routing prompt
+        catalog_lines = []
+        for name, skill in sorted(candidates.items()):
+            catalog_lines.append(f"- {name}: {skill['description'][:200]}")
+        catalog_text = "\n".join(catalog_lines)
+
+        routing_prompt = (
+            "You are a skill router. Given a user query and available skills, "
+            "decide which skills (if any) should be activated to help answer the query.\n\n"
+            f"Available skills:\n{catalog_text}\n\n"
+            f"User query: {query}\n\n"
+            'Return a JSON array of skill names to activate. '
+            'Return [] if no skills are relevant. '
+            'ONLY output the JSON array, nothing else.'
+        )
+
+        try:
+            t0 = time.time()
+            response = client.messages.create(
+                model=ROUTER_MODEL,
+                max_tokens=100,
+                timeout=ROUTER_TIMEOUT,
+                messages=[{"role": "user", "content": routing_prompt}],
+            )
+            elapsed = time.time() - t0
+
+            # Parse response
+            text = response.content[0].text.strip()
+            # Extract JSON array from response (handle markdown code fences)
+            if text.startswith("```"):
+                text = re.sub(r'^```\w*\n?', '', text)
+                text = re.sub(r'\n?```$', '', text)
+                text = text.strip()
+
+            selected = json.loads(text)
+            if not isinstance(selected, list):
+                return None
+
+            # Validate and activate
+            newly_activated = []
+            for name in selected:
+                if isinstance(name, str) and name in candidates:
+                    self._active.add(name)
+                    newly_activated.append(name)
+
+            # Log for debugging (always, even when [] — that's a valid decision)
+            if newly_activated:
+                print(f"\033[2m  ⚡ Skill router ({elapsed:.1f}s): "
+                      f"activated {newly_activated}\033[0m", file=sys.stderr)
+            else:
+                print(f"\033[2m  ⚡ Skill router ({elapsed:.1f}s): "
+                      f"no skills needed\033[0m", file=sys.stderr)
+
+            return newly_activated
+
+        except Exception:
+            # Any failure (network, parse, API error) → return None to trigger fallback
+            return None
+
+    def _auto_activate_keywords(self, query: str, candidates: dict) -> list[str]:
+        """
+        Fallback: keyword matching when LLM routing is unavailable.
+        Simple but reliable — 2+ meaningful word overlap or skill name match.
+        """
         query_lower = query.lower()
         newly_activated = []
 
-        for name, skill in self._skills.items():
-            if name in self._active:
-                continue
+        stopwords = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in',
+                    'and', 'or', 'on', 'it', 'this', 'that', 'use', 'when',
+                    'with', 'from', 'by', 'at', 'be', 'as', 'do', 'if', 'so',
+                    'what', 'how', 'why', 'can', 'will', 'my', 'your', 'me'}
+        query_words = set(re.findall(r'[a-z]{2,}', query_lower))
 
-            # Check if query matches skill description keywords
+        for name, skill in candidates.items():
             desc_lower = skill["description"].lower()
-            desc_words = set(re.findall(r'[a-z]+', desc_lower))
-            query_words = set(re.findall(r'[a-z]+', query_lower))
-
-            # Simple relevance: if 2+ meaningful words overlap (excluding stopwords)
-            stopwords = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in',
-                        'and', 'or', 'on', 'it', 'this', 'that', 'use', 'when',
-                        'with', 'from', 'by', 'at', 'be', 'as', 'do', 'if', 'so'}
+            desc_words = set(re.findall(r'[a-z]{2,}', desc_lower))
             meaningful_overlap = (desc_words & query_words) - stopwords
 
-            # Also check skill name words
             name_words = set(name.replace('-', ' ').split())
             name_overlap = name_words & query_words
 
@@ -423,15 +531,24 @@ class SkillManager:
                 self._active.add(name)
                 newly_activated.append(name)
 
+        if newly_activated:
+            print(f"\033[2m  ⚡ Skill keywords: activated {newly_activated}\033[0m", file=sys.stderr)
+
         return newly_activated
+
+    # ── 改进1: XML prompt format (agentskills.io spec) ────────────────────
 
     def build_prompt_context(self, query: str = "") -> str:
         """
         Build the skills context section for system prompt injection.
         
+        Uses the official agentskills.io XML format:
+        - <available_skills>: catalog of all skills (always included)
+        - <active_skill>: full instructions for activated skills
+        
         Implements progressive disclosure:
-        - Always includes: skill catalog (name + description) ~100 tokens/skill
-        - When active: full SKILL.md instructions for activated skills
+        - Stage 1 (advertise): name + description in <skill> elements ~100 tokens/skill
+        - Stage 2 (load): full SKILL.md body in <active_skill> elements
         """
         if not self._skills:
             return ""
@@ -440,46 +557,49 @@ class SkillManager:
         if query:
             self.auto_activate_for_query(query)
 
-        sections = []
+        lines = []
 
-        # ── Catalog: all available skills ──
-        catalog = self.get_catalog()
-        if catalog:
-            lines = ["Available skills (use /skill <name> to activate, or they auto-activate on relevant queries):"]
-            for entry in catalog:
-                status = "✅ ACTIVE" if entry["active"] else "📦"
-                lines.append(f"  {status} {entry['name']}: {entry['description'][:200]}")
-            sections.append("\n".join(lines))
+        # ── Stage 1: Catalog — <available_skills> XML ──
+        lines.append("<available_skills>")
+        lines.append("Use /skill <name> to manually activate, or they auto-activate on relevant queries.")
+        for name in sorted(self._skills.keys()):
+            skill = self._skills[name]
+            active_attr = ' status="active"' if name in self._active else ''
+            lines.append(f"<skill{active_attr}>")
+            lines.append(f"<name>{html.escape(name)}</name>")
+            lines.append(f"<description>{html.escape(skill['description'][:200])}</description>")
+            lines.append("</skill>")
+        lines.append("</available_skills>")
 
-        # ── Active skills: full instructions ──
+        # ── Stage 2: Active skill instructions ──
         for name in sorted(self._active):
             skill = self._skills.get(name)
             if not skill:
                 continue
-            
+
             body = skill.get("body", "")
             if not body:
                 continue
 
-            resources = self.list_resources(name)
-            resource_note = ""
-            if resources:
-                resource_note = f"\nAvailable resources (use manage_skills with action='read'): {', '.join(resources)}"
+            lines.append("")
+            lines.append(f'<active_skill name="{html.escape(name)}">')
 
-            allowed_tools = ""
+            # Optional: allowed tools
             if skill.get("allowed_tools"):
-                allowed_tools = f"\nPre-approved tools: {', '.join(skill['allowed_tools'])}"
+                tools_str = ", ".join(skill["allowed_tools"])
+                lines.append(f"<allowed_tools>{html.escape(tools_str)}</allowed_tools>")
 
-            sections.append(
-                f"═══ SKILL: {name} ═══{allowed_tools}{resource_note}\n"
-                f"{body[:MAX_INSTRUCTIONS_CHARS]}\n"
-                f"═══ END SKILL: {name} ═══"
-            )
+            # Optional: available resources
+            resources = self.list_resources(name)
+            if resources:
+                lines.append(f"<resources>{html.escape(', '.join(resources))}</resources>")
 
-        if not sections:
-            return ""
+            lines.append("<instructions>")
+            lines.append(body[:MAX_INSTRUCTIONS_CHARS])
+            lines.append("</instructions>")
+            lines.append(f"</active_skill>")
 
-        return "\n\n".join(sections)
+        return "\n".join(lines)
 
     def create_skill(self, name: str, description: str, instructions: str,
                      metadata: Optional[dict] = None) -> str:

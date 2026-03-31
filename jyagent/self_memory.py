@@ -1,6 +1,6 @@
-# Memory module — Claude Code-style: MEMORY.md index + topic files + user profile + session summaries
+# Memory module — MEMORY.md index + topic files + session summaries
 #
-# Layout: data/memory/MEMORY.md (index), topics/*.md (on-demand), user_profile.json, session_summaries.json
+# Layout: data/memory/MEMORY.md (index), topics/*.md (on-demand), session_summaries.json
 
 import json
 import os
@@ -26,7 +26,6 @@ SUMMARIZE_KEEP_RECENT = int(os.environ.get("AGENT_SUMMARIZE_KEEP_RECENT", "6"))
 SUMMARIZE_THRESHOLD = int(os.environ.get("AGENT_SUMMARIZE_THRESHOLD", "20"))
 
 # Self-memory file paths
-PROFILE_FILE = os.path.join(MEMORY_DIR, "user_profile.json")
 MEMORY_MD_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 SESSIONS_FILE = os.path.join(MEMORY_DIR, "session_summaries.json")
 
@@ -160,7 +159,7 @@ class ConversationMemory:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PERSISTENT MEMORY — File-backed key-value store (used by evolver)
+# PERSISTENT MEMORY — File-backed key-value store
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PersistentMemory:
@@ -477,64 +476,6 @@ def summarize_if_needed(
 # ═══════════════════════════════════════════════════════════════════════════════
 # USER PROFILE — Facts about the user that persist indefinitely
 # ═══════════════════════════════════════════════════════════════════════════════
-
-class UserProfile:
-    """Persistent user profile: name, role, tech stack, preferences, etc."""
-
-    def __init__(self):
-        self.data = _load_json(PROFILE_FILE, {
-            "name": None,
-            "role": None,
-            "tech_stack": [],
-            "os": None,
-            "preferences": {},
-            "projects": [],
-            "communication_style": None,
-            "custom_facts": {},
-            "last_updated": None,
-        })
-
-    def update(self, **kwargs):
-        for key, value in kwargs.items():
-            if value is not None:
-                if key in ("tech_stack", "projects") and isinstance(value, str):
-                    existing = self.data.get(key, [])
-                    if value not in existing:
-                        existing.append(value)
-                    self.data[key] = existing
-                elif key == "preferences" and isinstance(value, dict):
-                    self.data.setdefault("preferences", {}).update(value)
-                elif key == "custom_facts" and isinstance(value, dict):
-                    self.data.setdefault("custom_facts", {}).update(value)
-                else:
-                    self.data[key] = value
-        self.data["last_updated"] = datetime.now().isoformat()
-        self.save()
-
-    def save(self):
-        _atomic_write(PROFILE_FILE, self.data)
-
-    def to_prompt_text(self) -> str:
-        parts = []
-        if self.data.get("name"):
-            parts.append(f"User's name: {self.data['name']}")
-        if self.data.get("role"):
-            parts.append(f"Role: {self.data['role']}")
-        if self.data.get("os"):
-            parts.append(f"OS: {self.data['os']}")
-        if self.data.get("tech_stack"):
-            parts.append(f"Tech stack: {', '.join(self.data['tech_stack'])}")
-        if self.data.get("projects"):
-            parts.append(f"Projects: {', '.join(self.data['projects'])}")
-        if self.data.get("preferences"):
-            prefs = "; ".join(f"{k}: {v}" for k, v in self.data["preferences"].items())
-            parts.append(f"Preferences: {prefs}")
-        if self.data.get("communication_style"):
-            parts.append(f"Communication style: {self.data['communication_style']}")
-        if self.data.get("custom_facts"):
-            facts = "; ".join(f"{k}: {v}" for k, v in self.data["custom_facts"].items())
-            parts.append(f"Other facts: {facts}")
-        return "\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -870,26 +811,19 @@ def build_memory_context(query: str = "") -> str:
     """Build a memory context string to inject into the system prompt.
 
     Layout:
-      1. User Profile (always, structured)
-      2. MEMORY.md index (always, first 200 lines / 25KB)
-      3. Recent Session Summaries (always, last 5)
+      1. MEMORY.md index (always, first 200 lines / 25KB) — includes user profile section
+      2. Recent Session Summaries (always, last 5)
 
     Topic files are NOT injected here — agent reads them on-demand via read_file.
     """
     sections = []
 
-    # 1. User Profile
-    profile = UserProfile()
-    profile_text = profile.to_prompt_text()
-    if profile_text:
-        sections.append(f"## User Profile\n{profile_text}")
-
-    # 2. MEMORY.md index (with Claude Code limits)
+    # 1. MEMORY.md index (with Claude Code limits) — includes user profile
     memory_index = read_memory_index()
     if memory_index:
         sections.append(f"## Agent Memory (MEMORY.md)\n{memory_index}")
 
-    # 3. Session Summaries
+    # 2. Session Summaries
     sessions = SessionSummaries()
     session_text = sessions.to_prompt_text()
     if session_text:
@@ -945,11 +879,6 @@ def forget(keyword: str) -> str:
 def show_memory() -> str:
     """Display all stored memories in a readable format."""
     parts = []
-
-    profile = UserProfile()
-    profile_text = profile.to_prompt_text()
-    if profile_text:
-        parts.append(f"📋 USER PROFILE:\n{profile_text}")
 
     memory_md = read_memory_md()
     if memory_md:

@@ -160,7 +160,7 @@ class CLI:
         banner_text.append("✨ Now with rich output & multi-line input!\n\n", style="italic")
         banner_text.append("Commands: ", style="bold")
         banner_text.append("/quit /help /history /clear /tools /multi /markdown\n")
-        banner_text.append("          /skills /skill /evolve\n")
+        banner_text.append("          /skills /skill\n")
         banner_text.append("\nInput:    ", style="bold")
         banner_text.append("Enter=submit │ Meta+Enter=newline │ /multi=toggle mode\n")
         banner_text.append("          Paste multi-line content works automatically!\n")
@@ -211,7 +211,6 @@ class CLI:
             ("/history", "Show last 10 messages"),
             ("/clear", "Clear conversation history"),
             ("/tools", "List registered tools"),
-            ("/evolve", "Manually trigger self-evolution"),
             ("/multi", "Toggle multi-line input mode"),
             ("/markdown", "Toggle markdown rendering for responses"),
         ]

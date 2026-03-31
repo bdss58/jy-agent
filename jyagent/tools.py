@@ -292,27 +292,49 @@ def _format_size(size: int) -> str:
         return f"{size / (1024 * 1024 * 1024):.1f}GB"
 
 
-# ─── Evolution tool (lazy imports to avoid startup failures) ──────────────────
+# ─── Hot-reload tool (simplified from former evolve_self) ─────────────────────
 
 def evolve_self(module_name: str, feedback: str) -> str:
-    """Evolve and improve the agent's own source code."""
-    try:
-        from .evolver import evolve_module, read_module_source
+    """Hot-reload a jyagent module after external edits.
 
-        current_source = read_module_source(module_name)
-        if current_source.startswith("Error:"):
-            return current_source
-        
-        from .self_memory import PersistentMemory
-        persistent = PersistentMemory()
-        interaction_log = "Feedback: " + feedback
-        
-        success, message = evolve_module(_client, module_name, feedback, interaction_log, persistent)
-        return message
-    except ImportError as e:
-        return f"Error: Evolution engine not available: {e}"
+    This is a lightweight utility: validate the module's current on-disk source
+    with AST checks, then hot-reload it into the running process.
+    Actual code changes should be made via edit_file / write_file in conversation,
+    NOT by asking Claude to regenerate an entire module.
+
+    Args:
+        module_name: Module to reload (e.g. 'planner', 'tools', 'agent').
+        feedback: Reason for the reload (logged for reference).
+    """
+    import importlib
+
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    module_path = os.path.join(pkg_dir, f"{module_name}.py")
+
+    if not os.path.exists(module_path):
+        return f"Error: Module '{module_name}' not found at {module_path}"
+
+    # 1. Syntax check before reload
+    try:
+        with open(module_path, "r") as f:
+            source = f.read()
+        import ast
+        ast.parse(source)
+    except SyntaxError as e:
+        return f"Syntax error in {module_name}.py line {e.lineno}: {e.msg} — not reloading."
     except Exception as e:
-        return f"Error: {e}"
+        return f"Validation error: {e}"
+
+    # 2. Hot-reload
+    full_name = f"jyagent.{module_name}"
+    try:
+        if full_name in sys.modules:
+            importlib.reload(sys.modules[full_name])
+        else:
+            importlib.import_module(full_name)
+        return f"✅ Module '{module_name}' reloaded successfully. (reason: {feedback})"
+    except Exception as e:
+        return f"Hot-reload failed: {e}"
 
 
 # ─── Dynamic tool creation ───────────────────────────────────────────────────
@@ -325,10 +347,12 @@ def add_tool(name: str, code: str, description: str, parameters: str) -> str:
         except json.JSONDecodeError:
             return "Error: parameters must be valid JSON"
         
-        from validator import validate_single_module
-        success, errors = validate_single_module(f"tool_{name}.py", code)
-        if not success:
-            return f"Validation failed: {errors}"
+        # Syntax check
+        import ast
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            return f"Syntax error at line {e.lineno}: {e.msg}"
         
         # Execute the code to get the function
         import types
@@ -381,10 +405,10 @@ def add_tool(name: str, code: str, description: str, parameters: str) -> str:
 # ─── Memory management tool (LLM-accessible) ─────────────────────────────────
 
 def manage_memory(action: str, text: str = "", category: str = "") -> str:
-    """Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'profile' (update user profile), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions."""
+    """Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions."""
     from .self_memory import (
         remember, forget, show_memory,
-        UserProfile, append_memory_md,
+        append_memory_md,
         list_topics, read_topic, write_topic, delete_topic,
     )
     
@@ -402,19 +426,6 @@ def manage_memory(action: str, text: str = "", category: str = "") -> str:
         elif action == "show":
             return show_memory()
         
-        elif action == "profile":
-            if not text:
-                return "Error: 'text' parameter required. Format: 'key=value'"
-            profile = UserProfile()
-            if "=" in text:
-                key, value = text.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                profile.update(**{key: value})
-                return f"🧠 Profile updated: {key} = {value}"
-            else:
-                profile.update(custom_facts={text: True})
-                return f"🧠 Profile fact added: {text}"
         
         elif action == "topic":
             if not text:
@@ -469,21 +480,9 @@ def manage_memory(action: str, text: str = "", category: str = "") -> str:
                 return "Error: 'text' parameter required"
             return f"🧠 {remember(text, 'note')}"
         
-        elif action == "project":
-            if not text:
-                return "Error: 'text' parameter required"
-            profile = UserProfile()
-            if "|" in text:
-                name, desc = text.split("|", 1)
-                profile.update(projects=name.strip())
-                append_memory_md(f"- Active project: {name.strip()} — {desc.strip()}")
-                return f"🧠 Project noted: {name.strip()} — {desc.strip()}"
-            else:
-                profile.update(projects=text.strip())
-                return f"🧠 Project added to profile: {text.strip()}"
         
         else:
-            return f"Error: Unknown action '{action}'. Valid: remember, forget, show, profile, topic, goal, note, project"
+            return f"Error: Unknown action '{action}'. Valid: remember, forget, show, topic, goal, note"
     
     except Exception as e:
         return f"Error managing memory: {e}"
@@ -532,16 +531,18 @@ def manage_skills(action: str, name: str = "", description: str = "",
             skill = mgr.get_skill(name)
             if not skill:
                 return f"Error: Skill '{name}' not found."
+            is_active = name in mgr.get_active_skills()
+            body = skill.get("body", "")
             lines = [
-                f"📦 Skill: {skill.name}",
-                f"   Description: {skill.description}",
-                f"   Active: {'✅ Yes' if skill.active else '❌ No'}",
-                f"   Version: {getattr(skill, 'version', 'N/A')}",
-                f"   Instructions ({len(skill.instructions)} chars):",
-                "   " + skill.instructions[:500],
+                f"📦 Skill: {skill['name']}",
+                f"   Description: {skill['description']}",
+                f"   Active: {'✅ Yes' if is_active else '❌ No'}",
+                f"   Path: {skill.get('path', 'N/A')}",
+                f"   Instructions ({len(body)} chars):",
+                "   " + body[:500],
             ]
-            if len(skill.instructions) > 500:
-                lines.append(f"   ... ({len(skill.instructions) - 500} more chars)")
+            if len(body) > 500:
+                lines.append(f"   ... ({len(body) - 500} more chars)")
             return "\n".join(lines)
         
         elif action == "create":
@@ -552,18 +553,14 @@ def manage_skills(action: str, name: str = "", description: str = "",
             if not instructions:
                 return "Error: 'instructions' parameter required"
             
-            success = mgr.create_skill(name, description, instructions)
-            if success:
-                return f"✅ Skill '{name}' created. Use manage_skills(action='activate', name='{name}') to activate."
-            return f"Error: Failed to create skill '{name}' (may already exist)."
+            result = mgr.create_skill(name, description, instructions)
+            return result  # create_skill already returns a user-friendly message
         
         elif action == "delete":
             if not name:
                 return "Error: 'name' parameter required"
-            success = mgr.delete_skill(name)
-            if success:
-                return f"🗑️ Skill '{name}' deleted."
-            return f"Error: Skill '{name}' not found."
+            result = mgr.delete_skill(name)
+            return result  # delete_skill already returns a user-friendly message
         
         elif action == "resources":
             if not name:
@@ -702,17 +699,17 @@ CORE_TOOLS = [
     # --- evolve_self ---
     {
         "name": "evolve_self",
-        "description": "Evolve and improve the agent's own source code",
+        "description": "Validate and hot-reload a jyagent module after edits. Use edit_file to make changes first, then call this to reload.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "module_name": {
                     "type": "string",
-                    "description": "Name of the module to evolve"
+                    "description": "Name of the module to reload (e.g. 'planner', 'tools', 'agent')"
                 },
                 "feedback": {
                     "type": "string",
-                    "description": "Feedback describing the improvement needed"
+                    "description": "Reason for the reload (logged for reference)"
                 }
             },
             "required": ["module_name", "feedback"]
@@ -748,14 +745,14 @@ CORE_TOOLS = [
     # --- manage_memory ---
     {
         "name": "manage_memory",
-        "description": "Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'profile' (update user profile), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions.",
+        "description": "Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["remember", "forget", "show", "profile", "topic", "goal", "note", "project"],
-                    "description": "Action: remember, forget, show, profile, topic, goal, note, project"
+                    "enum": ["remember", "forget", "show", "topic", "goal", "note"],
+                    "description": "Action: remember, forget, show, topic, goal, note"
                 },
                 "text": {
                     "type": "string",

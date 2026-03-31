@@ -12,19 +12,17 @@ from .self_memory import (
 )
 from .planner import plan_next_action
 from .cli import CLI, console
-from .skills import get_skill_manager, init_skills
+from .skills import SkillManager, get_skill_manager, init_skills
 
 
 # ─── System prompt (externalized from run()) ──────────────────────────────────
 
-SYSTEM_PROMPT = """You are Claude Code, Anthropic's official CLI for Claude.\
-You are a self-assembled AI agent, bootstrapped from a single API call.
+SYSTEM_PROMPT = """You are jy-agent, a self-assembled AI agent built by Jianyong, bootstrapped from a single API call.
 You have access to tools for running shell commands, reading/writing files, listing directories, and evolving your own source code.
 You can also create NEW tools at runtime using the add_tool function — use it when you need a capability you don't have.
 Think step by step. Use tools when needed to accomplish tasks.
 Be helpful, precise, and concise.
-You can improve yourself: use the evolve_self tool to rewrite any of your modules when you identify weaknesses or bugs.
-You can also evolve your evolution_strategy module to improve how you improve yourself.
+You can improve yourself: use edit_file to modify your source code in jyagent/, then use evolve_self to validate and hot-reload the changed module.
 Your source code lives in the jyagent/ directory.
 
 CRITICAL BEHAVIORAL PRINCIPLES:
@@ -43,7 +41,6 @@ CRITICAL BEHAVIORAL PRINCIPLES:
 4. MEMORY AWARENESS: You have a self-use memory system (inspired by Claude Code):
    - MEMORY.md: the index file, always loaded (first 200 lines / 25KB). Keep it concise.
    - Topic files: detailed knowledge in data/memory/topics/<name>.md. Read on-demand with read_file.
-   - User profile: structured data (user_profile.json), always loaded.
    - Session summaries: recent session history, always loaded.
    
    Memory workflow:
@@ -63,38 +60,6 @@ CRITICAL BEHAVIORAL PRINCIPLES:
    - /skill <name> — activate a specific skill
    - manage_skills tool — full skill management (list, activate, deactivate, create, etc.)
    Active skills inject their instructions into your context. Use them to follow best practices for specific tasks."""
-
-
-# ─── Evolution helper (shared by /evolve and auto-evolution) ──────────────────
-
-def _run_evolution(client, conversation: ConversationMemory, cli: CLI) -> None:
-    """Run a single evolution evaluation and apply improvements if found."""
-    from evolver import evaluate_performance, read_module_source, _load_valid_modules
-
-    modules = _load_valid_modules()
-    sources_dict = {}
-    for module_name in modules:
-        source = read_module_source(module_name)
-        if not source.startswith("Error:"):
-            sources_dict[module_name] = source
-
-    recent_messages = conversation.get_recent(10)
-    interaction_log = "\n".join(
-        f"{msg['role']}: {msg['content']}" for msg in recent_messages
-    )
-
-    result = evaluate_performance(client, interaction_log, sources_dict)
-    if result:
-        cli.print_system(f"Found improvement opportunity: {result}")
-        evolve_fn = get_registry().get_function("evolve_self")
-        if evolve_fn:
-            evolution_result = evolve_fn(
-                module_name=result["module"],
-                feedback=result["weakness"],
-            )
-            cli.print_system(f"Evolution result: {evolution_result}")
-    else:
-        cli.print_system("No immediate improvements identified.")
 
 
 
@@ -122,11 +87,6 @@ def _cmd_tools(cli, **_):
     tools = get_registry().list_tools()
     cli.print_system(f"Registered tools: {tools}")
 
-def _cmd_evolve(cli, client, conversation, **_):
-    try:
-        _run_evolution(client, conversation, cli)
-    except Exception as e:
-        cli.print_error(f"Error during manual evolution: {e}")
 
 def _cmd_compact(cli, client, conversation, user_input, state, **_):
     """Manual /compact command — like Claude Code's /compact [instruction]."""
@@ -209,7 +169,6 @@ COMMAND_TABLE = {
     "/history": _cmd_history,
     "/clear": _cmd_clear,
     "/tools": _cmd_tools,
-    "/evolve": _cmd_evolve,
     "/skills": _cmd_skills,
 }
 
@@ -227,7 +186,7 @@ def _graceful_exit(client, conversation, cli):
 
 # ─── System prompt builder ───────────────────────────────────────────────────
 
-def _build_full_system_prompt(user_input: str, skill_mgr) -> str:
+def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
 
     This is extracted as a function so it can be called:
@@ -244,12 +203,10 @@ def _build_full_system_prompt(user_input: str, skill_mgr) -> str:
         full_system_prompt = SYSTEM_PROMPT + "\n\n" + memory_context
 
     # Re-read skills (ensures fresh state after compaction)
+    # Skills context uses official agentskills.io XML format (<available_skills>, <active_skill>)
     skills_context = skill_mgr.build_prompt_context(query=user_input)
     if skills_context:
-        full_system_prompt = full_system_prompt + "\n\n" + \
-            "═══ AGENT SKILLS (procedural knowledge) ═══\n" + \
-            skills_context + "\n" + \
-            "═══ END SKILLS ═══"
+        full_system_prompt = full_system_prompt + "\n\n" + skills_context
 
     return full_system_prompt
 
@@ -386,14 +343,6 @@ def run(client) -> None:
                         pass
 
                 cli.print_separator()
-
-                # Auto-evolution check every 10 interactions
-                if interaction_count % 10 == 0:
-                    try:
-                        cli.print_system("[Auto-evolution] Evaluating performance...")
-                        _run_evolution(client, conversation, cli)
-                    except Exception as e:
-                        cli.print_error(f"[Auto-evolution] Error: {e}")
 
             except KeyboardInterrupt:
                 cli.print_system("\n⚠ Interrupted — returning to prompt.")
