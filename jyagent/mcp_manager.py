@@ -138,7 +138,7 @@ class MCPManager:
     Now backed by the official MCP SDK. Each server gets an MCPClient instance
     which wraps the SDK's async ClientSession with a sync interface.
     
-    Improvements (2026-03):
+    Improvements (2025-03):
     - P1: Handles tools/list_changed notifications via MCPClient callback
     - P2: Background keepalive thread pings connected servers every 60s
     """

@@ -14,7 +14,13 @@ import re
 import fnmatch
 import time
 
-from .tools import SKIP_DIRS, BINARY_EXTS, _format_size
+try:
+    from .config import SKIP_DIRS, BINARY_EXTS
+    from .tools.core import _format_size
+except ImportError:
+    # Fallback for when loaded via auto-discovery with different package context
+    from jyagent.config import SKIP_DIRS, BINARY_EXTS
+    from jyagent.tools.core import _format_size
 
 
 def _should_skip_dir(dirname: str) -> bool:

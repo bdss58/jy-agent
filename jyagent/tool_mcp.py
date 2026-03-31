@@ -14,7 +14,10 @@ This tool only handles meta-operations:
 """
 
 import json
-from .mcp_manager import get_manager, reset_manager
+try:
+    from .mcp_manager import get_manager, reset_manager
+except ImportError:
+    from jyagent.mcp_manager import get_manager, reset_manager
 
 
 def mcp(action: str, server: str = "") -> str:

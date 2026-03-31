@@ -440,8 +440,9 @@ class SkillManager:
           - Timeout: ROUTER_TIMEOUT seconds, fail fast to fallback
         """
         try:
-            from .tools import _client as client
-        except ImportError:
+            import anthropic
+            client = anthropic.Anthropic()
+        except Exception:
             return None
         if client is None:
             return None

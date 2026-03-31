@@ -3,12 +3,11 @@
 import json
 import os
 import sys
-from .tools import set_client
 from .registry import get_registry
-from .self_memory import (
+from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context, on_session_start, on_session_end,
-    compact_conversation,
+    compact_conversation, estimate_conversation_tokens,
 )
 from .planner import plan_next_action
 from .cli import CLI, console
@@ -98,7 +97,6 @@ def _cmd_compact(cli, client, conversation, user_input, state, **_):
         cli.print_system("⚡ Nothing to compact — conversation is too short.")
         return
 
-    from .self_memory import estimate_conversation_tokens
     est_tokens = estimate_conversation_tokens(conversation.messages)
     cli.print_system(
         f"⚡ Compacting conversation (~{est_tokens} tokens, {len(conversation)} messages)..."
@@ -226,7 +224,6 @@ def run(client) -> None:
 
         conversation = ConversationMemory()
         persistent = PersistentMemory()
-        set_client(client)
         interaction_count = 0
 
         # Start session and load memory context
