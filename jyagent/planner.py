@@ -2,6 +2,7 @@
 # Honesty rules are in the main SYSTEM_PROMPT (agent.py), not duplicated here.
 import sys
 import time
+import atexit
 import traceback
 import concurrent.futures
 from .registry import get_registry
@@ -10,13 +11,15 @@ from .validation import validate_tool_input
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
-    MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, AGENT_MODEL,
-    COMPACT_TOOL_RESULT_CHARS,
+    MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, STREAM_TIMEOUT,
+    AGENT_MODEL, COMPACT_TOOL_RESULT_CHARS,
 )
 
 # Shared executor for tool timeouts.  max_workers=4 so a hung tool doesn't
-# block subsequent calls (future.cancel() can't stop a running thread).
+# block subsequent calls.  NOTE: future.cancel() can't stop a *running* thread,
+# so 4 hung tools would exhaust this pool.  atexit ensures clean shutdown.
 _tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+atexit.register(_tool_executor.shutdown, wait=False)
 
 TOOL_COLOR = "\033[0;33m"  # yellow for tool info
 COLOR_RESET = "\033[0m"
@@ -241,7 +244,7 @@ def _execute_tool_with_timeout(tool_name: str, tool_input: dict, tool_functions:
         raise
 
 
-# ─── Tool execution ──────────────────────────────────────────────────────────
+# ─── Multi-tool dispatch ─────────────────────────────────────────────────────
 
 def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
     """Execute tool calls with selective parallelization.
@@ -274,17 +277,25 @@ def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
                 parallel_batch.append((i, tool_blocks[i]))
                 i += 1
 
-            # Execute batch concurrently
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(parallel_batch)) as executor:
-                futures = {
-                    executor.submit(
-                        _execute_tool_with_timeout, block.name, block.input, tool_functions
-                    ): (idx, block)
-                    for idx, block in parallel_batch
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    idx, block = futures[future]
+            # Execute batch concurrently via the shared executor
+            # (_execute_tool_with_timeout already submits to _tool_executor for
+            # timeout enforcement, so we call _execute_tool directly here to
+            # avoid a double thread-pool layer.)
+            futures = {
+                _tool_executor.submit(
+                    _execute_tool, block.name, block.input, tool_functions
+                ): (idx, block)
+                for idx, block in parallel_batch
+            }
+            for future in concurrent.futures.as_completed(futures):
+                idx, block = futures[future]
+                try:
                     results[idx] = (block, future.result())
+                except Exception as exc:
+                    results[idx] = (block, ToolResult(
+                        f"Error calling tool {block.name}: {exc}\n{traceback.format_exc()}",
+                        is_error=True
+                    ))
         else:
             # Sequential tool — execute immediately as a barrier
             block = tool_blocks[i]
@@ -343,7 +354,7 @@ def _stream_response(client, api_kwargs: dict) -> tuple:
     stop_reason = None
     final_message = None
 
-    with client.messages.stream(**api_kwargs, timeout=300) as stream:
+    with client.messages.stream(**api_kwargs, timeout=STREAM_TIMEOUT) as stream:
         for event in stream:
             if hasattr(event, 'type') and event.type == 'content_block_delta':
                 delta = event.delta
@@ -390,8 +401,7 @@ def _stream_with_retry(client, api_kwargs: dict, step: int, all_text: str, worki
                 retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {retry_delay}s... (attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
                 sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
                 sys.stdout.flush()
-                for _ in range(int(retry_delay * 10)):
-                    time.sleep(0.1)
+                time.sleep(retry_delay)  # responds to KeyboardInterrupt
                 continue
             # Non-transient error or retries exhausted
             error_msg = f"\n[Stream error at step {step+1}: {stream_err}]\n"
@@ -563,7 +573,7 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
                 system=system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
                 messages=working_messages,
             )
-            with client.messages.stream(**api_kwargs_final, timeout=300) as stream:
+            with client.messages.stream(**api_kwargs_final, timeout=STREAM_TIMEOUT) as stream:
                 for event in stream:
                     if hasattr(event, 'type') and event.type == 'content_block_delta':
                         delta = event.delta
