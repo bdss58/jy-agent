@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from .registry import get_registry
+import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context, on_session_start, on_session_end,
@@ -17,16 +18,14 @@ from .skills import SkillManager, get_skill_manager, init_skills
 # ─── System prompt (externalized from run()) ──────────────────────────────────
 
 SYSTEM_PROMPT = """You are jy-agent, a self-assembled AI agent built by Jianyong, bootstrapped from a single API call.
-You have access to tools for running shell commands, reading/writing files, listing directories, and evolving your own source code.
-You can also create NEW tools at runtime using the add_tool function — use it when you need a capability you don't have.
+You have access to tools for running shell commands, reading/writing files, and listing directories.
 Think step by step. Use tools when needed to accomplish tasks.
 Be helpful, precise, and concise.
-You can improve yourself: use edit_file to modify your source code in jyagent/, then use evolve_self to validate and hot-reload the changed module.
 Your source code lives in the jyagent/ directory.
 
 CRITICAL BEHAVIORAL PRINCIPLES:
 
-1. TOOL-FIRST PRINCIPLE: Before writing ad-hoc code or workarounds, check what tools are available. Use existing tools (web_fetch, chrome_browser, manage_memory, etc.) directly. If a needed capability doesn't exist as a tool, create it with add_tool so it persists for future use.
+1. TOOL-FIRST PRINCIPLE: Before writing ad-hoc code or workarounds, check what tools are available. Use existing tools (web_fetch, chrome_browser, manage_memory, etc.) directly.
 
 2. HONESTY PRINCIPLE: Never pretend to have looked something up when you have not. If you are answering from training data alone, say so clearly. If the user asks for recent/current information, use your tools (web_fetch, run_shell with curl, etc.) to actually fetch it. Do not fabricate citations, changelogs, or sources. If you are uncertain, say so.
 
@@ -184,24 +183,28 @@ def _graceful_exit(client, conversation, cli):
 
 # ─── System prompt builder ───────────────────────────────────────────────────
 
-def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager) -> str:
+# Cache the memory portion of the system prompt (does not depend on user query).
+# Invalidated when _force_rebuild_context is set (after compaction or memory writes).
+_cached_memory_context: str | None = None
+
+
+def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager,
+                              force_rebuild: bool = False) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
 
-    This is extracted as a function so it can be called:
-    1. On every regular interaction
-    2. After compaction (to re-inject MEMORY.md and skills fresh from disk)
-
-    Like Claude Code's behavior: "CLAUDE.md fully survives compaction —
-    after /compact, Claude re-reads CLAUDE.md from disk and re-injects it fresh."
+    Memory context is cached between turns (invalidated by force_rebuild).
+    Skills context is always rebuilt because auto-activation depends on user query.
     """
-    # Re-read memory from disk (ensures fresh state after compaction)
-    memory_context = build_memory_context(query=user_input)
-    full_system_prompt = SYSTEM_PROMPT
-    if memory_context:
-        full_system_prompt = SYSTEM_PROMPT + "\n\n" + memory_context
+    global _cached_memory_context
 
-    # Re-read skills (ensures fresh state after compaction)
-    # Skills context uses official agentskills.io XML format (<available_skills>, <active_skill>)
+    if force_rebuild or _cached_memory_context is None:
+        _cached_memory_context = build_memory_context(query=user_input) or ""
+
+    full_system_prompt = SYSTEM_PROMPT
+    if _cached_memory_context:
+        full_system_prompt = SYSTEM_PROMPT + "\n\n" + _cached_memory_context
+
+    # Skills context depends on user query (auto-activation) — always rebuild
     skills_context = skill_mgr.build_prompt_context(query=user_input)
     if skills_context:
         full_system_prompt = full_system_prompt + "\n\n" + skills_context
@@ -212,6 +215,7 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager) -> str:
 # ─── Main agent loop ─────────────────────────────────────────────────────────
 
 def run(client) -> None:
+    global _cached_memory_context
     # Initialize before try block to avoid unbound variable risk in outer except
     cli = None
     conversation = None
@@ -227,7 +231,7 @@ def run(client) -> None:
         interaction_count = 0
 
         # Start session and load memory context
-        on_session_start()
+        on_session_start(client)
         memory_context = build_memory_context()
         if memory_context:
             cli.print_system("🧠 Memory loaded from previous sessions.")
@@ -303,11 +307,10 @@ def run(client) -> None:
 
                 messages = conversation.get_history()
 
-                # Build system prompt (re-reads memory & skills from disk each time)
-                full_system_prompt = _build_full_system_prompt(user_input, skill_mgr)
-
-                # Clear the rebuild flag if it was set
-                state.pop("_force_rebuild_context", None)
+                # Build system prompt (memory cached, skills always rebuilt)
+                force_rebuild = state.pop("_force_rebuild_context", False)
+                full_system_prompt = _build_full_system_prompt(user_input, skill_mgr,
+                                                               force_rebuild=force_rebuild)
 
                 cli.print_separator()
 
@@ -315,19 +318,30 @@ def run(client) -> None:
                 sys.stdout.flush()
 
                 try:
-                    response = plan_next_action(client, messages, full_system_prompt)
+                    response, final_text, planner_messages = plan_next_action(client, messages, full_system_prompt)
                 except KeyboardInterrupt:
                     cli.print_system("\n⚠ Interrupted — returning to prompt.")
                     response = "[Response interrupted by user]"
+                    final_text = ""
+                    planner_messages = []
 
-                conversation.add_message("assistant", response)
+                # Invalidate memory cache after planner runs (tools may have written memory)
+                _cached_memory_context = None
 
-                # Render with rich markdown if enabled
-                if state["use_markdown"] and response.strip() and not response.strip().startswith("["):
+                # Preserve structured tool_use/tool_result messages from the planner loop.
+                # planner_messages starts as messages.copy(), so new entries start after that.
+                new_messages = planner_messages[len(messages):]
+                if new_messages:
+                    conversation.messages.extend(new_messages)
+                else:
+                    conversation.add_message("assistant", response)
+
+                # Render final LLM output (not intermediate tool-use text) with rich markdown
+                if state["use_markdown"] and final_text.strip() and not final_text.strip().startswith("["):
                     try:
                         from rich.markdown import Markdown
                         from rich.panel import Panel
-                        md = Markdown(response, code_theme="monokai")
+                        md = Markdown(final_text, code_theme="monokai")
                         console.print()
                         console.print(Panel(
                             md,

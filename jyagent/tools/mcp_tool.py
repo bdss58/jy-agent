@@ -15,12 +15,16 @@ This tool only handles meta-operations:
 
 import json
 try:
-    from .mcp_manager import get_manager, reset_manager
+    from ..mcp_manager import get_manager, reset_manager
 except ImportError:
     from jyagent.mcp_manager import get_manager, reset_manager
+try:
+    from ..toolresult import ToolResult
+except ImportError:
+    from jyagent.toolresult import ToolResult
 
 
-def mcp(action: str, server: str = "") -> str:
+def mcp(action: str, server: str = "") -> ToolResult:
     """Manage MCP server connections.
 
     When you connect to an MCP server, its tools are automatically discovered
@@ -48,8 +52,8 @@ def mcp(action: str, server: str = "") -> str:
                     except Exception as e:
                         results.append(f"  {name}: ❌ {e}")
                 if not results:
-                    return "No MCP servers configured. Create a .mcp.json file."
-                return "Connected MCP servers:\n" + "\n".join(results)
+                    return ToolResult("No MCP servers configured. Create a .mcp.json file.", is_error=True)
+                return ToolResult("Connected MCP servers:\n" + "\n".join(results))
             else:
                 result = manager.connect(server)
                 status = result.get("status", "?")
@@ -60,19 +64,19 @@ def mcp(action: str, server: str = "") -> str:
                 if info:
                     msg += f"\nServer: {info.get('name', '?')} v{info.get('version', '?')}"
                 msg += f"\nProtocol: {proto}"
-                return msg
+                return ToolResult(msg)
 
         elif action == "disconnect":
             if not server:
                 manager.disconnect_all()
-                return "✅ All MCP servers disconnected"
+                return ToolResult("✅ All MCP servers disconnected")
             else:
                 result = manager.disconnect(server)
-                return f"✅ MCP server '{server}': {result.get('status', 'disconnected')}"
+                return ToolResult(f"✅ MCP server '{server}': {result.get('status', 'disconnected')}")
 
         elif action == "reconnect":
             if not server:
-                return "❌ Please specify which server to reconnect: server='chrome'"
+                return ToolResult("❌ Please specify which server to reconnect: server='chrome'", is_error=True)
             # Reload .mcp.json config before reconnecting so new args take effect
             manager.load_servers()
             manager.disconnect(server)
@@ -80,30 +84,31 @@ def mcp(action: str, server: str = "") -> str:
             status = result.get("status", "?")
             tools = result.get("tools_registered", 0)
             proto = result.get("protocol_version", "?")
-            return f"✅ MCP server '{server}' reconnected (config reloaded): {status} ({tools} tools, protocol {proto})"
+            return ToolResult(f"✅ MCP server '{server}' reconnected (config reloaded): {status} ({tools} tools, protocol {proto})")
 
         elif action == "status":
-            return manager.status()
+            return ToolResult(manager.status())
 
         elif action == "list_servers":
             servers = manager.get_server_names()
             if not servers:
-                return "No MCP servers configured. Create a .mcp.json file."
+                return ToolResult("No MCP servers configured. Create a .mcp.json file.", is_error=True)
             lines = ["Configured MCP servers:"]
             for name in servers:
                 connected = manager.is_connected(name)
                 status = "✅" if connected else "⬚"
                 lines.append(f"  {status} {name}")
-            return "\n".join(lines)
+            return ToolResult("\n".join(lines))
 
         else:
-            return (
+            return ToolResult(
                 f"❌ Unknown action '{action}'. "
-                f"Valid: connect, disconnect, reconnect, status, list_servers"
+                f"Valid: connect, disconnect, reconnect, status, list_servers",
+                is_error=True
             )
 
     except Exception as e:
-        return f"❌ MCP error: {e}"
+        return ToolResult(f"❌ MCP error: {e}", is_error=True)
 
 
 # ─── Tool schema for auto-discovery ──────────────────────────────────────────

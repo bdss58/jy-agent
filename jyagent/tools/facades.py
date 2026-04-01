@@ -1,7 +1,10 @@
 # Facade tools: manage_memory, manage_skills
 # These are thin wrappers that delegate to the memory/ and skills modules.
 
-def manage_memory(action: str, text: str = "", category: str = "") -> str:
+from ..toolresult import ToolResult
+
+
+def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult:
     """Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions."""
     from ..memory.operations import (
         remember, forget, show_memory,
@@ -11,78 +14,78 @@ def manage_memory(action: str, text: str = "", category: str = "") -> str:
     try:
         if action == "remember":
             if not text:
-                return "Error: 'text' parameter required for 'remember' action"
-            return f"🧠 {remember(text, category)}"
+                return ToolResult("Error: 'text' parameter required for 'remember' action", is_error=True)
+            return ToolResult(f"🧠 {remember(text, category)}")
 
         elif action == "forget":
             if not text:
-                return "Error: 'text' parameter required for 'forget' action (keyword to match)"
-            return f"🧠 {forget(text)}"
+                return ToolResult("Error: 'text' parameter required for 'forget' action (keyword to match)", is_error=True)
+            return ToolResult(f"🧠 {forget(text)}")
 
         elif action == "show":
-            return show_memory()
+            return ToolResult(show_memory())
 
         elif action == "topic":
             if not text:
-                return "Error: 'text' parameter required. Formats: 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'"
+                return ToolResult("Error: 'text' parameter required. Formats: 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'", is_error=True)
 
             if text == "list":
                 topics = list_topics()
                 if not topics:
-                    return "📂 No topic files yet. Create with topic action: 'write:<name>|<content>'"
+                    return ToolResult("📂 No topic files yet. Create with topic action: 'write:<name>|<content>'")
                 lines = []
                 for t in topics:
                     tc = read_topic(t)
                     lines.append(f"  📄 {t}.md ({len(tc.split(chr(10)))} lines, {len(tc)} chars)")
-                return "📂 Topic files (" + str(len(topics)) + "):\n" + "\n".join(lines)
+                return ToolResult("📂 Topic files (" + str(len(topics)) + "):\n" + "\n".join(lines))
 
             elif text.startswith("read:"):
                 name = text[5:].strip()
                 content = read_topic(name)
                 if not content:
-                    return f"Topic '{name}' not found. Available: {', '.join(list_topics()) or 'none'}"
-                return f"📄 Topic: {name}.md" + "\n\n" + content
+                    return ToolResult(f"Topic '{name}' not found. Available: {', '.join(list_topics()) or 'none'}", is_error=True)
+                return ToolResult(f"📄 Topic: {name}.md" + "\n\n" + content)
 
             elif text.startswith("write:"):
                 rest = text[6:]
                 if "|" not in rest:
-                    return "Error: format is 'write:<name>|<content>'"
+                    return ToolResult("Error: format is 'write:<name>|<content>'", is_error=True)
                 name, content = rest.split("|", 1)
                 name = name.strip()
                 content = content.strip()
                 write_topic(name, content)
-                return f"📄 Topic '{name}.md' written ({len(content)} chars)"
+                return ToolResult(f"📄 Topic '{name}.md' written ({len(content)} chars)")
 
             elif text.startswith("delete:"):
                 name = text[7:].strip()
                 if delete_topic(name):
-                    return f"📄 Topic '{name}.md' deleted"
-                return f"Topic '{name}' not found"
+                    return ToolResult(f"📄 Topic '{name}.md' deleted")
+                return ToolResult(f"Topic '{name}' not found", is_error=True)
 
             else:
-                return "Error: Unknown topic command. Use: 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'"
+                return ToolResult("Error: Unknown topic command. Use: 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'", is_error=True)
 
         elif action == "goal":
             if not text:
-                return "Error: 'text' parameter required"
+                return ToolResult("Error: 'text' parameter required", is_error=True)
             if text.lower().startswith("done:"):
-                return f"🧠 {forget(text[5:].strip())}"
-            return f"🧠 {remember(text, 'goal')}"
+                return ToolResult(f"🧠 {forget(text[5:].strip())}")
+            return ToolResult(f"🧠 {remember(text, 'goal')}")
 
         elif action == "note":
             if not text:
-                return "Error: 'text' parameter required"
-            return f"🧠 {remember(text, 'note')}"
+                return ToolResult("Error: 'text' parameter required", is_error=True)
+            return ToolResult(f"🧠 {remember(text, 'note')}")
 
         else:
-            return f"Error: Unknown action '{action}'. Valid: remember, forget, show, topic, goal, note"
+            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, show, topic, goal, note", is_error=True)
 
     except Exception as e:
-        return f"Error managing memory: {e}"
+        return ToolResult(f"Error managing memory: {e}", is_error=True)
 
 
 def manage_skills(action: str, name: str = "", description: str = "",
-                  instructions: str = "", resource_path: str = "") -> str:
+                  instructions: str = "", resource_path: str = "") -> ToolResult:
     """Manage Agent Skills (agentskills.io). Actions: 'list' (show all skills), 'activate'/'deactivate' (control which skills are loaded into context), 'info' (show skill details), 'create' (create new skill), 'delete' (remove skill), 'resources' (list skill files), 'read' (read a skill resource file), 'reload' (re-scan skills directory)."""
     from ..skills import get_skill_manager
 
@@ -92,36 +95,36 @@ def manage_skills(action: str, name: str = "", description: str = "",
         if action == "list":
             catalog = mgr.get_catalog()
             if not catalog:
-                return "📦 No skills found. Create one with manage_skills(action='create', ...)"
+                return ToolResult("📦 No skills found. Create one with manage_skills(action='create', ...)")
             lines = ["📦 Agent Skills:"]
             for entry in catalog:
                 status = "✅ ACTIVE" if entry["active"] else "  📦"
                 lines.append(f"  {status} {entry['name']}: {entry['description'][:100]}")
             lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['active'])} active")
-            return "\n".join(lines)
+            return ToolResult("\n".join(lines))
 
         elif action == "activate":
             if not name:
-                return "Error: 'name' parameter required"
+                return ToolResult("Error: 'name' parameter required", is_error=True)
             success = mgr.activate(name)
             if success:
-                return f"✅ Skill '{name}' activated. Its instructions will be included in the system prompt."
-            return f"Error: Skill '{name}' not found. Use manage_skills(action='list') to see available skills."
+                return ToolResult(f"✅ Skill '{name}' activated. Its instructions will be included in the system prompt.")
+            return ToolResult(f"Error: Skill '{name}' not found. Use manage_skills(action='list') to see available skills.", is_error=True)
 
         elif action == "deactivate":
             if not name:
-                return "Error: 'name' parameter required"
+                return ToolResult("Error: 'name' parameter required", is_error=True)
             success = mgr.deactivate(name)
             if success:
-                return f"📦 Skill '{name}' deactivated."
-            return f"Error: Skill '{name}' not found or not active."
+                return ToolResult(f"📦 Skill '{name}' deactivated.")
+            return ToolResult(f"Error: Skill '{name}' not found or not active.", is_error=True)
 
         elif action == "info":
             if not name:
-                return "Error: 'name' parameter required"
+                return ToolResult("Error: 'name' parameter required", is_error=True)
             skill = mgr.get_skill(name)
             if not skill:
-                return f"Error: Skill '{name}' not found."
+                return ToolResult(f"Error: Skill '{name}' not found.", is_error=True)
             is_active = name in mgr.get_active_skills()
             body = skill.get("body", "")
             lines = [
@@ -134,52 +137,52 @@ def manage_skills(action: str, name: str = "", description: str = "",
             ]
             if len(body) > 500:
                 lines.append(f"   ... ({len(body) - 500} more chars)")
-            return "\n".join(lines)
+            return ToolResult("\n".join(lines))
 
         elif action == "create":
             if not name:
-                return "Error: 'name' parameter required"
+                return ToolResult("Error: 'name' parameter required", is_error=True)
             if not description:
-                return "Error: 'description' parameter required"
+                return ToolResult("Error: 'description' parameter required", is_error=True)
             if not instructions:
-                return "Error: 'instructions' parameter required"
-            return mgr.create_skill(name, description, instructions)
+                return ToolResult("Error: 'instructions' parameter required", is_error=True)
+            return ToolResult(mgr.create_skill(name, description, instructions))
 
         elif action == "delete":
             if not name:
-                return "Error: 'name' parameter required"
-            return mgr.delete_skill(name)
+                return ToolResult("Error: 'name' parameter required", is_error=True)
+            return ToolResult(mgr.delete_skill(name))
 
         elif action == "resources":
             if not name:
-                return "Error: 'name' parameter required"
+                return ToolResult("Error: 'name' parameter required", is_error=True)
             resources = mgr.list_resources(name)
             if resources is None:
-                return f"Error: Skill '{name}' not found."
+                return ToolResult(f"Error: Skill '{name}' not found.", is_error=True)
             if not resources:
-                return f"📦 Skill '{name}' has no resource files."
+                return ToolResult(f"📦 Skill '{name}' has no resource files.")
             lines = [f"📦 Resources for '{name}':"]
             for r in resources:
                 lines.append(f"  📄 {r}")
-            return "\n".join(lines)
+            return ToolResult("\n".join(lines))
 
         elif action == "read":
             if not name:
-                return "Error: 'name' parameter required"
+                return ToolResult("Error: 'name' parameter required", is_error=True)
             if not resource_path:
-                return "Error: 'resource_path' parameter required"
+                return ToolResult("Error: 'resource_path' parameter required", is_error=True)
             content = mgr.read_resource(name, resource_path)
             if content is None:
-                return f"Error: Resource '{resource_path}' not found in skill '{name}'."
-            return content
+                return ToolResult(f"Error: Resource '{resource_path}' not found in skill '{name}'.", is_error=True)
+            return ToolResult(content)
 
         elif action == "reload":
-            mgr.reload()
+            mgr.discover()
             catalog = mgr.get_catalog()
-            return f"🔄 Skills reloaded. Found {len(catalog)} skills."
+            return ToolResult(f"🔄 Skills reloaded. Found {len(catalog)} skills.")
 
         else:
-            return f"Error: Unknown action '{action}'. Valid: list, activate, deactivate, info, create, delete, resources, read, reload"
+            return ToolResult(f"Error: Unknown action '{action}'. Valid: list, activate, deactivate, info, create, delete, resources, read, reload", is_error=True)
 
     except Exception as e:
-        return f"Error managing skills: {e}"
+        return ToolResult(f"Error managing skills: {e}", is_error=True)

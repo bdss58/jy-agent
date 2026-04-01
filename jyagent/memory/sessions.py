@@ -60,12 +60,14 @@ class SessionSummaries:
 PENDING_SESSION_FILE = os.path.join(MEMORY_DIR, "_pending_session.json")
 
 _session_start_time = None
+_client_ref = None
 
 
-def on_session_start() -> None:
+def on_session_start(client=None) -> None:
     """Called when a new agent session begins. Processes any pending session from last exit."""
-    global _session_start_time
+    global _session_start_time, _client_ref
     _session_start_time = time.time()
+    _client_ref = client
     _process_pending_session_background()
 
 
@@ -129,14 +131,14 @@ def _process_pending_session_background() -> None:
             pass
         return
 
-    try:
-        os.remove(PENDING_SESSION_FILE)
-    except OSError:
-        pass
-
     def _summarize():
         try:
-            _generate_session_summary(pending)
+            _generate_session_summary(pending, _client_ref)
+            # Success — now safe to delete the pending file
+            try:
+                os.remove(PENDING_SESSION_FILE)
+            except OSError:
+                pass
         except Exception:
             try:
                 sessions = SessionSummaries()
@@ -144,17 +146,20 @@ def _process_pending_session_background() -> None:
                 duration_min = pending.get("duration_min", 0)
                 duration = f" ({duration_min} min)" if duration_min > 0 else ""
                 sessions.add_summary(f"Session with {msg_count} messages{duration}")
+                # Fallback succeeded — safe to delete
+                try:
+                    os.remove(PENDING_SESSION_FILE)
+                except OSError:
+                    pass
             except Exception:
-                pass
+                pass  # Leave file for next session to retry
 
     t = threading.Thread(target=_summarize, daemon=True, name="pending-session-summarizer")
     t.start()
 
 
-def _generate_session_summary(pending: dict) -> None:
+def _generate_session_summary(pending: dict, client=None) -> None:
     """Generate a session summary using the API. Called from background thread."""
-    import anthropic
-
     messages = pending.get("messages", [])
     msg_count = pending.get("msg_count", len(messages))
     duration_min = pending.get("duration_min", 0)
@@ -166,7 +171,10 @@ def _generate_session_summary(pending: dict) -> None:
         f"{m['role']}: {m['content']}" for m in messages
     )
 
-    client = anthropic.Anthropic()
+    if client is None:
+        import anthropic
+        client = anthropic.Anthropic()
+
     response = client.messages.create(
         model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
         max_tokens=256,

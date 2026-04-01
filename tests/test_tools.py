@@ -94,7 +94,7 @@ class TestWriteFile:
         path = os.path.join(tempfile.gettempdir(), "jy_test_write.txt")
         try:
             result = write_file(path, "hello world")
-            assert "Successfully wrote" in result
+            assert "Successfully wrote" in result or "Created" in result
             with open(path) as f:
                 assert f.read() == "hello world"
         finally:
@@ -105,7 +105,7 @@ class TestWriteFile:
         path = os.path.join(tempfile.gettempdir(), "jy_test_deep", "sub", "file.txt")
         try:
             result = write_file(path, "nested")
-            assert "Successfully wrote" in result
+            assert "Successfully wrote" in result or "Created" in result
             assert os.path.exists(path)
         finally:
             import shutil

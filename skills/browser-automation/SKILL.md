@@ -1,84 +1,108 @@
 ---
 name: browser-automation
 description: >-
-  Automate Chrome browser interactions using MCP Chrome DevTools. Use when asked 
-  to navigate websites, fill forms, click buttons, take screenshots, scrape dynamic 
-  content, debug web pages, or interact with web applications like Taobao, Zhihu, etc.
+  Automate Chrome browser interactions using MCP Chrome DevTools Protocol. Use this skill
+  whenever the user asks to navigate websites, fill forms, click buttons, take screenshots,
+  scrape dynamic content, debug web pages, test web UIs, log into sites, or interact with
+  web applications. TRIGGER on: "open this page", "click the button", "fill the form",
+  "scrape", "screenshot", browser testing, Taobao/Zhihu/any website interaction, login
+  automation, web scraping, DOM inspection, cookie extraction, network monitoring.
+  DO NOT TRIGGER on: static file reading, API-only requests (use web_fetch), or CLI tools.
 metadata:
-  author: agent-builtin
-  version: "1.0"
+  author: jy-agent
+  version: "2.0"
 ---
 
-## Instructions
+# Browser Automation
 
-When automating browser interactions via Chrome MCP:
+Automate Chrome browser interactions via MCP Chrome DevTools.
 
-### 1. Connection Setup
-- Ensure Chrome MCP is connected: use `mcp` tool with action `connect`, server `chrome`
-- If connection fails, Chrome may need to be running with remote debugging enabled
+## Decision Tree: Choose Your Approach
 
-### 2. Navigation Pattern
-Always follow this sequence:
-1. **Navigate**: `navigate_page` to the target URL
-2. **Snapshot**: `take_snapshot` to see the page structure (a11y tree with UIDs)
-3. **Act**: Use UIDs from the snapshot to click, fill, type
-4. **Verify**: Take another snapshot or screenshot to confirm the result
-
-### 3. Element Interaction
-- **ALWAYS take a snapshot first** before trying to interact with elements
-- Use the `uid` from the snapshot to reference elements
-- For text inputs: use `fill` (sets value) or `type_text` (simulates typing)
-- For buttons/links: use `click`
-- For dropdowns/selects: use `fill` with the option value
-- For keyboard shortcuts: use `press_key` (e.g., "Enter", "Control+A")
-
-### 4. Handling Dynamic Content
-- After clicking, wait for content to load: use `wait_for` with expected text
-- For SPAs (Single Page Apps), take a new snapshot after navigation
-- Use `evaluate_script` for complex DOM operations
-
-### 5. Screenshots & Debugging
-- Use `take_screenshot` for visual verification
-- Use `take_snapshot` for structural analysis (preferred — uses less tokens)
-- Use `list_console_messages` to check for JavaScript errors
-- Use `list_network_requests` to debug API calls
-
-### 6. Multi-Page Workflows
-- Use `list_pages` to see all open tabs
-- Use `select_page` to switch between tabs  
-- Use `new_page` to open a new tab
-- Use `close_page` to close tabs when done
-
-### 7. Common Patterns
-
-#### Login to a website:
 ```
-1. navigate_page → URL
-2. take_snapshot → find login form UIDs
-3. fill → username field
-4. fill → password field  
-5. click → submit button
-6. wait_for → dashboard text
-7. take_snapshot → verify logged in
+User task → Does it need a real browser?
+├─ No (just fetch HTML/API) → Use web_fetch tool directly, not this skill
+└─ Yes → Is Chrome MCP connected?
+    ├─ No → mcp(action="connect", server="chrome")
+    │        └─ Failed? → Check references/troubleshooting.md
+    └─ Yes → What kind of task?
+        ├─ Simple page read → Navigate → Snapshot → Extract
+        ├─ Form fill/login → Navigate → Snapshot → Fill → Click → Verify
+        ├─ Multi-step workflow → Use the Snapshot-Act-Verify loop (below)
+        └─ Scrape dynamic content → Navigate → Wait → Evaluate JS
 ```
 
-#### Scrape dynamic content:
+## Core Pattern: Snapshot → Act → Verify
+
+Every browser interaction follows this loop. **Never skip the snapshot.**
+
 ```
-1. navigate_page → target URL
-2. wait_for → key content text
-3. take_snapshot → get element structure
-4. evaluate_script → extract specific data via JS
+1. navigate_page(url)           # Go to the page
+2. take_snapshot()              # See the a11y tree with UIDs — REQUIRED before any action
+3. <action>(uid from snapshot)  # click, fill, type using UIDs
+4. take_snapshot() or           # Verify the result
+   take_screenshot()
 ```
 
-#### Fill a complex form:
-```
-1. take_snapshot → identify all form fields
-2. fill_form → fill multiple fields at once
-3. take_screenshot → visual verification
-4. click → submit
-```
+**Why snapshot first?** The accessibility tree gives you stable UIDs for elements. Without it, you're guessing at selectors that may not exist or may have changed.
 
-### 8. Anti-Detection Tips
-- Don't navigate too rapidly between pages
-- Use realistic viewport sizes: `resize_page` width=1440, height=900
-- For sites that detect automation, add delays between actions
+## Actions Reference
+
+| Action | Tool | When to use |
+|--------|------|-------------|
+| Navigate | `navigate_page(url)` | Go to a URL |
+| See structure | `take_snapshot()` | Get a11y tree with UIDs (preferred — low tokens) |
+| See visually | `take_screenshot()` | Get a PNG for visual verification |
+| Click | `click(uid)` | Buttons, links, checkboxes |
+| Fill text | `fill(uid, value)` | Text inputs, textareas (sets value directly) |
+| Type text | `type_text(uid, text)` | When you need keystrokes (autocomplete, search) |
+| Keyboard | `press_key(key)` | "Enter", "Tab", "Escape", "Control+A" |
+| Wait | `wait_for(text)` | Wait for text to appear after navigation |
+| Run JS | `evaluate_script(js)` | Complex DOM ops, data extraction, scroll |
+| New tab | `new_page(url)` | Open a new tab |
+| Switch tab | `select_page(index)` | Switch between open tabs |
+| List tabs | `list_pages()` | See all open tabs |
+| Close tab | `close_page()` | Clean up tabs when done |
+| Resize | `resize_page(w, h)` | Set viewport (default 1440×900) |
+| Console | `list_console_messages()` | Debug JS errors |
+| Network | `list_network_requests()` | Debug API calls |
+
+## Common Workflows
+
+See [📋 Common Workflows](references/workflows.md) for step-by-step patterns:
+- Login to a website
+- Scrape a data table
+- Fill a multi-page form
+- Handle pagination
+- Download files
+
+## Anti-Patterns
+
+❌ **Don't** try to click/fill without taking a snapshot first
+✅ **Do** always snapshot → find UID → act
+
+❌ **Don't** navigate rapidly between pages without waiting
+✅ **Do** use `wait_for(text)` after navigation to confirm page loaded
+
+❌ **Don't** use `type_text` for filling form fields (slow, unreliable)
+✅ **Do** use `fill(uid, value)` for form fields; `type_text` only for search/autocomplete
+
+❌ **Don't** take screenshots for structural analysis (wastes tokens)
+✅ **Do** use `take_snapshot()` for structure, `take_screenshot()` only for visual verification
+
+❌ **Don't** leave tabs open after finishing a task
+✅ **Do** close tabs with `close_page()` to prevent tab leaks
+
+❌ **Don't** assume page structure from memory or training data
+✅ **Do** always inspect the actual page — sites change their DOM frequently
+
+## Anti-Bot & Stealth Tips
+
+See [🛡️ Anti-Detection Guide](references/anti-detection.md) for site-specific strategies.
+
+Quick rules:
+- Set viewport to realistic size: `resize_page(1440, 900)`
+- Don't navigate more than 1 page/second
+- For Chinese e-commerce (Taobao, JD): expect CAPTCHAs, use delays
+- For sites behind Cloudflare: the Chrome MCP tier already uses a real browser, which helps
+- If blocked, try adding realistic delays between actions (1-3 seconds)

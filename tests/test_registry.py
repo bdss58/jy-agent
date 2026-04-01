@@ -7,27 +7,22 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from jyagent.registry import get_registry
+import jyagent.tools  # noqa: F401 — ensure tools are registered for these tests
 
 
 class TestRegistry:
     def test_core_tools_registered(self):
         reg = get_registry()
         tools = reg.list_tools()
-        # All core tools should be registered
+        # All tools should be registered
         expected = [
             'run_shell', 'read_file', 'write_file', 'list_directory',
-            'evolve_self', 'add_tool', 'manage_memory', 'manage_skills',
+            'edit_file', 'glob_files', 'grep_files',
+            'manage_memory', 'manage_skills',
+            'web_fetch', 'mcp',
         ]
         for name in expected:
-            assert name in tools, f"Core tool '{name}' not registered"
-
-    def test_auto_discovered_tools(self):
-        reg = get_registry()
-        tools = reg.list_tools()
-        # These come from tool_*.py files
-        auto_discovered = ['web_fetch', 'edit_file', 'glob_files', 'grep_files']
-        for name in auto_discovered:
-            assert name in tools, f"Auto-discovered tool '{name}' not registered"
+            assert name in tools, f"Tool '{name}' not registered"
 
     def test_get_function(self):
         reg = get_registry()

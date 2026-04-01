@@ -1,90 +1,180 @@
 ---
 name: create-skill
 description: >-
-  Create new Agent Skills following the open standard (agentskills.io). Use when 
-  asked to create, write, or package a new skill, or when the user wants to add 
-  domain expertise to the agent. Guides proper SKILL.md format and structure.
+  Create new Agent Skills, modify existing skills, and improve skill quality following
+  the open standard (agentskills.io). Use this skill whenever the user wants to create
+  a skill from scratch, edit or improve an existing skill, turn a workflow into a reusable
+  skill, or package domain expertise. TRIGGER on: "create a skill", "make a skill for",
+  "turn this into a skill", "improve this skill", "skill for X", packaging expertise,
+  creating reusable agent instructions. DO NOT TRIGGER on: using an existing skill
+  (that skill should trigger instead), or general coding tasks.
 metadata:
-  author: agent-builtin
-  version: "1.0"
+  author: jy-agent
+  version: "2.0"
 ---
 
-## Instructions
+# Skill Creator
 
-When creating a new Agent Skill:
+Create and improve Agent Skills. Based on patterns from [Anthropic's skill-creator](https://github.com/anthropics/skills).
 
-### 1. Gather Requirements
-Ask the user:
-- What should the skill do? (→ becomes `description`)
-- What's a good short name? (→ becomes `name`, lowercase-hyphenated)
-- What tools does it need? (→ becomes `allowed-tools`)
-- Any reference material to include? (→ goes in `references/`)
+## Decision Tree: What's the User Doing?
 
-### 2. Name Rules
-- Lowercase letters, numbers, and hyphens only
-- 1-64 characters
-- No consecutive hyphens (`--`)
-- No starting/ending with hyphens
-- Must match the directory name
-- Examples: `data-analysis`, `api-testing`, `react-components`
+```
+User request →
+├─ "Create a skill for X" → Full Creation Flow (below)
+├─ "Turn this conversation into a skill" → Extract from Context
+│   1. Identify the workflow from conversation history
+│   2. Extract: tools used, step sequence, corrections made, patterns learned
+│   3. Skip interview — infer from context, confirm gaps with user
+│   4. Continue to Write phase
+├─ "Improve/fix this skill" → Improvement Flow
+│   1. manage_skills(action="info", name="skill-name")
+│   2. Read current SKILL.md and resources
+│   3. Identify specific issues (triggering? quality? missing cases?)
+│   4. Apply targeted fixes
+└─ "What skills do I have?" → Inventory
+    1. manage_skills(action="list")
+    2. Summarize what each does and quality assessment
+```
 
-### 3. SKILL.md Template
+## Full Creation Flow
 
+### Phase 1: Capture Intent
+
+Ask the user (but infer from context first — don't ask what you already know):
+
+1. **What** should this skill enable the agent to do?
+2. **When** should it trigger? (specific phrases, contexts, tool use patterns)
+3. **Output format** — what does success look like?
+4. **Edge cases** — what could go wrong?
+
+### Phase 2: Write the SKILL.md
+
+#### Anatomy of a Skill
+```
+skill-name/
+├── SKILL.md              # Required — YAML frontmatter + instructions
+├── references/           # Detailed docs, checklists, examples
+├── scripts/              # Executable helpers (use as black boxes)
+└── assets/               # Templates, icons, data files
+```
+
+#### Template
 ```markdown
 ---
 name: my-skill-name
 description: >-
-  Clear description of what this skill does and when to use it.
-  Include specific keywords that help the agent identify relevant tasks.
-  Max 1024 characters.
+  Clear description of what AND when to use. Be "pushy" — describe
+  specific trigger phrases. Include TRIGGER and DO NOT TRIGGER guidance.
+  Max 1024 chars.
 metadata:
-  author: "your-name"
+  author: "author-name"
   version: "1.0"
-allowed-tools: tool1 tool2
 ---
 
-## Instructions
+# Skill Title
 
-Step-by-step instructions for the agent to follow.
+Brief overview of what this skill does.
 
-### Step 1: ...
-### Step 2: ...
+## Decision Tree: Choose Your Approach
+(Route the user's task to the right workflow)
 
-## Examples
+## Core Process
+(Step-by-step instructions — the main workflow)
 
-Show input/output examples.
+## Anti-Patterns
+(❌/✅ pairs documenting common mistakes)
 
-## Edge Cases
-
-Document known edge cases and how to handle them.
+## Reference Files
+(Links to references/, scripts/, assets/)
 ```
 
-### 4. Progressive Disclosure
-- Keep SKILL.md body **under 500 lines** (~5000 tokens)
-- Move detailed reference material to `references/` directory
-- Move templates to `assets/` directory
-- Move executable code to `scripts/` directory
+### Phase 3: Create Resources
 
-### 5. Quality Checklist
-- [ ] `name` matches directory name
-- [ ] `description` clearly states what AND when to use
-- [ ] Instructions are step-by-step and actionable
-- [ ] Tools the skill needs are listed in `allowed-tools`
-- [ ] Examples are provided for common use cases
-- [ ] Edge cases are documented
+**Progressive disclosure is key:**
+- SKILL.md body: **< 500 lines** (~5000 tokens) — routing logic and core instructions
+- `references/`: Detailed checklists, examples, API docs — loaded on demand
+- `scripts/`: Executable code — run with `--help`, don't read source
+- `assets/`: Templates, data files — used in output
 
-### 6. Creation Method
-Use the `manage_skills` tool with action `create`:
-```
+### Phase 4: Register
+
+```python
+# Option A: Use manage_skills tool
 manage_skills(action="create", name="my-skill", description="...", instructions="...")
+
+# Option B: Create files directly (more control)
+run_shell("mkdir -p skills/my-skill/{references,scripts,assets}")
+write_file("skills/my-skill/SKILL.md", content)
+write_file("skills/my-skill/references/...", content)
+manage_skills(action="reload")
 ```
 
-Or create files directly:
-```
-1. mkdir -p skills/my-skill/{scripts,references,assets}
-2. write_file skills/my-skill/SKILL.md with proper content
-3. manage_skills(action="reload") to pick up the new skill
+## Skill Writing Guide
+
+### Descriptions — Be Pushy
+
+Claude tends to **under-trigger** skills. Make descriptions assertive:
+
+```yaml
+# ❌ Too passive
+description: Guide for building dashboards
+
+# ✅ Pushy — explicit trigger conditions
+description: >-
+  Build data dashboards and visualizations. Use this skill whenever the user 
+  mentions dashboards, data viz, charts, graphs, metrics display, or wants
+  to visualize any kind of data, even if they don't explicitly say "dashboard".
+  TRIGGER on: "show me a chart", "visualize this data", "dashboard", "metrics".
+  DO NOT TRIGGER on: static reports, CSV exports without visualization.
 ```
 
-### 7. Reference: Full Spec
-See `references/spec-summary.md` for the complete Agent Skills specification summary.
+### Instructions — Decision Trees, Not Checklists
+
+```markdown
+# ❌ Flat checklist (generic, doesn't guide decisions)
+1. Check for X
+2. Check for Y
+3. Check for Z
+
+# ✅ Decision tree (guides the agent to the right approach)
+What kind of input?
+├─ Type A → Use approach 1
+├─ Type B → Use approach 2
+└─ Unknown → Ask the user
+```
+
+### Anti-Patterns — Show ❌/✅ Pairs
+
+```markdown
+❌ **Don't** do X because [reason]
+✅ **Do** Y instead because [reason]
+```
+
+**Why pairs?** The ❌ shows what to watch for, the ✅ shows what to do instead. Just saying "do Y" misses the cases where the agent might accidentally do X.
+
+### Resources — Explain the Why
+
+From Anthropic's skill-creator:
+> "Try hard to explain the **why** behind everything you're asking the model to do. Today's LLMs are smart. If you find yourself writing ALWAYS or NEVER in all caps, that's a yellow flag — reframe and explain the reasoning."
+
+## Name Rules
+
+- Lowercase letters, numbers, and hyphens only
+- 1-64 characters, no `--`, no leading/trailing hyphens
+- Must match the directory name
+- Examples: `data-analysis`, `api-testing`, `react-components`
+
+## Quality Checklist
+
+- [ ] `name` matches directory name
+- [ ] `description` has TRIGGER and DO NOT TRIGGER guidance
+- [ ] Description is "pushy" enough to trigger when relevant
+- [ ] SKILL.md body has a decision tree (not just flat steps)
+- [ ] Anti-patterns documented with ❌/✅ pairs
+- [ ] Reference files for detailed content (body < 500 lines)
+- [ ] Instructions explain WHY, not just WHAT
+
+## Reference
+
+See [📋 Agent Skills Spec](references/spec-summary.md) for the full specification.

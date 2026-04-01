@@ -1,17 +1,22 @@
 # Planner — Streaming tool-use loop with structured results, concurrent execution, unified timeouts.
 # Honesty rules are in the main SYSTEM_PROMPT (agent.py), not duplicated here.
-import os
 import sys
 import time
-import inspect
 import traceback
 import concurrent.futures
 from .registry import get_registry
+from .toolresult import ToolResult
+from .validation import validate_tool_input
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
-    MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT,
+    MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, AGENT_MODEL,
+    COMPACT_TOOL_RESULT_CHARS,
 )
+
+# Shared executor for tool timeouts.  max_workers=4 so a hung tool doesn't
+# block subsequent calls (future.cancel() can't stop a running thread).
+_tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 TOOL_COLOR = "\033[0;33m"  # yellow for tool info
 COLOR_RESET = "\033[0m"
@@ -21,39 +26,11 @@ COLOR_CYAN = "\033[1;36m"
 COLOR_RED = "\033[1;31m"
 
 
-# ─── Structured Tool Result ──────────────────────────────────────────────────
-
-class ToolResult:
-    """Structured tool result with explicit error flag.
-    
-    Benefits over raw strings:
-    - Anthropic API supports `is_error: true` in tool_result blocks, which helps
-      Claude reason better about failures vs. successful results containing "Error"
-    - Error results are never truncated
-    - Clear programmatic distinction between success and failure
-    """
-    __slots__ = ('content', 'is_error')
-    
-    def __init__(self, content: str, is_error: bool = False):
-        self.content = content
-        self.is_error = is_error
-    
-    def __str__(self):
-        return self.content
-    
-    def __repr__(self):
-        return f"ToolResult(is_error={self.is_error}, content={self.content[:80]!r}...)"
-
-
 def _is_error_result(result) -> bool:
-    """Detect if a tool result indicates an error.
-    
-    Supports both:
-    - ToolResult objects (structured, preferred)
-    - Legacy string returns starting with "Error:" (backward compatible)
-    """
+    """Detect if a tool result indicates an error."""
     if isinstance(result, ToolResult):
         return result.is_error
+    # Fallback for any non-ToolResult values
     s = str(result)
     return s.startswith("Error:") or s.startswith("Error calling tool")
 
@@ -119,32 +96,33 @@ def _truncate_tool_result(result: str, is_error: bool = False, max_chars: int = 
 
 
 def _truncate_tool_use_inputs(blocks: list) -> list:
-    """Truncate large tool_use inputs (write_file, evolve_self, edit_file) in serialized blocks.
+    """Truncate large tool_use inputs in serialized blocks.
 
+    Uses registry metadata (large_input_keys) to identify which tools/keys to truncate.
     Claude already generated these — it doesn't need them echoed back in full.
     """
-    LARGE_INPUT_TOOLS = {"write_file", "evolve_self", "edit_file"}
-    LARGE_INPUT_KEYS = {"content", "new_text", "old_text"}
+    registry = get_registry()
     out = []
     for block in blocks:
         if (isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("name") in LARGE_INPUT_TOOLS):
-            inp = block.get("input", {})
-            truncated_inp = {}
-            did_truncate = False
-            for k, v in inp.items():
-                if k in LARGE_INPUT_KEYS and isinstance(v, str) and len(v) > MAX_TOOL_USE_INPUT_CHARS:
-                    truncated_inp[k] = (
-                        v[:MAX_TOOL_USE_INPUT_CHARS]
-                        + f"\n[... truncated, {len(v)} chars total ...]"
-                    )
-                    did_truncate = True
-                else:
-                    truncated_inp[k] = v
-            if did_truncate:
-                block = dict(block)
-                block["input"] = truncated_inp
+                and block.get("type") == "tool_use"):
+            large_keys = registry.get_large_input_keys(block.get("name", ""))
+            if large_keys:
+                inp = block.get("input", {})
+                truncated_inp = {}
+                did_truncate = False
+                for k, v in inp.items():
+                    if k in large_keys and isinstance(v, str) and len(v) > MAX_TOOL_USE_INPUT_CHARS:
+                        truncated_inp[k] = (
+                            v[:MAX_TOOL_USE_INPUT_CHARS]
+                            + f"\n[... truncated, {len(v)} chars total ...]"
+                        )
+                        did_truncate = True
+                    else:
+                        truncated_inp[k] = v
+                if did_truncate:
+                    block = dict(block)
+                    block["input"] = truncated_inp
         out.append(block)
     return out
 
@@ -163,7 +141,7 @@ def _compact_working_messages(messages: list, max_tokens: int = None) -> list:
     if estimated <= max_tokens:
         return messages
 
-    AGGRESSIVE_LIMIT = 2000
+    AGGRESSIVE_LIMIT = COMPACT_TOOL_RESULT_CHARS
     compacted = [dict(m) for m in messages]  # shallow copy each message
 
     # Work from oldest, skip the last 2 messages
@@ -205,37 +183,19 @@ def _execute_tool(tool_name: str, tool_input: dict, tool_functions: dict) -> Too
             is_error=True
         )
 
-    if tool_input is None:
-        tool_input = {}
-
-    # Validate required parameters
-    try:
-        sig = inspect.signature(fn)
-        missing = [
-            pname for pname, param in sig.parameters.items()
-            if param.default is inspect.Parameter.empty
-            and param.kind not in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
-            and pname not in tool_input
-        ]
-        if missing:
-            return ToolResult(
-                f"Error: Tool {tool_name} called with missing required parameters: {missing}. "
-                f"Received: {list(tool_input.keys())}. "
-                f"Try breaking the operation into smaller steps.",
-                is_error=True
-            )
-    except (ValueError, TypeError):
-        pass
+    tool_schema = get_registry().get_schema(tool_name)
+    validation_error = validate_tool_input(tool_name, tool_input, fn, tool_schema)
+    if validation_error:
+        return ToolResult(validation_error, is_error=True)
 
     try:
+        if tool_input is None:
+            tool_input = {}
         raw_result = fn(**tool_input)
-        # Support tools that already return ToolResult
+        # All tools should return ToolResult; wrap legacy string returns for safety
         if isinstance(raw_result, ToolResult):
             return raw_result
-        # Legacy string results — detect errors by convention
-        result_str = str(raw_result)
-        is_error = result_str.startswith("Error:") or result_str.startswith("Error calling tool")
-        return ToolResult(result_str, is_error=is_error)
+        return ToolResult(str(raw_result))
     except KeyboardInterrupt:
         raise
     except Exception as e:
@@ -245,82 +205,93 @@ def _execute_tool(tool_name: str, tool_input: dict, tool_functions: dict) -> Too
         )
 
 
-def _execute_tool_with_timeout(tool_name: str, tool_input: dict, tool_functions: dict, 
+def _execute_tool_with_timeout(tool_name: str, tool_input: dict, tool_functions: dict,
                                 timeout: int = None) -> ToolResult:
     """Execute a tool with a unified timeout.
-    
-    Tools that manage their own timeout (run_shell) are given extra slack.
-    MCP tools and other external calls benefit most from this safety net.
+
+    Timeout is determined from registry metadata (timeout_hint).
+    Tools without a hint use DEFAULT_TOOL_TIMEOUT.
+    run_shell is special: its timeout comes from its own input parameter.
     """
     if timeout is None:
         timeout = DEFAULT_TOOL_TIMEOUT
-    
-    # run_shell has its own timeout parameter — give it extra slack
+
+    registry = get_registry()
+    hint = registry.get_timeout_hint(tool_name)
+    if hint is not None:
+        timeout = max(timeout, hint)
+
+    # run_shell manages its own timeout — give it extra slack
     if tool_name == "run_shell":
         user_timeout = tool_input.get("timeout", 60)
         timeout = max(timeout, int(user_timeout) + 10)
-    
-    # web_fetch can be slow — give it more time
-    if tool_name == "web_fetch":
-        timeout = max(timeout, 180)
-    
-    # MCP tools may involve browser automation — generous timeout
-    if tool_name.startswith("mcp__"):
-        timeout = max(timeout, 180)
 
+    future = _tool_executor.submit(_execute_tool, tool_name, tool_input, tool_functions)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_execute_tool, tool_name, tool_input, tool_functions)
-            return future.result(timeout=timeout)
+        return future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
+        future.cancel()
         return ToolResult(
             f"Error: Tool '{tool_name}' timed out after {timeout}s. "
             f"Consider breaking the operation into smaller steps.",
             is_error=True
         )
     except KeyboardInterrupt:
+        future.cancel()
         raise
 
 
-# ─── Concurrent tool execution (P1) ─────────────────────────────────────────
+# ─── Tool execution ──────────────────────────────────────────────────────────
 
-def _execute_tools_concurrently(tool_blocks: list, tool_functions: dict) -> list:
-    """Execute multiple tool calls concurrently when they are independent.
-    
-    Claude may return multiple tool_use blocks in a single response.
-    These are independent by definition (Claude chose to emit them together),
-    so we can safely execute them in parallel.
-    
-    Returns list of (block, ToolResult) tuples in original order.
+def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
+    """Execute tool calls with selective parallelization.
+
+    Parallel-safe tools (read_file, glob_files, etc.) run concurrently.
+    State-mutating tools run sequentially in original order.
+    Sequential tools act as barriers between parallel batches.
+    Results are always returned in original order.
     """
-    if len(tool_blocks) <= 1:
-        # Single tool call — no need for thread pool overhead
-        block = tool_blocks[0]
-        result = _execute_tool_with_timeout(block.name, block.input, tool_functions)
-        return [(block, result)]
-    
+    registry = get_registry()
+
+    # Fast path: single tool or no parallel-safe tools → sequential
+    if len(tool_blocks) <= 1 or not any(
+        registry.is_parallel_safe(b.name) for b in tool_blocks
+    ):
+        results = []
+        for block in tool_blocks:
+            result = _execute_tool_with_timeout(block.name, block.input, tool_functions)
+            results.append((block, result))
+        return results
+
+    # Partition into contiguous groups and execute
     results = [None] * len(tool_blocks)
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tool_blocks), 4)) as executor:
-        future_to_idx = {}
-        for i, block in enumerate(tool_blocks):
-            future = executor.submit(
-                _execute_tool_with_timeout, block.name, block.input, tool_functions
-            )
-            future_to_idx[future] = i
-        
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                results[idx] = (tool_blocks[idx], future.result())
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                results[idx] = (tool_blocks[idx], ToolResult(
-                    f"Error: Unexpected failure executing {tool_blocks[idx].name}: {e}",
-                    is_error=True
-                ))
-    
+    i = 0
+    while i < len(tool_blocks):
+        if registry.is_parallel_safe(tool_blocks[i].name):
+            # Collect contiguous parallel-safe tools
+            parallel_batch = []
+            while i < len(tool_blocks) and registry.is_parallel_safe(tool_blocks[i].name):
+                parallel_batch.append((i, tool_blocks[i]))
+                i += 1
+
+            # Execute batch concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(parallel_batch)) as executor:
+                futures = {
+                    executor.submit(
+                        _execute_tool_with_timeout, block.name, block.input, tool_functions
+                    ): (idx, block)
+                    for idx, block in parallel_batch
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    idx, block = futures[future]
+                    results[idx] = (block, future.result())
+        else:
+            # Sequential tool — execute immediately as a barrier
+            block = tool_blocks[i]
+            result = _execute_tool_with_timeout(block.name, block.input, tool_functions)
+            results[i] = (block, result)
+            i += 1
+
     return results
 
 
@@ -367,7 +338,7 @@ def _stream_response(client, api_kwargs: dict) -> tuple:
     Stream a single API response.
     Returns (step_text, tool_use_blocks, stop_reason, final_message).
     """
-    step_text = ""
+    text_parts = []
     tool_use_blocks = []
     stop_reason = None
     final_message = None
@@ -378,7 +349,7 @@ def _stream_response(client, api_kwargs: dict) -> tuple:
                 delta = event.delta
                 if hasattr(delta, 'text'):
                     _stream_write(delta.text)
-                    step_text += delta.text
+                    text_parts.append(delta.text)
 
         final_message = stream.get_final_message()
         stop_reason = final_message.stop_reason
@@ -387,83 +358,162 @@ def _stream_response(client, api_kwargs: dict) -> tuple:
             if block.type == "tool_use":
                 tool_use_blocks.append(block)
 
-    return step_text, tool_use_blocks, stop_reason, final_message
+    return "".join(text_parts), tool_use_blocks, stop_reason, final_message
 
 
 # ─── Main planner loop ───────────────────────────────────────────────────────
 
-def plan_next_action(client, messages: list, system_prompt: str, max_steps: int = None) -> str:
+_STREAM_MAX_RETRIES = 2
+
+
+def _stream_with_retry(client, api_kwargs: dict, step: int, all_text: str, working_messages: list):
+    """Stream a response with auto-retry on transient failures.
+
+    Returns (step_text, tool_use_blocks, stop_reason, final_message) on success.
+    Returns None and a tuple (all_text, final_text, working_messages) on fatal error
+    via a special sentinel: raises _StreamAbort with the return tuple.
+    """
+    for attempt in range(_STREAM_MAX_RETRIES + 1):
+        try:
+            return _stream_response(client, api_kwargs)
+        except KeyboardInterrupt:
+            _interrupted_msg()
+            msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
+            raise _StreamAbort(msg, "", working_messages)
+        except Exception as stream_err:
+            is_transient = any(kw in str(stream_err).lower() for kw in [
+                "incomplete", "peer closed", "connection reset", "timeout",
+                "eof", "broken pipe", "overloaded", "529", "server_error",
+            ])
+            if is_transient and attempt < _STREAM_MAX_RETRIES:
+                retry_delay = 2 ** (attempt + 1)  # 2s, 4s
+                retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {retry_delay}s... (attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
+                sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
+                sys.stdout.flush()
+                for _ in range(int(retry_delay * 10)):
+                    time.sleep(0.1)
+                continue
+            # Non-transient error or retries exhausted
+            error_msg = f"\n[Stream error at step {step+1}: {stream_err}]\n"
+            sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
+            sys.stdout.flush()
+            if all_text:
+                raise _StreamAbort(
+                    all_text + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}]",
+                    "", working_messages
+                )
+            raise _StreamAbort(f"Error during streaming: {stream_err}", "", working_messages)
+
+
+class _StreamAbort(Exception):
+    """Raised by _stream_with_retry to signal an early return from plan_next_action."""
+    def __init__(self, all_text, final_text, working_messages):
+        self.result = (all_text, final_text, working_messages)
+
+
+def _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_text):
+    """Execute tool calls and append results to working_messages.
+
+    Returns the list of tool_result dicts.
+    Raises KeyboardInterrupt (with synthetic results already appended) if interrupted.
+    """
+    try:
+        n_tools = len(tool_use_blocks)
+        if n_tools > 1:
+            _tool_info(f"Executing {n_tools} tool calls...")
+
+        for block in tool_use_blocks:
+            input_preview = str(block.input)
+            if len(input_preview) > 150:
+                input_preview = input_preview[:150] + "..."
+            _tool_info(f"Calling: {block.name}({input_preview})")
+
+        executed = _execute_tools(tool_use_blocks, tool_functions)
+
+        tool_results = []
+        for block, result in executed:
+            content_str = _truncate_tool_result(result.content, is_error=result.is_error)
+            _tool_result_preview(content_str, is_error=result.is_error)
+
+            tool_result_block = {
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": content_str,
+            }
+            if result.is_error:
+                tool_result_block["is_error"] = True
+
+            tool_results.append(tool_result_block)
+
+        return tool_results
+
+    except KeyboardInterrupt:
+        _interrupted_msg()
+        synthetic_results = [
+            {"type": "tool_result", "tool_use_id": b.id,
+             "content": "[Tool execution interrupted by user]", "is_error": True}
+            for b in tool_use_blocks
+        ]
+        working_messages.append({"role": "user", "content": synthetic_results})
+        msg = all_text + "\n\n[Tool execution interrupted by user]" if all_text else "[Tool execution interrupted by user]"
+        raise _StreamAbort(msg, "", working_messages)
+
+def plan_next_action(client, messages: list, system_prompt: str, max_steps: int = None) -> tuple:
     """
     Streams Claude's response token-by-token to stdout.
     Handles tool use in a loop: when Claude calls tools, we execute them
     and continue streaming the next response.
-    Returns the full concatenated text response.
+    Returns (full_text, final_step_text, working_messages).
     """
     if max_steps is None:
         max_steps = DEFAULT_MAX_STEPS
 
+    # Defaults for the outer except handler (overwritten inside try)
+    working_messages = []
+    all_text = ""
+
     try:
         working_messages = messages.copy()
         all_text = ""
+        final_text = ""  # Only the last step's text (for markdown rendering)
         current_max_tokens = DEFAULT_MAX_TOKENS
 
-        augmented_system_prompt = system_prompt  # Honesty rules already in SYSTEM_PROMPT
+        registry = get_registry()
+        reg_version, tool_schemas, tool_functions = registry.snapshot()
 
         for step in range(max_steps):
-            registry = get_registry()
-            tool_schemas = registry.get_schemas()
-            tool_functions = registry.get_functions()
+            # Guard: compact working_messages if token count is too high
+            working_messages = _compact_working_messages(working_messages)
 
             api_kwargs = dict(
-                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+                model=AGENT_MODEL,
                 max_tokens=current_max_tokens,
-                system=augmented_system_prompt,
+                system=system_prompt,
                 messages=working_messages,
             )
 
             if tool_schemas:
                 api_kwargs["tools"] = tool_schemas
 
-            # Guard: compact working_messages if token count is too high
-            working_messages = _compact_working_messages(working_messages)
-
-            # Stream with auto-retry on transient failures (e.g. API connection drops)
-            _STREAM_MAX_RETRIES = 2
-            for _stream_attempt in range(_STREAM_MAX_RETRIES + 1):
-                try:
-                    step_text, tool_use_blocks, stop_reason, final_message = _stream_response(client, api_kwargs)
-                    break  # Success
-                except KeyboardInterrupt:
-                    _interrupted_msg()
-                    return all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
-                except Exception as stream_err:
-                    is_transient = any(kw in str(stream_err).lower() for kw in [
-                        "incomplete", "peer closed", "connection reset", "timeout",
-                        "eof", "broken pipe", "overloaded", "529", "server_error",
-                    ])
-                    if is_transient and _stream_attempt < _STREAM_MAX_RETRIES:
-                        _retry_delay = 2 ** (_stream_attempt + 1)  # 2s, 4s
-                        retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {_retry_delay}s... (attempt {_stream_attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
-                        sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
-                        sys.stdout.flush()
-                        time.sleep(_retry_delay)
-                        continue
-                    # Non-transient error or retries exhausted
-                    error_msg = f"\n[Stream error at step {step+1}: {stream_err}]\n"
-                    sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
-                    sys.stdout.flush()
-                    if all_text:
-                        return all_text + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}]"
-                    return f"Error during streaming: {stream_err}"
+            # Stream with auto-retry on transient failures
+            step_text, tool_use_blocks, stop_reason, final_message = _stream_with_retry(
+                client, api_kwargs, step, all_text, working_messages
+            )
 
             all_text += step_text
+            final_text = step_text  # Always track latest step's text
 
             # If there are no tool calls, we're done
             if not tool_use_blocks:
                 if step_text:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
-                return all_text if all_text else "I processed your request but had no text response to return."
+                result = all_text if all_text else "I processed your request but had no text response to return."
+                # Append the final assistant message so history doesn't end
+                # on a user-role tool_result from the previous step.
+                serialized = _serialize_content_blocks(final_message.content)
+                working_messages.append({"role": "assistant", "content": serialized})
+                return (result, final_text, working_messages)
 
             # --- Handle tool calls ---
             if step_text:
@@ -482,43 +532,14 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
             serialized = _truncate_tool_use_inputs(serialized)
             working_messages.append({"role": "assistant", "content": serialized})
 
-            # Execute tool calls — concurrently if multiple (P1)
-            try:
-                n_tools = len(tool_use_blocks)
-                if n_tools > 1:
-                    _tool_info(f"Executing {n_tools} tool calls concurrently...")
-
-                for block in tool_use_blocks:
-                    input_preview = str(block.input)
-                    if len(input_preview) > 150:
-                        input_preview = input_preview[:150] + "..."
-                    _tool_info(f"Calling: {block.name}({input_preview})")
-
-                # Execute (concurrent if multiple, sequential if single)
-                executed = _execute_tools_concurrently(tool_use_blocks, tool_functions)
-
-                # Build tool_results in original order
-                tool_results = []
-                for block, result in executed:
-                    content_str = _truncate_tool_result(result.content, is_error=result.is_error)
-                    _tool_result_preview(content_str, is_error=result.is_error)
-
-                    # Build the tool_result block — Anthropic API supports is_error
-                    tool_result_block = {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": content_str,
-                    }
-                    if result.is_error:
-                        tool_result_block["is_error"] = True
-
-                    tool_results.append(tool_result_block)
-
-            except KeyboardInterrupt:
-                _interrupted_msg()
-                return all_text + "\n\n[Tool execution interrupted by user]" if all_text else "[Tool execution interrupted by user]"
+            # Execute tool calls and build results
+            tool_results = _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_text)
 
             working_messages.append({"role": "user", "content": tool_results})
+
+            # Refresh tool snapshots if registry changed (e.g. MCP connect mid-turn)
+            if registry.version != reg_version:
+                reg_version, tool_schemas, tool_functions = registry.snapshot()
 
             # Show step progress for long operations
             if step >= 5:
@@ -531,15 +552,15 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
         sys.stdout.flush()
 
         if all_text:
-            return all_text + max_step_msg
+            return (all_text + max_step_msg, final_text, working_messages)
 
         # Try a final non-tool response
         fallback_text = ""
         try:
             api_kwargs_final = dict(
-                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+                model=AGENT_MODEL,
                 max_tokens=DEFAULT_MAX_TOKENS,
-                system=augmented_system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
+                system=system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
                 messages=working_messages,
             )
             with client.messages.stream(**api_kwargs_final, timeout=300) as stream:
@@ -551,20 +572,27 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
                             fallback_text += delta.text
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return fallback_text
+                # Append fallback assistant message to maintain valid history
+                working_messages.append({"role": "assistant", "content": [{"type": "text", "text": fallback_text}]})
+                return (fallback_text, fallback_text, working_messages)
         except KeyboardInterrupt:
             _interrupted_msg()
-            return fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
-        except Exception:
-            pass
+            msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
+            return (msg, "", working_messages)
+        except Exception as fallback_err:
+            sys.stdout.write(f"{COLOR_RED}\n  Fallback response failed: {fallback_err}{COLOR_RESET}\n")
+            sys.stdout.flush()
 
-        return "I've reached my maximum reasoning steps. Please try rephrasing your request."
+        return ("I've reached my maximum reasoning steps. Please try rephrasing your request.", "", working_messages)
 
+    except _StreamAbort as abort:
+        return abort.result
     except KeyboardInterrupt:
         _interrupted_msg()
-        return all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]"
+        msg = all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]"
+        return (msg, "", working_messages)
     except Exception as e:
         error_detail = traceback.format_exc()
         sys.stdout.write(f"{COLOR_RED}\nFatal error in planner: {e}\n{error_detail}{COLOR_RESET}\n")
         sys.stdout.flush()
-        return f"Error during planning: {e}"
+        return (f"Error during planning: {e}", "", working_messages)

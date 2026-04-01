@@ -19,6 +19,7 @@ Usage (as native tool):
 
 import re
 from urllib.parse import urlparse
+from ..toolresult import ToolResult
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -348,7 +349,7 @@ def _ensure_chrome_mcp_tools():
         dict with the 5 required tool functions, or raises ConnectionError.
     """
     try:
-        from .registry import get_registry
+        from ..registry import get_registry
     except ImportError:
         from jyagent.registry import get_registry
     registry = get_registry()
@@ -368,7 +369,7 @@ def _ensure_chrome_mcp_tools():
     
     # Tools not registered — auto-connect Chrome MCP via MCPManager
     try:
-        from .mcp_manager import get_manager
+        from ..mcp_manager import get_manager
     except ImportError:
         from jyagent.mcp_manager import get_manager
     manager = get_manager()
@@ -454,97 +455,98 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
     """
     import json as _json
 
-    # Step 1: Ensure Chrome MCP tools are available (auto-connect if needed)
-    fns = _ensure_chrome_mcp_tools()
-    new_page_fn = fns["mcp__chrome__new_page"]
-    snapshot_fn = fns["mcp__chrome__take_snapshot"]
-    close_fn = fns["mcp__chrome__close_page"]
-    list_pages_fn = fns["mcp__chrome__list_pages"]
-    select_page_fn = fns["mcp__chrome__select_page"]
+    def _call_chrome(fn, critical=True, **kwargs):
+        """Call a Chrome MCP function with error checking.
 
-    # Step 2: Record existing page IDs + currently selected page
-    prev_page_id = None
-    page_ids_before = set()
+        If critical=True, raises RuntimeError on failure (aborts the fetch).
+        If critical=False, returns None on failure (for cleanup steps).
+        """
+        try:
+            result = fn(**kwargs)
+        except Exception as e:
+            if critical:
+                raise RuntimeError(f"Chrome call failed: {e}")
+            return None
+        if isinstance(result, ToolResult) and result.is_error:
+            if critical:
+                raise RuntimeError(f"Chrome error: {result.content}")
+            return None
+        return result.content if isinstance(result, ToolResult) else result
+
     try:
-        pages_before = list_pages_fn()
-        prev_page_id = _extract_page_id(pages_before)
-        page_ids_before = _extract_all_page_ids(pages_before)
-    except Exception:
-        pass
+        # Step 1: Ensure Chrome MCP tools are available (auto-connect if needed)
+        fns = _ensure_chrome_mcp_tools()
+        new_page_fn = fns["mcp__chrome__new_page"]
+        snapshot_fn = fns["mcp__chrome__take_snapshot"]
+        close_fn = fns["mcp__chrome__close_page"]
+        list_pages_fn = fns["mcp__chrome__list_pages"]
+        select_page_fn = fns["mcp__chrome__select_page"]
 
-    # Step 3: Open URL in a new tab
-    new_page_result = new_page_fn(url=url, timeout=timeout * 1000)
+        # Step 2: Record existing page IDs + currently selected page
+        prev_page_id = None
+        page_ids_before = set()
+        pages_before = _call_chrome(list_pages_fn, critical=False)
+        if pages_before is not None:
+            prev_page_id = _extract_page_id(pages_before)
+            page_ids_before = _extract_all_page_ids(pages_before)
 
-    # Extract the new page's ID from the response
-    # new_page returns: "## Pages\n17: about:blank\n18: https://... [selected]"
-    new_page_id = _extract_page_id(new_page_result)
+        # Step 3: Open URL in a new tab (critical — abort if this fails)
+        new_page_result = _call_chrome(new_page_fn, critical=True, url=url, timeout=timeout * 1000)
 
-    # Fallback: if [selected] parsing fails, diff page lists to find the new tab
-    if new_page_id is None:
-        page_ids_after = _extract_all_page_ids(new_page_result)
-        new_ids = page_ids_after - page_ids_before
-        if new_ids:
-            # Pick the highest ID (most recently created)
-            new_page_id = max(new_ids)
+        # Extract the new page's ID from the response
+        # new_page returns: "## Pages\n17: about:blank\n18: https://... [selected]"
+        new_page_id = _extract_page_id(new_page_result)
 
-    # Use try/finally to GUARANTEE tab cleanup even if snapshot fails
-    content = ""
-    try:
-        # Step 4: Take a snapshot (a11y tree — gives us clean text content)
-        snapshot_result = snapshot_fn()
+        # Fallback: if [selected] parsing fails, diff page lists to find the new tab
+        if new_page_id is None:
+            page_ids_after = _extract_all_page_ids(new_page_result)
+            new_ids = page_ids_after - page_ids_before
+            if new_ids:
+                # Pick the highest ID (most recently created)
+                new_page_id = max(new_ids)
 
-        # Step 5: Extract text from the snapshot
-        if isinstance(snapshot_result, str):
-            content = snapshot_result
-        elif isinstance(snapshot_result, dict):
-            content = _json.dumps(snapshot_result, ensure_ascii=False)
-    finally:
-        # Step 6: Close the tab we opened (ALWAYS runs)
-        if new_page_id is not None:
-            try:
-                close_fn(pageId=new_page_id)
-            except Exception:
-                # Last resort: list pages again and close any new ones
-                try:
-                    pages_now = list_pages_fn()
+        # Use try/finally to GUARANTEE tab cleanup even if snapshot fails
+        content = ""
+        try:
+            # Step 4: Take a snapshot (critical — abort if this fails)
+            snapshot_result = _call_chrome(snapshot_fn, critical=True)
+
+            # Step 5: Extract text from the snapshot
+            if isinstance(snapshot_result, str):
+                content = snapshot_result
+            elif isinstance(snapshot_result, dict):
+                content = _json.dumps(snapshot_result, ensure_ascii=False)
+        finally:
+            # Step 6: Close the tab we opened (ALWAYS runs)
+            if new_page_id is not None:
+                close_result = _call_chrome(close_fn, critical=False, pageId=new_page_id)
+                if close_result is None:
+                    # Close failed — check for leaked tabs
+                    pages_now = _call_chrome(list_pages_fn, critical=False)
+                    if pages_now is not None:
+                        current_ids = _extract_all_page_ids(pages_now)
+                        leaked_ids = current_ids - page_ids_before
+                        for leaked_id in leaked_ids:
+                            _call_chrome(close_fn, critical=False, pageId=leaked_id)
+
+                # Step 7: Restore the previously selected page
+                if prev_page_id is not None and prev_page_id != new_page_id:
+                    _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
+            else:
+                # new_page_id is None — try to find and close any leaked tabs
+                pages_now = _call_chrome(list_pages_fn, critical=False)
+                if pages_now is not None:
                     current_ids = _extract_all_page_ids(pages_now)
                     leaked_ids = current_ids - page_ids_before
                     for leaked_id in leaked_ids:
-                        try:
-                            close_fn(pageId=leaked_id)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        _call_chrome(close_fn, critical=False, pageId=leaked_id)
+                    if prev_page_id is not None:
+                        _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
 
-            # Step 7: Restore the previously selected page
-            if prev_page_id is not None and prev_page_id != new_page_id:
-                try:
-                    select_page_fn(pageId=prev_page_id)
-                except Exception:
-                    pass
-        else:
-            # new_page_id is None — we couldn't identify which tab was created.
-            # Try to find and close any leaked tabs by diffing page lists.
-            try:
-                pages_now = list_pages_fn()
-                current_ids = _extract_all_page_ids(pages_now)
-                leaked_ids = current_ids - page_ids_before
-                for leaked_id in leaked_ids:
-                    try:
-                        close_fn(pageId=leaked_id)
-                    except Exception:
-                        pass
-                # Restore previously selected page
-                if prev_page_id is not None:
-                    try:
-                        select_page_fn(pageId=prev_page_id)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        return 200, content
 
-    return 200, content
+    except (ConnectionError, RuntimeError) as e:
+        return 0, f"Error: Chrome fetch failed: {e}"
 
 
 # ─── Strategy orchestration ──────────────────────────────────────────────────
@@ -589,7 +591,7 @@ def _is_blocked(status: int, body: str) -> bool:
 # ─── Main function ────────────────────────────────────────────────────────────
 
 def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
-              raw: bool = False, strategy: str = "auto") -> str:
+              raw: bool = False, strategy: str = "auto") -> ToolResult:
     """Fetch a URL and return its content as clean readable text.
 
     5-tier anti-blocking cascade: curl_cffi (Chrome TLS impersonation) →
@@ -612,7 +614,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
         Formatted string with URL, status, content length, and extracted text.
     """
     if not url:
-        return "Error: url parameter is required"
+        return ToolResult("Error: url parameter is required", is_error=True)
 
     # Normalize URL
     if not url.startswith(("http://", "https://")):
@@ -652,9 +654,11 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
                 # trying other strategies on the same non-existent URL.
                 if status in (404, 410) and strategy == "auto":
                     error_detail = "\n".join(f"  • {e}" for e in errors)
-                    return (f"Error: HTTP {status} — Resource not found: {url}\n"
-                            f"(Short-circuited after {strategy_name} — retrying won't help)\n\n"
-                            f"Details:\n{error_detail}")
+                    return ToolResult(
+                        f"Error: HTTP {status} — Resource not found: {url}\n"
+                        f"(Short-circuited after {strategy_name} — retrying won't help)\n\n"
+                        f"Details:\n{error_detail}",
+                        is_error=True)
                 continue
 
             # Extract text (unless raw mode or fetcher returns pre-extracted text)
@@ -693,7 +697,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
                 if remaining > 0:
                     header += f" ({remaining} chars remaining, use start_index={start_index + len(page)} for next page)"
 
-            return f"{header}\n\n{page}"
+            return ToolResult(f"{header}\n\n{page}")
 
         except Exception as e:
             errors.append(f"{strategy_name}: {type(e).__name__}: {e}")
@@ -701,7 +705,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
 
     # All strategies failed
     error_detail = "\n".join(f"  • {e}" for e in errors)
-    return f"Error: All fetch strategies failed for {url}\n\nDetails:\n{error_detail}"
+    return ToolResult(f"Error: All fetch strategies failed for {url}\n\nDetails:\n{error_detail}", is_error=True)
 
 
 # ─── Tool schema for auto-discovery by tools.py ──────────────────────────────

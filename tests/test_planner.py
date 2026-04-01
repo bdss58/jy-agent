@@ -8,8 +8,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from jyagent.planner import (
     ToolResult, _is_error_result, _result_content,
-    _truncate_tool_result, _compact_working_messages,
+    _truncate_tool_result, _compact_working_messages, _execute_tool,
 )
+from jyagent.registry import get_registry
 
 
 class TestToolResult:
@@ -98,3 +99,105 @@ class TestCompactWorkingMessages:
         first_content = compacted[0]["content"]
         tool_result = first_content[0]["content"]
         assert len(tool_result) < len(long_result)
+
+
+class TestToolInputValidation:
+    def test_rejects_non_object_input(self):
+        reg = get_registry()
+
+        def _tool(path: str) -> str:
+            return path
+
+        schema = {
+            "name": "_test_non_object",
+            "description": "test",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                },
+                "required": ["path"],
+            },
+        }
+        reg.register("_test_non_object", _tool, schema)
+        try:
+            result = _execute_tool("_test_non_object", "not-a-dict", {"_test_non_object": _tool})
+            assert result.is_error is True
+            assert "expected object input" in result.content
+        finally:
+            reg.unregister("_test_non_object")
+
+    def test_rejects_invalid_type(self):
+        reg = get_registry()
+
+        def _tool(timeout: int) -> str:
+            return f"timeout={timeout}"
+
+        schema = {
+            "name": "_test_invalid_type",
+            "description": "test",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "timeout": {"type": "integer"},
+                },
+                "required": ["timeout"],
+            },
+        }
+        reg.register("_test_invalid_type", _tool, schema)
+        try:
+            result = _execute_tool("_test_invalid_type", {"timeout": "fast"}, {"_test_invalid_type": _tool})
+            assert result.is_error is True
+            assert "input.timeout must be integer" in result.content
+        finally:
+            reg.unregister("_test_invalid_type")
+
+    def test_rejects_enum_violation(self):
+        reg = get_registry()
+
+        def _tool(action: str) -> str:
+            return action
+
+        schema = {
+            "name": "_test_enum",
+            "description": "test",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["connect", "status"]},
+                },
+                "required": ["action"],
+            },
+        }
+        reg.register("_test_enum", _tool, schema)
+        try:
+            result = _execute_tool("_test_enum", {"action": "launch"}, {"_test_enum": _tool})
+            assert result.is_error is True
+            assert "must be one of" in result.content
+        finally:
+            reg.unregister("_test_enum")
+
+    def test_rejects_numeric_constraint_violation(self):
+        reg = get_registry()
+
+        def _tool(limit: int) -> str:
+            return str(limit)
+
+        schema = {
+            "name": "_test_maximum",
+            "description": "test",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "maximum": 10},
+                },
+                "required": ["limit"],
+            },
+        }
+        reg.register("_test_maximum", _tool, schema)
+        try:
+            result = _execute_tool("_test_maximum", {"limit": 11}, {"_test_maximum": _tool})
+            assert result.is_error is True
+            assert "input.limit must be <= 10" in result.content
+        finally:
+            reg.unregister("_test_maximum")

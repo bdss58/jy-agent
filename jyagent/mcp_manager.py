@@ -15,6 +15,7 @@ import time
 from typing import Optional
 from .mcp_client import MCPClient
 from .registry import get_registry
+from .toolresult import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -333,28 +334,28 @@ class MCPManager:
             self._registered_tools.discard(tool_name)
 
     def _call_mcp_tool(self, server_name: str, mcp_tool_name: str,
-                       arguments: dict) -> str:
-        """Execute an MCP tool call and return the result as a string."""
+                       arguments: dict) -> ToolResult:
+        """Execute an MCP tool call and return the result as a ToolResult."""
         client = self._clients.get(server_name)
         if client is None or not client.is_connected:
             # Try to auto-reconnect
             try:
                 result = self.connect(server_name)
                 if result.get("status") not in ("connected", "already_connected"):
-                    return f"❌ MCP server '{server_name}' not connected and auto-connect failed: {result}"
+                    return ToolResult(f"MCP server '{server_name}' not connected and auto-connect failed: {result}", is_error=True)
                 client = self._clients.get(server_name)
             except Exception as e:
-                return f"❌ MCP server '{server_name}' not connected: {e}"
+                return ToolResult(f"MCP server '{server_name}' not connected: {e}", is_error=True)
 
         # Determine timeout based on tool name (some tools need longer)
         timeout = self._get_tool_timeout(mcp_tool_name)
 
         try:
             result = client.call_tool(mcp_tool_name, arguments, timeout=timeout)
-            return _extract_mcp_result(result)
+            return ToolResult(_extract_mcp_result(result))
         except Exception as e:
             error_msg = str(e)
-            return f"❌ Error calling {mcp_tool_name}: {error_msg}"
+            return ToolResult(f"Error calling {mcp_tool_name}: {error_msg}", is_error=True)
 
     def _get_tool_timeout(self, tool_name: str) -> float:
         """Get appropriate timeout for a tool based on its name.
