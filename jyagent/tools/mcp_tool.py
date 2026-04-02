@@ -131,7 +131,7 @@ TOOL_SCHEMA = {
             },
             "server": {
                 "type": "string",
-                "description": "MCP server name (e.g., 'chrome'). If omitted for connect, connects all.",
+                "description": "MCP server name (e.g., 'chrome'). REQUIRED for 'reconnect'. Optional for 'connect'/'disconnect' (omit to target all). Not needed for 'status'/'list_servers'.",
             },
         },
         "required": ["action"],

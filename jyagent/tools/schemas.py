@@ -143,15 +143,15 @@ CORE_TOOLS = [
                 },
                 "description": {
                     "type": "string",
-                    "description": "Skill description (for create action)"
+                    "description": "Skill description. REQUIRED for 'create' action."
                 },
                 "instructions": {
                     "type": "string",
-                    "description": "Skill instructions/body content (for create action)"
+                    "description": "Skill instructions/body content. REQUIRED for 'create' action."
                 },
                 "resource_path": {
                     "type": "string",
-                    "description": "Relative path to a resource file within the skill (for read action)"
+                    "description": "Relative path to a resource file within the skill. REQUIRED for 'read' action."
                 }
             },
             "required": ["action"]
