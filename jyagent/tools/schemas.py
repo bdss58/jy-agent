@@ -115,11 +115,11 @@ CORE_TOOLS = [
                 },
                 "text": {
                     "type": "string",
-                    "description": "Main text content (what to remember, keyword to forget, topic command like 'read:chrome-mcp', etc.)"
+                    "description": "Main text content. REQUIRED for all actions except 'show'. For 'remember'/'note': what to save. For 'forget': keyword to match. For 'topic': command like 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'. For 'goal': goal text or 'done:<text>' to complete."
                 },
                 "category": {
                     "type": "string",
-                    "description": "Category for learnings: correction, preference, gotcha, tip, workflow, user_stated, goal, note"
+                    "description": "Category for 'remember' action: correction, preference, gotcha, tip, workflow, user_stated, goal, note"
                 }
             },
             "required": ["action"]
@@ -139,7 +139,7 @@ CORE_TOOLS = [
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill name (for activate, deactivate, info, create, delete, resources, read)"
+                    "description": "Skill name. REQUIRED for: activate, deactivate, info, create, delete, resources, read. Not needed for: list, reload."
                 },
                 "description": {
                     "type": "string",
