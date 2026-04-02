@@ -338,6 +338,82 @@ def _fetch_jina(url: str, timeout: int = 30) -> tuple:
         return resp.status_code, resp.text
 
 
+_CHROME_REQUIRED_TOOLS = [
+    "mcp__chrome__new_page",
+    "mcp__chrome__take_snapshot",
+    "mcp__chrome__close_page",
+    "mcp__chrome__list_pages",
+    "mcp__chrome__select_page",
+]
+
+# Error patterns that indicate the underlying Chrome browser is dead/disconnected
+# (but the MCP stdio pipe may still be alive, so keepalive pings pass).
+# These warrant a full reconnect (kill old Chrome, spawn fresh one).
+_CHROME_DEAD_PATTERNS = [
+    "target closed",
+    "session closed",
+    "browser disconnected",
+    "browser has been closed",
+    "browser was closed",
+    "not connected to devtools",
+    "protocol error",
+    "connection refused",
+    "no page available",
+    "page has been closed",
+    "execution context was destroyed",
+    "inspected target navigated or closed",
+]
+
+
+def _is_chrome_dead_error(error_msg: str) -> bool:
+    """Check if an error message indicates the Chrome browser process is dead.
+    
+    When Chrome's CDP (DevTools Protocol) pipe breaks — e.g., the Chrome process
+    crashed, the --remote-debugging-pipe fd is closed, or the tab context was
+    destroyed — the MCP server returns these specific error messages.
+    
+    The MCP stdio connection may still be alive (keepalive pings pass), so this
+    failure mode is silent unless we detect these patterns.
+    """
+    lower = error_msg.lower()
+    return any(pattern in lower for pattern in _CHROME_DEAD_PATTERNS)
+
+
+def _reconnect_chrome_mcp() -> dict:
+    """Force-reconnect Chrome MCP: disconnect (kill old Chrome) + connect (spawn fresh one).
+    
+    This is the equivalent of mcp(action="reconnect", server="chrome") but callable
+    from within web_fetch without going through the LLM tool-call loop.
+    
+    Returns:
+        MCPManager.connect() result dict.
+    Raises:
+        ConnectionError if reconnect fails.
+    """
+    import sys
+    try:
+        from ..mcp_manager import get_manager
+    except ImportError:
+        from jyagent.mcp_manager import get_manager
+    
+    manager = get_manager()
+    
+    # Reload config in case .mcp.json was updated
+    manager.load_servers()
+    
+    # Disconnect old (kills Chrome process + MCP server)
+    manager.disconnect("chrome")
+    
+    # Connect fresh
+    result = manager.connect("chrome")
+    status = result.get("status", "")
+    if status not in ("connected", "already_connected"):
+        raise ConnectionError(f"Chrome MCP reconnect failed: {result}")
+    
+    print(f"[web_fetch] Chrome MCP auto-reconnected: {result.get('tools_registered', 0)} tools", file=sys.stderr)
+    return result
+
+
 def _ensure_chrome_mcp_tools():
     """Ensure Chrome MCP tools are registered in the agent's ToolRegistry.
     
@@ -354,16 +430,8 @@ def _ensure_chrome_mcp_tools():
         from jyagent.registry import get_registry
     registry = get_registry()
     
-    required_tools = [
-        "mcp__chrome__new_page",
-        "mcp__chrome__take_snapshot", 
-        "mcp__chrome__close_page",
-        "mcp__chrome__list_pages",
-        "mcp__chrome__select_page",
-    ]
-    
     # Check if tools are already registered
-    fns = {name: registry.get_function(name) for name in required_tools}
+    fns = {name: registry.get_function(name) for name in _CHROME_REQUIRED_TOOLS}
     if all(fns.values()):
         return fns
     
@@ -388,7 +456,7 @@ def _ensure_chrome_mcp_tools():
         )
     
     # Re-check registry after connect
-    fns = {name: registry.get_function(name) for name in required_tools}
+    fns = {name: registry.get_function(name) for name in _CHROME_REQUIRED_TOOLS}
     missing = [name.split("__")[-1] for name, fn in fns.items() if fn is None]
     if missing:
         raise ConnectionError(
@@ -435,23 +503,23 @@ def _extract_all_page_ids(result_text: str) -> set:
     return ids
 
 
-def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
-    """Tier 4: Real Chrome browser via registered MCP tools (same connection as agent).
+def _fetch_chrome_once(url: str, timeout: int = 30) -> tuple:
+    """Core Chrome fetch logic: open tab → snapshot → close tab.
 
-    Uses the agent's registered mcp__chrome__* tools from the ToolRegistry,
-    which share the same Chrome MCP connection the agent uses for browser automation.
-    This ensures we use the real Chrome with user's cookies/session.
-
-    Auto-connects Chrome MCP if tools are not yet registered (e.g., first use
-    before LLM has called mcp(action="connect")).
+    Returns (200, content) on success or raises RuntimeError/ConnectionError on failure.
+    This is the inner function called by _fetch_chrome (which adds auto-reconnect).
 
     Strategy:
       1. Ensure Chrome MCP tools are registered (auto-connect if needed)
       2. Record all existing page IDs + currently selected page
-      3. Open URL in a new tab
-      4. Take a snapshot (a11y tree text)
-      5. Close the new tab (guaranteed via try/finally)
+      3. Open URL in a new tab  ┐
+      4. Take a snapshot (a11y tree text) ├─ all inside try/finally
+      5. Close the new tab (guaranteed)  ┘
       6. Restore the previously selected page
+    
+    The try/finally wraps steps 3-5 together (not just 4-5) so that even if
+    new_page times out AFTER Chrome created the tab, the finally block still
+    runs and cleans it up via page-list diff.
     """
     import json as _json
 
@@ -473,23 +541,29 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
             return None
         return result.content if isinstance(result, ToolResult) else result
 
+    # Step 1: Ensure Chrome MCP tools are available (auto-connect if needed)
+    fns = _ensure_chrome_mcp_tools()
+    new_page_fn = fns["mcp__chrome__new_page"]
+    snapshot_fn = fns["mcp__chrome__take_snapshot"]
+    close_fn = fns["mcp__chrome__close_page"]
+    list_pages_fn = fns["mcp__chrome__list_pages"]
+    select_page_fn = fns["mcp__chrome__select_page"]
+
+    # Step 2: Record existing page IDs + currently selected page
+    prev_page_id = None
+    page_ids_before = set()
+    pages_before = _call_chrome(list_pages_fn, critical=False)
+    if pages_before is not None:
+        prev_page_id = _extract_page_id(pages_before)
+        page_ids_before = _extract_all_page_ids(pages_before)
+
+    # Steps 3-5 are ALL inside try/finally to guarantee tab cleanup.
+    # This is critical because new_page may timeout AFTER Chrome has already
+    # created the tab (initially about:blank → starts navigating → timeout).
+    # Without the finally, that tab would leak.
+    content = ""
+    new_page_id = None
     try:
-        # Step 1: Ensure Chrome MCP tools are available (auto-connect if needed)
-        fns = _ensure_chrome_mcp_tools()
-        new_page_fn = fns["mcp__chrome__new_page"]
-        snapshot_fn = fns["mcp__chrome__take_snapshot"]
-        close_fn = fns["mcp__chrome__close_page"]
-        list_pages_fn = fns["mcp__chrome__list_pages"]
-        select_page_fn = fns["mcp__chrome__select_page"]
-
-        # Step 2: Record existing page IDs + currently selected page
-        prev_page_id = None
-        page_ids_before = set()
-        pages_before = _call_chrome(list_pages_fn, critical=False)
-        if pages_before is not None:
-            prev_page_id = _extract_page_id(pages_before)
-            page_ids_before = _extract_all_page_ids(pages_before)
-
         # Step 3: Open URL in a new tab (critical — abort if this fails)
         new_page_result = _call_chrome(new_page_fn, critical=True, url=url, timeout=timeout * 1000)
 
@@ -505,48 +579,93 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
                 # Pick the highest ID (most recently created)
                 new_page_id = max(new_ids)
 
-        # Use try/finally to GUARANTEE tab cleanup even if snapshot fails
-        content = ""
-        try:
-            # Step 4: Take a snapshot (critical — abort if this fails)
-            snapshot_result = _call_chrome(snapshot_fn, critical=True)
+        # Step 4: Take a snapshot (critical — abort if this fails)
+        snapshot_result = _call_chrome(snapshot_fn, critical=True)
 
-            # Step 5: Extract text from the snapshot
-            if isinstance(snapshot_result, str):
-                content = snapshot_result
-            elif isinstance(snapshot_result, dict):
-                content = _json.dumps(snapshot_result, ensure_ascii=False)
-        finally:
-            # Step 6: Close the tab we opened (ALWAYS runs)
-            if new_page_id is not None:
-                close_result = _call_chrome(close_fn, critical=False, pageId=new_page_id)
-                if close_result is None:
-                    # Close failed — check for leaked tabs
-                    pages_now = _call_chrome(list_pages_fn, critical=False)
-                    if pages_now is not None:
-                        current_ids = _extract_all_page_ids(pages_now)
-                        leaked_ids = current_ids - page_ids_before
-                        for leaked_id in leaked_ids:
-                            _call_chrome(close_fn, critical=False, pageId=leaked_id)
-
-                # Step 7: Restore the previously selected page
-                if prev_page_id is not None and prev_page_id != new_page_id:
-                    _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
-            else:
-                # new_page_id is None — try to find and close any leaked tabs
+        # Step 5: Extract text from the snapshot
+        if isinstance(snapshot_result, str):
+            content = snapshot_result
+        elif isinstance(snapshot_result, dict):
+            content = _json.dumps(snapshot_result, ensure_ascii=False)
+    finally:
+        # Step 6: Close the tab we opened (ALWAYS runs — even if new_page or snapshot fails)
+        #
+        # If new_page_id was extracted, close it directly.
+        # If new_page_id is None (new_page threw before we could parse the ID,
+        # or the response format was unexpected), diff page lists to find leaked tabs.
+        if new_page_id is not None:
+            close_result = _call_chrome(close_fn, critical=False, pageId=new_page_id)
+            if close_result is None:
+                # Close failed — check for leaked tabs
                 pages_now = _call_chrome(list_pages_fn, critical=False)
                 if pages_now is not None:
                     current_ids = _extract_all_page_ids(pages_now)
                     leaked_ids = current_ids - page_ids_before
                     for leaked_id in leaked_ids:
                         _call_chrome(close_fn, critical=False, pageId=leaked_id)
-                    if prev_page_id is not None:
-                        _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
 
-        return 200, content
+            # Step 7: Restore the previously selected page
+            if prev_page_id is not None and prev_page_id != new_page_id:
+                _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
+        else:
+            # new_page_id is None — try to find and close any leaked tabs
+            pages_now = _call_chrome(list_pages_fn, critical=False)
+            if pages_now is not None:
+                current_ids = _extract_all_page_ids(pages_now)
+                leaked_ids = current_ids - page_ids_before
+                for leaked_id in leaked_ids:
+                    _call_chrome(close_fn, critical=False, pageId=leaked_id)
+                if prev_page_id is not None:
+                    _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
 
+    return 200, content
+
+
+def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
+    """Tier 4: Real Chrome browser via registered MCP tools (same connection as agent).
+
+    Uses the agent's registered mcp__chrome__* tools from the ToolRegistry,
+    which share the same Chrome MCP connection the agent uses for browser automation.
+
+    Auto-reconnect: If the Chrome browser is dead (Target closed, Session closed, etc.)
+    but the MCP stdio pipe is still alive, this function will automatically reconnect
+    Chrome MCP (kill old Chrome + spawn fresh one) and retry once.
+
+    This fixes the silent failure mode where Chrome crashes or its CDP pipe breaks
+    after long-running sessions, but the MCP keepalive ping still passes because
+    it only checks the stdio connection.
+    """
+    import sys
+
+    try:
+        return _fetch_chrome_once(url, timeout)
     except (ConnectionError, RuntimeError) as e:
-        return 0, f"Error: Chrome fetch failed: {e}"
+        error_msg = str(e)
+
+        # Check if this is a "Chrome is dead" error that reconnect can fix
+        if not _is_chrome_dead_error(error_msg):
+            # Not a dead-Chrome error — don't retry (e.g., timeout, actual HTTP error)
+            return 0, f"Error: Chrome fetch failed: {error_msg}"
+
+        # Chrome browser is dead — auto-reconnect and retry once
+        print(f"[web_fetch] Chrome appears dead ({error_msg}), attempting auto-reconnect...", file=sys.stderr)
+
+        try:
+            _reconnect_chrome_mcp()
+        except (ConnectionError, Exception) as reconnect_err:
+            return 0, (
+                f"Error: Chrome fetch failed ({error_msg}) "
+                f"and auto-reconnect also failed: {reconnect_err}"
+            )
+
+        # Retry once with fresh Chrome
+        try:
+            return _fetch_chrome_once(url, timeout)
+        except (ConnectionError, RuntimeError) as retry_err:
+            return 0, (
+                f"Error: Chrome fetch failed after auto-reconnect: {retry_err} "
+                f"(original error: {error_msg})"
+            )
 
 
 # ─── Strategy orchestration ──────────────────────────────────────────────────

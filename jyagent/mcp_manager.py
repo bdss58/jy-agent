@@ -335,7 +335,12 @@ class MCPManager:
 
     def _call_mcp_tool(self, server_name: str, mcp_tool_name: str,
                        arguments: dict) -> ToolResult:
-        """Execute an MCP tool call and return the result as a ToolResult."""
+        """Execute an MCP tool call and return the result as a ToolResult.
+        
+        Auto-reconnect: If the server is not connected, or if the call fails with
+        a "dead browser" error (e.g., Chrome's CDP pipe broke but stdio is alive),
+        this method will attempt to reconnect and retry once.
+        """
         client = self._clients.get(server_name)
         if client is None or not client.is_connected:
             # Try to auto-reconnect
@@ -355,7 +360,66 @@ class MCPManager:
             return ToolResult(_extract_mcp_result(result))
         except Exception as e:
             error_msg = str(e)
+            
+            # Check if this is a "dead browser" error (Chrome process died but
+            # MCP stdio pipe still alive — keepalive pings pass, tool calls fail).
+            # If so, force-reconnect (disconnect + connect) and retry once.
+            if self._is_dead_server_error(error_msg):
+                logger.warning(
+                    f"MCP server '{server_name}' appears dead ({error_msg[:80]}...), "
+                    f"attempting auto-reconnect..."
+                )
+                try:
+                    self.disconnect(server_name)
+                    self.load_servers()  # Reload config in case it changed
+                    reconnect_result = self.connect(server_name)
+                    if reconnect_result.get("status") not in ("connected", "already_connected"):
+                        return ToolResult(
+                            f"Error calling {mcp_tool_name}: {error_msg} "
+                            f"(auto-reconnect failed: {reconnect_result})",
+                            is_error=True
+                        )
+                    client = self._clients.get(server_name)
+                    # Retry the tool call once
+                    result = client.call_tool(mcp_tool_name, arguments, timeout=timeout)
+                    logger.info(f"MCP server '{server_name}' auto-reconnected, retry succeeded")
+                    return ToolResult(_extract_mcp_result(result))
+                except Exception as retry_err:
+                    return ToolResult(
+                        f"Error calling {mcp_tool_name}: {error_msg} "
+                        f"(auto-reconnect retry also failed: {retry_err})",
+                        is_error=True
+                    )
+            
             return ToolResult(f"Error calling {mcp_tool_name}: {error_msg}", is_error=True)
+
+    @staticmethod
+    def _is_dead_server_error(error_msg: str) -> bool:
+        """Check if an error indicates the underlying server process is dead.
+        
+        This detects the silent failure mode where the MCP stdio pipe is alive
+        (keepalive pings pass) but the server's backend (e.g., Chrome browser)
+        has crashed or its internal connection (e.g., CDP pipe) has broken.
+        """
+        lower = error_msg.lower()
+        dead_patterns = [
+            "target closed",
+            "session closed",
+            "browser disconnected",
+            "browser has been closed",
+            "browser was closed",
+            "not connected to devtools",
+            "protocol error",
+            "connection refused",
+            "no page available",
+            "page has been closed",
+            "execution context was destroyed",
+            "inspected target navigated or closed",
+            # Generic MCP-level connection errors
+            "broken pipe",
+            "connection reset",
+        ]
+        return any(pattern in lower for pattern in dead_patterns)
 
     def _get_tool_timeout(self, tool_name: str) -> float:
         """Get appropriate timeout for a tool based on its name.
