@@ -1,10 +1,11 @@
 # CLI module — Modern terminal interface using prompt_toolkit + rich
-# Provides: multi-line input, bracketed paste, syntax highlighting, rich output
+# Provides: multi-line input, bracketed paste, syntax highlighting, rich output,
+# status bar with token/cost tracking
 #
-# v5: Removed /memory, /remember, /forget from help and banner (consolidated into manage_memory tool)
+# v6: Added status bar with session stats (model, tokens, cost),
+#     turn summary after each response, updated banner
 
 import os
-import sys
 from typing import Optional
 
 from prompt_toolkit import PromptSession
@@ -16,10 +17,11 @@ from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.formatted_text import HTML
 
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
+
+from .session_stats import get_stats
 
 
 # ─── Rich console with custom theme ──────────────────────────────────────────
@@ -111,22 +113,16 @@ class CLI:
         """Get user input with prompt_toolkit. Returns None on EOF/Ctrl+C."""
         try:
             def get_toolbar():
+                from html import escape as html_escape
+                stats = get_stats()
+                stats_str = html_escape(stats.summary_line())
+
                 if self.multiline_mode[0]:
-                    return HTML(
-                        '<b>Mode:</b> multi-line │ '
-                        '<b>Enter</b>=newline │ '
-                        '<b>Meta+Enter</b>=submit │ '
-                        '<b>/multi</b>=toggle │ '
-                        '<b>Ctrl-C</b>=exit'
-                    )
+                    mode_str = '<b>multi-line</b> │ <b>Enter</b>=newline <b>Meta+Enter</b>=submit'
                 else:
-                    return HTML(
-                        '<b>Mode:</b> single-line │ '
-                        '<b>Enter</b>=submit │ '
-                        '<b>Meta+Enter</b>=newline │ '
-                        '<b>/multi</b>=toggle │ '
-                        '<b>Ctrl-C</b>=exit'
-                    )
+                    mode_str = '<b>single-line</b> │ <b>Enter</b>=submit <b>Meta+Enter</b>=newline'
+
+                return HTML(f'{stats_str} │ {mode_str}')
 
             if self.multiline_mode[0]:
                 prompt_text = [("class:prompt", "You ▶ "), ("class:continuation", "[multi] ")]
@@ -153,25 +149,25 @@ class CLI:
 
     def print_banner(self):
         """Print the startup banner."""
+        from .config import AGENT_MODEL
+        model_short = AGENT_MODEL.split("-202")[0] if "-202" in AGENT_MODEL else AGENT_MODEL
+
         banner_text = Text()
-        banner_text.append("Self-Assembled AI Agent", style="bold")
-        banner_text.append(" (Self-Evolving)\n", style="bold")
-        banner_text.append("Bootstrapped from a single API call\n")
-        banner_text.append("✨ Now with rich output & multi-line input!\n\n", style="italic")
-        banner_text.append("Commands: ", style="bold")
-        banner_text.append("/quit /help /history /clear /tools /multi /markdown\n")
-        banner_text.append("          /skills /skill\n")
+        banner_text.append("jy-agent", style="bold magenta")
+        banner_text.append(" — AI Agent in your terminal\n", style="bold")
+        banner_text.append(f"Model: {model_short}\n", style="dim")
+        banner_text.append("\nCommands: ", style="bold")
+        banner_text.append("/help /quit /clear /tools /multi /markdown /compact /skills\n")
         banner_text.append("\nInput:    ", style="bold")
-        banner_text.append("Enter=submit │ Meta+Enter=newline │ /multi=toggle mode\n")
-        banner_text.append("          Paste multi-line content works automatically!\n")
-        banner_text.append("\nExit:     ", style="bold")
-        banner_text.append("Ctrl-C at prompt to quit │ Ctrl-C during response to interrupt")
+        banner_text.append("Enter=submit │ Esc→Enter=newline │ /multi=toggle\n")
+        banner_text.append("Exit:     ", style="bold")
+        banner_text.append("Ctrl-C at prompt to quit")
 
         console.print(Panel(
             banner_text,
-            title="[bold magenta]🤖 AI Agent[/bold magenta]",
+            title="[bold magenta]🤖[/bold magenta]",
             border_style="magenta",
-            padding=(1, 2),
+            padding=(0, 2),
         ))
 
     def print_system(self, msg: str):
@@ -185,6 +181,12 @@ class CLI:
     def print_separator(self):
         """Print a subtle separator."""
         console.print("─" * 56, style="dim")
+
+    def print_turn_summary(self):
+        """Print a compact turn summary (tokens + cost) after the response."""
+        stats = get_stats()
+        summary = stats.turn_summary()
+        console.print(f"[dim]  {summary}[/dim]")
 
     def print_history(self, messages: list):
         """Print conversation history."""
@@ -212,7 +214,9 @@ class CLI:
             ("/clear", "Clear conversation history"),
             ("/tools", "List registered tools"),
             ("/multi", "Toggle multi-line input mode"),
-            ("/markdown", "Toggle markdown rendering for responses"),
+            ("/markdown", "Toggle markdown rendering"),
+            ("/compact", "Compact conversation (save tokens)"),
+            ("/stats", "Show session statistics (tokens, cost)"),
         ]
         for cmd, desc in commands_general:
             help_text.append(f"  {cmd:<18}", style="bold cyan")

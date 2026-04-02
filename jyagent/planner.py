@@ -3,11 +3,13 @@
 import sys
 import time
 import atexit
+import threading
 import traceback
 import concurrent.futures
 from .registry import get_registry
 from .toolresult import ToolResult
 from .validation import validate_tool_input
+from .session_stats import get_stats
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
@@ -27,6 +29,8 @@ COLOR_DIM = "\033[2m"
 COLOR_YELLOW = "\033[1;33m"
 COLOR_CYAN = "\033[1;36m"
 COLOR_RED = "\033[1;31m"
+COLOR_GREEN = "\033[0;32m"
+COLOR_MAGENTA = "\033[0;35m"
 
 
 def _is_error_result(result) -> bool:
@@ -53,20 +57,173 @@ def _stream_write(text: str):
     sys.stdout.flush()
 
 
+# ─── Thinking spinner ────────────────────────────────────────────────────────
+
+class _ThinkingSpinner:
+    """Animated spinner shown while waiting for the first token.
+
+    Uses a background thread to animate; call stop() when the first
+    text/tool_use delta arrives.  Thread-safe.
+    """
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, label: str = "Thinking"):
+        self._label = label
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._started = False
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if not self._started:
+            return
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        self._started = False
+        # Clear the spinner line
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+    def _animate(self):
+        idx = 0
+        t0 = time.time()
+        while not self._stop_event.is_set():
+            elapsed = time.time() - t0
+            frame = self._FRAMES[idx % len(self._FRAMES)]
+            sys.stdout.write(f"\r{COLOR_DIM}  {frame} {self._label}... ({elapsed:.1f}s){COLOR_RESET}")
+            sys.stdout.flush()
+            idx += 1
+            self._stop_event.wait(0.08)
+
+
+# ─── Tool output formatting ──────────────────────────────────────────────────
+
+_TOOL_ICONS = {
+    "run_shell": "⚡", "read_file": "📄", "write_file": "📝",
+    "edit_file": "✏️", "list_directory": "📁", "glob_files": "🔍",
+    "grep_files": "🔎", "web_fetch": "🌐", "manage_memory": "🧠",
+    "manage_skills": "📦", "mcp": "🔌",
+}
+
+
 def _tool_info(msg: str):
     """Print a visible tool/status message."""
     sys.stdout.write(f"\n{TOOL_COLOR}  🔧 {msg}{COLOR_RESET}\n")
     sys.stdout.flush()
 
 
-def _tool_result_preview(result_str: str, is_error: bool = False, max_len: int = 200):
-    """Print a short preview of the tool result."""
-    preview = result_str[:max_len].replace('\n', ' ')
-    if len(result_str) > max_len:
-        preview += "..."
-    color = COLOR_RED if is_error else COLOR_DIM
-    prefix = "✗" if is_error else "↳"
-    sys.stdout.write(f"{color}  {prefix} ({len(result_str)} chars) {preview}{COLOR_RESET}\n")
+def _tool_call_header(tool_name: str, tool_input: dict):
+    """Print a compact, visually distinct tool call header."""
+    icon = _TOOL_ICONS.get(tool_name, "🔧")
+    # Build compact arg summary
+    args_preview = _format_tool_args(tool_name, tool_input)
+    sys.stdout.write(f"\n{TOOL_COLOR}  {icon} {tool_name}{COLOR_RESET}")
+    if args_preview:
+        sys.stdout.write(f"{COLOR_DIM} {args_preview}{COLOR_RESET}")
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _format_tool_args(tool_name: str, tool_input: dict) -> str:
+    """Format tool arguments for display — show key info, hide verbosity."""
+    if not tool_input:
+        return ""
+    # Special formatting per tool
+    if tool_name == "run_shell":
+        cmd = tool_input.get("command", "")
+        if len(cmd) > 120:
+            cmd = cmd[:117] + "..."
+        return f"$ {cmd}"
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        path = tool_input.get("path", "")
+        extras = []
+        if tool_input.get("operation"):
+            extras.append(tool_input["operation"])
+        if tool_input.get("insert_at_line"):
+            extras.append(f"L{tool_input['insert_at_line']}")
+        if tool_input.get("dry_run"):
+            extras.append("dry-run")
+        suffix = f" ({', '.join(extras)})" if extras else ""
+        return f"{path}{suffix}"
+    if tool_name == "list_directory":
+        return tool_input.get("path", ".") or "."
+    if tool_name in ("glob_files", "grep_files"):
+        pattern = tool_input.get("pattern", "")
+        path = tool_input.get("path", "")
+        return f"'{pattern}'" + (f" in {path}" if path else "")
+    if tool_name == "web_fetch":
+        url = tool_input.get("url", "")
+        if len(url) > 100:
+            url = url[:97] + "..."
+        return url
+    if tool_name in ("manage_memory", "manage_skills"):
+        action = tool_input.get("action", "")
+        name = tool_input.get("name", "")
+        return f"{action}" + (f" {name}" if name else "")
+    if tool_name == "mcp":
+        return tool_input.get("action", "") + (" " + tool_input.get("server", "") if tool_input.get("server") else "")
+    # Generic: show first 120 chars of stringified input
+    s = str(tool_input)
+    return s[:120] + "..." if len(s) > 120 else s
+
+
+def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = False):
+    """Print a compact tool result summary with smart formatting."""
+    lines = result_str.split('\n')
+    n_lines = len(lines)
+    n_chars = len(result_str)
+
+    if is_error:
+        # Errors: show full (they're usually short)
+        preview = result_str[:300].replace('\n', ' ↵ ')
+        if n_chars > 300:
+            preview += "..."
+        sys.stdout.write(f"{COLOR_RED}  ✗ {preview}{COLOR_RESET}\n")
+        sys.stdout.flush()
+        return
+
+    # Detect edit_file diffs and show them nicely
+    if tool_name == "edit_file" and any(ln.strip().startswith(">") for ln in lines[:20]):
+        _render_edit_diff(result_str)
+        return
+
+    # Compact display: first line as summary + dims
+    first_line = lines[0].strip() if lines else ""
+    if len(first_line) > 150:
+        first_line = first_line[:147] + "..."
+
+    size_info = f"{n_chars} chars" if n_lines <= 1 else f"{n_lines} lines, {n_chars} chars"
+    sys.stdout.write(f"{COLOR_GREEN}  ✓{COLOR_RESET} {first_line}")
+    sys.stdout.write(f" {COLOR_DIM}({size_info}){COLOR_RESET}\n")
+    sys.stdout.flush()
+
+
+def _render_edit_diff(result_str: str):
+    """Render edit_file output with color-coded diff lines."""
+    lines = result_str.split('\n')
+    # First line is the summary (e.g. "Edited foo.py: replaced 3 lines...")
+    summary = lines[0] if lines else ""
+    sys.stdout.write(f"{COLOR_GREEN}  ✓ {summary}{COLOR_RESET}\n")
+
+    # Render context lines with diff coloring
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            # Changed line — highlight in green
+            sys.stdout.write(f"\033[32m    {line}{COLOR_RESET}\n")
+        elif stripped.startswith("L") or stripped.startswith(" "):
+            # Context line — dim
+            sys.stdout.write(f"{COLOR_DIM}    {line}{COLOR_RESET}\n")
+        elif line.strip():
+            sys.stdout.write(f"    {line}\n")
     sys.stdout.flush()
 
 
@@ -346,28 +503,47 @@ def _is_truncated_tool_call(stop_reason: str, tool_use_blocks: list) -> bool:
 
 def _stream_response(client, api_kwargs: dict) -> tuple:
     """
-    Stream a single API response.
+    Stream a single API response with thinking spinner and token tracking.
     Returns (step_text, tool_use_blocks, stop_reason, final_message).
     """
     text_parts = []
     tool_use_blocks = []
     stop_reason = None
     final_message = None
+    first_token = True
+    spinner = _ThinkingSpinner()
+    spinner.start()
 
-    with client.messages.stream(**api_kwargs, timeout=STREAM_TIMEOUT) as stream:
-        for event in stream:
-            if hasattr(event, 'type') and event.type == 'content_block_delta':
-                delta = event.delta
-                if hasattr(delta, 'text'):
-                    _stream_write(delta.text)
-                    text_parts.append(delta.text)
+    try:
+        with client.messages.stream(**api_kwargs, timeout=STREAM_TIMEOUT) as stream:
+            for event in stream:
+                if hasattr(event, 'type') and event.type == 'content_block_delta':
+                    delta = event.delta
+                    if hasattr(delta, 'text'):
+                        if first_token:
+                            spinner.stop()
+                            first_token = False
+                        _stream_write(delta.text)
+                        text_parts.append(delta.text)
+                    elif hasattr(delta, 'type') and delta.type == 'input_json_delta':
+                        # Tool input streaming — stop spinner but don't print
+                        if first_token:
+                            spinner.stop()
+                            first_token = False
 
-        final_message = stream.get_final_message()
-        stop_reason = final_message.stop_reason
+            final_message = stream.get_final_message()
+            stop_reason = final_message.stop_reason
 
-        for block in final_message.content:
-            if block.type == "tool_use":
-                tool_use_blocks.append(block)
+            for block in final_message.content:
+                if block.type == "tool_use":
+                    tool_use_blocks.append(block)
+
+            # Record token usage
+            stats = get_stats()
+            if hasattr(final_message, 'usage'):
+                stats.record_usage(final_message.usage, model=api_kwargs.get('model', ''))
+    finally:
+        spinner.stop()  # Ensure spinner is always cleaned up
 
     return "".join(text_parts), tool_use_blocks, stop_reason, final_message
 
@@ -428,22 +604,22 @@ def _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_te
     Raises KeyboardInterrupt (with synthetic results already appended) if interrupted.
     """
     try:
+        stats = get_stats()
         n_tools = len(tool_use_blocks)
         if n_tools > 1:
             _tool_info(f"Executing {n_tools} tool calls...")
 
+        # Print headers for all tool calls
         for block in tool_use_blocks:
-            input_preview = str(block.input)
-            if len(input_preview) > 150:
-                input_preview = input_preview[:150] + "..."
-            _tool_info(f"Calling: {block.name}({input_preview})")
+            _tool_call_header(block.name, block.input if hasattr(block, 'input') else {})
 
         executed = _execute_tools(tool_use_blocks, tool_functions)
 
         tool_results = []
         for block, result in executed:
+            stats.record_tool_call()
             content_str = _truncate_tool_result(result.content, is_error=result.is_error)
-            _tool_result_preview(content_str, is_error=result.is_error)
+            _tool_result_preview(content_str, tool_name=block.name, is_error=result.is_error)
 
             tool_result_block = {
                 "type": "tool_result",
@@ -483,6 +659,8 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
     all_text = ""
 
     try:
+        stats = get_stats()
+        stats.new_turn()
         working_messages = messages.copy()
         all_text = ""
         final_text = ""  # Only the last step's text (for markdown rendering)

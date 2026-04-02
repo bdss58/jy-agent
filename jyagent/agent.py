@@ -158,6 +158,25 @@ def _cmd_skill(cli, user_input, **_):
             cli.print_error(f"Skill '{name}' not found. Use /skills to list available skills.")
 
 
+def _cmd_stats(cli, **_):
+    """Show detailed session statistics."""
+    from .session_stats import get_stats
+    stats = get_stats()
+    lines = [
+        f"Model:         {stats._model or '(none yet)'}",
+        f"Turns:         {stats.turns}",
+        f"API calls:     {stats.api_calls}",
+        f"Tool calls:    {stats.tool_calls}",
+        f"Input tokens:  {stats.format_tokens(stats.total_input_tokens)} ({stats.total_input_tokens:,})",
+        f"Output tokens: {stats.format_tokens(stats.total_output_tokens)} ({stats.total_output_tokens:,})",
+        f"Cache create:  {stats.format_tokens(stats.total_cache_creation_tokens)}",
+        f"Cache read:    {stats.format_tokens(stats.total_cache_read_tokens)}",
+        f"Total cost:    {stats.format_cost(stats.total_cost)}",
+        f"Elapsed:       {stats.elapsed/60:.1f} min",
+    ]
+    cli.print_system("\n".join(lines))
+
+
 # Command dispatch table
 COMMAND_TABLE = {
     "/help": _cmd_help,
@@ -167,6 +186,7 @@ COMMAND_TABLE = {
     "/clear": _cmd_clear,
     "/tools": _cmd_tools,
     "/skills": _cmd_skills,
+    "/stats": _cmd_stats,
 }
 
 
@@ -353,6 +373,8 @@ def run(client) -> None:
                     except Exception:
                         pass
 
+                # Show turn stats (tokens + cost)
+                cli.print_turn_summary()
                 cli.print_separator()
 
             except KeyboardInterrupt:
