@@ -12,8 +12,10 @@ import asyncio
 import io
 import logging
 import os
+import signal
 import threading
 from concurrent.futures import Future as ConcurrentFuture
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Optional, Any, Callable
 
@@ -22,6 +24,48 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 logger = logging.getLogger(__name__)
+
+
+# ─── P5: PID-capturing stdio_client wrapper ──────────────────────────────────
+
+@asynccontextmanager
+async def _stdio_client_with_pid(params: StdioServerParameters, errlog, pid_callback):
+    """Wrap stdio_client to capture the subprocess PID.
+
+    The MCP library's stdio_client spawns a subprocess but doesn't expose its PID.
+    We need the PID to force-kill the process group if graceful disconnect times out.
+
+    Strategy: snapshot child PIDs before/after stdio_client enters, diff to find the new one.
+    """
+    import subprocess
+
+    # Get our PID to find children
+    my_pid = os.getpid()
+
+    def _get_child_pids():
+        """Get all child PIDs of current process using pgrep."""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(my_pid)],
+                capture_output=True, text=True, timeout=3
+            )
+            return set(int(p) for p in result.stdout.strip().split('\n') if p.strip())
+        except Exception:
+            return set()
+
+    pids_before = _get_child_pids()
+
+    async with stdio_client(params, errlog=errlog) as (read, write):
+        # Find the new child PID(s)
+        pids_after = _get_child_pids()
+        new_pids = pids_after - pids_before
+        if new_pids:
+            # Pick the lowest PID (the direct child, npm or the server)
+            child_pid = min(new_pids)
+            pid_callback(child_pid)
+            logger.debug(f"MCP subprocess PID captured: {child_pid} (new PIDs: {new_pids})")
+
+        yield read, write
 
 
 # ─── P4: MCP subprocess stderr log file ──────────────────────────────────────
@@ -103,10 +147,13 @@ class MCPClient:
         self._disconnect_event: Optional[asyncio.Event] = None
         self._lifecycle_task = None
         self._connected = False
-        
+
         # P4: stderr log file for MCP subprocess
         self._stderr_log: Optional[io.TextIOWrapper] = None
-        
+
+        # P5: Track subprocess PID for force-kill on disconnect timeout
+        self._subprocess_pid: Optional[int] = None
+
         # P1: Notification tracking
         self._tools_changed = False  # Set by notification callback
         self._on_tools_changed_callback: Optional[Callable] = None  # External callback (MCPManager)
@@ -223,7 +270,10 @@ class MCPClient:
                         self._stderr_log = _get_mcp_stderr_log(self.name)
                         
                         read, write = await exit_stack.enter_async_context(
-                            stdio_client(params, errlog=self._stderr_log)
+                            _stdio_client_with_pid(
+                                params, errlog=self._stderr_log,
+                                pid_callback=lambda pid: setattr(self, '_subprocess_pid', pid)
+                            )
                         )
 
                     # P1: Create session with tools_list_changed notification handler
@@ -277,6 +327,9 @@ class MCPClient:
             finally:
                 self._session = None
                 self._connected = False
+                # P5: Clear subprocess PID — if we reach here, the AsyncExitStack
+                # already ran stdio_client's cleanup which kills the subprocess.
+                self._subprocess_pid = None
 
         # Initialize queues
         self._call_queue = asyncio.Queue()
@@ -371,9 +424,17 @@ class MCPClient:
         return result_future.result(timeout=timeout)
 
     def disconnect(self) -> dict:
-        """Disconnect from the MCP server. Follows MCP spec shutdown sequence."""
+        """Disconnect from the MCP server. Follows MCP spec shutdown sequence.
+
+        P5: If graceful shutdown times out, force-kill the subprocess by process group.
+        This prevents zombie MCP server processes from accumulating on reconnect.
+        """
         if not self._connected and not self._lifecycle_task:
             return {"status": "not_connected", "name": self.name}
+
+        # Capture PID before we start cleanup (it gets cleared below)
+        subprocess_pid = self._subprocess_pid
+        graceful_ok = False
 
         # Signal disconnect
         if self._loop and self._disconnect_event:
@@ -383,6 +444,7 @@ class MCPClient:
         if self._lifecycle_task:
             try:
                 self._lifecycle_task.result(timeout=15)
+                graceful_ok = True
             except Exception as e:
                 logger.debug(f"Lifecycle task ended for '{self.name}': {e}")
             self._lifecycle_task = None
@@ -407,7 +469,113 @@ class MCPClient:
         # Stop the background event loop
         self._stop_loop()
 
+        # P5+: ALWAYS force-kill the subprocess tree on disconnect.
+        # Even when graceful shutdown "succeeds" (lifecycle task completes),
+        # the MCP server's child processes (e.g., Chrome launched with setsid())
+        # may survive in their own process group. Graceful shutdown only closes
+        # the stdio pipe and kills the direct MCP server process, but Chrome's
+        # independent process group lives on — preventing reconnect due to
+        # port conflicts or stale state.
+        if subprocess_pid:
+            self._force_kill_subprocess(subprocess_pid)
+
+        self._subprocess_pid = None
+
         return {"status": "disconnected", "name": self.name}
+
+    def _force_kill_subprocess(self, pid: int):
+        """Force-kill a subprocess and all its descendants.
+
+        P5: Last-resort cleanup when graceful disconnect times out.
+
+        Challenge: The MCP server (npm → chrome-devtools-mcp) is in one process group,
+        but Chrome (launched by the MCP server) does setsid() and runs in its own
+        process group. So os.killpg() on the npm group doesn't kill Chrome.
+
+        Strategy:
+        1. Walk the process tree to find ALL descendants (using pgrep -P recursively)
+        2. Kill Chrome's process group first (SIGTERM)
+        3. Kill the MCP server's process group (SIGTERM)
+        4. Escalate to SIGKILL if anything survives
+        """
+        import time
+        import subprocess as sp
+
+        def _get_descendants(root_pid: int) -> set:
+            """Recursively find all descendant PIDs."""
+            descendants = set()
+            to_visit = [root_pid]
+            while to_visit:
+                parent = to_visit.pop()
+                try:
+                    result = sp.run(
+                        ["pgrep", "-P", str(parent)],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    for line in result.stdout.strip().split('\n'):
+                        if line.strip():
+                            child_pid = int(line.strip())
+                            if child_pid not in descendants:
+                                descendants.add(child_pid)
+                                to_visit.append(child_pid)
+                except Exception:
+                    pass
+            return descendants
+
+        def _kill_pgid(pgid: int, sig: int):
+            """Send signal to a process group, ignoring errors."""
+            try:
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+        try:
+            logger.info(
+                f"MCP '{self.name}': force-killing subprocess tree to ensure "
+                f"no orphan processes (root PID {pid})"
+            )
+
+            # Collect all process group IDs in the tree
+            all_descendants = _get_descendants(pid)
+            all_pids = {pid} | all_descendants
+            pgids = set()
+            for p in all_pids:
+                try:
+                    pgids.add(os.getpgid(p))
+                except (ProcessLookupError, OSError):
+                    pass
+
+            logger.debug(f"MCP '{self.name}': killing PGIDs {pgids} (PIDs: {all_pids})")
+
+            # SIGTERM all process groups
+            for pgid in pgids:
+                _kill_pgid(pgid, signal.SIGTERM)
+
+            # Wait briefly for termination
+            for _ in range(20):  # 2 seconds max
+                alive = False
+                for p in all_pids:
+                    try:
+                        os.kill(p, 0)  # Check if still alive
+                        alive = True
+                        break
+                    except ProcessLookupError:
+                        pass
+                    except OSError:
+                        alive = True
+                        break
+                if not alive:
+                    return
+                time.sleep(0.1)
+
+            # Still alive — SIGKILL all process groups
+            for pgid in pgids:
+                _kill_pgid(pgid, signal.SIGKILL)
+
+            logger.warning(f"MCP '{self.name}': sent SIGKILL to process groups {pgids}")
+
+        except Exception as e:
+            logger.warning(f"MCP '{self.name}': force-kill failed for PID {pid}: {e}")
 
     # ─── Public API ──────────────────────────────────────────────────────────
 

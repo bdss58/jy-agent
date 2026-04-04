@@ -8,7 +8,7 @@ import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context, on_session_start, on_session_end,
-    compact_conversation, estimate_conversation_tokens,
+
 )
 from .planner import plan_next_action
 from .cli import CLI, console
@@ -77,46 +77,35 @@ def _cmd_history(cli, conversation, **_):
     recent = conversation.get_recent(10)
     cli.print_history(recent)
 
-def _cmd_clear(cli, conversation, **_):
+def _cmd_new(cli, client, conversation, **_):
+    """Save current session, then reset for a fresh conversation."""
+    from .memory.sessions import on_session_end, on_session_start
+    from .session_stats import get_stats
+
+    global _cached_memory_context
+
+    # Save current conversation (skips if < 4 messages)
+    on_session_end(client, conversation.get_history())
+
+    # Process the just-saved pending session in background
+    on_session_start(client)
+
+    # Clear conversation history
     conversation.clear()
-    cli.print_system("Conversation history cleared.")
+
+    # Reset session stats
+    get_stats().reset()
+
+    # Force memory context rebuild on next turn
+    _cached_memory_context = None
+
+    cli.print_system("Session saved. Starting fresh.")
 
 def _cmd_tools(cli, **_):
     tools = get_registry().list_tools()
     cli.print_system(f"Registered tools: {tools}")
 
 
-def _cmd_compact(cli, client, conversation, user_input, state, **_):
-    """Manual /compact command — like Claude Code's /compact [instruction]."""
-    # Extract optional custom instruction
-    parts = user_input.split(None, 1)
-    custom_instruction = parts[1] if len(parts) > 1 else ""
-
-    if len(conversation) < 4:
-        cli.print_system("⚡ Nothing to compact — conversation is too short.")
-        return
-
-    est_tokens = estimate_conversation_tokens(conversation.messages)
-    cli.print_system(
-        f"⚡ Compacting conversation (~{est_tokens} tokens, {len(conversation)} messages)..."
-    )
-
-    result = compact_conversation(
-        conversation, client,
-        custom_instruction=custom_instruction,
-    )
-
-    if result.get("compacted"):
-        cli.print_system(
-            f"✅ Compacted: ~{result['before_tokens']} → ~{result['after_tokens']} tokens "
-            f"(saved ~{result['before_tokens'] - result['after_tokens']} tokens)"
-        )
-        # Re-inject memory and skills (like Claude Code's CLAUDE.md re-injection)
-        state["_force_rebuild_context"] = True
-    elif result.get("error"):
-        cli.print_error(f"Compact failed: {result['error']}")
-    else:
-        cli.print_system("Nothing to compact.")
 
 def _cmd_skills(cli, **_):
     """List all available skills and their status."""
@@ -183,7 +172,7 @@ COMMAND_TABLE = {
     "/multi": _cmd_multi,
     "/markdown": _cmd_markdown,
     "/history": _cmd_history,
-    "/clear": _cmd_clear,
+    "/new": _cmd_new,
     "/tools": _cmd_tools,
     "/skills": _cmd_skills,
     "/stats": _cmd_stats,
@@ -197,6 +186,13 @@ def _graceful_exit(client, conversation, cli):
     cli.goodbye()  # Say goodbye FIRST — user sees immediate response
     try:
         on_session_end(client, conversation.get_history())  # File I/O only, no API
+    except Exception:
+        pass
+    # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as stale processes
+    try:
+        from .mcp_manager import _manager
+        if _manager and _manager._clients:
+            _manager.disconnect_all()
     except Exception:
         pass
 
@@ -290,13 +286,6 @@ def run(client) -> None:
                     _cmd_skill(cli=cli, user_input=user_input)
                     continue
 
-                # ─── /compact [instruction] (prefix match) ─────
-                if user_input == "/compact" or user_input.startswith("/compact "):
-                    _cmd_compact(
-                        cli=cli, client=client, conversation=conversation,
-                        user_input=user_input, state=state,
-                    )
-                    continue
 
                 # ─── Dispatch table commands ──────────
                 handler = COMMAND_TABLE.get(user_input)

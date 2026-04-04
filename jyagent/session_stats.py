@@ -131,28 +131,30 @@ class SessionStats:
             model_short = self._model.split("-202")[0] if "-202" in self._model else (self._model or "?")
             in_t = self.format_tokens(self.total_input_tokens)
             out_t = self.format_tokens(self.total_output_tokens)
-            cost = self.format_cost(self.total_cost)
+            tool_calls = self.tool_calls
             elapsed_min = self.elapsed / 60
+        # Compute cost outside the lock (total_cost also acquires _lock)
+        cost = self.format_cost(self.total_cost)
 
-            parts = [
-                f"⚡ {model_short}",
-                f"↑{in_t} ↓{out_t}",
-                f"💰{cost}",
-            ]
-            if self.tool_calls > 0:
-                parts.append(f"🔧{self.tool_calls}")
-            if elapsed_min >= 1:
-                parts.append(f"⏱{elapsed_min:.0f}m")
+        parts = [
+            f"⚡ {model_short}",
+            f"↑{in_t} ↓{out_t}",
+            f"💰{cost}",
+        ]
+        if tool_calls > 0:
+            parts.append(f"🔧{tool_calls}")
+        if elapsed_min >= 1:
+            parts.append(f"⏱{elapsed_min:.0f}m")
 
-            return " │ ".join(parts)
+        return " │ ".join(parts)
 
     def turn_summary(self) -> str:
         """Summary for the just-completed turn (printed after response)."""
         with self._lock:
             in_t = self.format_tokens(self.turn_input_tokens)
             out_t = self.format_tokens(self.turn_output_tokens)
-            cost = self.format_cost(self.turn_cost)
-            return f"↑{in_t} ↓{out_t} ({cost})"
+        cost = self.format_cost(self.turn_cost)
+        return f"↑{in_t} ↓{out_t} ({cost})"
 
 
 # ─── Singleton ────────────────────────────────────────────────────────────────

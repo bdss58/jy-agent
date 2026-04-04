@@ -5,7 +5,7 @@ web_fetch — Native tool for fetching URLs and extracting clean readable text.
   1. curl_cffi  — Chrome TLS fingerprint impersonation (fastest, best anti-bot bypass)
   2. httpx      — Standard HTTP with browser-like headers
   3. Jina Reader — JS-rendering proxy (handles SPAs/dynamic content)
-  4. Chrome MCP  — Real browser via DevTools (uses registered MCP tools from registry)
+  4. Chrome      — Direct Chrome DevTools MCP calls (navigate → extract → close)
   5. Error diagnostics
 
 Supports pagination via start_index/max_length for large pages.
@@ -18,8 +18,11 @@ Usage (as native tool):
 """
 
 import re
+import logging
 from urllib.parse import urlparse
 from ..toolresult import ToolResult
+
+logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -338,334 +341,202 @@ def _fetch_jina(url: str, timeout: int = 30) -> tuple:
         return resp.status_code, resp.text
 
 
-_CHROME_REQUIRED_TOOLS = [
-    "mcp__chrome__new_page",
-    "mcp__chrome__take_snapshot",
-    "mcp__chrome__close_page",
-    "mcp__chrome__list_pages",
-    "mcp__chrome__select_page",
-]
+# ─── Tier 4: Chrome via direct MCP calls ────────────────────────────────────
 
-# Error patterns that indicate the underlying Chrome browser is dead/disconnected
-# (but the MCP stdio pipe may still be alive, so keepalive pings pass).
-# These warrant a full reconnect (kill old Chrome, spawn fresh one).
-_CHROME_DEAD_PATTERNS = [
-    "target closed",
-    "session closed",
-    "browser disconnected",
-    "browser has been closed",
-    "browser was closed",
-    "not connected to devtools",
-    "protocol error",
-    "connection refused",
-    "no page available",
-    "page has been closed",
-    "execution context was destroyed",
-    "inspected target navigated or closed",
-]
+# Simple approach: call Chrome MCP tools directly (navigate → extract → close).
+# No LLM sub-call needed — just 3 deterministic tool calls.
 
+# JS to extract text content
+_CHROME_EXTRACT_JS = """() => {
+    return document.body.innerText;
+}"""
 
-def _is_chrome_dead_error(error_msg: str) -> bool:
-    """Check if an error message indicates the Chrome browser process is dead.
-    
-    When Chrome's CDP (DevTools Protocol) pipe breaks — e.g., the Chrome process
-    crashed, the --remote-debugging-pipe fd is closed, or the tab context was
-    destroyed — the MCP server returns these specific error messages.
-    
-    The MCP stdio connection may still be alive (keepalive pings pass), so this
-    failure mode is silent unless we detect these patterns.
-    """
-    lower = error_msg.lower()
-    return any(pattern in lower for pattern in _CHROME_DEAD_PATTERNS)
+# JS to extract search results with REAL href URLs.
+# Google/Bing/DuckDuckGo render truncated display URLs in innerText
+# (e.g. "dev.to › varshithvhegde › the-great-...") but the actual
+# <a href="..."> contains the full, correct URL.  This extractor
+# captures both the link text AND the real href so the agent (and
+# downstream web_fetch callers) get usable URLs.
+_CHROME_EXTRACT_SEARCH_JS = """() => {
+    // --- Google ---
+    const googleResults = [];
+    document.querySelectorAll('a').forEach(a => {
+        const h3 = a.querySelector('h3');
+        if (h3 && a.href && !a.href.includes('google.com')) {
+            googleResults.push({title: h3.textContent.trim(), url: a.href});
+        }
+    });
+    if (googleResults.length > 0) {
+        const lines = googleResults.map((r, i) =>
+            `${i+1}. ${r.title}\\n   ${r.url}`
+        );
+        // Also append the rest of innerText (snippets, knowledge panels, etc.)
+        const extra = document.body.innerText;
+        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
+    }
 
+    // --- Bing ---
+    const bingResults = [];
+    document.querySelectorAll('#b_results .b_algo h2 a').forEach(a => {
+        if (a.href) bingResults.push({title: a.textContent.trim(), url: a.href});
+    });
+    if (bingResults.length > 0) {
+        const lines = bingResults.map((r, i) =>
+            `${i+1}. ${r.title}\\n   ${r.url}`
+        );
+        const extra = document.body.innerText;
+        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
+    }
 
-def _reconnect_chrome_mcp() -> dict:
-    """Force-reconnect Chrome MCP: disconnect (kill old Chrome) + connect (spawn fresh one).
-    
-    This is the equivalent of mcp(action="reconnect", server="chrome") but callable
-    from within web_fetch without going through the LLM tool-call loop.
-    
-    Returns:
-        MCPManager.connect() result dict.
-    Raises:
-        ConnectionError if reconnect fails.
-    """
-    import sys
-    try:
-        from ..mcp_manager import get_manager
-    except ImportError:
-        from jyagent.mcp_manager import get_manager
-    
-    manager = get_manager()
-    
-    # Reload config in case .mcp.json was updated
-    manager.load_servers()
-    
-    # Disconnect old (kills Chrome process + MCP server)
-    manager.disconnect("chrome")
-    
-    # Connect fresh
-    result = manager.connect("chrome")
-    status = result.get("status", "")
-    if status not in ("connected", "already_connected"):
-        raise ConnectionError(f"Chrome MCP reconnect failed: {result}")
-    
-    print(f"[web_fetch] Chrome MCP auto-reconnected: {result.get('tools_registered', 0)} tools", file=sys.stderr)
-    return result
+    // --- DuckDuckGo ---
+    const ddgResults = [];
+    document.querySelectorAll('a.result__a').forEach(a => {
+        if (a.href) ddgResults.push({title: a.textContent.trim(), url: a.href});
+    });
+    if (ddgResults.length > 0) {
+        const lines = ddgResults.map((r, i) =>
+            `${i+1}. ${r.title}\\n   ${r.url}`
+        );
+        const extra = document.body.innerText;
+        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
+    }
 
+    // --- Baidu ---
+    const baiduResults = [];
+    document.querySelectorAll('.result h3 a, .c-container h3 a').forEach(a => {
+        if (a.href) baiduResults.push({title: a.textContent.trim(), url: a.href});
+    });
+    if (baiduResults.length > 0) {
+        const lines = baiduResults.map((r, i) =>
+            `${i+1}. ${r.title}\\n   ${r.url}`
+        );
+        const extra = document.body.innerText;
+        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
+    }
 
-def _ensure_chrome_mcp_tools():
-    """Ensure Chrome MCP tools are registered in the agent's ToolRegistry.
-    
-    If mcp__chrome__* tools are not yet registered (e.g., the LLM hasn't
-    called mcp(action="connect") yet), this function auto-connects Chrome MCP
-    via MCPManager, which discovers and registers all tools into the registry.
-    
-    Returns:
-        dict with the 5 required tool functions, or raises ConnectionError.
-    """
-    try:
-        from ..registry import get_registry
-    except ImportError:
-        from jyagent.registry import get_registry
-    registry = get_registry()
-    
-    # Check if tools are already registered
-    fns = {name: registry.get_function(name) for name in _CHROME_REQUIRED_TOOLS}
-    if all(fns.values()):
-        return fns
-    
-    # Tools not registered — auto-connect Chrome MCP via MCPManager
-    try:
-        from ..mcp_manager import get_manager
-    except ImportError:
-        from jyagent.mcp_manager import get_manager
-    manager = get_manager()
-    
-    if "chrome" not in manager.get_server_names():
-        raise ConnectionError(
-            "Chrome MCP server not configured in .mcp.json. "
-            "Add a 'chrome' server configuration first."
-        )
-    
-    result = manager.connect("chrome")
-    status = result.get("status", "")
-    if status not in ("connected", "already_connected"):
-        raise ConnectionError(
-            f"Chrome MCP auto-connect failed: {result}"
-        )
-    
-    # Re-check registry after connect
-    fns = {name: registry.get_function(name) for name in _CHROME_REQUIRED_TOOLS}
-    missing = [name.split("__")[-1] for name, fn in fns.items() if fn is None]
-    if missing:
-        raise ConnectionError(
-            f"Chrome MCP connected but tools still missing: {', '.join(missing)}. "
-            f"Tools registered: {result.get('tools_registered', 0)}"
-        )
-    
-    return fns
-
-
-def _extract_page_id(result_text: str) -> int | None:
-    """Extract the selected page ID from Chrome MCP response text.
-    
-    Chrome MCP returns page listings in the format:
-        ## Pages
-        17: about:blank
-        18: https://example.com/ [selected]
-    
-    The [selected] page is the one we just opened.
-    """
-    if not isinstance(result_text, str):
-        return None
-    for line in result_text.split('\n'):
-        if '[selected]' in line:
-            match = re.match(r'\s*(\d+):', line)
-            if match:
-                return int(match.group(1))
-    return None
-
-
-def _extract_all_page_ids(result_text: str) -> set:
-    """Extract ALL page IDs from Chrome MCP response text.
-    
-    Returns a set of integer page IDs. Used to diff before/after page lists
-    to find newly created tabs even when [selected] parsing fails.
-    """
-    ids = set()
-    if not isinstance(result_text, str):
-        return ids
-    for line in result_text.split('\n'):
-        match = re.match(r'\s*(\d+):', line)
-        if match:
-            ids.add(int(match.group(1)))
-    return ids
-
-
-def _fetch_chrome_once(url: str, timeout: int = 30) -> tuple:
-    """Core Chrome fetch logic: open tab → snapshot → close tab.
-
-    Returns (200, content) on success or raises RuntimeError/ConnectionError on failure.
-    This is the inner function called by _fetch_chrome (which adds auto-reconnect).
-
-    Strategy:
-      1. Ensure Chrome MCP tools are registered (auto-connect if needed)
-      2. Record all existing page IDs + currently selected page
-      3. Open URL in a new tab  ┐
-      4. Take a snapshot (a11y tree text) ├─ all inside try/finally
-      5. Close the new tab (guaranteed)  ┘
-      6. Restore the previously selected page
-    
-    The try/finally wraps steps 3-5 together (not just 4-5) so that even if
-    new_page times out AFTER Chrome created the tab, the finally block still
-    runs and cleans it up via page-list diff.
-    """
-    import json as _json
-
-    def _call_chrome(fn, critical=True, **kwargs):
-        """Call a Chrome MCP function with error checking.
-
-        If critical=True, raises RuntimeError on failure (aborts the fetch).
-        If critical=False, returns None on failure (for cleanup steps).
-        """
-        try:
-            result = fn(**kwargs)
-        except Exception as e:
-            if critical:
-                raise RuntimeError(f"Chrome call failed: {e}")
-            return None
-        if isinstance(result, ToolResult) and result.is_error:
-            if critical:
-                raise RuntimeError(f"Chrome error: {result.content}")
-            return None
-        return result.content if isinstance(result, ToolResult) else result
-
-    # Step 1: Ensure Chrome MCP tools are available (auto-connect if needed)
-    fns = _ensure_chrome_mcp_tools()
-    new_page_fn = fns["mcp__chrome__new_page"]
-    snapshot_fn = fns["mcp__chrome__take_snapshot"]
-    close_fn = fns["mcp__chrome__close_page"]
-    list_pages_fn = fns["mcp__chrome__list_pages"]
-    select_page_fn = fns["mcp__chrome__select_page"]
-
-    # Step 2: Record existing page IDs + currently selected page
-    prev_page_id = None
-    page_ids_before = set()
-    pages_before = _call_chrome(list_pages_fn, critical=False)
-    if pages_before is not None:
-        prev_page_id = _extract_page_id(pages_before)
-        page_ids_before = _extract_all_page_ids(pages_before)
-
-    # Steps 3-5 are ALL inside try/finally to guarantee tab cleanup.
-    # This is critical because new_page may timeout AFTER Chrome has already
-    # created the tab (initially about:blank → starts navigating → timeout).
-    # Without the finally, that tab would leak.
-    content = ""
-    new_page_id = None
-    try:
-        # Step 3: Open URL in a new tab (critical — abort if this fails)
-        new_page_result = _call_chrome(new_page_fn, critical=True, url=url, timeout=timeout * 1000)
-
-        # Extract the new page's ID from the response
-        # new_page returns: "## Pages\n17: about:blank\n18: https://... [selected]"
-        new_page_id = _extract_page_id(new_page_result)
-
-        # Fallback: if [selected] parsing fails, diff page lists to find the new tab
-        if new_page_id is None:
-            page_ids_after = _extract_all_page_ids(new_page_result)
-            new_ids = page_ids_after - page_ids_before
-            if new_ids:
-                # Pick the highest ID (most recently created)
-                new_page_id = max(new_ids)
-
-        # Step 4: Take a snapshot (critical — abort if this fails)
-        snapshot_result = _call_chrome(snapshot_fn, critical=True)
-
-        # Step 5: Extract text from the snapshot
-        if isinstance(snapshot_result, str):
-            content = snapshot_result
-        elif isinstance(snapshot_result, dict):
-            content = _json.dumps(snapshot_result, ensure_ascii=False)
-    finally:
-        # Step 6: Close the tab we opened (ALWAYS runs — even if new_page or snapshot fails)
-        #
-        # If new_page_id was extracted, close it directly.
-        # If new_page_id is None (new_page threw before we could parse the ID,
-        # or the response format was unexpected), diff page lists to find leaked tabs.
-        if new_page_id is not None:
-            close_result = _call_chrome(close_fn, critical=False, pageId=new_page_id)
-            if close_result is None:
-                # Close failed — check for leaked tabs
-                pages_now = _call_chrome(list_pages_fn, critical=False)
-                if pages_now is not None:
-                    current_ids = _extract_all_page_ids(pages_now)
-                    leaked_ids = current_ids - page_ids_before
-                    for leaked_id in leaked_ids:
-                        _call_chrome(close_fn, critical=False, pageId=leaked_id)
-
-            # Step 7: Restore the previously selected page
-            if prev_page_id is not None and prev_page_id != new_page_id:
-                _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
-        else:
-            # new_page_id is None — try to find and close any leaked tabs
-            pages_now = _call_chrome(list_pages_fn, critical=False)
-            if pages_now is not None:
-                current_ids = _extract_all_page_ids(pages_now)
-                leaked_ids = current_ids - page_ids_before
-                for leaked_id in leaked_ids:
-                    _call_chrome(close_fn, critical=False, pageId=leaked_id)
-                if prev_page_id is not None:
-                    _call_chrome(select_page_fn, critical=False, pageId=prev_page_id)
-
-    return 200, content
+    // Fallback: plain innerText
+    return document.body.innerText;
+}"""
 
 
 def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
-    """Tier 4: Real Chrome browser via registered MCP tools (same connection as agent).
+    """Tier 4: Fetch via Chrome DevTools MCP — direct tool calls, no LLM.
 
-    Uses the agent's registered mcp__chrome__* tools from the ToolRegistry,
-    which share the same Chrome MCP connection the agent uses for browser automation.
+    Opens a new tab, navigates to the URL, extracts text via JS, closes tab.
+    Falls back to take_snapshot if JS extraction yields too little text.
 
-    Auto-reconnect: If the Chrome browser is dead (Target closed, Session closed, etc.)
-    but the MCP stdio pipe is still alive, this function will automatically reconnect
-    Chrome MCP (kill old Chrome + spawn fresh one) and retry once.
-
-    This fixes the silent failure mode where Chrome crashes or its CDP pipe breaks
-    after long-running sessions, but the MCP keepalive ping still passes because
-    it only checks the stdio connection.
+    Raises RuntimeError on failure (causes fallthrough to next strategy).
     """
-    import sys
+    import time
+    from ..mcp_manager import get_manager
 
+    manager = get_manager()
+
+    # Ensure Chrome is connected (auto-connect if needed)
+    was_connected = manager.is_connected("chrome")
+    if not was_connected:
+        result = manager.connect("chrome")
+        if result.get("status") not in ("connected", "already_connected"):
+            raise RuntimeError(f"Failed to connect Chrome: {result}")
+
+    page_id = None
     try:
-        return _fetch_chrome_once(url, timeout)
-    except (ConnectionError, RuntimeError) as e:
-        error_msg = str(e)
+        # 1. Open a new tab with the URL
+        new_page_result = manager._call_mcp_tool("chrome", "new_page", {"url": url})
+        if new_page_result.is_error:
+            raise RuntimeError(f"new_page failed: {new_page_result.content}")
 
-        # Check if this is a "Chrome is dead" error that reconnect can fix
-        if not _is_chrome_dead_error(error_msg):
-            # Not a dead-Chrome error — don't retry (e.g., timeout, actual HTTP error)
-            return 0, f"Error: Chrome fetch failed: {error_msg}"
+        # Extract page ID from result for cleanup
+        page_id = _extract_page_id(new_page_result.content)
 
-        # Chrome browser is dead — auto-reconnect and retry once
-        print(f"[web_fetch] Chrome appears dead ({error_msg}), attempting auto-reconnect...", file=sys.stderr)
+        # 2. Wait a moment for dynamic content to render
+        time.sleep(1.5)
 
+        # 3. Extract text via evaluate_script
+        #    For search result pages, use the search-specific extractor that
+        #    captures real href URLs instead of truncated display URLs.
+        extract_js = _CHROME_EXTRACT_SEARCH_JS if _is_search_url(url) else _CHROME_EXTRACT_JS
+        extract_result = manager._call_mcp_tool("chrome", "evaluate_script", {
+            "function": extract_js,
+        })
+
+        content = ""
+        if not extract_result.is_error:
+            content = _extract_js_result(extract_result.content)
+
+        # 4. If JS extraction got too little, fall back to take_snapshot
+        if len(content) < 100:
+            logger.info("Chrome evaluate_script returned little text (%d chars), falling back to take_snapshot", len(content))
+            snapshot_result = manager._call_mcp_tool("chrome", "take_snapshot", {})
+            if not snapshot_result.is_error:
+                content = snapshot_result.content.strip()
+
+        if not content or len(content) < 50:
+            raise RuntimeError(f"Chrome returned too little content: {len(content)} chars")
+
+        return 200, content
+
+    finally:
+        # Always close the tab we opened
+        if page_id:
+            try:
+                manager._call_mcp_tool("chrome", "close_page", {"pageId": page_id})
+            except Exception:
+                pass
+        # If WE connected Chrome, disconnect to clean up
+        if not was_connected and manager.is_connected("chrome"):
+            try:
+                manager.disconnect("chrome")
+            except Exception:
+                pass
+
+
+def _extract_page_id(new_page_output: str) -> int | None:
+    """Extract the page/tab ID from new_page tool output.
+
+    Output format: '## Pages\\n1: about:blank\\n2: https://example.com/ [selected]'
+    The [selected] page is the one we just opened.
+    """
+    import re
+    if not new_page_output:
+        return None
+    # Find the [selected] page line and extract its numeric ID
+    m = re.search(r'(\d+):\s+\S+.*\[selected\]', new_page_output)
+    if m:
+        return int(m.group(1))
+    # Fallback: last numeric page ID
+    ids = re.findall(r'^(\d+):', new_page_output, re.MULTILINE)
+    if ids:
+        return int(ids[-1])
+    return None
+
+
+def _extract_js_result(evaluate_output: str) -> str:
+    """Extract the actual JS result from evaluate_script output.
+
+    Output format: 'Script ran on page and returned:\\n```json\\n"actual text"\\n```'
+    """
+    import json as _json
+    if not evaluate_output:
+        return ""
+    # Try to extract from ```json ... ``` block
+    m = re.search(r'```(?:json)?\s*\n(.*?)\n```', evaluate_output, re.DOTALL)
+    if m:
+        raw = m.group(1).strip()
+        # Try to JSON-decode (strings come as "quoted")
         try:
-            _reconnect_chrome_mcp()
-        except (ConnectionError, Exception) as reconnect_err:
-            return 0, (
-                f"Error: Chrome fetch failed ({error_msg}) "
-                f"and auto-reconnect also failed: {reconnect_err}"
-            )
-
-        # Retry once with fresh Chrome
-        try:
-            return _fetch_chrome_once(url, timeout)
-        except (ConnectionError, RuntimeError) as retry_err:
-            return 0, (
-                f"Error: Chrome fetch failed after auto-reconnect: {retry_err} "
-                f"(original error: {error_msg})"
-            )
+            decoded = _json.loads(raw)
+            if isinstance(decoded, str):
+                return decoded
+        except (ValueError, _json.JSONDecodeError):
+            pass
+        return raw
+    # Fallback: strip prefix
+    text = evaluate_output
+    for prefix in ("Script ran on page and returned:", "Result:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return text.strip()
 
 
 # ─── Strategy orchestration ──────────────────────────────────────────────────
@@ -681,6 +552,13 @@ _STRATEGY_MAP = {
 # For JS-heavy/anti-bot sites, skip simple HTTP and go straight to Jina/Chrome
 _STRATEGY_MAP_JS_HEAVY = {
     "auto": [_fetch_jina, _fetch_cffi, _fetch_chrome],
+}
+
+# For search result pages on JS-heavy sites (Google, Bing, Baidu), prefer Chrome
+# because Chrome can extract real href URLs via _CHROME_EXTRACT_SEARCH_JS,
+# while Jina/innerText only gives truncated display URLs like "dev.to › ..."
+_STRATEGY_MAP_SEARCH = {
+    "auto": [_fetch_chrome, _fetch_jina, _fetch_cffi],
 }
 
 # Jina and Chrome snapshot both return pre-extracted text — skip HTML extraction
@@ -715,7 +593,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
 
     5-tier anti-blocking cascade: curl_cffi (Chrome TLS impersonation) →
     httpx (browser headers) → Jina Reader (JS rendering proxy) →
-    Chrome MCP (real browser) → error diagnostics.
+    Chrome (agent's interactive browser) → error diagnostics.
 
     Smart URL detection: JS-heavy sites (Google, Zhihu, Twitter, etc.) skip
     straight to Jina/Chrome to avoid wasting time on doomed HTTP fetches.
@@ -743,7 +621,10 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
     is_search = _is_search_url(url)
     js_heavy = _is_js_heavy(url)
 
-    if strategy == "auto" and js_heavy:
+    if strategy == "auto" and is_search and js_heavy:
+        # Search pages on JS-heavy sites: prefer Chrome for real href extraction
+        fetchers = _STRATEGY_MAP_SEARCH["auto"]
+    elif strategy == "auto" and js_heavy:
         fetchers = _STRATEGY_MAP_JS_HEAVY["auto"]
     else:
         fetchers = _STRATEGY_MAP.get(strategy, _STRATEGY_MAP["auto"])
@@ -831,7 +712,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
 
 TOOL_SCHEMA = {
     "name": "web_fetch",
-    "description": "Fetch a URL and return its content as clean readable text. 5-tier anti-blocking cascade: curl_cffi (Chrome TLS impersonation) \u2192 httpx (browser headers) \u2192 Jina Reader (JS rendering proxy) \u2192 Chrome MCP (real browser) \u2192 error diagnostics. Supports pagination via start_index/max_length.",
+    "description": "Fetch a URL and return its content as clean readable text. 5-tier anti-blocking cascade: curl_cffi (Chrome TLS impersonation) → httpx (browser headers) → Jina Reader (JS rendering proxy) → Chrome (agent's interactive browser) → error diagnostics. Supports pagination via start_index/max_length.",
     "input_schema": {
         "type": "object",
         "properties": {

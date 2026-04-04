@@ -10,7 +10,7 @@ description: >-
   DO NOT TRIGGER on: static file reading, API-only requests (use web_fetch), or CLI tools.
 metadata:
   author: jy-agent
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Browser Automation
@@ -25,40 +25,60 @@ User task → Does it need a real browser?
 └─ Yes → Is Chrome MCP connected?
     ├─ No → mcp(action="connect", server="chrome")
     │        └─ Failed? → Check references/troubleshooting.md
-    └─ Yes → What kind of task?
-        ├─ Simple page read → Navigate → Snapshot → Extract
-        ├─ Form fill/login → Navigate → Snapshot → Fill → Click → Verify
-        ├─ Multi-step workflow → Use the Snapshot-Act-Verify loop (below)
-        └─ Scrape dynamic content → Navigate → Wait → Evaluate JS
+    └─ Yes → Will you need to INTERACT (click/fill) with elements?
+        ├─ No, read-only (scrape, extract, verify) → Navigate → evaluate_script(JS) to extract text/data
+        ├─ Yes, interact → What kind?
+        │   ├─ Form fill/login → Navigate → Snapshot → Fill → Click → Verify
+        │   ├─ Multi-step workflow → Use the Snapshot-Act-Verify loop (below)
+        │   └─ Click links/buttons → Navigate → Snapshot → Click → Verify
+        └─ Mixed (read + interact) → Snapshot for UIDs, evaluate_script for bulk data extraction
 ```
 
-## Core Pattern: Snapshot → Act → Verify
+## Core Patterns
+
+### Pattern A: Read-Only (scrape/extract — NO interaction needed)
+
+```
+1. navigate_page(url)                          # Go to the page
+2. evaluate_script(() => document.body.innerText)  # Extract text directly via JS
+   — or —
+   evaluate_script(() => {                     # Structured extraction
+     return Array.from(document.querySelectorAll('.item')).map(el => ({
+       title: el.querySelector('h3')?.textContent,
+       url: el.querySelector('a')?.href
+     }))
+   })
+```
+
+**Why not snapshot?** `take_snapshot()` returns the full a11y tree with UIDs, attributes, and nesting — great for finding clickable elements, but wastes tokens when you only need to read text. `evaluate_script` with `innerText` or DOM queries is leaner and returns exactly what you need.
+
+### Pattern B: Interactive (click/fill — needs element UIDs)
 
 Every browser interaction follows this loop. **Never skip the snapshot.**
 
 ```
 1. navigate_page(url)           # Go to the page
-2. take_snapshot()              # See the a11y tree with UIDs — REQUIRED before any action
+2. take_snapshot()              # Get a11y tree with UIDs — REQUIRED before click/fill
 3. <action>(uid from snapshot)  # click, fill, type using UIDs
 4. take_snapshot() or           # Verify the result
    take_screenshot()
 ```
 
-**Why snapshot first?** The accessibility tree gives you stable UIDs for elements. Without it, you're guessing at selectors that may not exist or may have changed.
+**Why snapshot?** The accessibility tree gives you stable UIDs for elements. Without it, you're guessing at selectors that may not exist or may have changed.
 
 ## Actions Reference
 
 | Action | Tool | When to use |
 |--------|------|-------------|
 | Navigate | `navigate_page(url)` | Go to a URL |
-| See structure | `take_snapshot()` | Get a11y tree with UIDs (preferred — low tokens) |
-| See visually | `take_screenshot()` | Get a PNG for visual verification |
+| **Extract text/data** | **`evaluate_script(js)`** | **Read-only: get page text, scrape data, run DOM queries (preferred over snapshot when no interaction needed)** |
+| Get element UIDs | `take_snapshot()` | Before click/fill — get a11y tree with UIDs for interaction |
+| See visually | `take_screenshot()` | Visual verification only (high token cost) |
 | Click | `click(uid)` | Buttons, links, checkboxes |
 | Fill text | `fill(uid, value)` | Text inputs, textareas (sets value directly) |
 | Type text | `type_text(uid, text)` | When you need keystrokes (autocomplete, search) |
 | Keyboard | `press_key(key)` | "Enter", "Tab", "Escape", "Control+A" |
 | Wait | `wait_for(text)` | Wait for text to appear after navigation |
-| Run JS | `evaluate_script(js)` | Complex DOM ops, data extraction, scroll |
 | New tab | `new_page(url)` | Open a new tab |
 | Switch tab | `select_page(index)` | Switch between open tabs |
 | List tabs | `list_pages()` | See all open tabs |
@@ -78,8 +98,11 @@ See [📋 Common Workflows](references/workflows.md) for step-by-step patterns:
 
 ## Anti-Patterns
 
+❌ **Don't** use `take_snapshot()` just to read page content (wastes tokens on UIDs/attributes you won't use)
+✅ **Do** use `evaluate_script(() => document.body.innerText)` or targeted DOM queries for read-only extraction
+
 ❌ **Don't** try to click/fill without taking a snapshot first
-✅ **Do** always snapshot → find UID → act
+✅ **Do** snapshot → find UID → act (snapshot is REQUIRED before any click/fill)
 
 ❌ **Don't** navigate rapidly between pages without waiting
 ✅ **Do** use `wait_for(text)` after navigation to confirm page loaded
@@ -88,7 +111,7 @@ See [📋 Common Workflows](references/workflows.md) for step-by-step patterns:
 ✅ **Do** use `fill(uid, value)` for form fields; `type_text` only for search/autocomplete
 
 ❌ **Don't** take screenshots for structural analysis (wastes tokens)
-✅ **Do** use `take_snapshot()` for structure, `take_screenshot()` only for visual verification
+✅ **Do** use `take_snapshot()` for element UIDs, `evaluate_script` for text, `take_screenshot()` only for visual proof
 
 ❌ **Don't** leave tabs open after finishing a task
 ✅ **Do** close tabs with `close_page()` to prevent tab leaks

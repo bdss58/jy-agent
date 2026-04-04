@@ -11,7 +11,7 @@
       "env": {},
       "prefix": true,
       "connect": "lazy",
-      "startup_wait": 3,
+      "startup_wait": 5,
       "init_timeout": 30
     }
   }

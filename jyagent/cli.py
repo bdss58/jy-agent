@@ -11,8 +11,7 @@ from typing import Optional
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.keys import Keys
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.formatted_text import HTML
 
@@ -48,42 +47,6 @@ PT_STYLE = PTStyle.from_dict({
 })
 
 
-# ─── Key bindings ─────────────────────────────────────────────────────────────
-
-def _create_key_bindings(multiline_mode: list):
-    """Create key bindings.
-    
-    multiline_mode is a mutable list [bool] so we can toggle it.
-    
-    Behavior:
-    - Single-line mode (default): Enter submits, Meta+Enter / Esc then Enter inserts newline
-    - Multi-line mode: Enter inserts newline, Meta+Enter submits
-    """
-    kb = KeyBindings()
-
-    @kb.add(Keys.Enter)
-    def handle_enter(event):
-        buf = event.app.current_buffer
-        if multiline_mode[0]:
-            # In multi-line mode, Enter inserts a newline
-            buf.insert_text("\n")
-        else:
-            # In single-line mode, submit the text
-            buf.validate_and_handle()
-
-    @kb.add(Keys.Escape, Keys.Enter)
-    def handle_meta_enter(event):
-        buf = event.app.current_buffer
-        if multiline_mode[0]:
-            # In multi-line mode, Meta+Enter submits
-            buf.validate_and_handle()
-        else:
-            # In single-line mode, Meta+Enter inserts newline
-            buf.insert_text("\n")
-
-    return kb
-
-
 # ─── CLI Interface class ─────────────────────────────────────────────────────
 
 class CLI:
@@ -91,18 +54,16 @@ class CLI:
 
     def __init__(self, history_file: str = ".agent_history"):
         self.multiline_mode = [False]  # mutable container for toggle
-        self.kb = _create_key_bindings(self.multiline_mode)
-        
+
         # Resolve history file path relative to project root
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         history_path = os.path.join(project_root, history_file)
-        
+
         self.session = PromptSession(
             history=FileHistory(history_path),
             auto_suggest=AutoSuggestFromHistory(),
-            key_bindings=self.kb,
             style=PT_STYLE,
-            multiline=True,  # Allow multi-line display; Enter behavior is controlled by keybindings
+            multiline=Condition(lambda: self.multiline_mode[0]),
             enable_open_in_editor=True,  # Ctrl+X Ctrl+E to open in $EDITOR
             mouse_support=False,
         )
@@ -113,16 +74,19 @@ class CLI:
         """Get user input with prompt_toolkit. Returns None on EOF/Ctrl+C."""
         try:
             def get_toolbar():
-                from html import escape as html_escape
-                stats = get_stats()
-                stats_str = html_escape(stats.summary_line())
+                try:
+                    from html import escape as html_escape
+                    stats = get_stats()
+                    stats_str = html_escape(stats.summary_line())
 
-                if self.multiline_mode[0]:
-                    mode_str = '<b>multi-line</b> │ <b>Enter</b>=newline <b>Meta+Enter</b>=submit'
-                else:
-                    mode_str = '<b>single-line</b> │ <b>Enter</b>=submit <b>Meta+Enter</b>=newline'
+                    if self.multiline_mode[0]:
+                        mode_str = '<b>multi-line</b> │ <b>Enter</b>=newline <b>Meta+Enter</b>=submit'
+                    else:
+                        mode_str = '<b>single-line</b> │ <b>Enter</b>=submit <b>Meta+Enter</b>=newline'
 
-                return HTML(f'{stats_str} │ {mode_str}')
+                    return HTML(f'{stats_str} │ {mode_str}')
+                except Exception:
+                    return ""
 
             if self.multiline_mode[0]:
                 prompt_text = [("class:prompt", "You ▶ "), ("class:continuation", "[multi] ")]
@@ -157,7 +121,7 @@ class CLI:
         banner_text.append(" — AI Agent in your terminal\n", style="bold")
         banner_text.append(f"Model: {model_short}\n", style="dim")
         banner_text.append("\nCommands: ", style="bold")
-        banner_text.append("/help /quit /clear /tools /multi /markdown /compact /skills\n")
+        banner_text.append("/help /quit /new /tools /multi /markdown /skills\n")
         banner_text.append("\nInput:    ", style="bold")
         banner_text.append("Enter=submit │ Esc→Enter=newline │ /multi=toggle\n")
         banner_text.append("Exit:     ", style="bold")
@@ -211,11 +175,10 @@ class CLI:
             ("/quit", "Exit the agent"),
             ("/help", "Show this help message"),
             ("/history", "Show last 10 messages"),
-            ("/clear", "Clear conversation history"),
+            ("/new", "Save session and start fresh"),
             ("/tools", "List registered tools"),
             ("/multi", "Toggle multi-line input mode"),
             ("/markdown", "Toggle markdown rendering"),
-            ("/compact", "Compact conversation (save tokens)"),
             ("/stats", "Show session statistics (tokens, cost)"),
         ]
         for cmd, desc in commands_general:

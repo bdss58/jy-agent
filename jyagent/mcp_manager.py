@@ -1,4 +1,4 @@
-# evolved v2 — Module reload support, simplified _chrome_pre_connect
+# evolved v2.1 — Chrome high-level helpers (chrome_fetch_page, chrome_ensure_connected)
 """
 MCP Manager — Manages MCP server lifecycle and dynamically registers tools.
 
@@ -7,9 +7,11 @@ and registers them into the agent's ToolRegistry. Includes background
 keepalive pings and tools/list_changed notification handling.
 """
 
+import atexit
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -20,7 +22,7 @@ from .toolresult import ToolResult
 logger = logging.getLogger(__name__)
 
 # Module version marker — bump this to confirm reloads are taking effect
-_MODULE_VERSION = "2.0.0"
+_MODULE_VERSION = "2.1.0"
 
 # P2: Keepalive configuration
 KEEPALIVE_INTERVAL_SECONDS = 60  # Ping every 60 seconds
@@ -514,6 +516,159 @@ class MCPManager:
                     self._ping_failures[server_name] = failures
                     logger.debug(f"Ping error for '{server_name}': {e} (failure #{failures})")
 
+    # ─── Chrome high-level helpers ────────────────────────────────────────────
+    # These encapsulate common Chrome operations so both the web_fetch Chrome
+    # tier and the LLM's interactive browser-automation share one codepath.
+
+    def chrome_ensure_connected(self) -> None:
+        """Ensure Chrome MCP is connected and healthy.
+
+        - If not connected, connects it.
+        - If connected, does a health check (list_pages). If the browser is
+          dead (CDP pipe broken), force-reconnects.
+
+        Raises RuntimeError if Chrome cannot be brought to a healthy state.
+        """
+        server = "chrome"
+
+        if not self.is_connected(server):
+            result = self.connect(server)
+            if result.get("status") not in ("connected", "already_connected"):
+                raise RuntimeError(f"Failed to connect Chrome: {result}")
+
+        # Health check: list_pages detects dead browser even if stdio pipe lives
+        health = self._call_mcp_tool(server, "list_pages", {})
+        if health.is_error:
+            error_msg = health.content or ""
+            if self._is_dead_server_error(error_msg):
+                logger.warning("Chrome health check failed (%s), forcing reconnect...",
+                               error_msg[:80])
+                self.disconnect(server)
+                result = self.connect(server)
+                if result.get("status") not in ("connected", "already_connected"):
+                    raise RuntimeError(
+                        f"Chrome is dead and reconnect failed: {result}")
+                # Re-check after reconnect
+                health = self._call_mcp_tool(server, "list_pages", {})
+                if health.is_error:
+                    raise RuntimeError(
+                        f"Chrome still unhealthy after reconnect: {health.content}")
+            else:
+                raise RuntimeError(f"Chrome health check failed: {error_msg}")
+
+    def chrome_fetch_page(self, url: str, *, timeout: int = 30) -> str:
+        """Open a URL in a temporary Chrome tab, snapshot it, and return the text.
+
+        This is the shared primitive used by:
+        - web_fetch's Chrome tier (Tier 4) for headless page fetching
+        - Any future code that needs "get me the text of this page via Chrome"
+
+        Lifecycle:
+        - If Chrome was NOT connected, connects → fetch → disconnect (clean).
+        - If Chrome WAS already connected (interactive use), opens a background
+          tab → snapshot → closes tab, preserving the user's session.
+
+        Returns:
+            The text content of the page (from a11y snapshot).
+
+        Raises:
+            RuntimeError: If any step fails (connection, navigation, snapshot).
+        """
+        was_connected = self.is_connected("chrome")
+
+        try:
+            self.chrome_ensure_connected()
+            return self._chrome_fetch_page_inner(url, timeout=timeout)
+        finally:
+            # If WE connected Chrome, disconnect to clean up
+            # (kills Chrome process, no leftover blank tabs)
+            if not was_connected and self.is_connected("chrome"):
+                logger.info("chrome_fetch_page connected Chrome — disconnecting to clean up")
+                try:
+                    self.disconnect("chrome")
+                except Exception:
+                    pass
+
+    def _chrome_fetch_page_inner(self, url: str, *, timeout: int = 30) -> str:
+        """Core fetch logic. Caller manages connect/disconnect lifecycle."""
+        server = "chrome"
+        call = self._call_mcp_tool
+
+        # Remember which page was selected so we can restore focus after
+        pages_result = call(server, "list_pages", {})
+        original_page_id = self._parse_chrome_page_id(
+            pages_result.content, selected=True
+        ) if not pages_result.is_error else None
+
+        new_page_id = None
+        try:
+            # Open URL in a background tab
+            np = call(server, "new_page", {
+                "url": url,
+                "background": True,
+                "timeout": timeout * 1000,
+            })
+            if np.is_error:
+                raise RuntimeError(f"new_page failed: {np.content}")
+
+            # The new tab is marked [selected] in the page list
+            new_page_id = self._parse_chrome_page_id(np.content, selected=True)
+            if new_page_id is not None and new_page_id == original_page_id:
+                new_page_id = None  # mis-parse guard
+
+            # Snapshot the page content
+            snap = call(server, "take_snapshot", {})
+            if snap.is_error:
+                raise RuntimeError(f"take_snapshot failed: {snap.content}")
+
+            content = snap.content
+            if not content or len(content.strip()) < 100:
+                raise RuntimeError("Chrome snapshot empty or too short")
+
+            return content
+
+        finally:
+            # Close the tab we opened
+            if new_page_id is not None:
+                try:
+                    call(server, "close_page", {"pageId": new_page_id})
+                except Exception:
+                    pass
+            # Restore original tab focus
+            if original_page_id is not None:
+                try:
+                    call(server, "select_page", {"pageId": original_page_id})
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _parse_chrome_page_id(text: str, selected: bool = False) -> int | None:
+        """Parse a page ID from Chrome MCP list_pages / new_page output.
+
+        Format:
+            ## Pages
+            2: https://example.com
+            3: https://google.com [selected]
+
+        Args:
+            text: Raw MCP tool output.
+            selected: If True, return the ``[selected]`` page ID.
+                      If False, return the highest (most recent) page ID.
+        """
+        best_id = None
+        for line in text.splitlines():
+            m = re.match(r'\s*(\d+):\s', line)
+            if not m:
+                continue
+            page_id = int(m.group(1))
+            if selected:
+                if "selected" in line.lower():
+                    return page_id
+            else:
+                if best_id is None or page_id > best_id:
+                    best_id = page_id
+        return best_id
+
     # ─── Public API ───────────────────────────────────────────────────────────
 
     def ping(self, server_name: str) -> bool:
@@ -607,3 +762,20 @@ def reset_manager():
     if _manager:
         _manager.disconnect_all()
     _manager = None
+
+
+def _atexit_cleanup():
+    """Safety net: disconnect all MCP servers on process exit.
+
+    Prevents Chrome and other MCP server processes from lingering as zombies
+    when the agent exits (whether cleanly or via uncaught exception).
+    """
+    global _manager
+    if _manager and _manager._clients:
+        try:
+            _manager.disconnect_all()
+        except Exception:
+            pass
+
+
+atexit.register(_atexit_cleanup)
