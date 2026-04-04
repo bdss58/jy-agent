@@ -36,6 +36,9 @@ except ImportError:
 _DEFAULT_MAX_STEPS = 30
 _DEFAULT_MAX_TOKENS_PER_RESPONSE = 8192
 _SUBAGENT_TIMEOUT = 300  # 5 min wall-clock per sub-agent
+_SUBAGENT_STATUS_COMPLETED = "completed"
+_SUBAGENT_STATUS_MAX_STEPS = "max_steps"
+_SUBAGENT_STATUS_API_ERROR = "api_error"
 
 # Track nesting to prevent runaway recursion
 _nesting_depth = threading.local()
@@ -147,6 +150,11 @@ Rules:
 6. Stay focused on your assigned task. Do not go off on tangents.
 7. If you cannot complete the task, explain what you tried and why it failed."""
 
+_SUBAGENT_FINAL_NO_TOOLS_SUFFIX = (
+    "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. "
+    "Provide your best answer now WITHOUT using any tools.]"
+)
+
 
 # ─── Non-streaming tool loop (the sub-agent engine) ──────────────────────────
 
@@ -214,8 +222,64 @@ def _truncate(text, max_chars=MAX_TOOL_RESULT_CHARS):
     )
 
 
+def _extract_text_blocks(content_blocks):
+    """Extract concatenated text from an SDK content block list."""
+    text_parts = []
+    for block in content_blocks:
+        if getattr(block, "type", None) == "text":
+            text_parts.append(getattr(block, "text", ""))
+    return "\n".join(text_parts)
+
+
+def _make_subagent_outcome(status, content, steps, input_tokens, output_tokens, tool_calls, error=None):
+    """Build a structured terminal result for the wrapper."""
+    outcome = {
+        "status": status,
+        "content": content,
+        "steps": steps,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tool_calls": tool_calls,
+    }
+    if error:
+        outcome["error"] = error
+    return outcome
+
+
+def _format_subagent_failure(message, partial_output="", final_answer=""):
+    """Format a predictable error body while preserving useful output."""
+    parts = [message]
+    final_answer = (final_answer or "").strip()
+    partial_output = (partial_output or "").strip()
+
+    if final_answer:
+        parts.extend(["", "Best-effort final answer:", final_answer])
+
+    if partial_output and partial_output != final_answer:
+        parts.extend(["", "Partial output:", partial_output])
+
+    return "\n".join(parts)
+
+
+def _best_effort_final_answer(client, messages, model_name):
+    """Ask the model for one last no-tools answer after max-step exhaustion."""
+    response = client.messages.create(
+        model=model_name,
+        max_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+        system=_SUBAGENT_SYSTEM_PROMPT + _SUBAGENT_FINAL_NO_TOOLS_SUFFIX,
+        messages=messages,
+        timeout=STREAM_TIMEOUT,
+    )
+    input_tokens = 0
+    output_tokens = 0
+    if hasattr(response, "usage"):
+        input_tokens = getattr(response.usage, "input_tokens", 0)
+        output_tokens = getattr(response.usage, "output_tokens", 0)
+    return _extract_text_blocks(response.content), input_tokens, output_tokens
+
+
 def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_functions):
-    """Run a sub-agent's tool loop to completion. Returns (answer_text, stats_dict).
+    """Run a sub-agent's tool loop to completion.
 
     This is the core engine — a non-streaming version of plan_next_action.
     Runs entirely in the calling thread (no terminal output).
@@ -248,13 +312,20 @@ def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_funct
         try:
             response = client.messages.create(**api_kwargs, timeout=STREAM_TIMEOUT)
         except Exception as e:
-            return f"[Sub-agent API error at step {step}: {e}]", {
-                "steps": step,
-                "input_tokens": total_input_tokens,
-                "output_tokens": total_output_tokens,
-                "tool_calls": tool_calls_count,
-                "error": str(e),
-            }
+            step_num = step + 1
+            content = _format_subagent_failure(
+                f"Error: Sub-agent API failure at step {step_num}: {e}",
+                partial_output=all_text,
+            )
+            return _make_subagent_outcome(
+                _SUBAGENT_STATUS_API_ERROR,
+                content,
+                step_num,
+                total_input_tokens,
+                total_output_tokens,
+                tool_calls_count,
+                error=str(e),
+            )
 
         # Track tokens
         if hasattr(response, "usage"):
@@ -275,7 +346,16 @@ def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_funct
 
         # No tool calls → sub-agent is done
         if not tool_use_blocks:
-            break
+            if not all_text:
+                all_text = "[Sub-agent completed but produced no text output]"
+            return _make_subagent_outcome(
+                _SUBAGENT_STATUS_COMPLETED,
+                all_text,
+                step + 1,
+                total_input_tokens,
+                total_output_tokens,
+                tool_calls_count,
+            )
 
         # Execute tool calls and build results
         serialized = _serialize_blocks(response.content)
@@ -295,17 +375,28 @@ def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_funct
 
         messages.append({"role": "user", "content": tool_results})
 
-    stats = {
-        "steps": step + 1 if 'step' in dir() else 0,
-        "input_tokens": total_input_tokens,
-        "output_tokens": total_output_tokens,
-        "tool_calls": tool_calls_count,
-    }
+    final_answer = ""
+    try:
+        final_answer, extra_in, extra_out = _best_effort_final_answer(client, messages, model_name)
+        total_input_tokens += extra_in
+        total_output_tokens += extra_out
+    except Exception:
+        pass
 
-    if not all_text:
-        all_text = "[Sub-agent completed but produced no text output]"
-
-    return all_text, stats
+    content = _format_subagent_failure(
+        f"Error: Sub-agent reached max_steps ({max_steps}).",
+        partial_output=all_text,
+        final_answer=final_answer,
+    )
+    return _make_subagent_outcome(
+        _SUBAGENT_STATUS_MAX_STEPS,
+        content,
+        max_steps,
+        total_input_tokens,
+        total_output_tokens,
+        tool_calls_count,
+        error=f"max_steps:{max_steps}",
+    )
 
 
 # ─── Terminal status display ─────────────────────────────────────────────────
@@ -413,7 +504,7 @@ def dispatch_agent(
                 max_steps, tool_schemas, tool_functions,
             )
             try:
-                answer, stats = future.result(timeout=_SUBAGENT_TIMEOUT)
+                outcome = future.result(timeout=_SUBAGENT_TIMEOUT)
             except concurrent.futures.TimeoutError:
                 future.cancel()
                 return ToolResult(
@@ -437,17 +528,18 @@ def dispatch_agent(
     elapsed = time.time() - t0
 
     # Print summary to terminal
-    steps = stats.get("steps", 0)
-    in_tok = stats.get("input_tokens", 0)
-    out_tok = stats.get("output_tokens", 0)
-    tool_calls = stats.get("tool_calls", 0)
-    error = stats.get("error")
+    status = outcome.get("status", _SUBAGENT_STATUS_COMPLETED)
+    answer = outcome.get("content", "")
+    steps = outcome.get("steps", 0)
+    in_tok = outcome.get("input_tokens", 0)
+    out_tok = outcome.get("output_tokens", 0)
+    tool_calls = outcome.get("tool_calls", 0)
 
-    status_icon = "✓" if not error else "✗"
-    status_color = COLOR_GREEN if not error else COLOR_RED
+    status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
+    status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
     sys.stdout.write(
         f"{status_color}  {status_icon} 🤖 Sub-agent done{COLOR_RESET}"
-        f"{COLOR_DIM} ({elapsed:.1f}s, {steps} steps, {tool_calls} tool calls, "
+        f"{COLOR_DIM} ({status}, {elapsed:.1f}s, {steps} steps, {tool_calls} tool calls, "
         f"{in_tok}+{out_tok} tokens){COLOR_RESET}\n"
     )
     sys.stdout.flush()
@@ -459,4 +551,4 @@ def dispatch_agent(
     except Exception:
         pass  # stats recording is best-effort
 
-    return ToolResult(answer)
+    return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
