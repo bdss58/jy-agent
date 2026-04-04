@@ -47,17 +47,17 @@ User wants a code change →
 ### Pattern A: Quick Task (most common)
 
 ```bash
-echo "TASK_DESCRIPTION" | claude -p --model sonnet --bare
+echo "TASK_DESCRIPTION" | claude -p --bare
 ```
 
 - `--bare` skips hooks, plugins, CLAUDE.md auto-discovery → fast, deterministic
-- `--model sonnet` for speed/cost balance; use `opus` for hard problems
+- Let the configured default model apply unless the task explicitly needs an override
 - Pipe the task via stdin for multi-line prompts
 
 ### Pattern B: Scoped Task (with tool permissions)
 
 ```bash
-claude -p --model sonnet \
+claude -p \
   --allowedTools "Read" "Edit" "Write" "Bash(npm test)" \
   "Refactor the auth middleware in src/auth.py to use JWT. Run tests after."
 ```
@@ -68,7 +68,7 @@ claude -p --model sonnet \
 ### Pattern C: Budget-Controlled
 
 ```bash
-claude -p --model sonnet --max-budget-usd 0.50 --max-turns 10 \
+claude -p --max-budget-usd 0.50 --max-turns 10 \
   "Fix the failing test in tests/test_api.py"
 ```
 
@@ -78,7 +78,7 @@ claude -p --model sonnet --max-budget-usd 0.50 --max-turns 10 \
 ### Pattern D: Structured Output
 
 ```bash
-claude -p --model sonnet --output-format json \
+claude -p --output-format json \
   --json-schema '{"type":"object","properties":{"summary":{"type":"string"},"files_changed":{"type":"array","items":{"type":"string"}}}}' \
   "Review src/main.py and summarize issues"
 ```
@@ -89,17 +89,17 @@ claude -p --model sonnet --output-format json \
 
 ```bash
 # First call
-claude -p --model sonnet "implement the user login feature"
+claude -p "implement the user login feature"
 
 # Follow-up (continues same session)
-claude -p --model sonnet --continue "now add rate limiting to the login endpoint"
+claude -p --continue "now add rate limiting to the login endpoint"
 ```
 
 ### Pattern F: Fan-Out (parallel bulk tasks)
 
 ```bash
 # Generate task list, then parallelize
-cat task_list.txt | xargs -P 4 -I {} claude -p --bare --model sonnet "{}"
+cat task_list.txt | xargs -P 4 -I {} claude -p --bare "{}"
 ```
 
 - Use git worktrees if tasks modify overlapping files
@@ -131,13 +131,16 @@ VERIFY: [How to confirm it worked — tests, linter, specific behavior check]
 
 ## Model Selection
 
+Use the Claude Code model configured in your local tool config by default.
+Only pass an explicit model override when the task genuinely needs a different tier.
+
 | Model | When to use | Cost | Speed |
 |-------|-------------|------|-------|
 | `haiku` | Trivial lookups, formatting, grep-like tasks | $ | Fast |
-| `sonnet` | **Default.** Most coding tasks, reviews, refactors | $$ | Medium |
+| `sonnet` | Most coding tasks, reviews, refactors | $$ | Medium |
 | `opus` | Hard problems: complex architecture, subtle bugs, novel algorithms | $$$$ | Slow |
 
-Rule of thumb: Start with `sonnet`. Escalate to `opus` only if sonnet fails or the task requires deep reasoning.
+Rule of thumb: rely on config for the normal path. Override to `opus` only when a cheaper/default model is not enough, or to `haiku` for intentionally lightweight tasks.
 
 ## Reading Claude Code Output
 
