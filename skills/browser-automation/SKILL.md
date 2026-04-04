@@ -1,131 +1,407 @@
 ---
 name: browser-automation
 description: >-
-  Automate Chrome browser interactions using MCP Chrome DevTools Protocol. Use this skill
-  whenever the user asks to navigate websites, fill forms, click buttons, take screenshots,
-  scrape dynamic content, debug web pages, test web UIs, log into sites, or interact with
-  web applications. TRIGGER on: "open this page", "click the button", "fill the form",
-  "scrape", "screenshot", browser testing, Taobao/Zhihu/any website interaction, login
-  automation, web scraping, DOM inspection, cookie extraction, network monitoring.
-  DO NOT TRIGGER on: static file reading, API-only requests (use web_fetch), or CLI tools.
+  Automate browser interactions using Chrome DevTools MCP tools. Use this skill
+  whenever the user asks to interact with a web page, click buttons, fill forms,
+  take screenshots, test a website, scrape page content, debug frontend issues,
+  inspect network requests, analyze page performance, run Lighthouse audits, or
+  automate any browser-based workflow. TRIGGER on: "click", "fill the form",
+  "navigate to", "take a screenshot", "test the page", "check the website",
+  "scrape", "inspect network", "debug frontend", "performance trace",
+  "Lighthouse audit", "open the browser", "browser automation", "check console
+  errors", "test mobile", "emulate", "wait for element", any task requiring
+  interaction with a live web page. DO NOT TRIGGER on: web search queries
+  (web-search skill), fetching a known URL for content (web_fetch), git
+  operations, code review without browser context, or pure API testing.
 metadata:
   author: jy-agent
-  version: "2.1"
+  version: "1.0"
 ---
 
 # Browser Automation
 
-Automate Chrome browser interactions via MCP Chrome DevTools.
+Automate browser interactions via Chrome DevTools MCP — navigate pages, interact
+with elements, debug frontend issues, analyze performance, and inspect network traffic.
 
-## Decision Tree: Choose Your Approach
+> **Prerequisite**: Chrome MCP must be connected. If not, run:
+> ```python
+> mcp(action="connect", server="chrome")
+> ```
 
-```
-User task → Does it need a real browser?
-├─ No (just fetch HTML/API) → Use web_fetch tool directly, not this skill
-└─ Yes → Is Chrome MCP connected?
-    ├─ No → mcp(action="connect", server="chrome")
-    │        └─ Failed? → Check references/troubleshooting.md
-    └─ Yes → Will you need to INTERACT (click/fill) with elements?
-        ├─ No, read-only (scrape, extract, verify) → Navigate → evaluate_script(JS) to extract text/data
-        ├─ Yes, interact → What kind?
-        │   ├─ Form fill/login → Navigate → Snapshot → Fill → Click → Verify
-        │   ├─ Multi-step workflow → Use the Snapshot-Act-Verify loop (below)
-        │   └─ Click links/buttons → Navigate → Snapshot → Click → Verify
-        └─ Mixed (read + interact) → Snapshot for UIDs, evaluate_script for bulk data extraction
-```
-
-## Core Patterns
-
-### Pattern A: Read-Only (scrape/extract — NO interaction needed)
+## Decision Tree: What Are You Doing?
 
 ```
-1. navigate_page(url)                          # Go to the page
-2. evaluate_script(() => document.body.innerText)  # Extract text directly via JS
-   — or —
-   evaluate_script(() => {                     # Structured extraction
-     return Array.from(document.querySelectorAll('.item')).map(el => ({
-       title: el.querySelector('h3')?.textContent,
-       url: el.querySelector('a')?.href
-     }))
-   })
+User request →
+├─ Navigate / interact with a page
+│   ├─ Simple page visit → Quick Navigation Flow
+│   ├─ Fill form / click buttons → Form & Interaction Flow
+│   ├─ Multi-step workflow (checkout, signup) → Multi-Page Flow
+│   └─ File upload → Upload Flow
+│
+├─ Inspect / debug
+│   ├─ Console errors → Console Debugging Flow
+│   ├─ Network requests / API failures → Network Debugging Flow
+│   ├─ DOM / element inspection → Snapshot & Script Flow
+│   └─ Visual verification → Screenshot Flow
+│
+├─ Performance / audits
+│   ├─ Core Web Vitals / speed → Performance Trace Flow
+│   ├─ Accessibility / SEO / best practices → Lighthouse Flow
+│   └─ Memory leaks → Memory Snapshot Flow
+│
+├─ Emulation / responsive testing
+│   ├─ Mobile viewport → Emulation Flow
+│   ├─ Slow network (3G/4G) → Emulation Flow
+│   └─ Dark mode / geolocation → Emulation Flow
+│
+└─ Scraping / data extraction
+    ├─ Structured data from page → Snapshot + Script Flow
+    └─ Multiple pages → Multi-Page Scraping Flow
 ```
 
-**Why not snapshot?** `take_snapshot()` returns the full a11y tree with UIDs, attributes, and nesting — great for finding clickable elements, but wastes tokens when you only need to read text. `evaluate_script` with `innerText` or DOM queries is leaner and returns exactly what you need.
+## Step 0: Ensure Chrome MCP is Connected
 
-### Pattern B: Interactive (click/fill — needs element UIDs)
-
-Every browser interaction follows this loop. **Never skip the snapshot.**
-
-```
-1. navigate_page(url)           # Go to the page
-2. take_snapshot()              # Get a11y tree with UIDs — REQUIRED before click/fill
-3. <action>(uid from snapshot)  # click, fill, type using UIDs
-4. take_snapshot() or           # Verify the result
-   take_screenshot()
+```python
+# Always verify connection first
+mcp(action="status")
+# If chrome is "not connected":
+mcp(action="connect", server="chrome")
 ```
 
-**Why snapshot?** The accessibility tree gives you stable UIDs for elements. Without it, you're guessing at selectors that may not exist or may have changed.
+Anti-detection tip: Chrome MCP launches via Puppeteer with `--enable-automation`.
+For sites with bot detection, the MCP config should include flags to reduce
+detection surface. See [references/anti-detection.md](references/anti-detection.md).
 
-## Actions Reference
+## Core Flows
 
-| Action | Tool | When to use |
-|--------|------|-------------|
-| Navigate | `navigate_page(url)` | Go to a URL |
-| **Extract text/data** | **`evaluate_script(js)`** | **Read-only: get page text, scrape data, run DOM queries (preferred over snapshot when no interaction needed)** |
-| Get element UIDs | `take_snapshot()` | Before click/fill — get a11y tree with UIDs for interaction |
-| See visually | `take_screenshot()` | Visual verification only (high token cost) |
-| Click | `click(uid)` | Buttons, links, checkboxes |
-| Fill text | `fill(uid, value)` | Text inputs, textareas (sets value directly) |
-| Type text | `type_text(uid, text)` | When you need keystrokes (autocomplete, search) |
-| Keyboard | `press_key(key)` | "Enter", "Tab", "Escape", "Control+A" |
-| Wait | `wait_for(text)` | Wait for text to appear after navigation |
-| New tab | `new_page(url)` | Open a new tab |
-| Switch tab | `select_page(index)` | Switch between open tabs |
-| List tabs | `list_pages()` | See all open tabs |
-| Close tab | `close_page()` | Clean up tabs when done |
-| Resize | `resize_page(w, h)` | Set viewport (default 1440×900) |
-| Console | `list_console_messages()` | Debug JS errors |
-| Network | `list_network_requests()` | Debug API calls |
+### Quick Navigation
 
-## Common Workflows
+```python
+# Open a new page
+mcp__chrome__new_page(url="https://example.com")
 
-See [📋 Common Workflows](references/workflows.md) for step-by-step patterns:
-- Login to a website
-- Scrape a data table
-- Fill a multi-page form
-- Handle pagination
-- Download files
+# Or navigate an existing page
+mcp__chrome__navigate_page(url="https://example.com")
+
+# Take a snapshot to see page structure (preferred over screenshot)
+mcp__chrome__take_snapshot()
+
+# Take a screenshot for visual verification
+mcp__chrome__take_screenshot()
+```
+
+**Key principle**: Always `take_snapshot()` after navigation. Snapshots return
+the accessibility tree with UIDs for every interactive element. You need UIDs
+to click, fill, hover, etc.
+
+### Form & Interaction Flow
+
+```python
+# 1. Take snapshot to find element UIDs
+mcp__chrome__take_snapshot()
+
+# 2. Fill a single field
+mcp__chrome__fill(uid="<element-uid>", value="hello@example.com")
+
+# 3. Fill multiple fields at once (more efficient)
+mcp__chrome__fill_form(elements=[
+    {"uid": "name-uid", "value": "John Doe"},
+    {"uid": "email-uid", "value": "john@example.com"},
+    {"uid": "country-uid", "value": "United States"}
+])
+
+# 4. Click submit
+mcp__chrome__click(uid="<submit-button-uid>")
+
+# 5. Wait for result
+mcp__chrome__wait_for(text=["Success", "Thank you"])
+```
+
+### Multi-Page Flow
+
+For multi-step workflows (checkout, wizards, onboarding):
+
+```python
+# Step 1: Navigate to start
+mcp__chrome__navigate_page(url="https://shop.example.com/cart")
+mcp__chrome__take_snapshot()
+
+# Step 2: Interact with current page
+mcp__chrome__click(uid="<checkout-btn-uid>")
+mcp__chrome__wait_for(text=["Shipping Address"])
+mcp__chrome__take_snapshot()  # RE-SNAPSHOT after each navigation!
+
+# Step 3: Fill next form
+mcp__chrome__fill_form(elements=[...])
+mcp__chrome__click(uid="<continue-uid>")
+
+# Repeat: wait → snapshot → interact → wait → snapshot
+```
+
+**Critical**: Re-take snapshot after every page navigation or significant DOM
+change. UIDs from old snapshots become stale.
+
+### Upload Flow
+
+```python
+mcp__chrome__take_snapshot()
+mcp__chrome__upload_file(uid="<file-input-uid>", filePath="/path/to/file.pdf")
+```
+
+### Console Debugging Flow
+
+```python
+# List all console messages (errors, warnings, logs)
+mcp__chrome__list_console_messages()
+
+# Filter to just errors
+mcp__chrome__list_console_messages(types=["error", "warn"])
+
+# Get details on a specific message
+mcp__chrome__get_console_message(msgid=42)
+```
+
+### Network Debugging Flow
+
+```python
+# List all network requests since last navigation
+mcp__chrome__list_network_requests()
+
+# Filter by type (xhr, fetch, document, etc.)
+mcp__chrome__list_network_requests(resourceTypes=["xhr", "fetch"])
+
+# Inspect a specific request (headers, body, response)
+mcp__chrome__get_network_request(reqid=15)
+
+# Save response body to file for analysis
+mcp__chrome__get_network_request(reqid=15, responseFilePath="response.json")
+```
+
+### Snapshot & Script Flow
+
+For DOM inspection or data extraction:
+
+```python
+# Accessibility tree snapshot (structured, has UIDs)
+mcp__chrome__take_snapshot()
+
+# Verbose snapshot (all a11y properties)
+mcp__chrome__take_snapshot(verbose=True)
+
+# Execute custom JavaScript for complex extraction
+mcp__chrome__evaluate_script(
+    function='() => { return document.querySelectorAll("h2").length }'
+)
+
+# With element arguments (pass UIDs)
+mcp__chrome__evaluate_script(
+    function='(el) => { return el.getBoundingClientRect() }',
+    args=["<element-uid>"]
+)
+```
+
+### Screenshot Flow
+
+```python
+# Viewport screenshot
+mcp__chrome__take_screenshot()
+
+# Full page screenshot
+mcp__chrome__take_screenshot(fullPage=True)
+
+# Element screenshot
+mcp__chrome__take_screenshot(uid="<element-uid>")
+
+# Save to file instead of inline
+mcp__chrome__take_screenshot(filePath="screenshot.png")
+
+# JPEG with quality control (smaller files)
+mcp__chrome__take_screenshot(format="jpeg", quality=80)
+```
+
+### Performance Trace Flow
+
+```python
+# 1. Navigate to the page first
+mcp__chrome__navigate_page(url="https://example.com")
+
+# 2. Start trace with auto-reload and auto-stop
+mcp__chrome__performance_start_trace(reload=True, autoStop=True)
+
+# 3. Analyze insights from the trace
+# The trace results show available insight sets with IDs
+mcp__chrome__performance_analyze_insight(
+    insightSetId="<id-from-results>",
+    insightName="LCPBreakdown"
+)
+
+# Save raw trace data for external analysis
+mcp__chrome__performance_start_trace(
+    reload=True, autoStop=True,
+    filePath="trace.json.gz"
+)
+```
+
+Key insights to analyze: `LCPBreakdown`, `CLSCulprits`, `DocumentLatency`,
+`RenderBlocking`, `ThirdParties`, `SlowCSS`.
+
+### Lighthouse Flow
+
+```python
+# Full audit (accessibility, SEO, best practices)
+mcp__chrome__lighthouse_audit()
+
+# Mobile-specific audit
+mcp__chrome__lighthouse_audit(device="mobile")
+
+# Snapshot mode (current state, no reload)
+mcp__chrome__lighthouse_audit(mode="snapshot")
+
+# Save reports to directory
+mcp__chrome__lighthouse_audit(outputDirPath="./lighthouse-reports")
+```
+
+Note: Lighthouse audits exclude performance scores. Use Performance Trace for
+Core Web Vitals (LCP, INP, CLS).
+
+### Memory Snapshot Flow
+
+```python
+# Capture heap snapshot for memory leak analysis
+mcp__chrome__take_memory_snapshot(filePath="heap.heapsnapshot")
+# Open the .heapsnapshot file in Chrome DevTools for analysis
+```
+
+### Emulation Flow
+
+```python
+# Mobile viewport
+mcp__chrome__emulate(viewport="375x812x3,mobile,touch")
+
+# Tablet landscape
+mcp__chrome__emulate(viewport="1024x768x2,touch,landscape")
+
+# Slow network
+mcp__chrome__emulate(networkConditions="Slow 3G")
+
+# CPU throttling (4x slowdown)
+mcp__chrome__emulate(cpuThrottlingRate=4)
+
+# Dark mode
+mcp__chrome__emulate(colorScheme="dark")
+
+# Geolocation (Tokyo)
+mcp__chrome__emulate(geolocation="35.6762x139.6503")
+
+# Reset all emulation
+mcp__chrome__emulate(
+    viewport="1280x720x1",
+    colorScheme="auto",
+    cpuThrottlingRate=1
+)
+# Network reset: omit networkConditions parameter
+```
+
+### Multi-Page Scraping Flow
+
+```python
+# Open multiple pages
+mcp__chrome__new_page(url="https://example.com/page1")
+mcp__chrome__new_page(url="https://example.com/page2", background=True)
+
+# List all open pages
+mcp__chrome__list_pages()
+
+# Switch between pages by ID
+mcp__chrome__select_page(pageId=2)
+mcp__chrome__take_snapshot()
+
+# Extract data with JavaScript
+mcp__chrome__evaluate_script(
+    function='() => { return [...document.querySelectorAll(".item")].map(e => e.textContent) }'
+)
+
+# Close when done
+mcp__chrome__close_page(pageId=2)
+```
+
+## Tab Management
+
+Chrome MCP can have multiple pages open. Always be aware of which page is selected.
+
+```python
+# See all pages
+mcp__chrome__list_pages()
+
+# Select a page (all subsequent commands target this page)
+mcp__chrome__select_page(pageId=1, bringToFront=True)
+
+# Open page in isolated context (separate cookies/storage)
+mcp__chrome__new_page(url="https://example.com", isolatedContext="session-2")
+```
+
+**Rule**: The last open page cannot be closed. Always keep at least one page open.
+
+## Keyboard & Special Interactions
+
+```python
+# Press a key
+mcp__chrome__press_key(key="Enter")
+
+# Key combinations
+mcp__chrome__press_key(key="Control+A")      # Select all
+mcp__chrome__press_key(key="Control+C")      # Copy
+mcp__chrome__press_key(key="Control+Shift+R") # Hard reload
+
+# Type text into focused input (use after clicking an input)
+mcp__chrome__type_text(text="Hello world", submitKey="Enter")
+
+# Handle browser dialogs (alert/confirm/prompt)
+mcp__chrome__handle_dialog(action="accept")
+mcp__chrome__handle_dialog(action="dismiss")
+mcp__chrome__handle_dialog(action="accept", promptText="my input")
+
+# Hover (for tooltips, dropdowns)
+mcp__chrome__hover(uid="<element-uid>")
+
+# Drag and drop
+mcp__chrome__drag(from_uid="<source-uid>", to_uid="<target-uid>")
+
+# Double click
+mcp__chrome__click(uid="<element-uid>", dblClick=True)
+```
 
 ## Anti-Patterns
 
-❌ **Don't** use `take_snapshot()` just to read page content (wastes tokens on UIDs/attributes you won't use)
-✅ **Do** use `evaluate_script(() => document.body.innerText)` or targeted DOM queries for read-only extraction
+❌ **Don't** interact with elements without taking a snapshot first
+✅ **Do** always `take_snapshot()` to get current UIDs before clicking/filling
 
-❌ **Don't** try to click/fill without taking a snapshot first
-✅ **Do** snapshot → find UID → act (snapshot is REQUIRED before any click/fill)
+❌ **Don't** reuse UIDs from old snapshots after navigation
+✅ **Do** re-take snapshot after every page load or major DOM change
 
-❌ **Don't** navigate rapidly between pages without waiting
-✅ **Do** use `wait_for(text)` after navigation to confirm page loaded
+❌ **Don't** use `take_screenshot()` as primary way to understand page content
+✅ **Do** use `take_snapshot()` (text-based a11y tree) — it's faster, structured, and gives UIDs
 
-❌ **Don't** use `type_text` for filling form fields (slow, unreliable)
-✅ **Do** use `fill(uid, value)` for form fields; `type_text` only for search/autocomplete
+❌ **Don't** forget to check MCP connection status before automation
+✅ **Do** verify `mcp(action="status")` shows chrome connected
 
-❌ **Don't** take screenshots for structural analysis (wastes tokens)
-✅ **Do** use `take_snapshot()` for element UIDs, `evaluate_script` for text, `take_screenshot()` only for visual proof
+❌ **Don't** leave tabs open after automation — causes tab leaks
+✅ **Do** close pages with `close_page()` when done (keep at least one open)
 
-❌ **Don't** leave tabs open after finishing a task
-✅ **Do** close tabs with `close_page()` to prevent tab leaks
+❌ **Don't** use `navigate_page` when you need a fresh tab with separate state
+✅ **Do** use `new_page(isolatedContext="...")` for separate cookie/storage contexts
 
-❌ **Don't** assume page structure from memory or training data
-✅ **Do** always inspect the actual page — sites change their DOM frequently
+❌ **Don't** start a performance trace without navigating to the target page first
+✅ **Do** navigate first, then `performance_start_trace(reload=True, autoStop=True)`
 
-## Anti-Bot & Stealth Tips
+❌ **Don't** try to use `fill()` for keyboard shortcuts or special keys
+✅ **Do** use `press_key()` for Enter, Tab, Escape, keyboard shortcuts
 
-See [🛡️ Anti-Detection Guide](references/anti-detection.md) for site-specific strategies.
+❌ **Don't** wait with arbitrary `sleep()` calls
+✅ **Do** use `wait_for(text=["Expected text"])` for deterministic waits
 
-Quick rules:
-- Set viewport to realistic size: `resize_page(1440, 900)`
-- Don't navigate more than 1 page/second
-- For Chinese e-commerce (Taobao, JD): expect CAPTCHAs, use delays
-- For sites behind Cloudflare: the Chrome MCP tier already uses a real browser, which helps
-- If blocked, try adding realistic delays between actions (1-3 seconds)
+## Reference Files
+
+- [🛡️ Anti-Detection](references/anti-detection.md) — Stealth flags, fingerprint evasion, bot detection bypass
+- [🔧 Tool Reference](references/tool-reference.md) — Complete Chrome MCP tool catalog with all parameters
+- [📋 Common Recipes](references/common-recipes.md) — Copy-paste patterns for frequent automation tasks

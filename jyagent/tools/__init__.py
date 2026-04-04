@@ -16,6 +16,7 @@ from .facades import manage_memory, manage_skills
 from .schemas import CORE_TOOLS
 from .web_fetch import web_fetch, TOOL_SCHEMA as WEB_FETCH_SCHEMA
 from .mcp_tool import mcp, TOOL_SCHEMA as MCP_SCHEMA
+from .subagent import dispatch_agent, set_client as set_subagent_client, TOOL_SCHEMA as SUBAGENT_SCHEMA
 
 # Re-export constants from config (backward compat)
 from ..config import SKIP_DIRS, BINARY_EXTS
@@ -35,6 +36,7 @@ _TOOL_FN_MAP = {
     "manage_skills": manage_skills,
     "web_fetch": web_fetch,
     "mcp": mcp,
+    "dispatch_agent": dispatch_agent,
 }
 
 _TOOL_METADATA = {
@@ -49,10 +51,11 @@ _TOOL_METADATA = {
     "manage_skills":   {"parallel_safe": False},
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180},
     "mcp":             {"parallel_safe": False, "timeout_hint": 180},
+    "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}},
 }
 
 _registry = get_registry()
-for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA]:
+for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA, SUBAGENT_SCHEMA]:
     fn = _TOOL_FN_MAP.get(tool_def["name"])
     if fn:
         meta = _TOOL_METADATA.get(tool_def["name"], {})

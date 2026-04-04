@@ -21,6 +21,14 @@ DEFAULT_TOOL_TIMEOUT = int(os.environ.get("AGENT_TOOL_TIMEOUT", "120"))
 STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
 
+# ─── Sub-agent ───────────────────────────────────────────────────────────────
+
+SUBAGENT_MODEL_TIERS = {
+    "fast": os.environ.get("SUBAGENT_MODEL_FAST", "claude-haiku-4-20250514"),
+    "default": os.environ.get("SUBAGENT_MODEL_DEFAULT", AGENT_MODEL),
+    "strong": os.environ.get("SUBAGENT_MODEL_STRONG", "claude-sonnet-4-20250514"),
+}
+
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
 MEMORY_DIR = os.path.join("data", "memory")

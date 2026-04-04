@@ -5,6 +5,7 @@ import os
 import sys
 from .registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
+from .tools.subagent import set_client as set_subagent_client
 from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context, on_session_start, on_session_end,
@@ -237,6 +238,9 @@ def run(client) -> None:
     conversation = None
 
     try:
+        # Share Anthropic client with sub-agent module
+        set_subagent_client(client)
+
         cli = CLI()
         state = {"use_markdown": True}
 

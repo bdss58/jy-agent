@@ -86,6 +86,15 @@ class SessionStats:
         with self._lock:
             self.tool_calls += 1
 
+    def record_subagent_usage(self, input_tokens: int, output_tokens: int, model: str = ""):
+        """Record token usage from a sub-agent (counts toward session totals)."""
+        with self._lock:
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+            self.turn_input_tokens += input_tokens
+            self.turn_output_tokens += output_tokens
+            self.api_calls += 1  # count sub-agent as at least 1 API call
+
     @property
     def total_cost(self) -> float:
         """Estimated total cost in USD."""
