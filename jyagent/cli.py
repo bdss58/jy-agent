@@ -5,6 +5,7 @@
 # v6: Added status bar with session stats (model, tokens, cost),
 #     turn summary after each response, updated banner
 
+import json
 import os
 from typing import Optional
 
@@ -135,13 +136,109 @@ class CLI:
             padding=(0, 2),
         ))
 
+    def _print_prefixed(self, prefix: str, prefix_style: str, body: str = "", body_style: str | None = None):
+        """Print a styled prefix plus literal body text without Rich markup parsing."""
+        text = Text()
+        body_str = "" if body is None else str(body)
+        if body_str and "\n" in body_str and prefix:
+            indent = " " * (len(prefix) + 1)
+            body_str = body_str.replace("\n", "\n" + indent)
+
+        if prefix:
+            text.append(prefix, style=prefix_style)
+        if body_str:
+            if prefix:
+                text.append(" ")
+            text.append(body_str, style=body_style)
+        console.print(text)
+
+    def _preview_history_text(self, text: str, max_chars: int = 300) -> str:
+        """Collapse long or multi-line history entries into a compact single-line preview."""
+        raw = "" if text is None else str(text)
+        line_count = raw.count("\n") + 1 if raw else 1
+        if line_count == 1 and len(raw) <= max_chars:
+            return raw
+
+        preview = raw.replace("\n", " ↵ ")
+        if len(preview) > max_chars:
+            preview = preview[: max_chars - 3].rstrip() + "..."
+        return f"{preview} ({line_count} lines, {len(raw)} chars)"
+
+    def _format_tool_args_preview(self, arguments: object, max_chars: int = 120) -> str:
+        """Serialize tool arguments into a compact single-line preview."""
+        try:
+            preview = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            preview = str(arguments)
+        if len(preview) > max_chars:
+            preview = preview[: max_chars - 3].rstrip() + "..."
+        return preview
+
+    def _format_assistant_history_lines(self, content: list) -> list[str]:
+        """Format normalized assistant content blocks for `/history`."""
+        lines = []
+        for block in content:
+            if not isinstance(block, dict):
+                lines.append(self._preview_history_text(block))
+                continue
+
+            block_type = block.get("type", "")
+            if block_type == "text":
+                lines.append(self._preview_history_text(block.get("text", "")))
+                continue
+
+            if block_type == "tool_call":
+                name = block.get("name", "")
+                args_preview = self._format_tool_args_preview(block.get("arguments", {}))
+                summary = f"tool_call: {name}"
+                if args_preview:
+                    summary += f" {args_preview}"
+                lines.append(self._preview_history_text(summary))
+                continue
+
+            if block_type == "thinking":
+                thinking = block.get("thinking") or ""
+                preview = self._preview_history_text(thinking) if thinking else "[redacted]"
+                lines.append(f"thinking: {preview}")
+                continue
+
+            lines.append(f"{block_type or 'block'}: {self._preview_history_text(block)}")
+
+        return lines or ["[no content]"]
+
+    def _format_history_lines(self, message: dict) -> list[str]:
+        """Format a conversation message into one or more display lines."""
+        role = message.get("role")
+        content = message.get("content", "")
+
+        if role == "assistant" and isinstance(content, list):
+            return self._format_assistant_history_lines(content)
+
+        if role == "tool_result":
+            tool_name = message.get("tool_name", "")
+            status = "error" if message.get("is_error") else "ok"
+            preview = self._preview_history_text(content)
+            return [f"({tool_name}, {status}): {preview}"]
+
+        return [str(content)]
+
+    def _history_style_for_role(self, role: str) -> str:
+        """Map history roles to Rich styles."""
+        if role == "user":
+            return "user"
+        if role == "assistant":
+            return "agent"
+        if role == "tool_result":
+            return "tool"
+        return "system"
+
     def print_system(self, msg: str):
         """Print a system message."""
-        console.print(f"[system]⚙ {msg}[/system]")
+        self._print_prefixed("⚙", "system", msg, body_style="system")
 
     def print_error(self, msg: str):
         """Print an error message."""
-        console.print(f"[error]✖ {msg}[/error]")
+        self._print_prefixed("✖", "error", msg, body_style="error")
 
     def print_separator(self):
         """Print a subtle separator."""
@@ -151,20 +248,16 @@ class CLI:
         """Print a compact turn summary (tokens + cost) after the response."""
         stats = get_stats()
         summary = stats.turn_summary()
-        console.print(f"[dim]  {summary}[/dim]")
+        self._print_prefixed("", "dim", f"  {summary}", body_style="dim")
 
     def print_history(self, messages: list):
         """Print conversation history."""
         self.print_separator()
         for msg in messages:
-            role = msg['role']
-            content = str(msg['content'])
-            if role == 'user':
-                console.print(f"[user]{role}:[/user] {content}")
-            elif role == 'assistant':
-                console.print(f"[agent]{role}:[/agent] {content}")
-            else:
-                console.print(f"[system]{role}:[/system] {content}")
+            role = str(msg.get("role", "system"))
+            role_style = self._history_style_for_role(role)
+            for line in self._format_history_lines(msg):
+                self._print_prefixed(f"{role}:", role_style, line)
         self.print_separator()
 
     def print_help(self):

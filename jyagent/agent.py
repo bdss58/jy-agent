@@ -206,6 +206,18 @@ COMMAND_TABLE = {
 
 # ─── Graceful exit helper ────────────────────────────────────────────────────
 
+def _print_unexpected_error(cli, error: Exception):
+    """Render fatal errors without Rich markup parsing dynamic exception text."""
+    message = f"Unexpected error in agent: {error}"
+    try:
+        if cli is not None:
+            cli.print_error(message)
+        else:
+            console.print(f"✖ {message}", style="error", markup=False)
+    except Exception:
+        print(message, file=sys.stderr)
+
+
 def _graceful_exit(runtime_owner, conversation, cli):
     """Save session and print goodbye on exit. Fast — no API calls."""
     cli.goodbye()  # Say goodbye FIRST — user sees immediate response
@@ -413,4 +425,4 @@ def run(runtime_owner: RuntimeOwner) -> None:
         except Exception:
             console.print("\n[system]👋 Goodbye![/system]")
     except Exception as e:
-        console.print(f"[error]Unexpected error in agent: {e}[/error]")
+        _print_unexpected_error(cli, e)
