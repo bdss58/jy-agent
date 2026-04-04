@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+import anthropic
+import httpx
+
+from ..core import register_adapter
+from ..history import transform_messages_for_target
+from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream, Usage
+
+
+def _usage_from_response(usage: Any) -> Usage:
+    return {
+        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+    }
+
+
+def _map_stop_reason(reason: str | None) -> str:
+    if reason == "max_tokens":
+        return "length"
+    if reason == "tool_use":
+        return "tool_use"
+    if reason in {"end_turn", "stop_sequence", "pause_turn", None}:
+        return "stop"
+    if reason in {"refusal", "sensitive"}:
+        return "error"
+    return "error"
+
+
+def _thinking_block(block: Any) -> dict[str, Any]:
+    if block.type == "redacted_thinking":
+        return {
+            "type": "thinking",
+            "thinking": "",
+            "signature": getattr(block, "data", ""),
+            "redacted": True,
+        }
+    return {
+        "type": "thinking",
+        "thinking": getattr(block, "thinking", ""),
+        "signature": getattr(block, "signature", ""),
+    }
+
+
+def _assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMessage:
+    content = []
+    message_id = getattr(response, "id", "")
+    for block in response.content:
+        if block.type == "text":
+            content.append({"type": "text", "text": block.text})
+        elif block.type in {"thinking", "redacted_thinking"}:
+            content.append(_thinking_block(block))
+        elif block.type == "tool_use":
+            content.append({
+                "type": "tool_call",
+                "id": block.id,
+                "name": block.name,
+                "arguments": block.input or {},
+            })
+    return {
+        "role": "assistant",
+        "content": content,
+        "provider": model_spec.provider,
+        "api": "anthropic-messages",
+        "model": model_spec.model,
+        "stop_reason": _map_stop_reason(getattr(response, "stop_reason", None)),
+        "usage": _usage_from_response(getattr(response, "usage", None)),
+        "response_id": message_id,
+        "id": message_id,
+    }
+
+
+def _convert_assistant_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
+    blocks = []
+    for block in message.get("content", []):
+        block_type = block.get("type")
+        if block_type == "text":
+            blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block_type == "thinking":
+            if block.get("redacted") and block.get("signature"):
+                blocks.append({"type": "redacted_thinking", "data": block["signature"]})
+            elif block.get("signature"):
+                blocks.append({
+                    "type": "thinking",
+                    "thinking": block.get("thinking", ""),
+                    "signature": block["signature"],
+                })
+            elif block.get("thinking", "").strip():
+                blocks.append({"type": "text", "text": block["thinking"]})
+        elif block_type == "tool_call":
+            blocks.append({
+                "type": "tool_use",
+                "id": block["id"],
+                "name": block["name"],
+                "input": block.get("arguments", {}),
+            })
+    return blocks
+
+
+def _convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dict[str, Any]]:
+    transformed = transform_messages_for_target(messages, model_spec)
+    out: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(transformed):
+        message = transformed[idx]
+        role = message.get("role")
+        if role == "user":
+            out.append({"role": "user", "content": message.get("content", "")})
+            idx += 1
+            continue
+        if role == "assistant":
+            out.append({"role": "assistant", "content": _convert_assistant_blocks(message)})
+            idx += 1
+            continue
+        tool_results = []
+        while idx < len(transformed) and transformed[idx].get("role") == "tool_result":
+            tool_result = transformed[idx]
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_result["tool_call_id"],
+                "content": tool_result["content"],
+                "is_error": tool_result["is_error"],
+            })
+            idx += 1
+        out.append({"role": "user", "content": tool_results})
+    return out
+
+
+def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    if not tools:
+        return []
+    return [
+        {
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "input_schema": tool.get("input_schema", {"type": "object", "properties": {}}),
+        }
+        for tool in tools
+    ]
+
+
+class _AnthropicStream(RuntimeStream):
+    def __init__(self, stream_cm: Any, model_spec: ModelSpec):
+        self._stream_cm = stream_cm
+        self._stream = stream_cm.__enter__()
+        self._model_spec = model_spec
+        self._final_message: AssistantMessage | None = None
+        self._closed = False
+
+    def __iter__(self):
+        for event in self._stream:
+            if getattr(event, "type", None) != "content_block_delta":
+                continue
+            delta = event.delta
+            if hasattr(delta, "text"):
+                yield {"type": "text_delta", "text": delta.text}
+            elif getattr(delta, "type", None) == "thinking_delta":
+                yield {"type": "thinking_delta", "text": delta.thinking}
+            elif getattr(delta, "type", None) == "input_json_delta":
+                yield {"type": "tool_call_delta", "delta": delta.partial_json}
+
+    def get_final_message(self) -> AssistantMessage:
+        if self._final_message is None:
+            self._final_message = _assistant_from_response(self._model_spec, self._stream.get_final_message())
+        return self._final_message
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._stream_cm.__exit__(None, None, None)
+        self._closed = True
+
+
+class AnthropicAdapter:
+    provider = "anthropic"
+    api_name = "anthropic-messages"
+
+    def _client(self) -> anthropic.Anthropic:
+        kwargs: dict[str, Any] = {"http_client": httpx.Client(verify=False)}
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+        if base_url:
+            kwargs["base_url"] = base_url
+        if auth_token:
+            kwargs["api_key"] = auth_token
+        return anthropic.Anthropic(**kwargs)
+
+    def _request_kwargs(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> dict[str, Any]:
+        options = options or RuntimeOptions()
+        kwargs: dict[str, Any] = {
+            "model": model_spec.model,
+            "max_tokens": options.max_output_tokens,
+            "messages": _convert_messages(model_spec, context.get("messages", [])),
+        }
+        if context.get("system_prompt"):
+            kwargs["system"] = context["system_prompt"]
+        tools = _convert_tools(context.get("tools"))
+        if tools:
+            kwargs["tools"] = tools
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        return kwargs
+
+    def stream(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> RuntimeStream:
+        client = self._client()
+        kwargs = self._request_kwargs(model_spec, context, options)
+        timeout = None if options is None else options.timeout
+        return _AnthropicStream(client.messages.stream(**kwargs, timeout=timeout), model_spec)
+
+    def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
+        client = self._client()
+        kwargs = self._request_kwargs(model_spec, context, options)
+        timeout = None if options is None else options.timeout
+        response = client.messages.create(**kwargs, timeout=timeout)
+        return _assistant_from_response(model_spec, response)
+
+
+register_adapter(AnthropicAdapter())
+

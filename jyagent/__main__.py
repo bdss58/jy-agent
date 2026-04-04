@@ -8,23 +8,14 @@ Usage:
 """
 
 import os
-import sys
 
-import httpx
-import anthropic
+from .config import get_active_model_spec
+from .runtime import RuntimeOwner
 
 
-def create_client() -> anthropic.Anthropic:
-    """Create an Anthropic client with optional base_url and auth_token from env."""
-    kwargs = {}
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    if base_url:
-        kwargs["base_url"] = base_url
-    if auth_token:
-        kwargs["api_key"] = auth_token
-    kwargs["http_client"] = httpx.Client(verify=False)
-    return anthropic.Anthropic(**kwargs)
+def create_runtime_owner() -> RuntimeOwner:
+    """Create the default runtime owner from environment configuration."""
+    return RuntimeOwner(get_active_model_spec())
 
 
 def main():
@@ -46,10 +37,10 @@ def main():
     if "LAUNCH_DIR" not in os.environ:
         os.environ["LAUNCH_DIR"] = os.getcwd()
 
-    client = create_client()
+    runtime_owner = create_runtime_owner()
 
     from .agent import run
-    run(client)
+    run(runtime_owner)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,6 @@ Eval set format (evals/trigger_evals.json):
 """
 
 import json
-import os
 import re
 import sys
 import time
@@ -196,6 +195,9 @@ def test_trigger(skill_dir: str, eval_set: list[dict], runs_per_query: int = 1,
     }
 
 
+test_trigger.__test__ = False
+
+
 def main():
     import argparse
 
@@ -228,7 +230,7 @@ def main():
     print(f"Passed: {s['passed']}/{s['total']} ({s['pass_rate']:.0%})")
 
     if s['failed'] > 0:
-        print(f"\nFailed cases:")
+        print("\nFailed cases:")
         for r in results["results"]:
             if not r["pass"]:
                 expected = "trigger" if r["should_trigger"] else "NOT trigger"

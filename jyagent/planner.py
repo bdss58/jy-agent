@@ -6,15 +6,17 @@ import atexit
 import threading
 import traceback
 import concurrent.futures
+from dataclasses import dataclass
 from .registry import get_registry
 from .toolresult import ToolResult
 from .validation import validate_tool_input
 from .session_stats import get_stats
+from .runtime import RuntimeOwner, RuntimeOptions
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
     MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, STREAM_TIMEOUT,
-    AGENT_MODEL, COMPACT_TOOL_RESULT_CHARS,
+    COMPACT_TOOL_RESULT_CHARS,
 )
 
 # Shared executor for tool timeouts.  max_workers=4 so a hung tool doesn't
@@ -31,6 +33,13 @@ COLOR_CYAN = "\033[1;36m"
 COLOR_RED = "\033[1;31m"
 COLOR_GREEN = "\033[0;32m"
 COLOR_MAGENTA = "\033[0;35m"
+
+
+@dataclass
+class _ToolCallRequest:
+    id: str
+    name: str
+    input: dict
 
 
 def _is_error_result(result) -> bool:
@@ -255,20 +264,15 @@ def _truncate_tool_result(result: str, is_error: bool = False, max_chars: int = 
     )
 
 
-def _truncate_tool_use_inputs(blocks: list) -> list:
-    """Truncate large tool_use inputs in serialized blocks.
-
-    Uses registry metadata (large_input_keys) to identify which tools/keys to truncate.
-    Claude already generated these — it doesn't need them echoed back in full.
-    """
+def _truncate_tool_call_blocks(blocks: list) -> list:
+    """Truncate large tool_call argument fields in normalized assistant content."""
     registry = get_registry()
     out = []
     for block in blocks:
-        if (isinstance(block, dict)
-                and block.get("type") == "tool_use"):
+        if isinstance(block, dict) and block.get("type") == "tool_call":
             large_keys = registry.get_large_input_keys(block.get("name", ""))
             if large_keys:
-                inp = block.get("input", {})
+                inp = block.get("arguments", {})
                 truncated_inp = {}
                 did_truncate = False
                 for k, v in inp.items():
@@ -282,7 +286,7 @@ def _truncate_tool_use_inputs(blocks: list) -> list:
                         truncated_inp[k] = v
                 if did_truncate:
                     block = dict(block)
-                    block["input"] = truncated_inp
+                    block["arguments"] = truncated_inp
         out.append(block)
     return out
 
@@ -307,10 +311,19 @@ def _compact_working_messages(messages: list, max_tokens: int = None) -> list:
     # Work from oldest, skip the last 2 messages
     for i in range(len(compacted) - 2):
         msg = compacted[i]
+        if msg.get("role") == "tool_result":
+            result_text = str(msg.get("content", ""))
+            if len(result_text) > AGGRESSIVE_LIMIT:
+                compacted[i]["content"] = (
+                    result_text[:AGGRESSIVE_LIMIT]
+                    + f"\n[... compacted from {len(result_text)} chars ...]"
+                )
+            continue
+
         content = msg.get("content", "")
         if isinstance(content, list):
             new_blocks = []
-            for block in content:
+            for block in _truncate_tool_call_blocks(content):
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     result_text = str(block.get("content", ""))
                     if len(result_text) > AGGRESSIVE_LIMIT:
@@ -463,86 +476,80 @@ def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
     return results
 
 
-def _serialize_content_blocks(content_blocks) -> list:
-    """Serialize SDK content block objects to plain dicts for Bedrock compatibility."""
-    serialized = []
-    for block in content_blocks:
-        if hasattr(block, 'model_dump'):
-            d = block.model_dump(exclude_none=True)
-        elif hasattr(block, 'dict'):
-            d = block.dict(exclude_none=True)
-        else:
-            serialized.append(block)
-            continue
-
-        if d.get("type") == "tool_use":
-            serialized.append({
-                "type": "tool_use",
-                "id": d["id"],
-                "name": d["name"],
-                "input": d.get("input", {}),
-            })
-        elif d.get("type") == "text":
-            serialized.append({
-                "type": "text",
-                "text": d.get("text", ""),
-            })
-        else:
-            serialized.append(d)
-    return serialized
+def _assistant_tool_calls(message: dict) -> list[_ToolCallRequest]:
+    return [
+        _ToolCallRequest(
+            id=block["id"],
+            name=block["name"],
+            input=block.get("arguments", {}),
+        )
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_call"
+    ]
 
 
-def _is_truncated_tool_call(stop_reason: str, tool_use_blocks: list) -> bool:
-    """Detect if tool_use blocks were truncated due to max_tokens."""
-    if stop_reason != "max_tokens" or not tool_use_blocks:
-        return False
-    return any(block.input is None for block in tool_use_blocks)
+def _assistant_text(message: dict) -> str:
+    return "".join(
+        block.get("text", "")
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _is_truncated_tool_call(stop_reason: str, tool_use_blocks: list[_ToolCallRequest]) -> bool:
+    """Detect if a response likely stopped while emitting tool calls."""
+    return stop_reason == "length" and bool(tool_use_blocks)
 
 
 # ─── Streaming helper ────────────────────────────────────────────────────────
 
-def _stream_response(client, api_kwargs: dict) -> tuple:
+def _stream_response(runtime_owner: RuntimeOwner, context: dict, max_output_tokens: int) -> tuple:
     """
-    Stream a single API response with thinking spinner and token tracking.
+    Stream a single runtime response with thinking spinner and token tracking.
     Returns (step_text, tool_use_blocks, stop_reason, final_message).
     """
     text_parts = []
-    tool_use_blocks = []
-    stop_reason = None
+    stop_reason = "stop"
     final_message = None
     first_token = True
     spinner = _ThinkingSpinner()
     spinner.start()
+    stream = None
 
     try:
-        with client.messages.stream(**api_kwargs, timeout=STREAM_TIMEOUT) as stream:
-            for event in stream:
-                if hasattr(event, 'type') and event.type == 'content_block_delta':
-                    delta = event.delta
-                    if hasattr(delta, 'text'):
-                        if first_token:
-                            spinner.stop()
-                            first_token = False
-                        _stream_write(delta.text)
-                        text_parts.append(delta.text)
-                    elif hasattr(delta, 'type') and delta.type == 'input_json_delta':
-                        # Tool input streaming — stop spinner but don't print
-                        if first_token:
-                            spinner.stop()
-                            first_token = False
+        stream = runtime_owner.stream(
+            context,
+            options=RuntimeOptions(max_output_tokens=max_output_tokens, timeout=STREAM_TIMEOUT),
+        )
+        for event in stream:
+            event_type = event.get("type")
+            if event_type == "text_delta":
+                if first_token:
+                    spinner.stop()
+                    first_token = False
+                _stream_write(event.get("text", ""))
+                text_parts.append(event.get("text", ""))
+            elif event_type in {"tool_call_delta", "thinking_delta"}:
+                if first_token:
+                    spinner.stop()
+                    first_token = False
 
-            final_message = stream.get_final_message()
-            stop_reason = final_message.stop_reason
+        final_message = stream.get_final_message()
+        stop_reason = final_message.get("stop_reason", "stop")
+        tool_use_blocks = _assistant_tool_calls(final_message)
 
-            for block in final_message.content:
-                if block.type == "tool_use":
-                    tool_use_blocks.append(block)
-
-            # Record token usage
-            stats = get_stats()
-            if hasattr(final_message, 'usage'):
-                stats.record_usage(final_message.usage, model=api_kwargs.get('model', ''))
+        stats = get_stats()
+        stats.record_usage(
+            final_message.get("usage", {}),
+            provider=final_message.get("provider", ""),
+            model=final_message.get("model", ""),
+        )
     finally:
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
         spinner.stop()  # Ensure spinner is always cleaned up
 
     return "".join(text_parts), tool_use_blocks, stop_reason, final_message
@@ -553,7 +560,14 @@ def _stream_response(client, api_kwargs: dict) -> tuple:
 _STREAM_MAX_RETRIES = 2
 
 
-def _stream_with_retry(client, api_kwargs: dict, step: int, all_text: str, working_messages: list):
+def _stream_with_retry(
+    runtime_owner: RuntimeOwner,
+    context: dict,
+    max_output_tokens: int,
+    step: int,
+    all_text: str,
+    working_messages: list,
+):
     """Stream a response with auto-retry on transient failures.
 
     Returns (step_text, tool_use_blocks, stop_reason, final_message) on success.
@@ -562,7 +576,7 @@ def _stream_with_retry(client, api_kwargs: dict, step: int, all_text: str, worki
     """
     for attempt in range(_STREAM_MAX_RETRIES + 1):
         try:
-            return _stream_response(client, api_kwargs)
+            return _stream_response(runtime_owner, context, max_output_tokens)
         except KeyboardInterrupt:
             _interrupted_msg()
             msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
@@ -600,7 +614,7 @@ class _StreamAbort(Exception):
 def _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_text):
     """Execute tool calls and append results to working_messages.
 
-    Returns the list of tool_result dicts.
+    Returns the list of normalized tool_result messages.
     Raises KeyboardInterrupt (with synthetic results already appended) if interrupted.
     """
     try:
@@ -622,12 +636,12 @@ def _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_te
             _tool_result_preview(content_str, tool_name=block.name, is_error=result.is_error)
 
             tool_result_block = {
-                "type": "tool_result",
-                "tool_use_id": block.id,
+                "role": "tool_result",
+                "tool_call_id": block.id,
+                "tool_name": block.name,
                 "content": content_str,
+                "is_error": result.is_error,
             }
-            if result.is_error:
-                tool_result_block["is_error"] = True
 
             tool_results.append(tool_result_block)
 
@@ -636,19 +650,24 @@ def _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_te
     except KeyboardInterrupt:
         _interrupted_msg()
         synthetic_results = [
-            {"type": "tool_result", "tool_use_id": b.id,
-             "content": "[Tool execution interrupted by user]", "is_error": True}
+            {
+                "role": "tool_result",
+                "tool_call_id": b.id,
+                "tool_name": b.name,
+                "content": "[Tool execution interrupted by user]",
+                "is_error": True,
+            }
             for b in tool_use_blocks
         ]
-        working_messages.append({"role": "user", "content": synthetic_results})
+        working_messages.extend(synthetic_results)
         msg = all_text + "\n\n[Tool execution interrupted by user]" if all_text else "[Tool execution interrupted by user]"
         raise _StreamAbort(msg, "", working_messages)
 
-def plan_next_action(client, messages: list, system_prompt: str, max_steps: int = None) -> tuple:
+def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt: str, max_steps: int = None) -> tuple:
     """
-    Streams Claude's response token-by-token to stdout.
-    Handles tool use in a loop: when Claude calls tools, we execute them
-    and continue streaming the next response.
+    Streams a provider-neutral runtime response token-by-token to stdout.
+    Handles tool use in a loop: when the model calls tools, execute them and
+    continue streaming the next response.
     Returns (full_text, final_step_text, working_messages).
     """
     if max_steps is None:
@@ -673,19 +692,16 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
             # Guard: compact working_messages if token count is too high
             working_messages = _compact_working_messages(working_messages)
 
-            api_kwargs = dict(
-                model=AGENT_MODEL,
-                max_tokens=current_max_tokens,
-                system=system_prompt,
-                messages=working_messages,
-            )
-
+            context = {
+                "system_prompt": system_prompt,
+                "messages": working_messages,
+            }
             if tool_schemas:
-                api_kwargs["tools"] = tool_schemas
+                context["tools"] = tool_schemas
 
             # Stream with auto-retry on transient failures
             step_text, tool_use_blocks, stop_reason, final_message = _stream_with_retry(
-                client, api_kwargs, step, all_text, working_messages
+                runtime_owner, context, current_max_tokens, step, all_text, working_messages
             )
 
             all_text += step_text
@@ -693,14 +709,14 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
 
             # If there are no tool calls, we're done
             if not tool_use_blocks:
+                if not step_text:
+                    final_text = _assistant_text(final_message)
+                    all_text = final_text or all_text
                 if step_text:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                 result = all_text if all_text else "I processed your request but had no text response to return."
-                # Append the final assistant message so history doesn't end
-                # on a user-role tool_result from the previous step.
-                serialized = _serialize_content_blocks(final_message.content)
-                working_messages.append({"role": "assistant", "content": serialized})
+                working_messages.append(final_message)
                 return (result, final_text, working_messages)
 
             # --- Handle tool calls ---
@@ -715,15 +731,15 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
                 all_text = all_text[:-len(step_text)] if step_text else all_text
                 continue
 
-            # Append assistant's full response (with large write inputs truncated)
-            serialized = _serialize_content_blocks(final_message.content)
-            serialized = _truncate_tool_use_inputs(serialized)
-            working_messages.append({"role": "assistant", "content": serialized})
+            # Append assistant's full normalized response (with large write inputs truncated)
+            final_message = dict(final_message)
+            final_message["content"] = _truncate_tool_call_blocks(final_message.get("content", []))
+            working_messages.append(final_message)
 
             # Execute tool calls and build results
             tool_results = _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_text)
 
-            working_messages.append({"role": "user", "content": tool_results})
+            working_messages.extend(tool_results)
 
             # Refresh tool snapshots if registry changed (e.g. MCP connect mid-turn)
             if registry.version != reg_version:
@@ -745,24 +761,25 @@ def plan_next_action(client, messages: list, system_prompt: str, max_steps: int 
         # Try a final non-tool response
         fallback_text = ""
         try:
-            api_kwargs_final = dict(
-                model=AGENT_MODEL,
-                max_tokens=DEFAULT_MAX_TOKENS,
-                system=system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
-                messages=working_messages,
+            final_message = runtime_owner.complete(
+                {
+                    "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
+                    "messages": working_messages,
+                },
+                options=RuntimeOptions(max_output_tokens=DEFAULT_MAX_TOKENS, timeout=STREAM_TIMEOUT),
             )
-            with client.messages.stream(**api_kwargs_final, timeout=STREAM_TIMEOUT) as stream:
-                for event in stream:
-                    if hasattr(event, 'type') and event.type == 'content_block_delta':
-                        delta = event.delta
-                        if hasattr(delta, 'text'):
-                            _stream_write(delta.text)
-                            fallback_text += delta.text
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                # Append fallback assistant message to maintain valid history
-                working_messages.append({"role": "assistant", "content": [{"type": "text", "text": fallback_text}]})
-                return (fallback_text, fallback_text, working_messages)
+            stats.record_usage(
+                final_message.get("usage", {}),
+                provider=final_message.get("provider", ""),
+                model=final_message.get("model", ""),
+            )
+            fallback_text = _assistant_text(final_message)
+            if fallback_text:
+                _stream_write(fallback_text)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            working_messages.append(final_message)
+            return (fallback_text, fallback_text, working_messages)
         except KeyboardInterrupt:
             _interrupted_msg()
             msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"

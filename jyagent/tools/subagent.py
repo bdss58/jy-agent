@@ -6,7 +6,6 @@
 # Sub-agents run silently (no streaming to terminal), have their own context
 # window and message history, and return only their final answer to the parent.
 
-import os
 import sys
 import time
 import traceback
@@ -15,17 +14,19 @@ import concurrent.futures
 
 try:
     from ..config import (
-        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, SUBAGENT_MODEL_TIERS,
+        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_subagent_model_spec,
     )
     from ..registry import get_registry
+    from ..runtime import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
     from ..validation import validate_tool_input
     from ..session_stats import get_stats
 except ImportError:
     from jyagent.config import (
-        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, SUBAGENT_MODEL_TIERS,
+        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_subagent_model_spec,
     )
     from jyagent.registry import get_registry
+    from jyagent.runtime import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
     from jyagent.validation import validate_tool_input
     from jyagent.session_stats import get_stats
@@ -45,35 +46,137 @@ _nesting_depth = threading.local()
 _MAX_NESTING = 2  # sub-agent can spawn sub-sub-agent, but no deeper
 
 
-# ─── Client access ────────────────────────────────────────────────────────────
+# ─── Runtime owner access ─────────────────────────────────────────────────────
 
+_runtime_owner = None
 _client = None
 
 
-def set_client(client):
-    """Called once during agent startup to share the Anthropic client."""
-    global _client
-    _client = client
+def set_runtime_owner(runtime_owner):
+    """Called during agent startup to share the active runtime owner."""
+    global _runtime_owner, _client
+    _runtime_owner = runtime_owner
+    _client = None
+
+
+def set_client(runtime_owner):
+    """Backward-compatible alias for older call sites/tests."""
+    global _runtime_owner, _client
+    if isinstance(runtime_owner, RuntimeOwner):
+        set_runtime_owner(runtime_owner)
+        return
+    _runtime_owner = None
+    _client = runtime_owner
 
 
 def _get_client():
-    """Get the shared Anthropic client, creating if needed."""
-    global _client
-    if _client is not None:
-        return _client
-    # Fallback: create a new client (should not happen in normal flow)
-    import httpx
-    import anthropic
-    kwargs = {}
-    base_url = os.environ.get("ANTHROPIC_BASE_URL")
-    auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-    if base_url:
-        kwargs["base_url"] = base_url
-    if auth_token:
-        kwargs["api_key"] = auth_token
-    kwargs["http_client"] = httpx.Client(verify=False)
-    _client = anthropic.Anthropic(**kwargs)
+    """Backward-compatible helper for tests that monkeypatch the raw client."""
     return _client
+
+
+class _LegacyClientRuntimeOwner:
+    """Compatibility shim for tests that still provide a fake Anthropic client."""
+
+    def __init__(self, client):
+        self._client = client
+        self.model_spec = get_active_model_spec()
+
+    def complete(self, context, options=None, model_spec=None):
+        model_spec = model_spec or self.model_spec
+        max_tokens = _DEFAULT_MAX_TOKENS_PER_RESPONSE
+        timeout = STREAM_TIMEOUT
+        if options is not None:
+            max_tokens = options.max_output_tokens or max_tokens
+            timeout = options.timeout or timeout
+
+        kwargs = {
+            "model": model_spec.model,
+            "max_tokens": max_tokens,
+            "system": context.get("system_prompt", ""),
+            "messages": self._convert_messages(context.get("messages", [])),
+        }
+        if context.get("tools"):
+            kwargs["tools"] = context["tools"]
+        response = self._client.messages.create(**kwargs, timeout=timeout)
+        return self._normalize_response(model_spec, response)
+
+    def _convert_messages(self, messages):
+        out = []
+        idx = 0
+        while idx < len(messages):
+            message = messages[idx]
+            role = message.get("role")
+            if role == "user":
+                out.append({"role": "user", "content": message.get("content", "")})
+                idx += 1
+                continue
+            if role == "assistant":
+                blocks = []
+                for block in message.get("content", []):
+                    if block.get("type") == "text":
+                        blocks.append({"type": "text", "text": block.get("text", "")})
+                    elif block.get("type") == "tool_call":
+                        blocks.append({
+                            "type": "tool_use",
+                            "id": block["id"],
+                            "name": block["name"],
+                            "input": block.get("arguments", {}),
+                        })
+                out.append({"role": "assistant", "content": blocks})
+                idx += 1
+                continue
+
+            tool_results = []
+            while idx < len(messages) and messages[idx].get("role") == "tool_result":
+                tool_result = messages[idx]
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_result["tool_call_id"],
+                    "content": tool_result["content"],
+                    "is_error": tool_result["is_error"],
+                })
+                idx += 1
+            out.append({"role": "user", "content": tool_results})
+        return out
+
+    def _normalize_response(self, model_spec, response):
+        content = []
+        stop_reason = "stop"
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                content.append({"type": "text", "text": getattr(block, "text", "")})
+            elif getattr(block, "type", None) == "tool_use":
+                stop_reason = "tool_use"
+                content.append({
+                    "type": "tool_call",
+                    "id": getattr(block, "id", ""),
+                    "name": getattr(block, "name", ""),
+                    "arguments": getattr(block, "input", {}) or {},
+                })
+        usage = getattr(response, "usage", None)
+        return {
+            "role": "assistant",
+            "content": content,
+            "provider": model_spec.provider,
+            "api": "anthropic-messages",
+            "model": model_spec.model,
+            "stop_reason": stop_reason,
+            "usage": {
+                "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
+                "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
+            },
+        }
+
+
+def _get_runtime_owner():
+    """Get the shared runtime owner, creating a default one if needed."""
+    global _runtime_owner
+    client = _get_client()
+    if client is not None:
+        return _LegacyClientRuntimeOwner(client)
+    if _runtime_owner is None:
+        _runtime_owner = RuntimeOwner(get_active_model_spec())
+    return _runtime_owner
 
 
 # ─── Schema ───────────────────────────────────────────────────────────────────
@@ -183,32 +286,6 @@ def _execute_tool_silent(tool_name, tool_input, tool_functions):
         return ToolResult(f"Error calling tool {tool_name}: {e}", is_error=True)
 
 
-def _serialize_blocks(content_blocks):
-    """Serialize SDK content blocks to plain dicts."""
-    out = []
-    for block in content_blocks:
-        if hasattr(block, "model_dump"):
-            d = block.model_dump(exclude_none=True)
-        elif hasattr(block, "dict"):
-            d = block.dict(exclude_none=True)
-        else:
-            out.append(block)
-            continue
-
-        if d.get("type") == "tool_use":
-            out.append({
-                "type": "tool_use",
-                "id": d["id"],
-                "name": d["name"],
-                "input": d.get("input", {}),
-            })
-        elif d.get("type") == "text":
-            out.append({"type": "text", "text": d.get("text", "")})
-        else:
-            out.append(d)
-    return out
-
-
 def _truncate(text, max_chars=MAX_TOOL_RESULT_CHARS):
     """Truncate text for context management."""
     if len(text) <= max_chars:
@@ -222,12 +299,12 @@ def _truncate(text, max_chars=MAX_TOOL_RESULT_CHARS):
     )
 
 
-def _extract_text_blocks(content_blocks):
-    """Extract concatenated text from an SDK content block list."""
+def _extract_text_blocks(message):
+    """Extract concatenated text from a normalized assistant message."""
     text_parts = []
-    for block in content_blocks:
-        if getattr(block, "type", None) == "text":
-            text_parts.append(getattr(block, "text", ""))
+    for block in message.get("content", []):
+        if isinstance(block, dict) and block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
     return "\n".join(text_parts)
 
 
@@ -261,30 +338,32 @@ def _format_subagent_failure(message, partial_output="", final_answer=""):
     return "\n".join(parts)
 
 
-def _best_effort_final_answer(client, messages, model_name):
+def _best_effort_final_answer(runtime_owner, messages, model_spec):
     """Ask the model for one last no-tools answer after max-step exhaustion."""
-    response = client.messages.create(
-        model=model_name,
-        max_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
-        system=_SUBAGENT_SYSTEM_PROMPT + _SUBAGENT_FINAL_NO_TOOLS_SUFFIX,
-        messages=messages,
-        timeout=STREAM_TIMEOUT,
+    response = runtime_owner.complete(
+        {
+            "system_prompt": _SUBAGENT_SYSTEM_PROMPT + _SUBAGENT_FINAL_NO_TOOLS_SUFFIX,
+            "messages": messages,
+        },
+        options=RuntimeOptions(
+            max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+            timeout=STREAM_TIMEOUT,
+        ),
+        model_spec=model_spec,
     )
-    input_tokens = 0
-    output_tokens = 0
-    if hasattr(response, "usage"):
-        input_tokens = getattr(response.usage, "input_tokens", 0)
-        output_tokens = getattr(response.usage, "output_tokens", 0)
-    return _extract_text_blocks(response.content), input_tokens, output_tokens
+    usage = response.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    return _extract_text_blocks(response), input_tokens, output_tokens
 
 
-def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_functions):
+def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions):
     """Run a sub-agent's tool loop to completion.
 
     This is the core engine — a non-streaming version of plan_next_action.
     Runs entirely in the calling thread (no terminal output).
     """
-    client = _get_client()
+    runtime_owner = _get_runtime_owner()
 
     # Build initial messages
     user_content = task
@@ -299,18 +378,22 @@ def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_funct
     tool_calls_count = 0
 
     for step in range(max_steps):
-        # API call (non-streaming for simplicity and thread-safety)
-        api_kwargs = dict(
-            model=model_name,
-            max_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
-            system=_SUBAGENT_SYSTEM_PROMPT,
-            messages=messages,
-        )
+        runtime_context = {
+            "system_prompt": _SUBAGENT_SYSTEM_PROMPT,
+            "messages": messages,
+        }
         if tool_schemas:
-            api_kwargs["tools"] = tool_schemas
+            runtime_context["tools"] = tool_schemas
 
         try:
-            response = client.messages.create(**api_kwargs, timeout=STREAM_TIMEOUT)
+            response = runtime_owner.complete(
+                runtime_context,
+                options=RuntimeOptions(
+                    max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+                    timeout=STREAM_TIMEOUT,
+                ),
+                model_spec=model_spec,
+            )
         except Exception as e:
             step_num = step + 1
             content = _format_subagent_failure(
@@ -328,17 +411,17 @@ def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_funct
             )
 
         # Track tokens
-        if hasattr(response, "usage"):
-            total_input_tokens += getattr(response.usage, "input_tokens", 0)
-            total_output_tokens += getattr(response.usage, "output_tokens", 0)
+        usage = response.get("usage", {})
+        total_input_tokens += usage.get("input_tokens", 0)
+        total_output_tokens += usage.get("output_tokens", 0)
 
-        # Extract text and tool_use blocks
+        # Extract text and tool_call blocks
         text_parts = []
         tool_use_blocks = []
-        for block in response.content:
-            if block.type == "text":
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
+        for block in response.get("content", []):
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif block.get("type") == "tool_call":
                 tool_use_blocks.append(block)
 
         step_text = "\n".join(text_parts)
@@ -358,26 +441,26 @@ def _run_subagent(task, context, model_name, max_steps, tool_schemas, tool_funct
             )
 
         # Execute tool calls and build results
-        serialized = _serialize_blocks(response.content)
-        messages.append({"role": "assistant", "content": serialized})
+        messages.append(response)
 
         tool_results = []
         for block in tool_use_blocks:
             tool_calls_count += 1
-            result = _execute_tool_silent(block.name, block.input, tool_functions)
+            result = _execute_tool_silent(block["name"], block.get("arguments", {}), tool_functions)
             content_str = _truncate(result.content)
             tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
+                "role": "tool_result",
+                "tool_call_id": block["id"],
+                "tool_name": block["name"],
                 "content": content_str,
                 "is_error": result.is_error,
             })
 
-        messages.append({"role": "user", "content": tool_results})
+        messages.extend(tool_results)
 
     final_answer = ""
     try:
-        final_answer, extra_in, extra_out = _best_effort_final_answer(client, messages, model_name)
+        final_answer, extra_in, extra_out = _best_effort_final_answer(runtime_owner, messages, model_spec)
         total_input_tokens += extra_in
         total_output_tokens += extra_out
     except Exception:
@@ -468,7 +551,8 @@ def dispatch_agent(
         )
 
     # Resolve model
-    model_name = SUBAGENT_MODEL_TIERS.get(model, SUBAGENT_MODEL_TIERS["default"])
+    runtime_owner = _get_runtime_owner()
+    model_spec = get_subagent_model_spec(model, runtime_owner.model_spec)
 
     # Build tool schemas & functions for the sub-agent
     registry = get_registry()
@@ -500,7 +584,7 @@ def dispatch_agent(
         # Run with wall-clock timeout
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
-                _run_subagent, task, context, model_name,
+                _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
             )
             try:
@@ -547,7 +631,7 @@ def dispatch_agent(
     # Record token usage in parent stats
     try:
         parent_stats = get_stats()
-        parent_stats.record_subagent_usage(in_tok, out_tok, model_name)
+        parent_stats.record_subagent_usage(in_tok, out_tok, model_spec.provider, model_spec.model)
     except Exception:
         pass  # stats recording is best-effort
 

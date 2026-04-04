@@ -1,11 +1,8 @@
 # Agent — Main run loop, command handlers, session lifecycle.
 
-import json
-import os
 import sys
 from .registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
-from .tools.subagent import set_client as set_subagent_client
 from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context, on_session_start, on_session_end,
@@ -14,6 +11,8 @@ from .memory import (
 from .planner import plan_next_action
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
+from .runtime import RuntimeOwner, list_adapters
+from .session_stats import get_stats
 
 
 # ─── System prompt (externalized from run()) ──────────────────────────────────
@@ -78,24 +77,25 @@ def _cmd_history(cli, conversation, **_):
     recent = conversation.get_recent(10)
     cli.print_history(recent)
 
-def _cmd_new(cli, client, conversation, **_):
+def _cmd_new(cli, runtime_owner, conversation, **_):
     """Save current session, then reset for a fresh conversation."""
     from .memory.sessions import on_session_end, on_session_start
-    from .session_stats import get_stats
 
     global _cached_memory_context
 
     # Save current conversation (skips if < 4 messages)
-    on_session_end(client, conversation.get_history())
+    on_session_end(runtime_owner, conversation.get_history())
 
     # Process the just-saved pending session in background
-    on_session_start(client)
+    on_session_start(runtime_owner)
 
     # Clear conversation history
     conversation.clear()
 
     # Reset session stats
-    get_stats().reset()
+    stats = get_stats()
+    stats.reset()
+    stats.set_active_model(runtime_owner.model_spec.provider, runtime_owner.model_spec.model)
 
     # Force memory context rebuild on next turn
     _cached_memory_context = None
@@ -150,10 +150,14 @@ def _cmd_skill(cli, user_input, **_):
 
 def _cmd_stats(cli, **_):
     """Show detailed session statistics."""
-    from .session_stats import get_stats
     stats = get_stats()
+    model_label = (
+        f"{stats._provider}:{stats._model}"
+        if stats._provider and stats._model
+        else "(none yet)"
+    )
     lines = [
-        f"Model:         {stats._model or '(none yet)'}",
+        f"Model:         {model_label}",
         f"Turns:         {stats.turns}",
         f"API calls:     {stats.api_calls}",
         f"Tool calls:    {stats.tool_calls}",
@@ -165,6 +169,26 @@ def _cmd_stats(cli, **_):
         f"Elapsed:       {stats.elapsed/60:.1f} min",
     ]
     cli.print_system("\n".join(lines))
+
+
+def _cmd_model(cli, runtime_owner: RuntimeOwner, user_input: str, **_):
+    """Show or switch the active provider:model for future turns."""
+    parts = user_input.split()
+    if len(parts) == 1:
+        cli.print_system(f"Active model: {runtime_owner.label()}")
+        return
+    if len(parts) < 3:
+        cli.print_error("Usage: /model <provider> <model>")
+        return
+    provider = parts[1].strip()
+    model = " ".join(parts[2:]).strip()
+    available = list_adapters()
+    if provider not in available:
+        cli.print_error(f"Unknown provider '{provider}'. Available: {available}")
+        return
+    runtime_owner.switch_model(provider, model)
+    get_stats().set_active_model(provider, model)
+    cli.print_system(f"Switched model to {provider}:{model}")
 
 
 # Command dispatch table
@@ -182,11 +206,11 @@ COMMAND_TABLE = {
 
 # ─── Graceful exit helper ────────────────────────────────────────────────────
 
-def _graceful_exit(client, conversation, cli):
+def _graceful_exit(runtime_owner, conversation, cli):
     """Save session and print goodbye on exit. Fast — no API calls."""
     cli.goodbye()  # Say goodbye FIRST — user sees immediate response
     try:
-        on_session_end(client, conversation.get_history())  # File I/O only, no API
+        on_session_end(runtime_owner, conversation.get_history())  # File I/O only, no API
     except Exception:
         pass
     # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as stale processes
@@ -205,7 +229,7 @@ def _graceful_exit(client, conversation, cli):
 _cached_memory_context: str | None = None
 
 
-def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager,
+def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: RuntimeOwner,
                               force_rebuild: bool = False) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
 
@@ -222,7 +246,7 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager,
         full_system_prompt = SYSTEM_PROMPT + "\n\n" + _cached_memory_context
 
     # Skills context depends on user query (auto-activation) — always rebuild
-    skills_context = skill_mgr.build_prompt_context(query=user_input)
+    skills_context = skill_mgr.build_prompt_context(query=user_input, runtime_owner=runtime_owner)
     if skills_context:
         full_system_prompt = full_system_prompt + "\n\n" + skills_context
 
@@ -231,27 +255,26 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager,
 
 # ─── Main agent loop ─────────────────────────────────────────────────────────
 
-def run(client) -> None:
+def run(runtime_owner: RuntimeOwner) -> None:
     global _cached_memory_context
     # Initialize before try block to avoid unbound variable risk in outer except
     cli = None
     conversation = None
 
     try:
-        # Share Anthropic client with sub-agent module
-        set_subagent_client(client)
-
         cli = CLI()
         state = {"use_markdown": True}
+        stats = get_stats()
+        stats.set_active_model(runtime_owner.model_spec.provider, runtime_owner.model_spec.model)
 
-        cli.print_banner()
+        cli.print_banner(runtime_owner.label())
 
         conversation = ConversationMemory()
         persistent = PersistentMemory()
         interaction_count = 0
 
         # Start session and load memory context
-        on_session_start(client)
+        on_session_start(runtime_owner)
         memory_context = build_memory_context()
         if memory_context:
             cli.print_system("🧠 Memory loaded from previous sessions.")
@@ -272,7 +295,7 @@ def run(client) -> None:
                 continue
 
             if user_input is None:
-                _graceful_exit(client, conversation, cli)
+                _graceful_exit(runtime_owner, conversation, cli)
                 break
 
             user_input = user_input.strip()
@@ -282,12 +305,16 @@ def run(client) -> None:
             try:
                 # ─── Quit ─────────────────────────────
                 if user_input == "/quit":
-                    _graceful_exit(client, conversation, cli)
+                    _graceful_exit(runtime_owner, conversation, cli)
                     break
 
                 # ─── /skill <name> (prefix match) ─────
                 if user_input.startswith("/skill "):
                     _cmd_skill(cli=cli, user_input=user_input)
+                    continue
+
+                if user_input.startswith("/model"):
+                    _cmd_model(cli=cli, runtime_owner=runtime_owner, user_input=user_input)
                     continue
 
 
@@ -296,7 +323,7 @@ def run(client) -> None:
                 if handler:
                     handler(
                         cli=cli,
-                        client=client,
+                        runtime_owner=runtime_owner,
                         conversation=conversation,
                         persistent=persistent,
                         state=state,
@@ -314,7 +341,7 @@ def run(client) -> None:
                     state["_force_rebuild_context"] = True
 
                 summarize_if_needed(
-                    conversation, client,
+                    conversation, runtime_owner,
                     system_prompt_rebuilder=_on_compacted,
                 )
 
@@ -322,7 +349,7 @@ def run(client) -> None:
 
                 # Build system prompt (memory cached, skills always rebuilt)
                 force_rebuild = state.pop("_force_rebuild_context", False)
-                full_system_prompt = _build_full_system_prompt(user_input, skill_mgr,
+                full_system_prompt = _build_full_system_prompt(user_input, skill_mgr, runtime_owner,
                                                                force_rebuild=force_rebuild)
 
                 cli.print_separator()
@@ -331,7 +358,7 @@ def run(client) -> None:
                 sys.stdout.flush()
 
                 try:
-                    response, final_text, planner_messages = plan_next_action(client, messages, full_system_prompt)
+                    response, final_text, planner_messages = plan_next_action(runtime_owner, messages, full_system_prompt)
                 except KeyboardInterrupt:
                     cli.print_system("\n⚠ Interrupted — returning to prompt.")
                     response = "[Response interrupted by user]"
@@ -380,7 +407,7 @@ def run(client) -> None:
         try:
             console.print("\n[system]⚠ Interrupted.[/system]")
             if cli and conversation:
-                _graceful_exit(client, conversation, cli)
+                _graceful_exit(runtime_owner, conversation, cli)
             else:
                 console.print("[system]👋 Goodbye![/system]")
         except Exception:

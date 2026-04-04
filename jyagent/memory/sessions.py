@@ -5,7 +5,6 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Optional
 
 from ..config import MEMORY_DIR, SESSIONS_FILE, MAX_SESSIONS
 from .utils import atomic_write, load_json, ensure_dirs
@@ -60,18 +59,18 @@ class SessionSummaries:
 PENDING_SESSION_FILE = os.path.join(MEMORY_DIR, "_pending_session.json")
 
 _session_start_time = None
-_client_ref = None
+_runtime_owner_ref = None
 
 
-def on_session_start(client=None) -> None:
+def on_session_start(runtime_owner=None) -> None:
     """Called when a new agent session begins. Processes any pending session from last exit."""
-    global _session_start_time, _client_ref
+    global _session_start_time, _runtime_owner_ref
     _session_start_time = time.time()
-    _client_ref = client
+    _runtime_owner_ref = runtime_owner
     _process_pending_session_background()
 
 
-def on_session_end(client, conversation_messages: list) -> None:
+def on_session_end(runtime_owner, conversation_messages: list) -> None:
     """Called when a session ends. Only writes files — NO API calls.
 
     Saves raw conversation to _pending_session.json for the next session to summarize.
@@ -133,7 +132,7 @@ def _process_pending_session_background() -> None:
 
     def _summarize():
         try:
-            _generate_session_summary(pending, _client_ref)
+            _generate_session_summary(pending, _runtime_owner_ref)
             # Success — now safe to delete the pending file
             try:
                 os.remove(PENDING_SESSION_FILE)
@@ -158,7 +157,7 @@ def _process_pending_session_background() -> None:
     t.start()
 
 
-def _generate_session_summary(pending: dict, client=None) -> None:
+def _generate_session_summary(pending: dict, runtime_owner=None) -> None:
     """Generate a session summary using the API. Called from background thread."""
     messages = pending.get("messages", [])
     msg_count = pending.get("msg_count", len(messages))
@@ -171,33 +170,26 @@ def _generate_session_summary(pending: dict, client=None) -> None:
         f"{m['role']}: {m['content']}" for m in messages
     )
 
-    if client is None:
-        import anthropic
-        client = anthropic.Anthropic()
+    if runtime_owner is None:
+        from ..config import get_active_model_spec
+        from ..runtime import RuntimeOwner
 
-    response = client.messages.create(
-        model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
-        max_tokens=256,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Summarize this conversation in one short sentence. "
-                "Also list 2-5 topic keywords.\n"
-                "Return JSON: {\"summary\": \"...\", \"topics\": [...]}\n\n"
-                + conversation_text
-            )
-        }]
+        runtime_owner = RuntimeOwner(get_active_model_spec())
+
+    response_text = runtime_owner.complete_text(
+        (
+            "Summarize this conversation in one short sentence. "
+            "Also list 2-5 topic keywords.\n"
+            "Return JSON: {\"summary\": \"...\", \"topics\": [...]}\n\n"
+            + conversation_text
+        ),
+        max_output_tokens=256,
     )
-
-    response_text = ""
-    for block in response.content:
-        if block.type == "text":
-            response_text += block.text
 
     response_text = response_text.strip()
     if response_text.startswith("```"):
         lines = response_text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [line for line in lines if not line.strip().startswith("```")]
         response_text = "\n".join(lines)
 
     result = json.loads(response_text)

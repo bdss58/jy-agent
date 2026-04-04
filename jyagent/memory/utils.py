@@ -54,6 +54,12 @@ def estimate_tokens(text: str) -> int:
 
 def estimate_message_tokens(message: dict) -> int:
     """Estimate token count for a single conversation message."""
+    if message.get("role") == "tool_result":
+        total = 4
+        total += estimate_tokens(message.get("tool_name", ""))
+        total += estimate_tokens(str(message.get("content", "")))
+        return total
+
     content = message.get("content", "")
 
     if isinstance(content, str):
@@ -68,9 +74,11 @@ def estimate_message_tokens(message: dict) -> int:
                 block_type = block.get("type", "")
                 if block_type == "text":
                     total += estimate_tokens(block.get("text", ""))
-                elif block_type == "tool_use":
+                elif block_type in {"tool_use", "tool_call"}:
                     total += estimate_tokens(block.get("name", ""))
-                    total += estimate_tokens(str(block.get("input", {})))
+                    total += estimate_tokens(str(block.get("arguments", block.get("input", {}))))
+                elif block_type == "thinking":
+                    total += estimate_tokens(block.get("thinking", ""))
                 elif block_type == "tool_result":
                     total += estimate_tokens(str(block.get("content", "")))
                 else:

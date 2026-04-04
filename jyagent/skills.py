@@ -25,6 +25,8 @@ import sys
 import time
 from typing import Optional
 
+from .config import SKILL_ROUTER_TIMEOUT, get_skill_router_model_spec
+
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -35,12 +37,6 @@ SKILL_FILENAME = "SKILL.md"
 MAX_CATALOG_TOKENS_PER_SKILL = 150   # ~name + description for advertising
 MAX_INSTRUCTIONS_CHARS = 20000       # loaded skill body limit
 MAX_RESOURCE_CHARS = 30000           # single reference file limit
-
-# LLM-based skill routing (改进2: 用轻量 LLM 替代关键词匹配)
-# Prefers haiku (cheapest), falls back to sonnet, then main model
-ROUTER_MODEL = os.environ.get("SKILL_ROUTER_MODEL", "claude-sonnet-4-20250514")
-ROUTER_TIMEOUT = int(os.environ.get("SKILL_ROUTER_TIMEOUT", "8"))  # seconds — fail fast, fallback to keyword matching
-
 
 # ─── SKILL.md Parser ─────────────────────────────────────────────────────────
 
@@ -64,7 +60,7 @@ def parse_skill_md(filepath: str) -> Optional[dict]:
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
-    except (FileNotFoundError, PermissionError, UnicodeDecodeError) as e:
+    except (FileNotFoundError, PermissionError, UnicodeDecodeError):
         return None
 
     # Split YAML frontmatter from body
@@ -196,7 +192,7 @@ def _parse_yaml_frontmatter(text: str) -> dict:
 
             if fold:
                 # >  or >- : fold newlines into spaces
-                result[key] = ' '.join(l for l in block_lines if l)
+                result[key] = ' '.join(line for line in block_lines if line)
             else:
                 # |  or |- : preserve newlines
                 result[key] = '\n'.join(block_lines)
@@ -400,7 +396,7 @@ class SkillManager:
 
     # ── 改进2: LLM-based skill routing ──────────────────────────────────────
 
-    def auto_activate_for_query(self, query: str) -> list[str]:
+    def auto_activate_for_query(self, query: str, runtime_owner=None) -> list[str]:
         """
         Automatically activate relevant skills based on user query.
         
@@ -419,14 +415,14 @@ class SkillManager:
             return []
 
         # Try LLM routing first
-        newly_activated = self._auto_activate_llm(query, inactive)
+        newly_activated = self._auto_activate_llm(query, inactive, runtime_owner=runtime_owner)
         if newly_activated is not None:
             return newly_activated
 
         # Fallback: keyword matching
         return self._auto_activate_keywords(query, inactive)
 
-    def _auto_activate_llm(self, query: str, candidates: dict) -> Optional[list[str]]:
+    def _auto_activate_llm(self, query: str, candidates: dict, runtime_owner=None) -> Optional[list[str]]:
         """
         Use a fast LLM to decide which skills to activate.
         
@@ -439,13 +435,12 @@ class SkillManager:
           - JSON output: ["skill-name-1", "skill-name-2"] or []
           - Timeout: ROUTER_TIMEOUT seconds, fail fast to fallback
         """
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-        except Exception:
-            return None
-        if client is None:
-            return None
+        if runtime_owner is None:
+            try:
+                from .runtime import RuntimeOwner
+                runtime_owner = RuntimeOwner(get_skill_router_model_spec())
+            except Exception:
+                return None
 
         # Build skill catalog for routing prompt
         catalog_lines = []
@@ -465,16 +460,16 @@ class SkillManager:
 
         try:
             t0 = time.time()
-            response = client.messages.create(
-                model=ROUTER_MODEL,
-                max_tokens=100,
-                timeout=ROUTER_TIMEOUT,
-                messages=[{"role": "user", "content": routing_prompt}],
+            text = runtime_owner.complete_text(
+                routing_prompt,
+                max_output_tokens=100,
+                model_spec=get_skill_router_model_spec(runtime_owner.model_spec),
+                timeout=SKILL_ROUTER_TIMEOUT,
             )
             elapsed = time.time() - t0
 
             # Parse response
-            text = response.content[0].text.strip()
+            text = text.strip()
             # Extract JSON array from response (handle markdown code fences)
             if text.startswith("```"):
                 text = re.sub(r'^```\w*\n?', '', text)
@@ -539,7 +534,7 @@ class SkillManager:
 
     # ── 改进1: XML prompt format (agentskills.io spec) ────────────────────
 
-    def build_prompt_context(self, query: str = "") -> str:
+    def build_prompt_context(self, query: str = "", runtime_owner=None) -> str:
         """
         Build the skills context section for system prompt injection.
         
@@ -556,7 +551,7 @@ class SkillManager:
 
         # Auto-activate relevant skills if query provided
         if query:
-            self.auto_activate_for_query(query)
+            self.auto_activate_for_query(query, runtime_owner=runtime_owner)
 
         lines = []
 
@@ -598,7 +593,7 @@ class SkillManager:
             lines.append("<instructions>")
             lines.append(body[:MAX_INSTRUCTIONS_CHARS])
             lines.append("</instructions>")
-            lines.append(f"</active_skill>")
+            lines.append("</active_skill>")
 
         return "\n".join(lines)
 
@@ -612,7 +607,7 @@ class SkillManager:
         if not re.match(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$', name) or len(name) > 64:
             return f"Error: Invalid skill name '{name}'. Must be lowercase alphanumeric with hyphens, 1-64 chars."
         if '--' in name:
-            return f"Error: Skill name must not contain consecutive hyphens."
+            return "Error: Skill name must not contain consecutive hyphens."
         if name in self._skills:
             return f"Error: Skill '{name}' already exists."
 
@@ -627,7 +622,7 @@ class SkillManager:
         fm_lines = [
             "---",
             f"name: {name}",
-            f"description: >-",
+            "description: >-",
             f"  {description}",
         ]
         if metadata:

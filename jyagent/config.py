@@ -7,9 +7,11 @@ import os
 
 # ─── API & Model ──────────────────────────────────────────────────────────────
 
-DEFAULT_MAX_TOKENS = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16384"))
-MAX_TOKENS_CAP = int(os.environ.get("ANTHROPIC_MAX_TOKENS_CAP", "128000"))
-AGENT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+AGENT_PROVIDER = (os.environ.get("AGENT_PROVIDER") or "anthropic").strip() or "anthropic"
+AGENT_MODEL = os.environ.get("AGENT_MODEL", DEFAULT_ANTHROPIC_MODEL)
+DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
+MAX_TOKENS_CAP = int(os.environ.get("AGENT_MAX_TOKENS_CAP", "128000"))
 
 # ─── Planner / Tool dispatch ─────────────────────────────────────────────────
 
@@ -20,14 +22,6 @@ MAX_WORKING_TOKENS = int(os.environ.get("AGENT_MAX_WORKING_TOKENS", "100000"))
 DEFAULT_TOOL_TIMEOUT = int(os.environ.get("AGENT_TOOL_TIMEOUT", "120"))
 STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
-
-# ─── Sub-agent ───────────────────────────────────────────────────────────────
-
-SUBAGENT_MODEL_TIERS = {
-    "fast": os.environ.get("SUBAGENT_MODEL_FAST", "claude-haiku-4-20250514"),
-    "default": os.environ.get("SUBAGENT_MODEL_DEFAULT", AGENT_MODEL),
-    "strong": os.environ.get("SUBAGENT_MODEL_STRONG", "claude-sonnet-4-20250514"),
-}
 
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
@@ -50,7 +44,8 @@ CHARS_PER_TOKEN = 4
 SKILLS_DIR = os.environ.get("AGENT_SKILLS_DIR", "skills")
 MAX_INSTRUCTIONS_CHARS = int(os.environ.get("AGENT_MAX_SKILL_CHARS", "8000"))
 MAX_RESOURCE_CHARS = int(os.environ.get("AGENT_MAX_RESOURCE_CHARS", "10000"))
-SKILL_ROUTER_MODEL = os.environ.get("SKILL_ROUTER_MODEL", "claude-sonnet-4-20250514")
+SKILL_ROUTER_PROVIDER = os.environ.get("SKILL_ROUTER_PROVIDER", AGENT_PROVIDER)
+SKILL_ROUTER_MODEL = os.environ.get("SKILL_ROUTER_MODEL", AGENT_MODEL)
 SKILL_ROUTER_TIMEOUT = int(os.environ.get("SKILL_ROUTER_TIMEOUT", "5"))
 
 # ─── Web Fetch ────────────────────────────────────────────────────────────────
@@ -76,3 +71,28 @@ BINARY_EXTS = {
     '.pdf', '.doc', '.docx', '.xls', '.xlsx',
     '.db', '.sqlite', '.sqlite3',
 }
+
+
+def get_active_model_spec():
+    from .runtime.types import ModelSpec
+
+    return ModelSpec(provider=AGENT_PROVIDER, model=AGENT_MODEL)
+
+
+def get_skill_router_model_spec(active_spec=None):
+    from .runtime.types import ModelSpec
+
+    active_spec = active_spec or get_active_model_spec()
+    provider = (os.environ.get("SKILL_ROUTER_PROVIDER") or active_spec.provider).strip() or active_spec.provider
+    model = (os.environ.get("SKILL_ROUTER_MODEL") or active_spec.model).strip() or active_spec.model
+    return ModelSpec(provider=provider, model=model)
+
+
+def get_subagent_model_spec(tier: str, active_spec=None):
+    from .runtime.types import ModelSpec
+
+    active_spec = active_spec or get_active_model_spec()
+    tier_key = tier.upper()
+    provider = (os.environ.get(f"SUBAGENT_{tier_key}_PROVIDER") or active_spec.provider).strip() or active_spec.provider
+    model = (os.environ.get(f"SUBAGENT_{tier_key}_MODEL") or active_spec.model).strip() or active_spec.model
+    return ModelSpec(provider=provider, model=model)

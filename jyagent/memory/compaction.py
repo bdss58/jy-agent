@@ -5,18 +5,14 @@
 #   2. Structured summary: preserves files modified, key decisions, pending tasks
 #   3. Memory re-injection after compaction
 
-import os
 import sys
 from typing import Optional
 
 from ..config import (
     COMPACT_TOKEN_THRESHOLD, SUMMARIZE_KEEP_RECENT, SUMMARIZE_THRESHOLD,
-    AGENT_MODEL,
+    DEFAULT_MAX_TOKENS,
 )
 from .conversation import ConversationMemory
-from .utils import estimate_conversation_tokens
-
-
 COMPACT_PROMPT = """\
 You are compacting a conversation to free up context space. \
 Analyze the conversation below and produce a STRUCTURED summary that preserves critical information.
@@ -55,7 +51,7 @@ CONVERSATION TO COMPACT:
 
 def compact_conversation(
     conversation: ConversationMemory,
-    client,
+    runtime_owner,
     keep_recent: int = None,
     custom_instruction: str = "",
 ) -> dict:
@@ -83,17 +79,10 @@ def compact_conversation(
         if custom_instruction:
             prompt += f"\n\nAdditional instruction: {custom_instruction}"
 
-        model = AGENT_MODEL
-        response = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}]
+        summary = runtime_owner.complete_text(
+            prompt,
+            max_output_tokens=min(2048, DEFAULT_MAX_TOKENS),
         )
-
-        summary = ""
-        for block in response.content:
-            if block.type == "text":
-                summary += block.text
 
         if not summary.strip():
             return {"compacted": False, "before_tokens": before_tokens,
@@ -152,12 +141,16 @@ def _format_messages_for_compact(messages: list) -> str:
                     btype = block.get("type", "")
                     if btype == "text":
                         parts.append(block.get("text", ""))
-                    elif btype == "tool_use":
+                    elif btype in {"tool_use", "tool_call"}:
                         name = block.get("name", "?")
-                        inp = str(block.get("input", {}))
+                        inp = str(block.get("arguments", block.get("input", {})))
                         if len(inp) > 500:
                             inp = inp[:500] + "..."
                         parts.append(f"[Tool call: {name}({inp})]")
+                    elif btype == "thinking":
+                        thinking = block.get("thinking", "")
+                        if thinking:
+                            parts.append(f"[Thinking: {thinking[:500]}]")
                     elif btype == "tool_result":
                         result = str(block.get("content", ""))
                         if len(result) > MAX_TOOL_RESULT_CHARS:
@@ -179,7 +172,7 @@ def _format_messages_for_compact(messages: list) -> str:
 
 def summarize_if_needed(
     conversation: ConversationMemory,
-    client,
+    runtime_owner,
     system_prompt_rebuilder=None,
     threshold_tokens: int = None,
     keep_recent: int = None,
@@ -205,7 +198,7 @@ def summarize_if_needed(
     )
     sys.stdout.flush()
 
-    result = compact_conversation(conversation, client, keep_recent)
+    result = compact_conversation(conversation, runtime_owner, keep_recent)
 
     if result.get("compacted"):
         sys.stdout.write(

@@ -111,17 +111,18 @@ class CLI:
 
     # ─── Output ───────────────────────────────────────────────────────────
 
-    def print_banner(self):
+    def print_banner(self, model_label: str = ""):
         """Print the startup banner."""
-        from .config import AGENT_MODEL
-        model_short = AGENT_MODEL.split("-202")[0] if "-202" in AGENT_MODEL else AGENT_MODEL
+        if not model_label:
+            from .config import AGENT_PROVIDER, AGENT_MODEL
+            model_label = f"{AGENT_PROVIDER}:{AGENT_MODEL}"
 
         banner_text = Text()
         banner_text.append("jy-agent", style="bold magenta")
         banner_text.append(" — AI Agent in your terminal\n", style="bold")
-        banner_text.append(f"Model: {model_short}\n", style="dim")
+        banner_text.append(f"Model: {model_label}\n", style="dim")
         banner_text.append("\nCommands: ", style="bold")
-        banner_text.append("/help /quit /new /tools /multi /markdown /skills\n")
+        banner_text.append("/help /quit /new /tools /multi /markdown /skills /model\n")
         banner_text.append("\nInput:    ", style="bold")
         banner_text.append("Enter=submit │ Esc→Enter=newline │ /multi=toggle\n")
         banner_text.append("Exit:     ", style="bold")
@@ -177,6 +178,7 @@ class CLI:
             ("/history", "Show last 10 messages"),
             ("/new", "Save session and start fresh"),
             ("/tools", "List registered tools"),
+            ("/model", "Show or switch provider/model"),
             ("/multi", "Toggle multi-line input mode"),
             ("/markdown", "Toggle markdown rendering"),
             ("/stats", "Show session statistics (tokens, cost)"),
