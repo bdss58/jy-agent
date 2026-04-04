@@ -1,0 +1,42 @@
+[
+  {
+    "query": "Use Codex to refactor the auth middleware",
+    "should_trigger": true
+  },
+  {
+    "query": "Run codex review on my uncommitted changes",
+    "should_trigger": true
+  },
+  {
+    "query": "Delegate this bug fix to Codex CLI",
+    "should_trigger": true
+  },
+  {
+    "query": "Use codex exec to analyze this repo and suggest the smallest fix",
+    "should_trigger": true
+  },
+  {
+    "query": "Continue the Codex session and add tests",
+    "should_trigger": true
+  },
+  {
+    "query": "Fix this bug",
+    "should_trigger": false
+  },
+  {
+    "query": "Use Claude Code to implement this feature",
+    "should_trigger": false
+  },
+  {
+    "query": "Research the latest OpenAI pricing",
+    "should_trigger": false
+  },
+  {
+    "query": "Create a skill for Docker deployments",
+    "should_trigger": false
+  },
+  {
+    "query": "Rename this variable in one file",
+    "should_trigger": false
+  }
+]
