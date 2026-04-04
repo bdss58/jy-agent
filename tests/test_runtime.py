@@ -7,9 +7,14 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from jyagent.runtime import RuntimeOwner, get_adapter
 from jyagent.runtime.history import normalize_anthropic_tool_call_id, transform_messages_for_target
-from jyagent.runtime.providers.anthropic import _assistant_from_response as anthropic_assistant_from_response
+from jyagent.runtime.providers.anthropic import (
+    AnthropicAdapter,
+    _assistant_from_response as anthropic_assistant_from_response,
+)
 from jyagent.runtime.providers.openai import (
+    OpenAIAdapter,
     _assistant_from_response as openai_assistant_from_response,
     _convert_messages as openai_convert_messages,
 )
@@ -28,6 +33,79 @@ class _OpenAIItem:
         self.type = item_type
         for key, value in kwargs.items():
             setattr(self, key, value)
+
+
+class _FakeManagedStream:
+    def __init__(self, events):
+        self._events = list(events)
+        self.iterated = False
+
+    def __iter__(self):
+        self.iterated = True
+        yield from self._events
+
+
+class _FakeOpenAIManagedStream(_FakeManagedStream):
+    def __init__(self, events, final_response):
+        super().__init__(events)
+        self._final_response = final_response
+
+    def get_final_response(self):
+        return self._final_response
+
+
+class _FakeAnthropicManagedStream(_FakeManagedStream):
+    def __init__(self, events, final_message):
+        super().__init__(events)
+        self._final_message = final_message
+
+    def get_final_message(self):
+        return self._final_message
+
+
+class _FakeStreamManager:
+    def __init__(self, stream):
+        self._stream = stream
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self._stream
+
+    def __exit__(self, exc_type, exc, tb):
+        self.exited = True
+        return False
+
+
+class _FakeOpenAIResponsesAPI:
+    def __init__(self, manager):
+        self._manager = manager
+        self.stream_calls = []
+        self.create_calls = []
+
+    def stream(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        return self._manager
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        raise AssertionError("complete() should use responses.stream()")
+
+
+class _FakeAnthropicMessagesAPI:
+    def __init__(self, manager):
+        self._manager = manager
+        self.stream_calls = []
+        self.create_calls = []
+
+    def stream(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        return self._manager
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        raise AssertionError("complete() should use messages.stream()")
 
 
 class TestRuntimeTransforms:
@@ -182,3 +260,184 @@ class TestRuntimeAdapters:
         assert message["content"][0] == {"type": "text", "text": "hello"}
         assert message["content"][1]["type"] == "tool_call"
         assert message["content"][1]["arguments"] == {"value": "x"}
+
+    def test_openai_complete_uses_stream_for_text_response(self, monkeypatch):
+        final_response = SimpleNamespace(
+            id="resp_text",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_text",
+                    phase="final_answer",
+                    content=[_OpenAIItem("output_text", text="hello from stream")],
+                ),
+            ],
+        )
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.output_text.delta", delta="hello ")],
+            final_response,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["content"] == [{"type": "text", "text": "hello from stream"}]
+        assert message["stop_reason"] == "stop"
+        assert managed_stream.iterated is True
+        assert manager.entered is True
+        assert manager.exited is True
+        assert responses_api.create_calls == []
+        assert len(responses_api.stream_calls) == 1
+
+    def test_openai_complete_uses_stream_for_tool_call_response(self, monkeypatch):
+        final_response = SimpleNamespace(
+            id="resp_tool",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3, total_tokens=10),
+            output=[
+                _OpenAIItem(
+                    "function_call",
+                    call_id="call_1",
+                    name="echo",
+                    arguments=json.dumps({"value": "x"}),
+                ),
+            ],
+        )
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.function_call_arguments.delta", delta="{")],
+            final_response,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["stop_reason"] == "tool_use"
+        assert message["content"] == [
+            {"type": "tool_call", "id": "call_1", "name": "echo", "arguments": {"value": "x"}}
+        ]
+        assert managed_stream.iterated is True
+        assert manager.exited is True
+        assert responses_api.create_calls == []
+
+    def test_anthropic_complete_uses_stream_for_text_response(self, monkeypatch):
+        final_response = SimpleNamespace(
+            id="msg_text",
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=4),
+            content=[_AnthropicBlock("text", text="hello from stream")],
+        )
+        managed_stream = _FakeAnthropicManagedStream(
+            [SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(text="hello "))],
+            final_response,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        messages_api = _FakeAnthropicMessagesAPI(manager)
+        adapter = AnthropicAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(messages=messages_api),
+        )
+
+        message = adapter.complete(ModelSpec("anthropic", "claude-sonnet-4"), {"messages": []})
+
+        assert message["content"] == [{"type": "text", "text": "hello from stream"}]
+        assert message["stop_reason"] == "stop"
+        assert managed_stream.iterated is True
+        assert manager.entered is True
+        assert manager.exited is True
+        assert messages_api.create_calls == []
+        assert len(messages_api.stream_calls) == 1
+
+    def test_anthropic_complete_uses_stream_for_tool_call_response(self, monkeypatch):
+        final_response = SimpleNamespace(
+            id="msg_tool",
+            stop_reason="tool_use",
+            usage=SimpleNamespace(input_tokens=8, output_tokens=2),
+            content=[_AnthropicBlock("tool_use", id="tool_1", name="echo", input={"value": "x"})],
+        )
+        managed_stream = _FakeAnthropicManagedStream(
+            [
+                SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(type="input_json_delta", partial_json="{"),
+                )
+            ],
+            final_response,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        messages_api = _FakeAnthropicMessagesAPI(manager)
+        adapter = AnthropicAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(messages=messages_api),
+        )
+
+        message = adapter.complete(ModelSpec("anthropic", "claude-sonnet-4"), {"messages": []})
+
+        assert message["stop_reason"] == "tool_use"
+        assert message["content"] == [
+            {"type": "tool_call", "id": "tool_1", "name": "echo", "arguments": {"value": "x"}}
+        ]
+        assert managed_stream.iterated is True
+        assert manager.exited is True
+        assert messages_api.create_calls == []
+
+    def test_runtime_owner_complete_text_uses_stream_backed_complete(self, monkeypatch):
+        class _FakeRuntimeStream:
+            def __init__(self, final_message):
+                self._final_message = final_message
+                self.iterated = False
+                self.closed = False
+
+            def __iter__(self):
+                self.iterated = True
+                yield {"type": "text_delta", "text": "partial"}
+
+            def get_final_message(self):
+                return self._final_message
+
+            def close(self):
+                self.closed = True
+
+        final_message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "silent answer"}],
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "stop_reason": "stop",
+        }
+        fake_stream = _FakeRuntimeStream(final_message)
+        adapter = get_adapter("openai")
+        monkeypatch.setattr(
+            adapter,
+            "stream",
+            lambda model_spec, context, options=None: fake_stream,
+        )
+
+        owner = RuntimeOwner(ModelSpec("openai", "gpt-5-mini"))
+        text = owner.complete_text("hello", system_prompt="system")
+
+        assert text == "silent answer"
+        assert fake_stream.iterated is True
+        assert fake_stream.closed is True

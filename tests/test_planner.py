@@ -6,11 +6,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import jyagent.planner as planner
 from jyagent.planner import (
     ToolResult, _is_error_result, _result_content,
-    _truncate_tool_result, _compact_working_messages, _execute_tool,
+    _truncate_tool_result, _compact_working_messages, _execute_tool, plan_next_action,
 )
 from jyagent.registry import get_registry
+from jyagent.runtime import RuntimeOwner, get_adapter
+from jyagent.runtime.types import ModelSpec
 
 
 class TestToolResult:
@@ -201,3 +204,108 @@ class TestToolInputValidation:
             assert "input.limit must be <= 10" in result.content
         finally:
             reg.unregister("_test_maximum")
+
+
+class TestPlannerFallback:
+    def test_max_steps_fallback_uses_stream_backed_complete(self, monkeypatch):
+        tool_name = "_test_planner_fallback_tool"
+
+        class _DummyStats:
+            def __init__(self):
+                self.recorded_usage = []
+
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                self.recorded_usage.append((usage, provider, model))
+
+            def record_tool_call(self):
+                pass
+
+        class _FakeRuntimeStream:
+            def __init__(self, final_message):
+                self._final_message = final_message
+                self.iterated = False
+                self.closed = False
+
+            def __iter__(self):
+                self.iterated = True
+                yield {"type": "text_delta", "text": "fallback"}
+
+            def get_final_message(self):
+                return self._final_message
+
+            def close(self):
+                self.closed = True
+
+        def _tool():
+            return "tool output"
+
+        schema = {
+            "name": tool_name,
+            "description": "planner fallback tool",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+            },
+        }
+        reg = get_registry()
+        reg.register(tool_name, _tool, schema)
+
+        dummy_stats = _DummyStats()
+        written = []
+        final_message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "fallback answer"}],
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+            "stop_reason": "stop",
+        }
+        fake_stream = _FakeRuntimeStream(final_message)
+        adapter = get_adapter("openai")
+
+        def _fake_stream_with_retry(runtime_owner, context, max_output_tokens, step, all_text, working_messages):
+            return (
+                "",
+                [planner._ToolCallRequest(id="call_1", name=tool_name, input={})],
+                "tool_use",
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_call", "id": "call_1", "name": tool_name, "arguments": {}}],
+                    "provider": "openai",
+                    "model": "gpt-5-mini",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "tool_use",
+                },
+            )
+
+        monkeypatch.setattr(planner, "_stream_with_retry", _fake_stream_with_retry)
+        monkeypatch.setattr(planner, "get_stats", lambda: dummy_stats)
+        monkeypatch.setattr(planner, "_stream_write", written.append)
+        monkeypatch.setattr(
+            adapter,
+            "stream",
+            lambda model_spec, context, options=None: fake_stream,
+        )
+
+        try:
+            result, final_text, working_messages = plan_next_action(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                [],
+                "system prompt",
+                max_steps=1,
+            )
+        finally:
+            reg.unregister(tool_name)
+
+        assert result == "fallback answer"
+        assert final_text == "fallback answer"
+        assert working_messages[-1]["content"] == [{"type": "text", "text": "fallback answer"}]
+        assert written == ["fallback answer"]
+        assert fake_stream.iterated is True
+        assert fake_stream.closed is True
+        assert dummy_stats.recorded_usage == [
+            ({"input_tokens": 2, "output_tokens": 3}, "openai", "gpt-5-mini")
+        ]

@@ -65,9 +65,11 @@ class _FakeMessagesAPI:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
+        self.create_calls = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        self.create_calls.append(kwargs)
         if not self._responses:
             raise AssertionError("No fake responses left for client.messages.create()")
         response = self._responses.pop(0)
@@ -76,9 +78,50 @@ class _FakeMessagesAPI:
         return response
 
 
-class _FakeClient:
+class _FakeStream:
+    def __init__(self, response):
+        self._response = response
+
+    def __iter__(self):
+        yield from ()
+
+    def get_final_message(self):
+        return self._response
+
+
+class _FakeStreamContext:
+    def __init__(self, response):
+        self._stream = _FakeStream(response)
+
+    def __enter__(self):
+        return self._stream
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeStreamingMessagesAPI(_FakeMessagesAPI):
     def __init__(self, responses):
-        self.messages = _FakeMessagesAPI(responses)
+        super().__init__(responses)
+        self.stream_calls = []
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        self.stream_calls.append(kwargs)
+        if not self._responses:
+            raise AssertionError("No fake responses left for client.messages.stream()")
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return _FakeStreamContext(response)
+
+
+class _FakeClient:
+    def __init__(self, responses, stream=False):
+        if stream:
+            self.messages = _FakeStreamingMessagesAPI(responses)
+        else:
+            self.messages = _FakeMessagesAPI(responses)
 
 
 def _register_tool(name, fn):
@@ -120,6 +163,19 @@ class TestDispatchAgent:
 
         assert result.is_error is False
         assert result.content == "final answer"
+
+    def test_completed_child_prefers_stream_when_available(self, monkeypatch):
+        client = _FakeClient([
+            _FakeResponse([_FakeTextBlock("final answer")], input_tokens=5, output_tokens=7),
+        ], stream=True)
+        monkeypatch.setattr(subagent, "_get_client", lambda: client)
+
+        result = dispatch_agent("summarize this", max_steps=2)
+
+        assert result.is_error is False
+        assert result.content == "final answer"
+        assert len(client.messages.stream_calls) == 1
+        assert client.messages.create_calls == []
 
     def test_api_failure_returns_hard_error_with_partial_output(self, monkeypatch):
         tool_name = "_test_subagent_api_failure_tool"
@@ -177,6 +233,38 @@ class TestDispatchAgent:
         assert "tools" in client.messages.calls[0]
         assert "tools" not in client.messages.calls[1]
 
+    def test_max_steps_streaming_returns_hard_error_and_best_effort_answer(self, monkeypatch):
+        tool_name = "_test_subagent_max_steps_stream_tool"
+        _register_tool(tool_name, lambda value: f"ok:{value}")
+        client = _FakeClient([
+            _FakeResponse(
+                [
+                    _FakeTextBlock("step draft"),
+                    _FakeToolUseBlock("tool-1", tool_name, {"value": "x"}),
+                ],
+                input_tokens=2,
+                output_tokens=3,
+            ),
+            _FakeResponse([_FakeTextBlock("best final answer")], input_tokens=4, output_tokens=5),
+        ], stream=True)
+        monkeypatch.setattr(subagent, "_get_client", lambda: client)
+
+        try:
+            result = dispatch_agent("analyze", max_steps=1, tool_whitelist=[tool_name])
+        finally:
+            get_registry().unregister(tool_name)
+
+        assert result.is_error is True
+        assert "Error: Sub-agent reached max_steps (1)." in result.content
+        assert "Best-effort final answer:" in result.content
+        assert "best final answer" in result.content
+        assert "Partial output:" in result.content
+        assert "step draft" in result.content
+        assert "tools" in client.messages.calls[0]
+        assert "tools" not in client.messages.calls[1]
+        assert len(client.messages.stream_calls) == 2
+        assert client.messages.create_calls == []
+
     def test_timeout_remains_hard_error(self, monkeypatch):
         def _slow_run_subagent(*_args, **_kwargs):
             time.sleep(0.2)
@@ -228,3 +316,29 @@ class TestDispatchAgent:
         tool_results = client.messages.calls[1]["messages"][-1]["content"]
         assert tool_results[0]["is_error"] is True
         assert "Error calling tool" in tool_results[0]["content"]
+
+    def test_child_tool_error_can_recover_via_stream_and_finish_successfully(self, monkeypatch):
+        tool_name = "_test_subagent_recovering_stream_tool"
+
+        def _boom(value):
+            raise RuntimeError("tool exploded")
+
+        _register_tool(tool_name, _boom)
+        client = _FakeClient([
+            _FakeResponse([_FakeToolUseBlock("tool-1", tool_name, {"value": "x"})]),
+            _FakeResponse([_FakeTextBlock("Recovered answer")], input_tokens=1, output_tokens=2),
+        ], stream=True)
+        monkeypatch.setattr(subagent, "_get_client", lambda: client)
+
+        try:
+            result = dispatch_agent("recover", max_steps=3, tool_whitelist=[tool_name])
+        finally:
+            get_registry().unregister(tool_name)
+
+        assert result.is_error is False
+        assert result.content == "Recovered answer"
+        tool_results = client.messages.calls[1]["messages"][-1]["content"]
+        assert tool_results[0]["is_error"] is True
+        assert "Error calling tool" in tool_results[0]["content"]
+        assert len(client.messages.stream_calls) == 2
+        assert client.messages.create_calls == []

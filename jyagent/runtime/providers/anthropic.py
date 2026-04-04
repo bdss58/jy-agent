@@ -212,12 +212,13 @@ class AnthropicAdapter:
         return _AnthropicStream(client.messages.stream(**kwargs, timeout=timeout), model_spec)
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
-        client = self._client()
-        kwargs = self._request_kwargs(model_spec, context, options)
-        timeout = None if options is None else options.timeout
-        response = client.messages.create(**kwargs, timeout=timeout)
-        return _assistant_from_response(model_spec, response)
+        stream = self.stream(model_spec, context, options)
+        try:
+            for _event in stream:
+                pass
+            return stream.get_final_message()
+        finally:
+            stream.close()
 
 
 register_adapter(AnthropicAdapter())
-

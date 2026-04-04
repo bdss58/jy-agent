@@ -3,7 +3,7 @@
 # The parent (lead) agent decomposes a complex task into sub-problems,
 # dispatches sub-agents for each, and synthesizes results.
 #
-# Sub-agents run silently (no streaming to terminal), have their own context
+# Sub-agents run silently (no terminal streaming), have their own context
 # window and message history, and return only their final answer to the parent.
 
 import sys
@@ -97,7 +97,14 @@ class _LegacyClientRuntimeOwner:
         }
         if context.get("tools"):
             kwargs["tools"] = context["tools"]
-        response = self._client.messages.create(**kwargs, timeout=timeout)
+        stream_fn = getattr(self._client.messages, "stream", None)
+        if callable(stream_fn):
+            with stream_fn(**kwargs, timeout=timeout) as stream:
+                for _event in stream:
+                    pass
+                response = stream.get_final_message()
+        else:
+            response = self._client.messages.create(**kwargs, timeout=timeout)
         return self._normalize_response(model_spec, response)
 
     def _convert_messages(self, messages):
@@ -259,7 +266,7 @@ _SUBAGENT_FINAL_NO_TOOLS_SUFFIX = (
 )
 
 
-# ─── Non-streaming tool loop (the sub-agent engine) ──────────────────────────
+# ─── Silent tool loop (the sub-agent engine) ─────────────────────────────────
 
 def _execute_tool_silent(tool_name, tool_input, tool_functions):
     """Execute a single tool call. Same as planner._execute_tool but standalone."""
@@ -360,7 +367,8 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
 def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions):
     """Run a sub-agent's tool loop to completion.
 
-    This is the core engine — a non-streaming version of plan_next_action.
+    This is the core engine for silent sub-agent execution.
+    Provider transport may still stream under the hood.
     Runs entirely in the calling thread (no terminal output).
     """
     runtime_owner = _get_runtime_owner()
