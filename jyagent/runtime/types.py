@@ -57,6 +57,7 @@ class AssistantMessage(TypedDict, total=False):
     response_id: str
     id: str
     phase: Literal["commentary", "final_answer"]
+    runtime_warnings: list[str]
 
 
 class ToolResultMessage(TypedDict):
@@ -121,4 +122,3 @@ class RuntimeStream(Protocol):
 
     def close(self) -> None:
         ...
-

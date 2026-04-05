@@ -46,11 +46,15 @@ class _FakeManagedStream:
 
 
 class _FakeOpenAIManagedStream(_FakeManagedStream):
-    def __init__(self, events, final_response):
+    def __init__(self, events, final_response, *, final_error=None, state=None):
         super().__init__(events)
         self._final_response = final_response
+        self._final_error = final_error
+        self._state = state if state is not None else SimpleNamespace()
 
     def get_final_response(self):
+        if self._final_error is not None:
+            raise self._final_error
         return self._final_response
 
 
@@ -79,10 +83,13 @@ class _FakeStreamManager:
 
 
 class _FakeOpenAIResponsesAPI:
-    def __init__(self, manager):
+    def __init__(self, manager, *, retrieve_result=None, retrieve_error=None):
         self._manager = manager
+        self._retrieve_result = retrieve_result
+        self._retrieve_error = retrieve_error
         self.stream_calls = []
         self.create_calls = []
+        self.retrieve_calls = []
 
     def stream(self, **kwargs):
         self.stream_calls.append(kwargs)
@@ -91,6 +98,14 @@ class _FakeOpenAIResponsesAPI:
     def create(self, **kwargs):
         self.create_calls.append(kwargs)
         raise AssertionError("complete() should use responses.stream()")
+
+    def retrieve(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        if self._retrieve_error is not None:
+            raise self._retrieve_error
+        if self._retrieve_result is None:
+            raise AssertionError("retrieve() should not be called without a configured fake response")
+        return self._retrieve_result
 
 
 class _FakeAnthropicMessagesAPI:
@@ -336,6 +351,141 @@ class TestRuntimeAdapters:
         assert managed_stream.iterated is True
         assert manager.exited is True
         assert responses_api.create_calls == []
+
+    def test_openai_complete_recovers_missing_completed_event_via_retrieve(self, monkeypatch):
+        retrieved_response = SimpleNamespace(
+            id="resp_recovered_text",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=9, output_tokens=4, total_tokens=13),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_recovered_text",
+                    phase="final_answer",
+                    content=[_OpenAIItem("output_text", text="recovered text")],
+                ),
+            ],
+        )
+        missing_completed = RuntimeError("Didn't receive a `response.completed` event.")
+        managed_stream = _FakeOpenAIManagedStream(
+            [
+                SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_recovered_text")),
+                SimpleNamespace(type="response.output_text.delta", delta="recover"),
+            ],
+            None,
+            final_error=missing_completed,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager, retrieve_result=retrieved_response)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["content"] == [{"type": "text", "text": "recovered text"}]
+        assert message["runtime_warnings"] == [
+            "Recovered OpenAI stream after missing terminal event via responses.retrieve()."
+        ]
+        assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_text"
+        assert manager.exited is True
+
+    def test_openai_complete_recovers_tool_call_via_retrieve(self, monkeypatch):
+        retrieved_response = SimpleNamespace(
+            id="resp_recovered_tool",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=7, output_tokens=3, total_tokens=10),
+            output=[
+                _OpenAIItem(
+                    "function_call",
+                    call_id="call_recovered",
+                    name="echo",
+                    arguments=json.dumps({"value": "retrieved"}),
+                ),
+            ],
+        )
+        missing_completed = RuntimeError("Didn't receive a `response.completed` event.")
+        managed_stream = _FakeOpenAIManagedStream(
+            [
+                SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_recovered_tool")),
+                SimpleNamespace(type="response.function_call_arguments.delta", delta="{"),
+            ],
+            None,
+            final_error=missing_completed,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager, retrieve_result=retrieved_response)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["stop_reason"] == "tool_use"
+        assert message["content"] == [
+            {"type": "tool_call", "id": "call_recovered", "name": "echo", "arguments": {"value": "retrieved"}}
+        ]
+        assert message["runtime_warnings"] == [
+            "Recovered OpenAI stream after missing terminal event via responses.retrieve()."
+        ]
+        assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_tool"
+
+    def test_openai_complete_recovers_from_partial_stream_snapshot_when_retrieve_fails(self, monkeypatch):
+        snapshot = SimpleNamespace(
+            id="resp_snapshot_tool",
+            output=[
+                _OpenAIItem(
+                    "function_call",
+                    call_id="call_snapshot",
+                    name="echo",
+                    arguments=json.dumps({"value": "snapshot"}),
+                ),
+            ],
+            usage=None,
+            error=None,
+            incomplete_details=None,
+        )
+        missing_completed = RuntimeError("Didn't receive a `response.completed` event.")
+        managed_stream = _FakeOpenAIManagedStream(
+            [
+                SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_snapshot_tool")),
+                SimpleNamespace(type="response.function_call_arguments.delta", delta="{"),
+            ],
+            None,
+            final_error=missing_completed,
+            state=SimpleNamespace(_ResponseStreamState__current_snapshot=snapshot),
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(
+            manager,
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["stop_reason"] == "tool_use"
+        assert message["content"] == [
+            {"type": "tool_call", "id": "call_snapshot", "name": "echo", "arguments": {"value": "snapshot"}}
+        ]
+        assert message["usage"] == {}
+        assert message["runtime_warnings"] == [
+            "Recovered OpenAI stream after missing terminal event from partial stream snapshot."
+        ]
+        assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_tool"
 
     def test_anthropic_complete_uses_stream_for_text_response(self, monkeypatch):
         final_response = SimpleNamespace(

@@ -33,6 +33,7 @@ COLOR_CYAN = "\033[1;36m"
 COLOR_RED = "\033[1;31m"
 COLOR_GREEN = "\033[0;32m"
 COLOR_MAGENTA = "\033[0;35m"
+COLOR_DIM_YELLOW = "\033[2;33m"
 
 
 @dataclass
@@ -239,6 +240,12 @@ def _render_edit_diff(result_str: str):
 def _interrupted_msg():
     """Print interruption message."""
     sys.stdout.write(f"\n{COLOR_YELLOW}⚠ Interrupted by Ctrl-C{COLOR_RESET}\n")
+    sys.stdout.flush()
+
+
+def _runtime_warning(msg: str):
+    """Print a short runtime recovery warning without aborting the turn."""
+    sys.stdout.write(f"\n{COLOR_DIM_YELLOW}  ⚠ {msg}{COLOR_RESET}\n")
     sys.stdout.flush()
 
 
@@ -535,6 +542,8 @@ def _stream_response(runtime_owner: RuntimeOwner, context: dict, max_output_toke
                     first_token = False
 
         final_message = stream.get_final_message()
+        for warning in final_message.get("runtime_warnings", []):
+            _runtime_warning(warning)
         stop_reason = final_message.get("stop_reason", "stop")
         tool_use_blocks = _assistant_tool_calls(final_message)
 

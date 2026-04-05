@@ -309,3 +309,73 @@ class TestPlannerFallback:
         assert dummy_stats.recorded_usage == [
             ({"input_tokens": 2, "output_tokens": 3}, "openai", "gpt-5-mini")
         ]
+
+
+class TestPlannerWarnings:
+    def test_runtime_warnings_are_printed_without_aborting_turn(self, monkeypatch, capsys):
+        class _DummyStats:
+            def __init__(self):
+                self.recorded_usage = []
+
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                self.recorded_usage.append((usage, provider, model))
+
+            def record_tool_call(self):
+                pass
+
+        class _FakeRuntimeStream:
+            def __init__(self, final_message):
+                self._final_message = final_message
+                self.closed = False
+
+            def __iter__(self):
+                yield {"type": "text_delta", "text": "warning-safe answer"}
+
+            def get_final_message(self):
+                return self._final_message
+
+            def close(self):
+                self.closed = True
+
+        dummy_stats = _DummyStats()
+        final_message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "warning-safe answer"}],
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "usage": {"input_tokens": 4, "output_tokens": 5},
+            "stop_reason": "stop",
+            "runtime_warnings": [
+                "Recovered OpenAI stream after missing terminal event via responses.retrieve()."
+            ],
+        }
+        fake_stream = _FakeRuntimeStream(final_message)
+        adapter = get_adapter("openai")
+
+        monkeypatch.setattr(planner, "get_stats", lambda: dummy_stats)
+        monkeypatch.setattr(
+            adapter,
+            "stream",
+            lambda model_spec, context, options=None: fake_stream,
+        )
+
+        result, final_text, working_messages = plan_next_action(
+            RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+            [],
+            "system prompt",
+            max_steps=1,
+        )
+
+        output = capsys.readouterr().out
+
+        assert "Recovered OpenAI stream after missing terminal event via responses.retrieve()." in output
+        assert result == "warning-safe answer"
+        assert final_text == "warning-safe answer"
+        assert working_messages[-1]["runtime_warnings"] == final_message["runtime_warnings"]
+        assert fake_stream.closed is True
+        assert dummy_stats.recorded_usage == [
+            ({"input_tokens": 4, "output_tokens": 5}, "openai", "gpt-5-mini")
+        ]

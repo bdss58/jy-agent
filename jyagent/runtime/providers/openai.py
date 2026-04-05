@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -189,16 +190,29 @@ def _assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantM
 
 
 class _OpenAIStream(RuntimeStream):
-    def __init__(self, manager: Any, model_spec: ModelSpec):
+    _MISSING_COMPLETED_EVENT = "Didn't receive a `response.completed` event."
+
+    def __init__(self, manager: Any, model_spec: ModelSpec, responses_api: Any, timeout: float | None = None):
         self._manager = manager
         self._stream = manager.__enter__()
         self._model_spec = model_spec
+        self._responses_api = responses_api
+        self._timeout = timeout
         self._final_message: AssistantMessage | None = None
+        self._response_id = ""
+        self._incomplete_details = None
         self._closed = False
 
     def __iter__(self):
         for event in self._stream:
             event_type = getattr(event, "type", "")
+            response = getattr(event, "response", None)
+            if response is not None and not self._response_id:
+                self._response_id = getattr(response, "id", "") or self._response_id
+            if event_type == "response.incomplete":
+                self._incomplete_details = getattr(response, "incomplete_details", None)
+                if self._incomplete_details is None:
+                    self._incomplete_details = getattr(event, "incomplete_details", None)
             if event_type == "response.output_text.delta":
                 yield {"type": "text_delta", "text": event.delta}
             elif event_type == "response.function_call_arguments.delta":
@@ -206,7 +220,16 @@ class _OpenAIStream(RuntimeStream):
 
     def get_final_message(self) -> AssistantMessage:
         if self._final_message is None:
-            self._final_message = _assistant_from_response(self._model_spec, self._stream.get_final_response())
+            try:
+                response = self._stream.get_final_response()
+                self._final_message = _assistant_from_response(self._model_spec, response)
+            except RuntimeError as err:
+                recovered = self._recover_response(err)
+                if recovered is None:
+                    raise
+                response, warning = recovered
+                self._final_message = _assistant_from_response(self._model_spec, response)
+                self._final_message["runtime_warnings"] = [warning]
         return self._final_message
 
     def close(self) -> None:
@@ -214,6 +237,61 @@ class _OpenAIStream(RuntimeStream):
             return
         self._manager.__exit__(None, None, None)
         self._closed = True
+
+    def _recover_response(self, error: RuntimeError) -> tuple[Any, str] | None:
+        if self._MISSING_COMPLETED_EVENT not in str(error):
+            return None
+
+        retrieved = self._retrieve_response()
+        if retrieved is not None:
+            return (
+                retrieved,
+                "Recovered OpenAI stream after missing terminal event via responses.retrieve().",
+            )
+
+        snapshot = self._snapshot_response()
+        if snapshot is not None:
+            return (
+                snapshot,
+                "Recovered OpenAI stream after missing terminal event from partial stream snapshot.",
+            )
+
+        return None
+
+    def _retrieve_response(self) -> Any | None:
+        if not self._response_id:
+            return None
+        retrieve = getattr(self._responses_api, "retrieve", None)
+        if not callable(retrieve):
+            return None
+        try:
+            return retrieve(response_id=self._response_id, timeout=self._timeout)
+        except Exception:
+            return None
+
+    def _snapshot_response(self) -> Any | None:
+        state = getattr(self._stream, "_state", None)
+        if state is None:
+            return None
+        snapshot = getattr(state, "_ResponseStreamState__current_snapshot", None)
+        if snapshot is None:
+            return None
+
+        output = getattr(snapshot, "output", None) or []
+        response_id = getattr(snapshot, "id", "") or self._response_id
+        if not output:
+            return None
+
+        return SimpleNamespace(
+            id=response_id,
+            output=output,
+            usage=getattr(snapshot, "usage", None),
+            error=getattr(snapshot, "error", None),
+            incomplete_details=(
+                getattr(snapshot, "incomplete_details", None)
+                or self._incomplete_details
+            ),
+        )
 
 
 class OpenAIAdapter:
@@ -255,7 +333,7 @@ class OpenAIAdapter:
         client = self._client()
         kwargs = self._request_kwargs(model_spec, context, options)
         timeout = None if options is None else options.timeout
-        return _OpenAIStream(client.responses.stream(**kwargs, timeout=timeout), model_spec)
+        return _OpenAIStream(client.responses.stream(**kwargs, timeout=timeout), model_spec, client.responses, timeout=timeout)
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
         stream = self.stream(model_spec, context, options)
