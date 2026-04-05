@@ -6,13 +6,7 @@ from .types import (
     AnthropicReasoningConfig,
     AnthropicThinkingAdaptiveConfig,
     AnthropicThinkingDisabledConfig,
-    OpenAIReasoningConfig,
 )
-
-
-_OPENAI_REASONING_KEYS = {"effort", "summary"}
-_OPENAI_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
-_OPENAI_REASONING_SUMMARIES = {"auto", "concise", "detailed"}
 
 _ANTHROPIC_REASONING_KEYS = {"type", "budget_tokens", "display", "effort"}
 _ANTHROPIC_THINKING_TYPES = {"disabled", "adaptive"}
@@ -92,37 +86,6 @@ def _anthropic_effort_unsupported_error(model: str | None) -> ValueError:
         f"Anthropic reasoning effort is not supported by model '{model or '<unset>'}'. "
         "Use 'claude-sonnet-4-6', 'claude-opus-4-6', or 'claude-opus-4-5'."
     )
-
-
-def validate_openai_reasoning(reasoning: Any) -> OpenAIReasoningConfig:
-    config = _ensure_mapping(reasoning, provider="OpenAI")
-    if "generate_summary" in config:
-        raise ValueError("OpenAI reasoning config field 'generate_summary' is deprecated; use 'summary' instead.")
-    _ensure_allowed_keys(config, provider="OpenAI", allowed_keys=_OPENAI_REASONING_KEYS)
-
-    validated: OpenAIReasoningConfig = {}
-
-    if "effort" in config:
-        validated["effort"] = cast(
-            Any,
-            _require_literal(
-                config["effort"],
-                field_name="effort",
-                allowed_values=_OPENAI_REASONING_EFFORTS,
-                provider="OpenAI",
-            ),
-        )
-    if "summary" in config:
-        validated["summary"] = cast(
-            Any,
-            _require_literal(
-                config["summary"],
-                field_name="summary",
-                allowed_values=_OPENAI_REASONING_SUMMARIES,
-                provider="OpenAI",
-            ),
-        )
-    return validated
 
 
 def validate_anthropic_reasoning(reasoning: Any, *, model: str | None = None) -> AnthropicReasoningConfig:

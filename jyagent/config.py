@@ -24,6 +24,7 @@ AGENT_PROVIDER = (os.environ.get("AGENT_PROVIDER") or "anthropic").strip() or "a
 AGENT_MODEL = os.environ.get("AGENT_MODEL", DEFAULT_ANTHROPIC_MODEL)
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
 MAX_TOKENS_CAP = int(os.environ.get("AGENT_MAX_TOKENS_CAP", "128000"))
+SUPPORTED_RUNTIME_PROVIDERS = ("anthropic",)
 
 # ─── Planner / Tool dispatch ─────────────────────────────────────────────────
 
@@ -91,28 +92,47 @@ BINARY_EXTS = {
 
 
 def get_active_model_spec():
+    return build_model_spec(AGENT_PROVIDER, AGENT_MODEL, source="AGENT_PROVIDER")
+
+
+def validate_runtime_provider(provider: str, *, source: str) -> str:
+    resolved = (provider or "").strip()
+    if not resolved:
+        raise ValueError(
+            f"{source} is empty. Anthropic is now the only supported provider; use 'anthropic'."
+        )
+    if resolved == "openai":
+        raise ValueError(
+            f"{source} selects removed provider 'openai'. "
+            "OpenAI support was removed; Anthropic is now the only supported provider."
+        )
+    if resolved not in SUPPORTED_RUNTIME_PROVIDERS:
+        raise ValueError(
+            f"{source} has unsupported provider '{resolved}'. "
+            "Anthropic is now the only supported provider."
+        )
+    return resolved
+
+
+def build_model_spec(provider: str, model: str, *, source: str):
     from .runtime.types import ModelSpec
 
-    return ModelSpec(provider=AGENT_PROVIDER, model=AGENT_MODEL)
+    return ModelSpec(provider=validate_runtime_provider(provider, source=source), model=model)
 
 
 def get_skill_router_model_spec(active_spec=None):
-    from .runtime.types import ModelSpec
-
     active_spec = active_spec or get_active_model_spec()
     provider = (os.environ.get("SKILL_ROUTER_PROVIDER") or active_spec.provider).strip() or active_spec.provider
     model = (os.environ.get("SKILL_ROUTER_MODEL") or active_spec.model).strip() or active_spec.model
-    return ModelSpec(provider=provider, model=model)
+    return build_model_spec(provider, model, source="SKILL_ROUTER_PROVIDER")
 
 
 def get_subagent_model_spec(tier: str, active_spec=None):
-    from .runtime.types import ModelSpec
-
     active_spec = active_spec or get_active_model_spec()
     tier_key = tier.upper()
     provider = (os.environ.get(f"SUBAGENT_{tier_key}_PROVIDER") or active_spec.provider).strip() or active_spec.provider
     model = (os.environ.get(f"SUBAGENT_{tier_key}_MODEL") or active_spec.model).strip() or active_spec.model
-    return ModelSpec(provider=provider, model=model)
+    return build_model_spec(provider, model, source=f"SUBAGENT_{tier_key}_PROVIDER")
 
 
 def get_reasoning_config_for_provider(
@@ -121,21 +141,9 @@ def get_reasoning_config_for_provider(
     max_output_tokens: int | None = None,
     model: str | None = None,
 ):
-    from .runtime.reasoning import validate_anthropic_reasoning, validate_openai_reasoning
+    from .runtime.reasoning import validate_anthropic_reasoning
 
-    provider = (provider or "").strip()
-
-    if provider == "openai":
-        config = {}
-        effort = (os.environ.get("OPENAI_REASONING_EFFORT") or "").strip()
-        summary = (os.environ.get("OPENAI_REASONING_SUMMARY") or "").strip()
-        if effort:
-            config["effort"] = effort
-        if summary:
-            config["summary"] = summary
-        if not config:
-            return None
-        return validate_openai_reasoning(config)
+    provider = validate_runtime_provider(provider, source="reasoning provider")
 
     if provider == "anthropic":
         config = {}

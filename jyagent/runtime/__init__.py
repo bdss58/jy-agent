@@ -7,7 +7,6 @@ from .types import (
     Context,
     Message,
     ModelSpec,
-    OpenAIReasoningConfig,
     ReasoningConfig,
     RuntimeOptions,
     StopReason,
@@ -17,7 +16,6 @@ from .types import (
 
 # Import provider modules for registration side effects.
 from .providers import anthropic as _anthropic  # noqa: F401
-from .providers import openai as _openai  # noqa: F401
 
 __all__ = [
     "AssistantMessage",
@@ -27,7 +25,6 @@ __all__ = [
     "Context",
     "Message",
     "ModelSpec",
-    "OpenAIReasoningConfig",
     "ReasoningConfig",
     "RuntimeOptions",
     "RuntimeOwner",

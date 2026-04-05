@@ -10,7 +10,7 @@ from .memory import (
 from .planner import plan_next_action
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
-from .runtime import RuntimeOwner, list_adapters
+from .runtime import RuntimeOwner
 from .session_stats import get_stats
 
 
@@ -175,11 +175,11 @@ def _cmd_model(cli, runtime_owner: RuntimeOwner, user_input: str, **_):
         return
     provider = parts[1].strip()
     model = " ".join(parts[2:]).strip()
-    available = list_adapters()
-    if provider not in available:
-        cli.print_error(f"Unknown provider '{provider}'. Available: {available}")
+    try:
+        runtime_owner.switch_model(provider, model)
+    except ValueError as err:
+        cli.print_error(str(err))
         return
-    runtime_owner.switch_model(provider, model)
     get_stats().set_active_model(provider, model)
     cli.print_system(f"Switched model to {provider}:{model}")
 

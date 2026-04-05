@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from ..config import get_reasoning_config_for_provider
+from ..config import build_model_spec, get_reasoning_config_for_provider
 from .types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
 
 
@@ -37,7 +37,9 @@ def list_adapters() -> list[str]:
 
 class RuntimeOwner:
     def __init__(self, model_spec: ModelSpec):
-        self._model_spec = model_spec
+        resolved = build_model_spec(model_spec.provider, model_spec.model, source="model spec provider")
+        get_adapter(resolved.provider)
+        self._model_spec = resolved
 
     @property
     def model_spec(self) -> ModelSpec:
@@ -47,7 +49,9 @@ class RuntimeOwner:
         return self._model_spec.label()
 
     def switch_model(self, provider: str, model: str) -> ModelSpec:
-        self._model_spec = ModelSpec(provider=provider, model=model)
+        resolved = build_model_spec(provider, model, source="/model provider")
+        get_adapter(resolved.provider)
+        self._model_spec = resolved
         return self._model_spec
 
     def stream(self, context: Context, options: RuntimeOptions | None = None, model_spec: ModelSpec | None = None) -> RuntimeStream:

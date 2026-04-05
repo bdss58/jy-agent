@@ -7,14 +7,19 @@ Usage:
     jy-agent                   # Via CLI entry point
 """
 
-import os
+from __future__ import annotations
 
-from .runtime import RuntimeOwner
+import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .runtime import RuntimeOwner
 
 
 def create_runtime_owner() -> RuntimeOwner:
     """Create the default runtime owner from environment configuration."""
     from .config import get_active_model_spec
+    from .runtime import RuntimeOwner
 
     return RuntimeOwner(get_active_model_spec())
 

@@ -5,13 +5,11 @@
 
 import threading
 import time
-import re
 from dataclasses import dataclass
 
 
 # ─── Pricing (USD per million tokens) ──────────────────────────────────────
-# Override via set_model_pricing(). Common OpenAI models are pinned locally,
-# and unknown OpenAI models fall back to the official model docs page.
+# Override via set_model_pricing() when needed.
 
 
 @dataclass(frozen=True)
@@ -59,38 +57,7 @@ _MODEL_PRICING = {
         "claude-3-opus": _pricing(15.0, 75.0, cache_creation_per_million=18.75, cache_read_per_million=1.5),
         "claude-opus-4": _pricing(15.0, 75.0, cache_creation_per_million=18.75, cache_read_per_million=1.5),
     },
-    "openai": {
-        "gpt-5.4-pro": _pricing(
-            30.0,
-            180.0,
-            input_tokens_include_cache_reads=True,
-            long_context_threshold_tokens=272_000,
-            long_context_input_multiplier=2.0,
-            long_context_output_multiplier=1.5,
-        ),
-        "gpt-5.4-mini": _pricing(0.75, 4.50, cache_read_per_million=0.075, input_tokens_include_cache_reads=True),
-        "gpt-5.4-nano": _pricing(0.20, 1.25, cache_read_per_million=0.02, input_tokens_include_cache_reads=True),
-        "gpt-5.4": _pricing(
-            2.50,
-            15.0,
-            cache_read_per_million=0.25,
-            input_tokens_include_cache_reads=True,
-            long_context_threshold_tokens=272_000,
-            long_context_input_multiplier=2.0,
-            long_context_output_multiplier=1.5,
-        ),
-        "gpt-5-pro": _pricing(15.0, 120.0, input_tokens_include_cache_reads=True),
-        "gpt-5-mini": _pricing(0.25, 2.0, cache_read_per_million=0.025, input_tokens_include_cache_reads=True),
-        "gpt-5-nano": _pricing(0.05, 0.40, cache_read_per_million=0.005, input_tokens_include_cache_reads=True),
-        "gpt-5.3-chat-latest": _pricing(1.75, 14.0, cache_read_per_million=0.175, input_tokens_include_cache_reads=True),
-        "gpt-5.3-codex": _pricing(1.75, 14.0, cache_read_per_million=0.175, input_tokens_include_cache_reads=True),
-        "gpt-5": _pricing(1.25, 10.0, cache_read_per_million=0.125, input_tokens_include_cache_reads=True),
-    },
 }
-
-_OPENAI_MODEL_PAGE_BASE_URL = "https://developers.openai.com/api/docs/models"
-_OPENAI_DOCS_FETCH_LOCK = threading.Lock()
-_OPENAI_DOCS_PRICING_CACHE: dict[str, ModelPricing | None] = {}
 
 
 def _coerce_pricing(pricing: ModelPricing | tuple[float, float] | tuple[float, float, float | None, float | None]) -> ModelPricing:
@@ -108,152 +75,12 @@ def _coerce_pricing(pricing: ModelPricing | tuple[float, float] | tuple[float, f
     raise TypeError("pricing must be a ModelPricing or a 2-/4-item tuple")
 
 
-def _openai_model_candidates(model: str) -> list[str]:
-    candidates: list[str] = []
-
-    def add(candidate: str) -> None:
-        candidate = candidate.strip()
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    add(model)
-    add(re.sub(r"-20\d{2}-\d{2}-\d{2}$", "", model))
-    return candidates
-
-
-def _parse_price_token(value: str | None) -> float | None:
-    if value is None:
-        return None
-    value = value.strip()
-    if value == "-":
-        return None
-    if value.startswith("$"):
-        value = value[1:]
-    return float(value.replace(",", ""))
-
-
-def _parse_token_count(value: str) -> int:
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMB]?)", value.strip(), re.IGNORECASE)
-    if not match:
-        raise ValueError(f"Unsupported token count: {value}")
-
-    number = float(match.group(1))
-    suffix = match.group(2).upper()
-    multiplier = {
-        "": 1,
-        "K": 1_000,
-        "M": 1_000_000,
-        "B": 1_000_000_000,
-    }[suffix]
-    return int(number * multiplier)
-
-
-def _parse_openai_model_page_text(text: str) -> ModelPricing | None:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    price_labels = {"Input", "Cached input", "Output"}
-    stop_markers = {"Quick comparison", "Modalities", "Rate limits", "Pricing"}
-    pricing_values: dict[str, str] = {}
-
-    for index, line in enumerate(lines):
-        if line != "Text tokens":
-            continue
-
-        current_label: str | None = None
-        for next_line in lines[index + 1:index + 24]:
-            if next_line in stop_markers:
-                break
-            if next_line in price_labels:
-                current_label = next_line
-                continue
-            if current_label and (next_line.startswith("$") or next_line == "-"):
-                pricing_values[current_label] = next_line
-                current_label = None
-
-        if "Input" in pricing_values and "Output" in pricing_values:
-            break
-        pricing_values = {}
-
-    if "Input" not in pricing_values or "Output" not in pricing_values:
-        return None
-
-    long_context_match = re.search(
-        r"prompts with >([0-9]+(?:\.[0-9]+)?[KMB]?) input tokens are priced at "
-        r"([0-9]+(?:\.[0-9]+)?)x input and ([0-9]+(?:\.[0-9]+)?)x output",
-        text,
-        re.IGNORECASE,
-    )
-
-    long_context_threshold_tokens = None
-    long_context_input_multiplier = 1.0
-    long_context_output_multiplier = 1.0
-    if long_context_match:
-        long_context_threshold_tokens = _parse_token_count(long_context_match.group(1))
-        long_context_input_multiplier = float(long_context_match.group(2))
-        long_context_output_multiplier = float(long_context_match.group(3))
-
-    return ModelPricing(
-        input_per_million=_parse_price_token(pricing_values["Input"]) or 0.0,
-        output_per_million=_parse_price_token(pricing_values["Output"]) or 0.0,
-        cache_creation_per_million=None,
-        cache_read_per_million=_parse_price_token(pricing_values.get("Cached input")),
-        input_tokens_include_cache_reads=True,
-        long_context_threshold_tokens=long_context_threshold_tokens,
-        long_context_input_multiplier=long_context_input_multiplier,
-        long_context_output_multiplier=long_context_output_multiplier,
-    )
-
-
-def _fetch_openai_model_page_text(model: str) -> str | None:
-    try:
-        import httpx
-        from bs4 import BeautifulSoup
-    except Exception:
-        return None
-
-    try:
-        response = httpx.get(f"{_OPENAI_MODEL_PAGE_BASE_URL}/{model}", follow_redirects=True, timeout=5.0)
-        response.raise_for_status()
-    except Exception:
-        return None
-
-    return BeautifulSoup(response.text, "html.parser").get_text("\n")
-
-
-def _lookup_openai_pricing_from_docs(model: str) -> ModelPricing | None:
-    for candidate in _openai_model_candidates(model):
-        if candidate in _OPENAI_DOCS_PRICING_CACHE:
-            cached = _OPENAI_DOCS_PRICING_CACHE[candidate]
-            if cached is not None:
-                set_model_pricing("openai", candidate, cached)
-                return cached
-
-    with _OPENAI_DOCS_FETCH_LOCK:
-        for candidate in _openai_model_candidates(model):
-            if candidate in _OPENAI_DOCS_PRICING_CACHE:
-                cached = _OPENAI_DOCS_PRICING_CACHE[candidate]
-                if cached is not None:
-                    set_model_pricing("openai", candidate, cached)
-                    return cached
-                continue
-
-            page_text = _fetch_openai_model_page_text(candidate)
-            pricing = _parse_openai_model_page_text(page_text) if page_text else None
-            _OPENAI_DOCS_PRICING_CACHE[candidate] = pricing
-            if pricing is not None:
-                set_model_pricing("openai", candidate, pricing)
-                return pricing
-
-    return None
-
-
 def _lookup_pricing(provider: str, model: str) -> ModelPricing | None:
     """Find pricing by longest prefix match."""
     pricing_map = _MODEL_PRICING.get(provider, {})
     for prefix, pricing in sorted(pricing_map.items(), key=lambda x: -len(x[0])):
         if model.startswith(prefix):
             return _coerce_pricing(pricing)
-    if provider == "openai":
-        return _lookup_openai_pricing_from_docs(model)
     return None
 
 

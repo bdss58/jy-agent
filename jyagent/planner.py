@@ -592,22 +592,6 @@ def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars:
     return "\n".join(lines)
 
 
-def _is_terminal_openai_stream_error(runtime_owner: RuntimeOwner, error: BaseException) -> bool:
-    if runtime_owner.model_spec.provider != "openai":
-        return False
-    if isinstance(error, json.JSONDecodeError):
-        return True
-    return "response.completed" in str(error).lower()
-
-
-def _terminal_openai_stream_error_reason(error: BaseException) -> str:
-    if isinstance(error, json.JSONDecodeError):
-        return "malformed SSE JSON"
-    if "response.completed" in str(error).lower():
-        return "missing response.completed event"
-    return "stream transport failure"
-
-
 class _StreamFailure(Exception):
     """Raised when a streamed response fails after emitting partial output."""
 
@@ -719,44 +703,13 @@ def _stream_with_retry(
         except _StreamFailure as stream_failure:
             stream_err = stream_failure.error
             partial_step_text = stream_failure.partial_text
-        except Exception as stream_err:
+        except Exception as err:
+            stream_err = err
             partial_step_text = ""
-
-        if _is_terminal_openai_stream_error(runtime_owner, stream_err):
-            reason = _terminal_openai_stream_error_reason(stream_err)
-            diagnostics_text = _format_stream_error_diagnostics(stream_err)
-            log_event(
-                logger,
-                logging.ERROR,
-                "planner.stream.failed",
-                component="planner",
-                step=step + 1,
-                attempt=attempt + 1,
-                transient=False,
-                terminal_openai_stream_error=True,
-                partial_step_chars=len(partial_step_text),
-                error_type=type(stream_err).__name__,
-                error_message=scrub_string(str(stream_err), max_text_chars=500),
-                stream_failure_reason=reason,
-                traceback=scrub_string(format_traceback(stream_err), max_text_chars=4000),
-                **_stream_error_log_fields(stream_err),
-            )
-            error_msg = f"\n[Stream error at step {step+1}: {stream_err}]"
-            if diagnostics_text:
-                error_msg += f"\n{diagnostics_text}"
-            error_msg += "\n"
-            sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
-            sys.stdout.flush()
-            raise _StreamAbort(
-                _stream_abort_text(all_text + partial_step_text, step, stream_err),
-                "",
-                working_messages,
-            )
 
         is_transient = isinstance(stream_err, json.JSONDecodeError) or any(kw in str(stream_err).lower() for kw in [
             "incomplete", "peer closed", "connection reset", "timeout",
             "eof", "broken pipe", "overloaded", "529", "server_error",
-            "response.completed",  # OpenAI stream missing terminal event
         ])
         if is_transient and attempt < _STREAM_MAX_RETRIES:
             retry_delay = 2 ** (attempt + 1)  # 2s, 4s
@@ -798,11 +751,8 @@ def _stream_with_retry(
         error_msg += "\n"
         sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
         sys.stdout.flush()
-        if all_text:
-            raise _StreamAbort(
-                all_text + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}]",
-                "", working_messages
-            )
+        if all_text or partial_step_text:
+            raise _StreamAbort(_stream_abort_text(all_text + partial_step_text, step, stream_err), "", working_messages)
         raise _StreamAbort(f"Error during streaming: {stream_err}", "", working_messages)
 
 

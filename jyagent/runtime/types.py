@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Literal, Protocol, TypedDict
 
 
-ProviderName = Literal["anthropic", "openai"]
 StopReason = Literal["stop", "length", "tool_use", "error", "aborted"]
 
 
@@ -95,11 +94,6 @@ class ToolCallDeltaEvent(TypedDict):
 StreamEvent = TextDeltaEvent | ThinkingDeltaEvent | ToolCallDeltaEvent
 
 
-class OpenAIReasoningConfig(TypedDict, total=False):
-    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"]
-    summary: Literal["auto", "concise", "detailed"]
-
-
 class AnthropicThinkingDisabledConfig(TypedDict):
     type: Literal["disabled"]
 
@@ -113,10 +107,7 @@ class AnthropicThinkingAdaptiveConfig(TypedDict, total=False):
 AnthropicReasoningConfig = AnthropicThinkingDisabledConfig | AnthropicThinkingAdaptiveConfig
 
 
-ReasoningConfig = (
-    OpenAIReasoningConfig
-    | AnthropicReasoningConfig
-)
+ReasoningConfig = AnthropicReasoningConfig
 
 
 @dataclass(frozen=True)
