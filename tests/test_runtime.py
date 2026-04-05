@@ -396,6 +396,36 @@ class TestRuntimeAdapters:
         assert message["content"][1]["type"] == "tool_call"
         assert message["content"][1]["arguments"] == {"value": "x"}
 
+    def test_openai_response_maps_content_filter_to_error_stop_reason(self):
+        response = SimpleNamespace(
+            id="resp_filtered",
+            error=None,
+            incomplete_details=SimpleNamespace(reason="content_filter"),
+            usage=None,
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_filtered",
+                    content=[_OpenAIItem("output_text", text="partial")],
+                ),
+            ],
+        )
+
+        message = openai_assistant_from_response(ModelSpec("openai", "gpt-5-mini"), response)
+
+        assert message["stop_reason"] == "error"
+        assert message["content"] == [{"type": "text", "text": "partial"}]
+
+    def test_openai_request_kwargs_always_include_encrypted_reasoning_content(self):
+        adapter = OpenAIAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("openai", "gpt-5-mini"),
+            {"messages": []},
+        )
+
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
+
     def test_openai_request_kwargs_accept_reasoning_effort(self):
         adapter = OpenAIAdapter()
 
@@ -405,6 +435,7 @@ class TestRuntimeAdapters:
             RuntimeOptions(reasoning={"effort": "high"}),
         )
 
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
         assert kwargs["reasoning"] == {"effort": "high"}
 
     def test_openai_request_kwargs_accept_reasoning_summary(self):

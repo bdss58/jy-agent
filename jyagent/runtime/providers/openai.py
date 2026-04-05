@@ -213,8 +213,11 @@ def _stop_reason(response: Any, content: list[dict[str, Any]]) -> str:
     if any(block.get("type") == "tool_call" for block in content):
         return "tool_use"
     incomplete = getattr(response, "incomplete_details", None)
-    if incomplete and getattr(incomplete, "reason", None) == "max_output_tokens":
+    incomplete_reason = getattr(incomplete, "reason", None)
+    if incomplete_reason == "max_output_tokens":
         return "length"
+    if incomplete_reason == "content_filter":
+        return "error"
     return "stop"
 
 
@@ -527,6 +530,7 @@ class OpenAIAdapter:
             "input": _convert_messages(model_spec, context.get("messages", [])),
             "tools": _convert_tools(context.get("tools")),
             "instructions": context.get("system_prompt"),
+            "include": ["reasoning.encrypted_content"],
             "max_output_tokens": options.max_output_tokens,
             "parallel_tool_calls": True,
         }
