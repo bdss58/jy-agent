@@ -542,6 +542,7 @@ def _stream_response(
                 reasoning=get_reasoning_config_for_provider(
                     runtime_owner.model_spec.provider,
                     max_output_tokens=max_output_tokens,
+                    model=runtime_owner.model_spec.model,
                 ),
                 metadata=metadata,
             ),
@@ -834,6 +835,7 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
                     reasoning=get_reasoning_config_for_provider(
                         runtime_owner.model_spec.provider,
                         max_output_tokens=DEFAULT_MAX_TOKENS,
+                        model=runtime_owner.model_spec.model,
                     ),
                     metadata={
                         "component": "planner",

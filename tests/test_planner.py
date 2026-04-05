@@ -343,7 +343,7 @@ class TestPlannerFallback:
         monkeypatch.setattr(
             planner,
             "get_reasoning_config_for_provider",
-            lambda provider, *, max_output_tokens=None: {"effort": "high", "summary": "concise"},
+            lambda provider, *, max_output_tokens=None, model=None: {"effort": "high", "summary": "concise"},
         )
 
         result = planner._stream_response(_FakeOwner(), {"messages": []}, 2048)
@@ -433,7 +433,7 @@ class TestPlannerFallback:
         monkeypatch.setattr(
             planner,
             "get_reasoning_config_for_provider",
-            lambda provider, *, max_output_tokens=None: {"effort": "high"},
+            lambda provider, *, max_output_tokens=None, model=None: {"effort": "high"},
         )
 
         def _fake_adapter_stream(model_spec, context, options=None):

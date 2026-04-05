@@ -297,7 +297,7 @@ class TestDispatchAgent:
         assert len(client.messages.stream_calls) == 2
         assert client.messages.create_calls == []
 
-    def test_legacy_client_subagent_includes_configured_thinking(self, monkeypatch):
+    def test_legacy_client_subagent_includes_configured_reasoning(self, monkeypatch):
         client = _FakeClient([
             _FakeResponse(
                 [_FakeToolUseBlock("tool-1", "nonexistent", {"value": "x"})],
@@ -310,14 +310,16 @@ class TestDispatchAgent:
         monkeypatch.setattr(
             subagent,
             "get_reasoning_config_for_provider",
-            lambda provider, *, max_output_tokens=None: {"type": "adaptive"},
+            lambda provider, *, max_output_tokens=None, model=None: {"type": "adaptive", "effort": "medium"},
         )
 
         result = dispatch_agent("analyze", max_steps=1)
 
         assert result.is_error is True
         assert client.messages.calls[0]["thinking"] == {"type": "adaptive"}
+        assert client.messages.calls[0]["output_config"] == {"effort": "medium"}
         assert client.messages.calls[1]["thinking"] == {"type": "adaptive"}
+        assert client.messages.calls[1]["output_config"] == {"effort": "medium"}
 
     def test_timeout_remains_hard_error(self, monkeypatch):
         def _slow_run_subagent(*_args, **_kwargs):

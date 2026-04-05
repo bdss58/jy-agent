@@ -10,7 +10,7 @@ import httpx
 from ...observability import LLMCallLogger, new_call_id, summarize_runtime_context
 from ..core import register_adapter
 from ..history import transform_messages_for_target
-from ..reasoning import validate_anthropic_thinking
+from ..reasoning import build_anthropic_request_reasoning
 from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream, Usage
 
 
@@ -238,10 +238,14 @@ class AnthropicAdapter:
             "messages": _convert_messages(model_spec, context.get("messages", [])),
         }
         if options.reasoning is not None:
-            kwargs["thinking"] = validate_anthropic_thinking(
+            thinking, output_config = build_anthropic_request_reasoning(
                 options.reasoning,
-                max_output_tokens=options.max_output_tokens,
+                model=model_spec.model,
             )
+            if thinking is not None:
+                kwargs["thinking"] = thinking
+            if output_config is not None:
+                kwargs["output_config"] = output_config
         if context.get("system_prompt"):
             kwargs["system"] = context["system_prompt"]
         tools = _convert_tools(context.get("tools"))

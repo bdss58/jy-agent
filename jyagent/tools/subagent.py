@@ -19,7 +19,7 @@ try:
         get_subagent_model_spec,
     )
     from ..registry import get_registry
-    from ..runtime.reasoning import validate_anthropic_thinking
+    from ..runtime.reasoning import build_anthropic_request_reasoning
     from ..runtime import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
     from ..validation import validate_tool_input
@@ -31,7 +31,7 @@ except ImportError:
         get_subagent_model_spec,
     )
     from jyagent.registry import get_registry
-    from jyagent.runtime.reasoning import validate_anthropic_thinking
+    from jyagent.runtime.reasoning import build_anthropic_request_reasoning
     from jyagent.runtime import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
     from jyagent.validation import validate_tool_input
@@ -104,7 +104,11 @@ class _LegacyClientRuntimeOwner:
             "messages": self._convert_messages(context.get("messages", [])),
         }
         if options is not None and options.reasoning is not None:
-            kwargs["thinking"] = validate_anthropic_thinking(options.reasoning, max_output_tokens=max_tokens)
+            thinking, output_config = build_anthropic_request_reasoning(options.reasoning, model=model_spec.model)
+            if thinking is not None:
+                kwargs["thinking"] = thinking
+            if output_config is not None:
+                kwargs["output_config"] = output_config
         if context.get("tools"):
             kwargs["tools"] = context["tools"]
         stream_fn = getattr(self._client.messages, "stream", None)
@@ -368,6 +372,7 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
             reasoning=get_reasoning_config_for_provider(
                 model_spec.provider,
                 max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+                model=model_spec.model,
             ),
             metadata={
                 "component": "subagent",
@@ -422,6 +427,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
                     reasoning=get_reasoning_config_for_provider(
                         model_spec.provider,
                         max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+                        model=model_spec.model,
                     ),
                     metadata={
                         "component": "subagent",

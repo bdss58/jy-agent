@@ -57,6 +57,12 @@ class TestConfig:
         assert AGENT_LOG_LLM_FAILURE_PAYLOADS is True
         assert AGENT_LOG_MAX_TEXT_CHARS == 4000
 
+    def test_default_anthropic_model_targets_claude_46(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        cfg = _reload_config()
+
+        assert cfg.DEFAULT_ANTHROPIC_MODEL == "claude-sonnet-4-6"
+
     def test_provider_neutral_envs(self, monkeypatch):
         monkeypatch.setenv("AGENT_PROVIDER", "openai")
         monkeypatch.setenv("AGENT_MODEL", "gpt-5-mini")
@@ -111,35 +117,53 @@ class TestConfig:
         }
 
     def test_anthropic_reasoning_envs_parse_to_structured_config(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_THINKING_TYPE", "enabled")
-        monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "2048")
+        monkeypatch.delenv("ANTHROPIC_THINKING_TYPE", raising=False)
+        monkeypatch.setenv("ANTHROPIC_REASONING_EFFORT", "medium")
         monkeypatch.setenv("ANTHROPIC_THINKING_DISPLAY", "omitted")
         cfg = _reload_config()
 
-        assert cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096) == {
-            "type": "enabled",
-            "budget_tokens": 2048,
+        assert cfg.get_reasoning_config_for_provider("anthropic", model="claude-sonnet-4-6") == {
+            "type": "adaptive",
+            "effort": "medium",
             "display": "omitted",
+        }
+
+    def test_anthropic_adaptive_type_defaults_medium_effort_on_claude_46(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_THINKING_TYPE", "adaptive")
+        monkeypatch.delenv("ANTHROPIC_REASONING_EFFORT", raising=False)
+        monkeypatch.delenv("ANTHROPIC_THINKING_DISPLAY", raising=False)
+        cfg = _reload_config()
+
+        assert cfg.get_reasoning_config_for_provider("anthropic", model="claude-sonnet-4-6") == {
+            "type": "adaptive",
+            "effort": "medium",
         }
 
     def test_reasoning_config_returns_none_when_unset(self, monkeypatch):
         monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
         monkeypatch.delenv("OPENAI_REASONING_SUMMARY", raising=False)
         monkeypatch.delenv("ANTHROPIC_THINKING_TYPE", raising=False)
+        monkeypatch.delenv("ANTHROPIC_REASONING_EFFORT", raising=False)
         monkeypatch.delenv("ANTHROPIC_THINKING_BUDGET_TOKENS", raising=False)
         monkeypatch.delenv("ANTHROPIC_THINKING_DISPLAY", raising=False)
         cfg = _reload_config()
 
         assert cfg.get_reasoning_config_for_provider("openai") is None
-        assert cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096) is None
+        assert cfg.get_reasoning_config_for_provider("anthropic", model="claude-sonnet-4-6") is None
 
-    def test_anthropic_reasoning_budget_env_must_be_integer(self, monkeypatch):
-        monkeypatch.setenv("ANTHROPIC_THINKING_TYPE", "enabled")
-        monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "not-an-int")
+    def test_anthropic_reasoning_budget_env_is_rejected_with_migration_error(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "2048")
         cfg = _reload_config()
 
-        with pytest.raises(ValueError, match="must be an integer"):
-            cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096)
+        with pytest.raises(ValueError, match="no longer supported"):
+            cfg.get_reasoning_config_for_provider("anthropic", model="claude-sonnet-4-6")
+
+    def test_anthropic_reasoning_enabled_type_is_rejected_with_migration_error(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_THINKING_TYPE", "enabled")
+        cfg = _reload_config()
+
+        with pytest.raises(ValueError, match="no longer supported"):
+            cfg.get_reasoning_config_for_provider("anthropic", model="claude-sonnet-4-6")
 
     def test_logging_envs_parse(self, monkeypatch):
         monkeypatch.setenv("AGENT_LOG_LEVEL", "debug")

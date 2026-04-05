@@ -1,9 +1,9 @@
 from .core import RuntimeOwner, get_adapter, list_adapters, register_adapter
 from .types import (
     AssistantMessage,
+    AnthropicReasoningConfig,
     AnthropicThinkingAdaptiveConfig,
     AnthropicThinkingDisabledConfig,
-    AnthropicThinkingEnabledConfig,
     Context,
     Message,
     ModelSpec,
@@ -21,9 +21,9 @@ from .providers import openai as _openai  # noqa: F401
 
 __all__ = [
     "AssistantMessage",
+    "AnthropicReasoningConfig",
     "AnthropicThinkingAdaptiveConfig",
     "AnthropicThinkingDisabledConfig",
-    "AnthropicThinkingEnabledConfig",
     "Context",
     "Message",
     "ModelSpec",

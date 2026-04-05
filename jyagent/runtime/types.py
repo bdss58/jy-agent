@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, Protocol, Required, TypedDict
+from typing import Any, Iterator, Literal, Protocol, TypedDict
 
 
 ProviderName = Literal["anthropic", "openai"]
@@ -105,21 +105,17 @@ class AnthropicThinkingDisabledConfig(TypedDict):
 
 
 class AnthropicThinkingAdaptiveConfig(TypedDict, total=False):
-    type: Required[Literal["adaptive"]]
+    type: Literal["adaptive"]
     display: Literal["summarized", "omitted"]
+    effort: Literal["low", "medium", "high", "max"]
 
 
-class AnthropicThinkingEnabledConfig(TypedDict, total=False):
-    type: Required[Literal["enabled"]]
-    budget_tokens: Required[int]
-    display: Literal["summarized", "omitted"]
+AnthropicReasoningConfig = AnthropicThinkingDisabledConfig | AnthropicThinkingAdaptiveConfig
 
 
 ReasoningConfig = (
     OpenAIReasoningConfig
-    | AnthropicThinkingDisabledConfig
-    | AnthropicThinkingAdaptiveConfig
-    | AnthropicThinkingEnabledConfig
+    | AnthropicReasoningConfig
 )
 
 

@@ -79,6 +79,7 @@ class RuntimeOwner:
                 reasoning=get_reasoning_config_for_provider(
                     (model_spec or self._model_spec).provider,
                     max_output_tokens=max_output_tokens,
+                    model=(model_spec or self._model_spec).model,
                 ),
                 metadata={
                     "component": "runtime_owner",

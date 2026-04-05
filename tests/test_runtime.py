@@ -494,29 +494,31 @@ class TestRuntimeAdapters:
         adapter = AnthropicAdapter()
 
         kwargs = adapter._request_kwargs(
-            ModelSpec("anthropic", "claude-sonnet-4"),
+            ModelSpec("anthropic", "claude-sonnet-4-6"),
             {"messages": []},
             RuntimeOptions(max_output_tokens=2048, reasoning={"type": "disabled"}),
         )
 
         assert kwargs["thinking"] == {"type": "disabled"}
+        assert "output_config" not in kwargs
 
-    def test_anthropic_request_kwargs_accept_adaptive_thinking(self):
+    def test_anthropic_request_kwargs_accept_adaptive_thinking_with_default_effort(self):
         adapter = AnthropicAdapter()
 
         kwargs = adapter._request_kwargs(
-            ModelSpec("anthropic", "claude-sonnet-4"),
+            ModelSpec("anthropic", "claude-sonnet-4-6"),
             {"messages": []},
             RuntimeOptions(max_output_tokens=2048, reasoning={"type": "adaptive"}),
         )
 
         assert kwargs["thinking"] == {"type": "adaptive"}
+        assert kwargs["output_config"] == {"effort": "medium"}
 
     def test_anthropic_request_kwargs_accept_adaptive_thinking_with_display(self):
         adapter = AnthropicAdapter()
 
         kwargs = adapter._request_kwargs(
-            ModelSpec("anthropic", "claude-sonnet-4"),
+            ModelSpec("anthropic", "claude-sonnet-4-6"),
             {"messages": []},
             RuntimeOptions(
                 max_output_tokens=2048,
@@ -525,78 +527,93 @@ class TestRuntimeAdapters:
         )
 
         assert kwargs["thinking"] == {"type": "adaptive", "display": "omitted"}
+        assert kwargs["output_config"] == {"effort": "medium"}
 
-    def test_anthropic_request_kwargs_accept_enabled_thinking(self):
+    def test_anthropic_request_kwargs_auto_infer_adaptive_from_effort_on_claude_46(self):
         adapter = AnthropicAdapter()
 
         kwargs = adapter._request_kwargs(
-            ModelSpec("anthropic", "claude-sonnet-4"),
+            ModelSpec("anthropic", "claude-sonnet-4-6"),
             {"messages": []},
             RuntimeOptions(
-                max_output_tokens=4096,
-                reasoning={"type": "enabled", "budget_tokens": 1024, "display": "summarized"},
+                max_output_tokens=2048,
+                reasoning={"effort": "high"},
             ),
         )
 
-        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 1024, "display": "summarized"}
+        assert kwargs["thinking"] == {"type": "adaptive"}
+        assert kwargs["output_config"] == {"effort": "high"}
+
+    def test_anthropic_request_kwargs_accept_effort_only_for_claude_opus_45(self):
+        adapter = AnthropicAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("anthropic", "claude-opus-4-5"),
+            {"messages": []},
+            RuntimeOptions(max_output_tokens=2048, reasoning={"effort": "high"}),
+        )
+
+        assert "thinking" not in kwargs
+        assert kwargs["output_config"] == {"effort": "high"}
 
     def test_anthropic_request_kwargs_reject_openai_reasoning_shape(self):
         adapter = AnthropicAdapter()
 
         with pytest.raises(ValueError, match="unsupported keys"):
             adapter._request_kwargs(
-                ModelSpec("anthropic", "claude-sonnet-4"),
+                ModelSpec("anthropic", "claude-sonnet-4-6"),
                 {"messages": []},
-                RuntimeOptions(max_output_tokens=2048, reasoning={"effort": "high"}),
+                RuntimeOptions(max_output_tokens=2048, reasoning={"summary": "concise"}),  # type: ignore[arg-type]
             )
 
-    def test_anthropic_request_kwargs_reject_enabled_thinking_without_budget(self):
+    def test_anthropic_request_kwargs_reject_enabled_thinking(self):
         adapter = AnthropicAdapter()
 
-        with pytest.raises(ValueError, match="requires 'budget_tokens'"):
+        with pytest.raises(ValueError, match="no longer supported"):
             adapter._request_kwargs(
-                ModelSpec("anthropic", "claude-sonnet-4"),
+                ModelSpec("anthropic", "claude-sonnet-4-6"),
                 {"messages": []},
-                RuntimeOptions(
-                    max_output_tokens=2048,
-                    reasoning={"type": "enabled"},  # type: ignore[arg-type]
-                ),
+                RuntimeOptions(max_output_tokens=2048, reasoning={"type": "enabled"}),  # type: ignore[arg-type]
             )
 
-    def test_anthropic_request_kwargs_reject_enabled_thinking_below_min_budget(self):
+    def test_anthropic_request_kwargs_reject_budget_tokens(self):
         adapter = AnthropicAdapter()
 
-        with pytest.raises(ValueError, match="must be >= 1024"):
+        with pytest.raises(ValueError, match="no longer supported"):
             adapter._request_kwargs(
-                ModelSpec("anthropic", "claude-sonnet-4"),
+                ModelSpec("anthropic", "claude-sonnet-4-6"),
                 {"messages": []},
-                RuntimeOptions(
-                    max_output_tokens=2048,
-                    reasoning={"type": "enabled", "budget_tokens": 512},
-                ),
+                RuntimeOptions(max_output_tokens=2048, reasoning={"budget_tokens": 1024}),  # type: ignore[arg-type]
             )
 
-    def test_anthropic_request_kwargs_reject_enabled_thinking_budget_at_or_above_max_output_tokens(self):
+    def test_anthropic_request_kwargs_reject_disabled_thinking_with_effort(self):
         adapter = AnthropicAdapter()
 
-        with pytest.raises(ValueError, match="less than max_output_tokens"):
+        with pytest.raises(ValueError, match="does not support"):
             adapter._request_kwargs(
-                ModelSpec("anthropic", "claude-sonnet-4"),
+                ModelSpec("anthropic", "claude-sonnet-4-6"),
                 {"messages": []},
-                RuntimeOptions(
-                    max_output_tokens=1024,
-                    reasoning={"type": "enabled", "budget_tokens": 1024},
-                ),
+                RuntimeOptions(max_output_tokens=2048, reasoning={"type": "disabled", "effort": "high"}),
             )
 
-    def test_anthropic_request_kwargs_reject_enabled_thinking_without_max_output_tokens(self):
+    def test_anthropic_request_kwargs_reject_max_effort_on_claude_sonnet_46(self):
         adapter = AnthropicAdapter()
 
-        with pytest.raises(ValueError, match="requires RuntimeOptions.max_output_tokens"):
+        with pytest.raises(ValueError, match="only supported by model 'claude-opus-4-6'"):
             adapter._request_kwargs(
-                ModelSpec("anthropic", "claude-sonnet-4"),
+                ModelSpec("anthropic", "claude-sonnet-4-6"),
                 {"messages": []},
-                RuntimeOptions(reasoning={"type": "enabled", "budget_tokens": 1024}),
+                RuntimeOptions(max_output_tokens=2048, reasoning={"effort": "max"}),
+            )
+
+    def test_anthropic_request_kwargs_reject_adaptive_thinking_on_pre_46_models(self):
+        adapter = AnthropicAdapter()
+
+        with pytest.raises(ValueError, match="Switch to 'claude-sonnet-4-6' or 'claude-opus-4-6'"):
+            adapter._request_kwargs(
+                ModelSpec("anthropic", "claude-sonnet-4-20250514"),
+                {"messages": []},
+                RuntimeOptions(max_output_tokens=2048, reasoning={"type": "adaptive"}),
             )
 
     def test_openai_complete_uses_stream_for_text_response(self, monkeypatch):
@@ -1341,7 +1358,7 @@ class TestRuntimeAdapters:
         monkeypatch.setattr(
             runtime_core,
             "get_reasoning_config_for_provider",
-            lambda provider, *, max_output_tokens=None: {"effort": "high"},
+            lambda provider, *, max_output_tokens=None, model=None: {"effort": "high"},
         )
         monkeypatch.setattr(
             adapter,

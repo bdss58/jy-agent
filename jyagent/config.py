@@ -19,7 +19,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 # ─── API & Model ──────────────────────────────────────────────────────────────
 
-DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 AGENT_PROVIDER = (os.environ.get("AGENT_PROVIDER") or "anthropic").strip() or "anthropic"
 AGENT_MODEL = os.environ.get("AGENT_MODEL", DEFAULT_ANTHROPIC_MODEL)
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
@@ -115,8 +115,13 @@ def get_subagent_model_spec(tier: str, active_spec=None):
     return ModelSpec(provider=provider, model=model)
 
 
-def get_reasoning_config_for_provider(provider: str, *, max_output_tokens: int | None = None):
-    from .runtime.reasoning import validate_anthropic_thinking, validate_openai_reasoning
+def get_reasoning_config_for_provider(
+    provider: str,
+    *,
+    max_output_tokens: int | None = None,
+    model: str | None = None,
+):
+    from .runtime.reasoning import validate_anthropic_reasoning, validate_openai_reasoning
 
     provider = (provider or "").strip()
 
@@ -136,18 +141,21 @@ def get_reasoning_config_for_provider(provider: str, *, max_output_tokens: int |
         config = {}
         thinking_type = (os.environ.get("ANTHROPIC_THINKING_TYPE") or "").strip()
         display = (os.environ.get("ANTHROPIC_THINKING_DISPLAY") or "").strip()
+        effort = (os.environ.get("ANTHROPIC_REASONING_EFFORT") or "").strip()
         budget_tokens = (os.environ.get("ANTHROPIC_THINKING_BUDGET_TOKENS") or "").strip()
         if thinking_type:
             config["type"] = thinking_type
         if display:
             config["display"] = display
+        if effort:
+            config["effort"] = effort
         if budget_tokens:
-            try:
-                config["budget_tokens"] = int(budget_tokens)
-            except ValueError as exc:
-                raise ValueError("ANTHROPIC_THINKING_BUDGET_TOKENS must be an integer.") from exc
+            config["budget_tokens"] = budget_tokens
         if not config:
             return None
-        return validate_anthropic_thinking(config, max_output_tokens=max_output_tokens)
+        resolved_model = (model or "").strip()
+        if not resolved_model:
+            resolved_model = AGENT_MODEL if AGENT_PROVIDER == "anthropic" else DEFAULT_ANTHROPIC_MODEL
+        return validate_anthropic_reasoning(config, model=resolved_model)
 
     return None
