@@ -117,8 +117,10 @@ class _FakeStreamManager:
 
 
 class _FakeOpenAIResponsesAPI:
-    def __init__(self, manager, *, retrieve_result=None, retrieve_error=None):
+    def __init__(self, manager=None, *, create_result=None, create_error=None, retrieve_result=None, retrieve_error=None):
         self._manager = manager
+        self._create_result = create_result
+        self._create_error = create_error
         self._retrieve_result = retrieve_result
         self._retrieve_error = retrieve_error
         self.stream_calls = []
@@ -127,11 +129,17 @@ class _FakeOpenAIResponsesAPI:
 
     def stream(self, **kwargs):
         self.stream_calls.append(kwargs)
+        if self._manager is None:
+            raise AssertionError("stream() should not be called without a configured fake manager")
         return self._manager
 
     def create(self, **kwargs):
         self.create_calls.append(kwargs)
-        raise AssertionError("complete() should use responses.stream()")
+        if self._create_error is not None:
+            raise self._create_error
+        if self._create_result is None:
+            raise AssertionError("complete() should use responses.create() only when a fake result is configured")
+        return self._create_result
 
     def retrieve(self, **kwargs):
         self.retrieve_calls.append(kwargs)
@@ -155,6 +163,15 @@ class _FakeAnthropicMessagesAPI:
     def create(self, **kwargs):
         self.create_calls.append(kwargs)
         raise AssertionError("complete() should use messages.stream()")
+
+
+def _drain_runtime_stream(stream):
+    try:
+        for _event in stream:
+            pass
+        return stream.get_final_message()
+    finally:
+        stream.close()
 
 
 class TestRuntimeTransforms:
@@ -616,7 +633,7 @@ class TestRuntimeAdapters:
                 RuntimeOptions(max_output_tokens=2048, reasoning={"type": "adaptive"}),
             )
 
-    def test_openai_complete_uses_stream_for_text_response(self, monkeypatch):
+    def test_openai_complete_uses_non_stream_create_for_text_response(self, monkeypatch):
         final_response = SimpleNamespace(
             id="resp_text",
             error=None,
@@ -631,12 +648,7 @@ class TestRuntimeAdapters:
                 ),
             ],
         )
-        managed_stream = _FakeOpenAIManagedStream(
-            [SimpleNamespace(type="response.output_text.delta", delta="hello ")],
-            final_response,
-        )
-        manager = _FakeStreamManager(managed_stream)
-        responses_api = _FakeOpenAIResponsesAPI(manager)
+        responses_api = _FakeOpenAIResponsesAPI(create_result=final_response)
         adapter = OpenAIAdapter()
         monkeypatch.setattr(
             adapter,
@@ -648,13 +660,11 @@ class TestRuntimeAdapters:
 
         assert message["content"] == [{"type": "text", "text": "hello from stream"}]
         assert message["stop_reason"] == "stop"
-        assert managed_stream.iterated is True
-        assert manager.entered is True
-        assert manager.exited is True
-        assert responses_api.create_calls == []
-        assert len(responses_api.stream_calls) == 1
+        assert responses_api.stream_calls == []
+        assert len(responses_api.create_calls) == 1
+        assert responses_api.create_calls[0]["stream"] is False
 
-    def test_openai_complete_uses_stream_for_tool_call_response(self, monkeypatch):
+    def test_openai_complete_uses_non_stream_create_for_tool_call_response(self, monkeypatch):
         final_response = SimpleNamespace(
             id="resp_tool",
             error=None,
@@ -669,12 +679,7 @@ class TestRuntimeAdapters:
                 ),
             ],
         )
-        managed_stream = _FakeOpenAIManagedStream(
-            [SimpleNamespace(type="response.function_call_arguments.delta", delta="{")],
-            final_response,
-        )
-        manager = _FakeStreamManager(managed_stream)
-        responses_api = _FakeOpenAIResponsesAPI(manager)
+        responses_api = _FakeOpenAIResponsesAPI(create_result=final_response)
         adapter = OpenAIAdapter()
         monkeypatch.setattr(
             adapter,
@@ -688,11 +693,11 @@ class TestRuntimeAdapters:
         assert message["content"] == [
             {"type": "tool_call", "id": "call_1", "name": "echo", "arguments": {"value": "x"}}
         ]
-        assert managed_stream.iterated is True
-        assert manager.exited is True
-        assert responses_api.create_calls == []
+        assert responses_api.stream_calls == []
+        assert len(responses_api.create_calls) == 1
+        assert responses_api.create_calls[0]["stream"] is False
 
-    def test_openai_complete_recovers_missing_completed_event_via_retrieve(self, monkeypatch):
+    def test_openai_stream_recovers_missing_completed_event_via_retrieve(self, monkeypatch):
         retrieved_response = SimpleNamespace(
             id="resp_recovered_text",
             error=None,
@@ -725,7 +730,8 @@ class TestRuntimeAdapters:
             lambda: SimpleNamespace(responses=responses_api),
         )
 
-        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        message = _drain_runtime_stream(stream)
 
         assert message["content"] == [{"type": "text", "text": "recovered text"}]
         assert message["runtime_warnings"] == [
@@ -734,7 +740,7 @@ class TestRuntimeAdapters:
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_text"
         assert manager.exited is True
 
-    def test_openai_complete_recovers_malformed_sse_json_via_retrieve(self, monkeypatch):
+    def test_openai_stream_recovers_malformed_sse_json_via_retrieve(self, monkeypatch):
         retrieved_response = SimpleNamespace(
             id="resp_recovered_json",
             error=None,
@@ -769,7 +775,8 @@ class TestRuntimeAdapters:
         )
 
         with _capture_logger("jyagent.runtime.providers.openai") as records:
-            message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+            stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+            message = _drain_runtime_stream(stream)
 
         assert message["content"] == [{"type": "text", "text": "recovered after json error"}]
         assert message["runtime_warnings"] == [
@@ -794,12 +801,7 @@ class TestRuntimeAdapters:
                 ),
             ],
         )
-        managed_stream = _FakeOpenAIManagedStream(
-            [SimpleNamespace(type="response.output_text.delta", delta="hello ")],
-            final_response,
-        )
-        manager = _FakeStreamManager(managed_stream)
-        responses_api = _FakeOpenAIResponsesAPI(manager)
+        responses_api = _FakeOpenAIResponsesAPI(create_result=final_response)
         adapter = OpenAIAdapter()
         monkeypatch.setattr(
             adapter,
@@ -830,7 +832,7 @@ class TestRuntimeAdapters:
         long_prompt = f"prefix {secret} " + ("x" * 200)
 
         class _FailingResponsesAPI:
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
                 raise RuntimeError(f"backend rejected {secret}")
 
         adapter = OpenAIAdapter()
@@ -856,7 +858,7 @@ class TestRuntimeAdapters:
         assert "[REDACTED]" in serialized
         assert "[truncated " in serialized
 
-    def test_openai_recovery_logs_success_without_failure(self, monkeypatch):
+    def test_openai_stream_recovery_logs_success_without_failure(self, monkeypatch):
         retrieved_response = SimpleNamespace(
             id="resp_recovered_text",
             error=None,
@@ -890,7 +892,8 @@ class TestRuntimeAdapters:
         )
 
         with _capture_logger("jyagent.runtime.providers.openai") as records:
-            message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+            stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+            message = _drain_runtime_stream(stream)
 
         assert message["runtime_warnings"] == [
             "Recovered OpenAI stream after missing terminal event via responses.retrieve()."
@@ -898,7 +901,7 @@ class TestRuntimeAdapters:
         assert [record.event for record in records] == ["llm.request.started", "llm.request.succeeded"]
         assert records[1].payload["runtime_warnings"] == message["runtime_warnings"]
 
-    def test_openai_complete_recovers_tool_call_via_retrieve(self, monkeypatch):
+    def test_openai_stream_recovers_tool_call_via_retrieve(self, monkeypatch):
         retrieved_response = SimpleNamespace(
             id="resp_recovered_tool",
             error=None,
@@ -931,7 +934,8 @@ class TestRuntimeAdapters:
             lambda: SimpleNamespace(responses=responses_api),
         )
 
-        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        message = _drain_runtime_stream(stream)
 
         assert message["stop_reason"] == "tool_use"
         assert message["content"] == [
@@ -942,7 +946,7 @@ class TestRuntimeAdapters:
         ]
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_tool"
 
-    def test_openai_complete_recovers_text_from_partial_stream_snapshot_when_retrieve_fails(self, monkeypatch):
+    def test_openai_stream_recovers_text_from_partial_stream_snapshot_when_retrieve_fails(self, monkeypatch):
         snapshot = SimpleNamespace(
             id="resp_snapshot_text",
             output=[
@@ -979,7 +983,8 @@ class TestRuntimeAdapters:
             lambda: SimpleNamespace(responses=responses_api),
         )
 
-        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        message = _drain_runtime_stream(stream)
 
         assert message["stop_reason"] == "stop"
         assert message["content"] == [{"type": "text", "text": "snapshot text"}]
@@ -988,7 +993,7 @@ class TestRuntimeAdapters:
         ]
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_text"
 
-    def test_openai_complete_recovers_from_partial_stream_snapshot_when_retrieve_fails(self, monkeypatch):
+    def test_openai_stream_recovers_from_partial_stream_snapshot_when_retrieve_fails(self, monkeypatch):
         snapshot = SimpleNamespace(
             id="resp_snapshot_tool",
             output=[
@@ -1025,7 +1030,8 @@ class TestRuntimeAdapters:
             lambda: SimpleNamespace(responses=responses_api),
         )
 
-        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        message = _drain_runtime_stream(stream)
 
         assert message["stop_reason"] == "tool_use"
         assert message["content"] == [
@@ -1037,7 +1043,7 @@ class TestRuntimeAdapters:
         ]
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_tool"
 
-    def test_openai_complete_recovers_malformed_sse_json_from_partial_stream_snapshot(self, monkeypatch):
+    def test_openai_stream_recovers_malformed_sse_json_from_partial_stream_snapshot(self, monkeypatch):
         snapshot = SimpleNamespace(
             id="resp_snapshot_json",
             output=[
@@ -1075,7 +1081,8 @@ class TestRuntimeAdapters:
             lambda: SimpleNamespace(responses=responses_api),
         )
 
-        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+        message = _drain_runtime_stream(stream)
 
         assert message["stop_reason"] == "tool_use"
         assert message["content"] == [
@@ -1086,7 +1093,7 @@ class TestRuntimeAdapters:
         ]
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_json"
 
-    def test_openai_discards_empty_snapshot_recovery_and_reraises_json_error(self, monkeypatch):
+    def test_openai_stream_discards_empty_snapshot_recovery_and_reraises_json_error(self, monkeypatch):
         snapshot = SimpleNamespace(
             id="resp_snapshot_empty",
             output=[
@@ -1125,7 +1132,8 @@ class TestRuntimeAdapters:
 
         with _capture_logger("jyagent.runtime.providers.openai") as records:
             with pytest.raises(json.JSONDecodeError) as excinfo:
-                adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+                stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+                _drain_runtime_stream(stream)
 
         assert excinfo.value is json_error
         assert [record.event for record in records] == [
@@ -1140,7 +1148,7 @@ class TestRuntimeAdapters:
         assert records[2].payload["discard_reason"] == "snapshot message items contained no assistant-visible text"
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_empty"
 
-    def test_openai_discards_snapshot_tool_call_with_invalid_json_arguments(self, monkeypatch):
+    def test_openai_stream_discards_snapshot_tool_call_with_invalid_json_arguments(self, monkeypatch):
         snapshot = SimpleNamespace(
             id="resp_snapshot_invalid_tool",
             output=[
@@ -1179,12 +1187,13 @@ class TestRuntimeAdapters:
         )
 
         with pytest.raises(json.JSONDecodeError) as excinfo:
-            adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+            stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+            _drain_runtime_stream(stream)
 
         assert excinfo.value is json_error
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_invalid_tool"
 
-    def test_openai_unrecoverable_malformed_sse_json_logs_failure_with_sanitized_snippet(self, monkeypatch):
+    def test_openai_stream_unrecoverable_malformed_sse_json_logs_failure_with_sanitized_snippet(self, monkeypatch):
         secret = "sk-test-secret-123456789"
         bad_doc = (
             '{"type":"response.created","secret":"'
@@ -1216,7 +1225,8 @@ class TestRuntimeAdapters:
 
         with _capture_logger("jyagent.runtime.providers.openai") as records:
             with pytest.raises(json.JSONDecodeError):
-                adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+                stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+                _drain_runtime_stream(stream)
 
         assert [record.event for record in records] == ["llm.request.started", "llm.request.failed"]
         failure_payload = records[1].payload
@@ -1224,10 +1234,43 @@ class TestRuntimeAdapters:
         assert failure_payload["response_id"] == "resp_bad_json"
         assert failure_payload["json_error_position"] == error_pos
         assert failure_payload["json_error_snippet"]
+        assert failure_payload["stream_payload_kind"] == "unknown"
+        assert failure_payload["stream_payload_summary"] == "Malformed unclassified stream payload."
         serialized = json.dumps(failure_payload, ensure_ascii=False)
         assert secret not in serialized
         assert "[REDACTED]" in serialized
         assert "[truncated " in failure_payload["json_error_snippet"]
+
+    def test_openai_stream_keepalive_json_error_logs_payload_classification(self, monkeypatch):
+        bad_doc = '{ "event": "keepalive", "data": {"type":"keepalive","sequence_number":3}'
+        json_error = json.JSONDecodeError("Expecting ',' delimiter", bad_doc, 72)
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_keepalive"))],
+            None,
+            iter_error=json_error,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(
+            manager,
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.openai") as records:
+            with pytest.raises(json.JSONDecodeError):
+                stream = adapter.stream(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+                _drain_runtime_stream(stream)
+
+        failure_payload = records[1].payload
+        assert failure_payload["response_id"] == "resp_keepalive"
+        assert failure_payload["stream_payload_kind"] == "keepalive"
+        assert failure_payload["stream_payload_summary"] == "Malformed keepalive stream payload."
+        assert failure_payload["json_error_snippet"] == bad_doc
 
     def test_anthropic_complete_uses_stream_for_text_response(self, monkeypatch):
         final_response = SimpleNamespace(
@@ -1327,23 +1370,7 @@ class TestRuntimeAdapters:
         serialized = json.dumps([record.payload for record in records], ensure_ascii=False)
         assert "private prompt" not in serialized
 
-    def test_runtime_owner_complete_text_uses_stream_backed_complete(self, monkeypatch):
-        class _FakeRuntimeStream:
-            def __init__(self, final_message):
-                self._final_message = final_message
-                self.iterated = False
-                self.closed = False
-
-            def __iter__(self):
-                self.iterated = True
-                yield {"type": "text_delta", "text": "partial"}
-
-            def get_final_message(self):
-                return self._final_message
-
-            def close(self):
-                self.closed = True
-
+    def test_runtime_owner_complete_text_uses_complete(self, monkeypatch):
         final_message = {
             "role": "assistant",
             "content": [{"type": "text", "text": "silent answer"}],
@@ -1352,7 +1379,6 @@ class TestRuntimeAdapters:
             "usage": {"input_tokens": 1, "output_tokens": 1},
             "stop_reason": "stop",
         }
-        fake_stream = _FakeRuntimeStream(final_message)
         adapter = get_adapter("openai")
         captured = {}
         monkeypatch.setattr(
@@ -1362,8 +1388,8 @@ class TestRuntimeAdapters:
         )
         monkeypatch.setattr(
             adapter,
-            "stream",
-            lambda model_spec, context, options=None: (captured.__setitem__("options", options), fake_stream)[1],
+            "complete",
+            lambda model_spec, context, options=None: (captured.__setitem__("options", options), final_message)[1],
         )
 
         owner = RuntimeOwner(ModelSpec("openai", "gpt-5-mini"))
@@ -1371,5 +1397,3 @@ class TestRuntimeAdapters:
 
         assert text == "silent answer"
         assert captured["options"].reasoning == {"effort": "high"}
-        assert fake_stream.iterated is True
-        assert fake_stream.closed is True

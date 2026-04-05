@@ -515,6 +515,121 @@ def _is_truncated_tool_call(stop_reason: str, tool_use_blocks: list[_ToolCallReq
 
 # ─── Streaming helper ────────────────────────────────────────────────────────
 
+def _runtime_options(
+    runtime_owner: RuntimeOwner,
+    max_output_tokens: int,
+    metadata: dict | None = None,
+) -> RuntimeOptions:
+    return RuntimeOptions(
+        max_output_tokens=max_output_tokens,
+        timeout=STREAM_TIMEOUT,
+        reasoning=get_reasoning_config_for_provider(
+            runtime_owner.model_spec.provider,
+            max_output_tokens=max_output_tokens,
+            model=runtime_owner.model_spec.model,
+        ),
+        metadata=metadata,
+    )
+
+
+def _record_response_usage(final_message: dict):
+    stats = get_stats()
+    stats.record_usage(
+        final_message.get("usage", {}),
+        provider=final_message.get("provider", ""),
+        model=final_message.get("model", ""),
+    )
+
+
+def _stream_error_diagnostics(error: BaseException) -> dict:
+    diagnostics = getattr(error, "stream_diagnostics", None)
+    if isinstance(diagnostics, dict):
+        return diagnostics
+    return {}
+
+
+def _stream_error_log_fields(error: BaseException) -> dict:
+    diagnostics = _stream_error_diagnostics(error)
+    return {
+        key: value
+        for key, value in diagnostics.items()
+        if value not in (None, "")
+    }
+
+
+def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars: int = 220) -> str:
+    diagnostics = _stream_error_diagnostics(error)
+    if not diagnostics:
+        return ""
+
+    lines = []
+    response_id = diagnostics.get("response_id")
+    if response_id:
+        lines.append(f"    response_id: {response_id}")
+
+    payload_kind = diagnostics.get("stream_payload_kind")
+    payload_summary = diagnostics.get("stream_payload_summary")
+    if payload_kind and payload_summary:
+        lines.append(f"    payload: {payload_kind} ({payload_summary})")
+    elif payload_kind:
+        lines.append(f"    payload: {payload_kind}")
+
+    line = diagnostics.get("json_error_line")
+    column = diagnostics.get("json_error_column")
+    position = diagnostics.get("json_error_position")
+    location_bits = []
+    if line is not None and column is not None:
+        location_bits.append(f"L{line}:C{column}")
+    if position is not None:
+        location_bits.append(f"char {position}")
+    if location_bits:
+        lines.append(f"    location: {'; '.join(location_bits)}")
+
+    snippet = diagnostics.get("json_error_snippet")
+    if snippet:
+        lines.append(f"    snippet: {scrub_string(str(snippet), max_text_chars=max_snippet_chars)}")
+
+    return "\n".join(lines)
+
+
+def _is_openai_stream_transport_error(runtime_owner: RuntimeOwner, error: BaseException) -> bool:
+    if runtime_owner.model_spec.provider != "openai":
+        return False
+    if isinstance(error, json.JSONDecodeError):
+        return True
+    return "response.completed" in str(error).lower()
+
+
+def _stream_transport_error_reason(error: BaseException) -> str:
+    if isinstance(error, json.JSONDecodeError):
+        return "malformed SSE JSON"
+    if "response.completed" in str(error).lower():
+        return "missing response.completed event"
+    return "stream transport failure"
+
+
+def _complete_response(
+    runtime_owner: RuntimeOwner,
+    context: dict,
+    max_output_tokens: int,
+    metadata: dict | None = None,
+) -> tuple:
+    """Run a single non-stream runtime response and render any final text."""
+    final_message = runtime_owner.complete(
+        context,
+        options=_runtime_options(runtime_owner, max_output_tokens, metadata),
+    )
+    for warning in final_message.get("runtime_warnings", []):
+        _runtime_warning(warning)
+
+    step_text = _assistant_text(final_message)
+    if step_text:
+        _stream_write(step_text)
+    stop_reason = final_message.get("stop_reason", "stop")
+    tool_use_blocks = _assistant_tool_calls(final_message)
+    _record_response_usage(final_message)
+    return step_text, tool_use_blocks, stop_reason, final_message
+
 def _stream_response(
     runtime_owner: RuntimeOwner,
     context: dict,
@@ -536,16 +651,7 @@ def _stream_response(
     try:
         stream = runtime_owner.stream(
             context,
-            options=RuntimeOptions(
-                max_output_tokens=max_output_tokens,
-                timeout=STREAM_TIMEOUT,
-                reasoning=get_reasoning_config_for_provider(
-                    runtime_owner.model_spec.provider,
-                    max_output_tokens=max_output_tokens,
-                    model=runtime_owner.model_spec.model,
-                ),
-                metadata=metadata,
-            ),
+            options=_runtime_options(runtime_owner, max_output_tokens, metadata),
         )
         for event in stream:
             event_type = event.get("type")
@@ -565,13 +671,7 @@ def _stream_response(
             _runtime_warning(warning)
         stop_reason = final_message.get("stop_reason", "stop")
         tool_use_blocks = _assistant_tool_calls(final_message)
-
-        stats = get_stats()
-        stats.record_usage(
-            final_message.get("usage", {}),
-            provider=final_message.get("provider", ""),
-            model=final_message.get("model", ""),
-        )
+        _record_response_usage(final_message)
     finally:
         if stream is not None:
             try:
@@ -620,6 +720,80 @@ def _stream_with_retry(
             msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
             raise _StreamAbort(msg, "", working_messages)
         except Exception as stream_err:
+            if _is_openai_stream_transport_error(runtime_owner, stream_err):
+                reason = _stream_transport_error_reason(stream_err)
+                diagnostics_text = _format_stream_error_diagnostics(stream_err)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "planner.stream.nonstream_fallback",
+                    component="planner",
+                    step=step + 1,
+                    attempt=attempt + 1,
+                    error_type=type(stream_err).__name__,
+                    error_message=scrub_string(str(stream_err), max_text_chars=500),
+                    fallback_reason=reason,
+                    **_stream_error_log_fields(stream_err),
+                )
+                warning_msg = (
+                    f"OpenAI stream transport failed ({reason}); retrying this step with non-stream response."
+                )
+                if diagnostics_text:
+                    warning_msg += f"\n{diagnostics_text}"
+                _runtime_warning(warning_msg)
+                try:
+                    return _complete_response(
+                        runtime_owner,
+                        context,
+                        max_output_tokens,
+                        metadata={
+                            "component": "planner",
+                            "mode": "complete",
+                            "step": step + 1,
+                            "attempt": attempt + 1,
+                            "stream_fallback": True,
+                            "stream_failure": reason,
+                        },
+                    )
+                except KeyboardInterrupt:
+                    _interrupted_msg()
+                    msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
+                    raise _StreamAbort(msg, "", working_messages)
+                except Exception as fallback_err:
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "planner.stream.nonstream_fallback_failed",
+                        component="planner",
+                        step=step + 1,
+                        attempt=attempt + 1,
+                        error_type=type(stream_err).__name__,
+                        error_message=scrub_string(str(stream_err), max_text_chars=500),
+                        fallback_error_type=type(fallback_err).__name__,
+                        fallback_error_message=scrub_string(str(fallback_err), max_text_chars=500),
+                        traceback=scrub_string(format_traceback(fallback_err), max_text_chars=4000),
+                        **_stream_error_log_fields(stream_err),
+                    )
+                    error_msg = (
+                        f"\n[Stream error at step {step+1}: {stream_err}]"
+                        + (f"\n{diagnostics_text}" if diagnostics_text else "")
+                        + f"\n[Non-stream fallback failed: {fallback_err}]\n"
+                    )
+                    sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
+                    sys.stdout.flush()
+                    combined_error = (
+                        f"Error during streaming: {stream_err}; "
+                        f"non-stream fallback failed: {fallback_err}"
+                    )
+                    if all_text:
+                        raise _StreamAbort(
+                            all_text
+                            + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}; "
+                            + f"non-stream fallback failed: {fallback_err}]",
+                            "",
+                            working_messages,
+                        )
+                    raise _StreamAbort(combined_error, "", working_messages)
             is_transient = isinstance(stream_err, json.JSONDecodeError) or any(kw in str(stream_err).lower() for kw in [
                 "incomplete", "peer closed", "connection reset", "timeout",
                 "eof", "broken pipe", "overloaded", "529", "server_error",
@@ -656,8 +830,13 @@ def _stream_with_retry(
                 error_type=type(stream_err).__name__,
                 error_message=scrub_string(str(stream_err), max_text_chars=500),
                 traceback=scrub_string(format_traceback(stream_err), max_text_chars=4000),
+                **_stream_error_log_fields(stream_err),
             )
-            error_msg = f"\n[Stream error at step {step+1}: {stream_err}]\n"
+            diagnostics_text = _format_stream_error_diagnostics(stream_err)
+            error_msg = f"\n[Stream error at step {step+1}: {stream_err}]"
+            if diagnostics_text:
+                error_msg += f"\n{diagnostics_text}"
+            error_msg += "\n"
             sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
             sys.stdout.flush()
             if all_text:

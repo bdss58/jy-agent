@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 from openai import OpenAI
 
-from ...observability import LLMCallLogger, log_event, new_call_id, summarize_runtime_context
+from ...observability import LLMCallLogger, log_event, new_call_id, scrub_string, summarize_runtime_context
 from ..core import register_adapter
 from ..history import transform_messages_for_target
 from ..reasoning import validate_openai_reasoning
@@ -23,14 +23,17 @@ def _json_error_details(error: BaseException) -> dict[str, Any]:
     if not isinstance(error, json.JSONDecodeError):
         return {}
 
+    raw_doc = getattr(error, "doc", "") or ""
     details: dict[str, Any] = {
         "json_error_line": error.lineno,
         "json_error_column": error.colno,
         "json_error_position": error.pos,
+        "stream_payload_kind": _stream_payload_kind(raw_doc),
+        "stream_payload_summary": _stream_payload_summary(_stream_payload_kind(raw_doc)),
     }
     snippet = _json_error_snippet(error)
     if snippet:
-        details["json_error_snippet"] = snippet
+        details["json_error_snippet"] = scrub_string(snippet)
     return details
 
 
@@ -45,6 +48,55 @@ def _json_error_snippet(error: json.JSONDecodeError, radius: int = 120) -> str:
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(doc) else ""
     return f"{prefix}{doc[start:end]}{suffix}"
+
+
+def _stream_payload_kind(doc: str) -> str:
+    text = (doc or "").lower()
+    if not text:
+        return "unknown"
+    if '"event"' in text and "keepalive" in text:
+        return "keepalive"
+    if '"type":"keepalive"' in text or '"type": "keepalive"' in text:
+        return "keepalive"
+    if "function_call" in text or '"arguments"' in text:
+        return "tool_call_delta"
+    if "output_text" in text or "text.delta" in text:
+        return "text_delta"
+    if "reasoning" in text:
+        return "reasoning"
+    return "unknown"
+
+
+def _stream_payload_summary(kind: str) -> str:
+    summaries = {
+        "keepalive": "Malformed keepalive stream payload.",
+        "tool_call_delta": "Malformed tool-call delta stream payload.",
+        "text_delta": "Malformed text-delta stream payload.",
+        "reasoning": "Malformed reasoning stream payload.",
+        "unknown": "Malformed unclassified stream payload.",
+    }
+    return summaries.get(kind, summaries["unknown"])
+
+
+def _attach_stream_error_diagnostics(
+    error: BaseException,
+    *,
+    response_id: str = "",
+    **extra: Any,
+) -> BaseException:
+    if not isinstance(error, json.JSONDecodeError):
+        return error
+
+    diagnostics = getattr(error, "stream_diagnostics", None)
+    if not isinstance(diagnostics, dict):
+        diagnostics = _json_error_details(error)
+    if response_id:
+        diagnostics["response_id"] = response_id
+    for key, value in extra.items():
+        if value not in (None, ""):
+            diagnostics[key] = value
+    setattr(error, "stream_diagnostics", diagnostics)
+    return error
 
 
 def _response_usage(response: Any) -> dict[str, int]:
@@ -328,7 +380,11 @@ class _OpenAIStream(RuntimeStream):
                     yield {"type": "tool_call_delta", "delta": event.delta}
         except Exception as err:
             if isinstance(err, json.JSONDecodeError):
-                self._stream_error = err
+                self._stream_error = _attach_stream_error_diagnostics(
+                    err,
+                    response_id=self._response_id,
+                    stage="stream_iter",
+                )
                 self._stream_error_stage = "stream_iter"
                 return
             if self._call_logger is not None:
@@ -351,6 +407,11 @@ class _OpenAIStream(RuntimeStream):
             except (RuntimeError, json.JSONDecodeError) as err:
                 recovered = self._recover_response(err)
                 if recovered is None:
+                    _attach_stream_error_diagnostics(
+                        err,
+                        response_id=self._response_id,
+                        stage=self._stream_error_stage or "final_response",
+                    )
                     if self._call_logger is not None:
                         self._call_logger.failed(
                             err,
@@ -365,6 +426,13 @@ class _OpenAIStream(RuntimeStream):
                 if self._recovery_method == "stream_snapshot":
                     discard_reason = _snapshot_discard_reason(response)
                     if discard_reason is not None:
+                        _attach_stream_error_diagnostics(
+                            err,
+                            response_id=self._response_id,
+                            stage=self._stream_error_stage or "final_response",
+                            recovery_method=self._recovery_method,
+                            discard_reason=discard_reason,
+                        )
                         self._log_discarded_recovery(discard_reason)
                         if self._call_logger is not None:
                             self._call_logger.failed(
@@ -571,13 +639,38 @@ class OpenAIAdapter:
         )
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
-        stream = self.stream(model_spec, context, options)
+        options = options or RuntimeOptions()
+        kwargs = self._request_kwargs(model_spec, context, options)
+        kwargs["stream"] = False
+        timeout = options.timeout
+        call_logger = LLMCallLogger(
+            logger,
+            call_id=new_call_id(),
+            provider=self.provider,
+            api=self.api_name,
+            model=model_spec.model,
+            metadata=options.metadata or {},
+            request_summary=summarize_runtime_context(context, options),
+            request_payload=kwargs,
+        )
+        call_logger.started()
         try:
-            for _event in stream:
-                pass
-            return stream.get_final_message()
-        finally:
-            stream.close()
+            client = self._client()
+            response = client.responses.create(**kwargs, timeout=timeout)
+        except Exception as err:
+            call_logger.failed(err, stage="complete_create")
+            raise
+        try:
+            message = _assistant_from_response(model_spec, response)
+        except Exception as err:
+            call_logger.failed(
+                err,
+                stage="complete_response",
+                response_id=getattr(response, "id", ""),
+            )
+            raise
+        call_logger.succeeded(message)
+        return message
 
 
 register_adapter(OpenAIAdapter())

@@ -83,10 +83,13 @@ class _FakeStreamManager:
 
 
 class _FakeOpenAIResponsesAPI:
-    def __init__(self, managers, *, retrieve_error=None):
+    def __init__(self, managers, *, create_result=None, create_error=None, retrieve_error=None):
         self._managers = list(managers)
+        self._create_result = create_result
+        self._create_error = create_error
         self._retrieve_error = retrieve_error
         self.stream_calls = []
+        self.create_calls = []
         self.retrieve_calls = []
 
     def stream(self, **kwargs):
@@ -94,6 +97,14 @@ class _FakeOpenAIResponsesAPI:
         if not self._managers:
             raise AssertionError("No fake stream managers left")
         return self._managers.pop(0)
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        if self._create_error is not None:
+            raise self._create_error
+        if self._create_result is None:
+            raise AssertionError("create() should not be called without a configured fake response")
+        return self._create_result
 
     def retrieve(self, **kwargs):
         self.retrieve_calls.append(kwargs)
@@ -352,7 +363,7 @@ class TestPlannerFallback:
         assert result[0] == "answer"
         assert fake_stream.closed is True
 
-    def test_max_steps_fallback_uses_stream_backed_complete(self, monkeypatch):
+    def test_max_steps_fallback_uses_complete(self, monkeypatch):
         tool_name = "_test_planner_fallback_tool"
 
         class _DummyStats:
@@ -367,22 +378,6 @@ class TestPlannerFallback:
 
             def record_tool_call(self):
                 pass
-
-        class _FakeRuntimeStream:
-            def __init__(self, final_message):
-                self._final_message = final_message
-                self.iterated = False
-                self.closed = False
-
-            def __iter__(self):
-                self.iterated = True
-                yield {"type": "text_delta", "text": "fallback"}
-
-            def get_final_message(self):
-                return self._final_message
-
-            def close(self):
-                self.closed = True
 
         def _tool():
             return "tool output"
@@ -408,7 +403,6 @@ class TestPlannerFallback:
             "usage": {"input_tokens": 2, "output_tokens": 3},
             "stop_reason": "stop",
         }
-        fake_stream = _FakeRuntimeStream(final_message)
         adapter = get_adapter("openai")
         captured = {}
 
@@ -436,14 +430,14 @@ class TestPlannerFallback:
             lambda provider, *, max_output_tokens=None, model=None: {"effort": "high"},
         )
 
-        def _fake_adapter_stream(model_spec, context, options=None):
+        def _fake_adapter_complete(model_spec, context, options=None):
             captured["options"] = options
-            return fake_stream
+            return final_message
 
         monkeypatch.setattr(
             adapter,
-            "stream",
-            _fake_adapter_stream,
+            "complete",
+            _fake_adapter_complete,
         )
 
         try:
@@ -461,8 +455,6 @@ class TestPlannerFallback:
         assert working_messages[-1]["content"] == [{"type": "text", "text": "fallback answer"}]
         assert written == ["fallback answer"]
         assert captured["options"].reasoning == {"effort": "high"}
-        assert fake_stream.iterated is True
-        assert fake_stream.closed is True
         assert dummy_stats.recorded_usage == [
             ({"input_tokens": 2, "output_tokens": 3}, "openai", "gpt-5-mini")
         ]
@@ -567,7 +559,7 @@ class TestPlannerLogging:
         assert records[0].payload["attempt"] == 1
         assert records[0].payload["retry_in_seconds"] == 2
 
-    def test_json_decode_stream_failure_retries_as_transient(self, monkeypatch):
+    def test_json_decode_stream_failure_retries_as_transient_for_non_openai(self, monkeypatch):
         attempts = {"count": 0}
 
         def _fake_stream_response(runtime_owner, context, max_output_tokens, metadata=None):
@@ -585,7 +577,7 @@ class TestPlannerLogging:
 
         with _capture_logger("jyagent.planner") as records:
             result = planner._stream_with_retry(
-                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                RuntimeOwner(ModelSpec("anthropic", "claude-sonnet-4")),
                 {"messages": []},
                 2048,
                 0,
@@ -598,7 +590,7 @@ class TestPlannerLogging:
         assert records[0].payload["transient"] is True
         assert records[0].payload["error_type"] == "JSONDecodeError"
 
-    def test_plan_next_action_retries_after_discarded_snapshot_recovery(self, monkeypatch):
+    def test_plan_next_action_uses_nonstream_fallback_after_discarded_snapshot_recovery(self, monkeypatch, capsys):
         class _DummySpinner:
             def start(self):
                 pass
@@ -621,8 +613,8 @@ class TestPlannerLogging:
 
         json_error = json.JSONDecodeError(
             "Expecting ',' delimiter",
-            '{"type":"response.created","response":{"id":"resp_retry_bad""}}',
-            60,
+            '{ "event": "keepalive", "data": {"type":"keepalive","sequence_number":3}',
+            72,
         )
         discarded_snapshot = SimpleNamespace(
             id="resp_retry_bad",
@@ -656,12 +648,9 @@ class TestPlannerLogging:
                 ),
             ],
         )
-        good_stream = _FakeOpenAIManagedStream(
-            [SimpleNamespace(type="response.output_text.delta", delta="retried answer")],
-            good_response,
-        )
         responses_api = _FakeOpenAIResponsesAPI(
-            [_FakeStreamManager(bad_stream), _FakeStreamManager(good_stream)],
+            [_FakeStreamManager(bad_stream)],
+            create_result=good_response,
             retrieve_error=RuntimeError("retrieve failed"),
         )
         adapter = get_adapter("openai")
@@ -682,13 +671,17 @@ class TestPlannerLogging:
                 max_steps=1,
             )
 
+        output = capsys.readouterr().out
+
         assert result == "retried answer"
         assert final_text == "retried answer"
         assert working_messages[-1]["content"] == [{"type": "text", "text": "retried answer"}]
         assert dummy_stats.recorded_usage == [
             ({"input_tokens": 3, "output_tokens": 2, "cache_read_input_tokens": 0, "total_tokens": 5}, "openai", "gpt-5-mini")
         ]
-        assert [record.event for record in planner_records] == ["planner.stream.retry"]
+        assert [record.event for record in planner_records] == ["planner.stream.nonstream_fallback"]
+        assert planner_records[0].payload["stream_payload_kind"] == "keepalive"
+        assert planner_records[0].payload["response_id"] == "resp_retry_bad"
         assert [record.event for record in provider_records] == [
             "llm.request.started",
             "llm.request.recovery_discarded",
@@ -696,9 +689,192 @@ class TestPlannerLogging:
             "llm.request.started",
             "llm.request.succeeded",
         ]
+        assert "response_id: resp_retry_bad" in output
+        assert "payload: keepalive" in output
+        assert 'snippet: { "event": "keepalive"' in output
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_retry_bad"
+        assert len(responses_api.stream_calls) == 1
+        assert len(responses_api.create_calls) == 1
+        assert responses_api.create_calls[0]["stream"] is False
 
-    def test_plan_next_action_surfaces_error_after_discarded_snapshot_recovery_retries_exhausted(self, monkeypatch):
+    def test_plan_next_action_uses_nonstream_fallback_after_missing_completed_event(self, monkeypatch, capsys):
+        class _DummySpinner:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class _DummyStats:
+            def __init__(self):
+                self.recorded_usage = []
+
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                self.recorded_usage.append((usage, provider, model))
+
+            def record_tool_call(self):
+                pass
+
+        missing_completed = RuntimeError("Didn't receive a `response.completed` event.")
+        bad_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_missing_completed"))],
+            None,
+            final_error=missing_completed,
+        )
+        create_response = SimpleNamespace(
+            id="resp_missing_completed_fallback",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=4, output_tokens=3, total_tokens=7),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_missing_completed_fallback",
+                    content=[_OpenAIItem("output_text", text="fallback answer")],
+                ),
+            ],
+        )
+        responses_api = _FakeOpenAIResponsesAPI(
+            [_FakeStreamManager(bad_stream)],
+            create_result=create_response,
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = get_adapter("openai")
+        dummy_stats = _DummyStats()
+
+        monkeypatch.setattr(adapter, "_client", lambda: SimpleNamespace(responses=responses_api))
+        monkeypatch.setattr(planner, "_ThinkingSpinner", _DummySpinner)
+        monkeypatch.setattr(planner, "get_stats", lambda: dummy_stats)
+        monkeypatch.setattr(planner.time, "sleep", lambda _seconds: None)
+
+        with _capture_logger("jyagent.planner") as planner_records:
+            result, final_text, working_messages = plan_next_action(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                [],
+                "system prompt",
+                max_steps=1,
+            )
+
+        output = capsys.readouterr().out
+
+        assert result == "fallback answer"
+        assert final_text == "fallback answer"
+        assert working_messages[-1]["content"] == [{"type": "text", "text": "fallback answer"}]
+        assert [record.event for record in planner_records] == ["planner.stream.nonstream_fallback"]
+        assert "retrying this step with non-stream response" in output
+        assert len(responses_api.stream_calls) == 1
+        assert len(responses_api.create_calls) == 1
+        assert responses_api.create_calls[0]["stream"] is False
+
+    def test_plan_next_action_continues_tool_loop_after_nonstream_fallback_tool_call(self, monkeypatch):
+        class _DummySpinner:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class _DummyStats:
+            def __init__(self):
+                self.recorded_usage = []
+                self.tool_calls = 0
+
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                self.recorded_usage.append((usage, provider, model))
+
+            def record_tool_call(self):
+                self.tool_calls += 1
+
+        tool_name = "_test_nonstream_fallback_tool"
+
+        def _tool():
+            return "tool output"
+
+        schema = {
+            "name": tool_name,
+            "description": "tool for planner fallback test",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        reg = get_registry()
+        reg.register(tool_name, _tool, schema)
+        try:
+            json_error = json.JSONDecodeError(
+                "Expecting ',' delimiter",
+                '{"type":"response.created","response":{"id":"resp_tool_turn""}}',
+                60,
+            )
+            bad_stream = _FakeOpenAIManagedStream(
+                [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_tool_turn"))],
+                None,
+                iter_error=json_error,
+            )
+            tool_call_response = SimpleNamespace(
+                id="resp_tool_turn_fallback",
+                error=None,
+                incomplete_details=None,
+                usage=SimpleNamespace(input_tokens=2, output_tokens=2, total_tokens=4),
+                output=[
+                    _OpenAIItem(
+                        "function_call",
+                        call_id="call_tool_turn",
+                        name=tool_name,
+                        arguments=json.dumps({}),
+                    ),
+                ],
+            )
+            final_response = SimpleNamespace(
+                id="resp_tool_turn_final",
+                error=None,
+                incomplete_details=None,
+                usage=SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
+                output=[
+                    _OpenAIItem(
+                        "message",
+                        id="msg_tool_turn_final",
+                        content=[_OpenAIItem("output_text", text="done after tool")],
+                    ),
+                ],
+            )
+            good_stream = _FakeOpenAIManagedStream(
+                [SimpleNamespace(type="response.output_text.delta", delta="done after tool")],
+                final_response,
+            )
+            responses_api = _FakeOpenAIResponsesAPI(
+                [_FakeStreamManager(bad_stream), _FakeStreamManager(good_stream)],
+                create_result=tool_call_response,
+            )
+            adapter = get_adapter("openai")
+            dummy_stats = _DummyStats()
+
+            monkeypatch.setattr(adapter, "_client", lambda: SimpleNamespace(responses=responses_api))
+            monkeypatch.setattr(planner, "_ThinkingSpinner", _DummySpinner)
+            monkeypatch.setattr(planner, "get_stats", lambda: dummy_stats)
+            monkeypatch.setattr(planner.time, "sleep", lambda _seconds: None)
+
+            result, final_text, working_messages = plan_next_action(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                [],
+                "system prompt",
+                max_steps=2,
+            )
+        finally:
+            reg.unregister(tool_name)
+
+        assert result == "done after tool"
+        assert final_text == "done after tool"
+        assert dummy_stats.tool_calls == 1
+        assert any(msg.get("role") == "tool_result" and msg.get("tool_name") == tool_name for msg in working_messages)
+        assert len(responses_api.stream_calls) == 2
+        assert len(responses_api.create_calls) == 1
+        assert responses_api.create_calls[0]["stream"] is False
+
+    def test_plan_next_action_surfaces_error_when_nonstream_fallback_also_fails(self, monkeypatch, capsys):
         class _DummySpinner:
             def start(self):
                 pass
@@ -716,36 +892,34 @@ class TestPlannerLogging:
             def record_tool_call(self):
                 pass
 
-        def _bad_manager(response_id: str):
-            json_error = json.JSONDecodeError(
-                "Expecting ',' delimiter",
-                f'{{"type":"response.created","response":{{"id":"{response_id}""}}}}',
-                len(response_id) + 46,
-            )
-            discarded_snapshot = SimpleNamespace(
-                id=response_id,
-                output=[
-                    _OpenAIItem(
-                        "function_call",
-                        call_id=f"call_{response_id}",
-                        name="echo",
-                        arguments='{"value":',
-                    ),
-                ],
-                usage=None,
-                error=None,
-                incomplete_details=None,
-            )
-            stream = _FakeOpenAIManagedStream(
-                [SimpleNamespace(type="response.created", response=SimpleNamespace(id=response_id))],
-                None,
-                iter_error=json_error,
-                state=SimpleNamespace(_ResponseStreamState__current_snapshot=discarded_snapshot),
-            )
-            return _FakeStreamManager(stream)
-
+        json_error = json.JSONDecodeError(
+            "Expecting ',' delimiter",
+            '{ "event": "keepalive", "data": {"type":"keepalive","sequence_number":3}',
+            72,
+        )
+        discarded_snapshot = SimpleNamespace(
+            id="resp_bad_1",
+            output=[
+                _OpenAIItem(
+                    "function_call",
+                    call_id="call_resp_bad_1",
+                    name="echo",
+                    arguments='{"value":',
+                ),
+            ],
+            usage=None,
+            error=None,
+            incomplete_details=None,
+        )
+        bad_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_bad_1"))],
+            None,
+            iter_error=json_error,
+            state=SimpleNamespace(_ResponseStreamState__current_snapshot=discarded_snapshot),
+        )
         responses_api = _FakeOpenAIResponsesAPI(
-            [_bad_manager("resp_bad_1"), _bad_manager("resp_bad_2"), _bad_manager("resp_bad_3")],
+            [_FakeStreamManager(bad_stream)],
+            create_error=RuntimeError("non-stream backend exploded"),
             retrieve_error=RuntimeError("retrieve failed"),
         )
         adapter = get_adapter("openai")
@@ -765,26 +939,30 @@ class TestPlannerLogging:
                 max_steps=1,
             )
 
-        assert result.startswith("Error during streaming: Expecting ',' delimiter")
+        output = capsys.readouterr().out
+
+        assert "Expecting ',' delimiter" in result
+        assert "non-stream fallback failed: non-stream backend exploded" in result
         assert final_text == ""
         assert working_messages == []
         assert [record.event for record in planner_records] == [
-            "planner.stream.retry",
-            "planner.stream.retry",
-            "planner.stream.failed",
+            "planner.stream.nonstream_fallback",
+            "planner.stream.nonstream_fallback_failed",
         ]
+        assert planner_records[0].payload["stream_payload_kind"] == "keepalive"
+        assert planner_records[1].payload["stream_payload_kind"] == "keepalive"
         assert [record.event for record in provider_records] == [
             "llm.request.started",
             "llm.request.recovery_discarded",
             "llm.request.failed",
             "llm.request.started",
-            "llm.request.recovery_discarded",
-            "llm.request.failed",
-            "llm.request.started",
-            "llm.request.recovery_discarded",
             "llm.request.failed",
         ]
-        assert len(responses_api.retrieve_calls) == 3
+        assert "response_id: resp_bad_1" in output
+        assert "payload: keepalive" in output
+        assert 'snippet: { "event": "keepalive"' in output
+        assert len(responses_api.retrieve_calls) == 1
+        assert len(responses_api.create_calls) == 1
 
     def test_fatal_stream_failure_logs_and_preserves_return_shape(self, monkeypatch):
         class _FakeOwner:
