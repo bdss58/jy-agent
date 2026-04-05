@@ -19,6 +19,34 @@ from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOption
 logger = logging.getLogger(__name__)
 
 
+def _json_error_details(error: BaseException) -> dict[str, Any]:
+    if not isinstance(error, json.JSONDecodeError):
+        return {}
+
+    details: dict[str, Any] = {
+        "json_error_line": error.lineno,
+        "json_error_column": error.colno,
+        "json_error_position": error.pos,
+    }
+    snippet = _json_error_snippet(error)
+    if snippet:
+        details["json_error_snippet"] = snippet
+    return details
+
+
+def _json_error_snippet(error: json.JSONDecodeError, radius: int = 120) -> str:
+    doc = getattr(error, "doc", "") or ""
+    if not doc:
+        return ""
+
+    pos = min(max(getattr(error, "pos", 0), 0), len(doc))
+    start = max(0, pos - radius)
+    end = min(len(doc), pos + radius)
+    prefix = "..." if start > 0 else ""
+    suffix = "..." if end < len(doc) else ""
+    return f"{prefix}{doc[start:end]}{suffix}"
+
+
 def _response_usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -221,6 +249,8 @@ class _OpenAIStream(RuntimeStream):
         self._text_delta_chars = 0
         self._tool_call_delta_chars = 0
         self._recovery_method = ""
+        self._stream_error: BaseException | None = None
+        self._stream_error_stage = ""
         self._closed = False
 
     def __iter__(self):
@@ -242,29 +272,37 @@ class _OpenAIStream(RuntimeStream):
                     self._tool_call_delta_chars += len(getattr(event, "delta", "") or "")
                     yield {"type": "tool_call_delta", "delta": event.delta}
         except Exception as err:
+            if isinstance(err, json.JSONDecodeError):
+                self._stream_error = err
+                self._stream_error_stage = "stream_iter"
+                return
             if self._call_logger is not None:
                 self._call_logger.failed(
                     err,
                     stage="stream_iter",
                     response_id=self._response_id,
                     stream_state=self.log_snapshot(),
+                    **_json_error_details(err),
                 )
             raise
 
     def get_final_message(self) -> AssistantMessage:
         if self._final_message is None:
             try:
+                if self._stream_error is not None:
+                    raise self._stream_error
                 response = self._stream.get_final_response()
                 self._final_message = _assistant_from_response(self._model_spec, response)
-            except RuntimeError as err:
+            except (RuntimeError, json.JSONDecodeError) as err:
                 recovered = self._recover_response(err)
                 if recovered is None:
                     if self._call_logger is not None:
                         self._call_logger.failed(
                             err,
-                            stage="final_response",
+                            stage=self._stream_error_stage or "final_response",
                             response_id=self._response_id,
                             stream_state=self.log_snapshot(),
+                            **_json_error_details(err),
                         )
                     raise
                 response, warning = recovered
@@ -302,7 +340,26 @@ class _OpenAIStream(RuntimeStream):
             "recovery_method": self._recovery_method or None,
         }
 
-    def _recover_response(self, error: RuntimeError) -> tuple[Any, str] | None:
+    def _recover_response(self, error: BaseException) -> tuple[Any, str] | None:
+        if isinstance(error, json.JSONDecodeError):
+            retrieved = self._retrieve_response()
+            if retrieved is not None:
+                self._recovery_method = "responses.retrieve"
+                return (
+                    retrieved,
+                    "Recovered OpenAI stream after malformed SSE JSON via responses.retrieve().",
+                )
+
+            snapshot = self._snapshot_response()
+            if snapshot is not None:
+                self._recovery_method = "stream_snapshot"
+                return (
+                    snapshot,
+                    "Recovered OpenAI stream after malformed SSE JSON from partial stream snapshot.",
+                )
+
+            return None
+
         if self._MISSING_COMPLETED_EVENT not in str(error):
             return None
 

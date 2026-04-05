@@ -67,18 +67,21 @@ class _OpenAIItem:
 
 
 class _FakeManagedStream:
-    def __init__(self, events):
+    def __init__(self, events, *, iter_error=None):
         self._events = list(events)
+        self._iter_error = iter_error
         self.iterated = False
 
     def __iter__(self):
         self.iterated = True
         yield from self._events
+        if self._iter_error is not None:
+            raise self._iter_error
 
 
 class _FakeOpenAIManagedStream(_FakeManagedStream):
-    def __init__(self, events, final_response, *, final_error=None, state=None):
-        super().__init__(events)
+    def __init__(self, events, final_response, *, final_error=None, state=None, iter_error=None):
+        super().__init__(events, iter_error=iter_error)
         self._final_response = final_response
         self._final_error = final_error
         self._state = state if state is not None else SimpleNamespace()
@@ -683,6 +686,51 @@ class TestRuntimeAdapters:
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_text"
         assert manager.exited is True
 
+    def test_openai_complete_recovers_malformed_sse_json_via_retrieve(self, monkeypatch):
+        retrieved_response = SimpleNamespace(
+            id="resp_recovered_json",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=8, output_tokens=3, total_tokens=11),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_recovered_json",
+                    phase="final_answer",
+                    content=[_OpenAIItem("output_text", text="recovered after json error")],
+                ),
+            ],
+        )
+        json_error = json.JSONDecodeError(
+            "Expecting ',' delimiter",
+            '{"type":"response.created","response":{"id":"resp_recovered_json""}}',
+            62,
+        )
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_recovered_json"))],
+            None,
+            iter_error=json_error,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager, retrieve_result=retrieved_response)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.openai") as records:
+            message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["content"] == [{"type": "text", "text": "recovered after json error"}]
+        assert message["runtime_warnings"] == [
+            "Recovered OpenAI stream after malformed SSE JSON via responses.retrieve()."
+        ]
+        assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_json"
+        assert [record.event for record in records] == ["llm.request.started", "llm.request.succeeded"]
+        assert records[1].payload["runtime_warnings"] == message["runtime_warnings"]
+
     def test_openai_success_logging_stays_summary_only(self, monkeypatch):
         final_response = SimpleNamespace(
             id="resp_text",
@@ -894,6 +942,100 @@ class TestRuntimeAdapters:
             "Recovered OpenAI stream after missing terminal event from partial stream snapshot."
         ]
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_tool"
+
+    def test_openai_complete_recovers_malformed_sse_json_from_partial_stream_snapshot(self, monkeypatch):
+        snapshot = SimpleNamespace(
+            id="resp_snapshot_json",
+            output=[
+                _OpenAIItem(
+                    "function_call",
+                    call_id="call_snapshot_json",
+                    name="echo",
+                    arguments=json.dumps({"value": "snapshot json"}),
+                ),
+            ],
+            usage=None,
+            error=None,
+            incomplete_details=None,
+        )
+        json_error = json.JSONDecodeError(
+            "Expecting ',' delimiter",
+            '{"type":"response.created","response":{"id":"resp_snapshot_json""}}',
+            61,
+        )
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_snapshot_json"))],
+            None,
+            iter_error=json_error,
+            state=SimpleNamespace(_ResponseStreamState__current_snapshot=snapshot),
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(
+            manager,
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["stop_reason"] == "tool_use"
+        assert message["content"] == [
+            {"type": "tool_call", "id": "call_snapshot_json", "name": "echo", "arguments": {"value": "snapshot json"}}
+        ]
+        assert message["runtime_warnings"] == [
+            "Recovered OpenAI stream after malformed SSE JSON from partial stream snapshot."
+        ]
+        assert responses_api.retrieve_calls[0]["response_id"] == "resp_snapshot_json"
+
+    def test_openai_unrecoverable_malformed_sse_json_logs_failure_with_sanitized_snippet(self, monkeypatch):
+        secret = "sk-test-secret-123456789"
+        bad_doc = (
+            '{"type":"response.created","secret":"'
+            + secret
+            + '" "payload":"'
+            + ("x" * 160)
+            + '"}'
+        )
+        error_pos = bad_doc.index(secret) + (len(secret) // 2)
+        json_error = json.JSONDecodeError("Expecting ',' delimiter", bad_doc, error_pos)
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_bad_json"))],
+            None,
+            iter_error=json_error,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(
+            manager,
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = OpenAIAdapter()
+        monkeypatch.setenv("OPENAI_API_KEY", secret)
+        monkeypatch.setenv("AGENT_LOG_MAX_TEXT_CHARS", "60")
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.openai") as records:
+            with pytest.raises(json.JSONDecodeError):
+                adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert [record.event for record in records] == ["llm.request.started", "llm.request.failed"]
+        failure_payload = records[1].payload
+        assert failure_payload["stage"] == "stream_iter"
+        assert failure_payload["response_id"] == "resp_bad_json"
+        assert failure_payload["json_error_position"] == error_pos
+        assert failure_payload["json_error_snippet"]
+        serialized = json.dumps(failure_payload, ensure_ascii=False)
+        assert secret not in serialized
+        assert "[REDACTED]" in serialized
+        assert "[truncated " in failure_payload["json_error_snippet"]
 
     def test_anthropic_complete_uses_stream_for_text_response(self, monkeypatch):
         final_response = SimpleNamespace(

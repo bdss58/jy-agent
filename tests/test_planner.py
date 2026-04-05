@@ -1,5 +1,6 @@
 # Tests for planner utilities (ToolResult, truncation, error detection)
 
+import json
 import os
 import sys
 import logging
@@ -507,6 +508,37 @@ class TestPlannerLogging:
         assert records[0].payload["step"] == 1
         assert records[0].payload["attempt"] == 1
         assert records[0].payload["retry_in_seconds"] == 2
+
+    def test_json_decode_stream_failure_retries_as_transient(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def _fake_stream_response(runtime_owner, context, max_output_tokens, metadata=None):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise json.JSONDecodeError(
+                    "Expecting ',' delimiter",
+                    '{"type":"response.created","response":{"id":"resp_retry""}}',
+                    56,
+                )
+            return ("ok", [], "stop", {"role": "assistant", "content": []})
+
+        monkeypatch.setattr(planner, "_stream_response", _fake_stream_response)
+        monkeypatch.setattr(planner.time, "sleep", lambda _seconds: None)
+
+        with _capture_logger("jyagent.planner") as records:
+            result = planner._stream_with_retry(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                {"messages": []},
+                2048,
+                0,
+                "",
+                [],
+            )
+
+        assert result[0] == "ok"
+        assert [record.event for record in records] == ["planner.stream.retry"]
+        assert records[0].payload["transient"] is True
+        assert records[0].payload["error_type"] == "JSONDecodeError"
 
     def test_fatal_stream_failure_logs_and_preserves_return_shape(self, monkeypatch):
         class _FakeOwner:

@@ -1,5 +1,6 @@
 # Planner — Streaming tool-use loop with structured results, concurrent execution, unified timeouts.
 # Honesty rules are in the main SYSTEM_PROMPT (agent.py), not duplicated here.
+import json
 import sys
 import time
 import atexit
@@ -618,7 +619,7 @@ def _stream_with_retry(
             msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
             raise _StreamAbort(msg, "", working_messages)
         except Exception as stream_err:
-            is_transient = any(kw in str(stream_err).lower() for kw in [
+            is_transient = isinstance(stream_err, json.JSONDecodeError) or any(kw in str(stream_err).lower() for kw in [
                 "incomplete", "peer closed", "connection reset", "timeout",
                 "eof", "broken pipe", "overloaded", "529", "server_error",
                 "response.completed",  # OpenAI stream missing terminal event
