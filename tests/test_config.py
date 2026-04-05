@@ -12,7 +12,7 @@ from jyagent.config import (
     SKIP_DIRS, BINARY_EXTS,
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT,
-    MEMORY_DIR, TOPICS_DIR, MEMORY_MD_FILE, SESSIONS_FILE,
+    MEMORY_DIR, TOPICS_DIR, MEMORY_MD_FILE,
     CHARS_PER_TOKEN,
 )
 
@@ -44,7 +44,6 @@ class TestConfig:
         assert "memory" in MEMORY_DIR
         assert "topics" in TOPICS_DIR
         assert MEMORY_MD_FILE.endswith("MEMORY.md")
-        assert SESSIONS_FILE.endswith(".json")
 
     def test_chars_per_token(self):
         assert CHARS_PER_TOKEN == 4

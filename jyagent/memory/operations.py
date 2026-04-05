@@ -8,7 +8,6 @@ from ..config import (
     MAX_MEMORY_INDEX_LINES, MAX_MEMORY_INDEX_BYTES,
 )
 from .utils import ensure_dirs
-from .sessions import SessionSummaries
 
 
 # ─── MEMORY.md operations ─────────────────────────────────────────────────────
@@ -154,14 +153,6 @@ def show_memory() -> str:
             lines = len(tc.split("\n"))
             topic_lines.append(f"  📄 {t}.md ({lines} lines, {size} chars)")
         parts.append(f"📂 TOPIC FILES ({len(topics)} topics):\n" + "\n".join(topic_lines))
-
-    sessions = SessionSummaries()
-    if sessions.sessions:
-        sess_lines = []
-        for s in sessions.sessions[-5:]:
-            ts = s.get("timestamp", "?")[:10]
-            sess_lines.append(f"  [{ts}] {s['summary']}")
-        parts.append(f"📅 RECENT SESSIONS ({len(sessions.sessions)} total):\n" + "\n".join(sess_lines))
 
     if not parts:
         return "🧠 Memory is empty. I'll start learning about you as we interact!"

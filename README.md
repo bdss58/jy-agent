@@ -7,7 +7,7 @@ A personal AI assistant with Anthropic + OpenAI runtime support, self-evolution 
 - **Multi-Provider Runtime**: Anthropic Messages and OpenAI Responses with provider-neutral conversation state
 - **Tool-use Loop**: Streaming tool execution with concurrent parallel-safe tools
 - **MCP Integration**: Chrome DevTools, and any MCP-compatible server
-- **Persistent Memory**: Cross-session memory with topic files, user profile, session summaries
+- **Persistent Memory**: Cross-session memory with `MEMORY.md`, topic files, and user profile
 - **Agent Skills**: Procedural knowledge system (agentskills.io standard)
 - **Web Fetch**: 5-tier anti-blocking cascade (curl_cffi → httpx → Jina → Chrome → error)
 - **Rich CLI**: Markdown rendering, syntax highlighting, multi-line input

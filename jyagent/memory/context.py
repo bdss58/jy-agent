@@ -2,7 +2,6 @@
 
 from ..config import MAX_MEMORY_PROMPT_CHARS
 from .operations import read_memory_index, list_topics
-from .sessions import SessionSummaries
 
 
 def build_memory_context(query: str = "") -> str:
@@ -10,7 +9,6 @@ def build_memory_context(query: str = "") -> str:
 
     Layout:
       1. MEMORY.md index (always, first 200 lines / 25KB) — includes user profile section
-      2. Recent Session Summaries (always, last 5)
 
     Topic files are NOT injected here — agent reads them on-demand via read_file.
     """
@@ -20,12 +18,6 @@ def build_memory_context(query: str = "") -> str:
     memory_index = read_memory_index()
     if memory_index:
         sections.append(f"## Agent Memory (MEMORY.md)\n{memory_index}")
-
-    # 2. Session Summaries
-    sessions = SessionSummaries()
-    session_text = sessions.to_prompt_text()
-    if session_text:
-        sections.append(f"## Recent Sessions\n{session_text}")
 
     if not sections:
         return ""

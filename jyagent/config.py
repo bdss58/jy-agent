@@ -28,7 +28,6 @@ COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool re
 MEMORY_DIR = os.path.join("data", "memory")
 TOPICS_DIR = os.path.join(MEMORY_DIR, "topics")
 MEMORY_MD_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
-SESSIONS_FILE = os.path.join(MEMORY_DIR, "session_summaries.json")
 
 COMPACT_TOKEN_THRESHOLD = int(os.environ.get("AGENT_COMPACT_TOKEN_THRESHOLD", "80000"))
 SUMMARIZE_KEEP_RECENT = int(os.environ.get("AGENT_SUMMARIZE_KEEP_RECENT", "6"))

@@ -269,7 +269,7 @@ class CLI:
             ("/quit", "Exit the agent"),
             ("/help", "Show this help message"),
             ("/history", "Show last 10 messages"),
-            ("/new", "Save session and start fresh"),
+            ("/new", "Clear conversation and start fresh"),
             ("/tools", "List registered tools"),
             ("/model", "Show or switch provider/model"),
             ("/multi", "Toggle multi-line input mode"),
@@ -297,7 +297,7 @@ class CLI:
         
         help_text.append("\n")
         help_text.append("Keyboard Shortcuts:\n", style="bold")
-        help_text.append("  • Ctrl-C at prompt:            Exit the agent (saves session)\n")
+        help_text.append("  • Ctrl-C at prompt:            Exit the agent\n")
         help_text.append("  • Ctrl-C during response:      Interrupt current operation, return to prompt\n")
         help_text.append("  • Single-line mode (default):  Enter submits, Meta+Enter adds newline\n")
         help_text.append("  • Multi-line mode (/multi):    Enter adds newline, Meta+Enter submits\n")

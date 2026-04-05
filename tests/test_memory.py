@@ -14,6 +14,8 @@ from jyagent.memory.utils import (
 )
 from jyagent.memory.conversation import ConversationMemory
 from jyagent.memory.persistent import PersistentMemory
+import jyagent.memory.context as memory_context
+import jyagent.memory.operations as memory_operations
 
 
 class TestTokenEstimation:
@@ -143,3 +145,34 @@ class TestPersistentMemory:
             result = pm.load("to_delete")
             assert result is None or result == {}
             assert pm.delete("to_delete") is False
+
+
+class TestMemoryContext:
+    def test_build_memory_context_includes_memory_index(self, monkeypatch):
+        monkeypatch.setattr(memory_context, "read_memory_index", lambda: "# Agent Memory\n\n- user profile")
+        monkeypatch.setattr(memory_context, "list_topics", lambda: ["alpha", "beta"])
+
+        result = memory_context.build_memory_context()
+
+        assert "## Agent Memory (MEMORY.md)" in result
+        assert "# Agent Memory" in result
+        assert "Recent Sessions" not in result
+        assert "data/memory/topics/alpha.md" in result
+        assert "data/memory/topics/beta.md" in result
+
+
+class TestMemoryOperations:
+    def test_show_memory_lists_memory_and_topics_only(self, monkeypatch):
+        monkeypatch.setattr(memory_operations, "read_memory_md", lambda: "# Agent Memory\n\n- note")
+        monkeypatch.setattr(memory_operations, "list_topics", lambda: ["alpha"])
+        monkeypatch.setattr(
+            memory_operations,
+            "read_topic",
+            lambda name: "topic details" if name == "alpha" else "",
+        )
+
+        result = memory_operations.show_memory()
+
+        assert "🧠 MEMORY.md" in result
+        assert "📂 TOPIC FILES" in result
+        assert "RECENT SESSIONS" not in result

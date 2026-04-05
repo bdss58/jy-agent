@@ -1,12 +1,11 @@
-# Agent — Main run loop, command handlers, session lifecycle.
+# Agent — Main run loop and command handlers.
 
 import sys
 from .registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
-    build_memory_context, on_session_start, on_session_end,
-
+    build_memory_context,
 )
 from .planner import plan_next_action
 from .cli import CLI, console
@@ -39,7 +38,6 @@ CRITICAL BEHAVIORAL PRINCIPLES:
 4. MEMORY AWARENESS: You have a self-use memory system (inspired by Claude Code):
    - MEMORY.md: the index file, always loaded (first 200 lines / 25KB). Keep it concise.
    - Topic files: detailed knowledge in data/memory/topics/<name>.md. Read on-demand with read_file.
-   - Session summaries: recent session history, always loaded.
    
    Memory workflow:
    - To remember something: use manage_memory(action='remember') or directly write to files.
@@ -78,16 +76,8 @@ def _cmd_history(cli, conversation, **_):
     cli.print_history(recent)
 
 def _cmd_new(cli, runtime_owner, conversation, **_):
-    """Save current session, then reset for a fresh conversation."""
-    from .memory.sessions import on_session_end, on_session_start
-
+    """Clear current conversation state and start fresh."""
     global _cached_memory_context
-
-    # Save current conversation (skips if < 4 messages)
-    on_session_end(runtime_owner, conversation.get_history())
-
-    # Process the just-saved pending session in background
-    on_session_start(runtime_owner)
 
     # Clear conversation history
     conversation.clear()
@@ -100,7 +90,7 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     # Force memory context rebuild on next turn
     _cached_memory_context = None
 
-    cli.print_system("Session saved. Starting fresh.")
+    cli.print_system("Conversation cleared. Starting fresh.")
 
 def _cmd_tools(cli, **_):
     tools = get_registry().list_tools()
@@ -218,13 +208,9 @@ def _print_unexpected_error(cli, error: Exception):
         print(message, file=sys.stderr)
 
 
-def _graceful_exit(runtime_owner, conversation, cli):
-    """Save session and print goodbye on exit. Fast — no API calls."""
+def _graceful_exit(cli):
+    """Print goodbye and disconnect background services."""
     cli.goodbye()  # Say goodbye FIRST — user sees immediate response
-    try:
-        on_session_end(runtime_owner, conversation.get_history())  # File I/O only, no API
-    except Exception:
-        pass
     # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as stale processes
     try:
         from .mcp_manager import _manager
@@ -285,12 +271,6 @@ def run(runtime_owner: RuntimeOwner) -> None:
         persistent = PersistentMemory()
         interaction_count = 0
 
-        # Start session and load memory context
-        on_session_start(runtime_owner)
-        memory_context = build_memory_context()
-        if memory_context:
-            cli.print_system("🧠 Memory loaded from previous sessions.")
-
         # Initialize Agent Skills
         skill_mgr = init_skills()
         discovered_skills = skill_mgr.list_skills()
@@ -307,7 +287,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 continue
 
             if user_input is None:
-                _graceful_exit(runtime_owner, conversation, cli)
+                _graceful_exit(cli)
                 break
 
             user_input = user_input.strip()
@@ -317,7 +297,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
             try:
                 # ─── Quit ─────────────────────────────
                 if user_input == "/quit":
-                    _graceful_exit(runtime_owner, conversation, cli)
+                    _graceful_exit(cli)
                     break
 
                 # ─── /skill <name> (prefix match) ─────
