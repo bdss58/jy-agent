@@ -82,6 +82,9 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     # Clear conversation history
     conversation.clear()
 
+    # Clear active skills
+    get_skill_manager().deactivate_all()
+
     # Reset session stats
     stats = get_stats()
     stats.reset()

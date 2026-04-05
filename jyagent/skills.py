@@ -4,7 +4,7 @@
 #   - SkillManager: discovers, parses, and manages SKILL.md files
 #   - Progressive disclosure: advertise → load → read resources
 #   - System prompt injection: XML format per agentskills.io spec
-#   - LLM-based auto-activation: uses Haiku for smart skill routing
+#   - LLM-based auto-activation: model-assisted skill routing
 #   - CLI integration: /skills command
 #
 # Directory layout:
@@ -25,7 +25,12 @@ import sys
 import time
 from typing import Optional
 
-from .config import SKILL_ROUTER_TIMEOUT, get_skill_router_model_spec
+from .config import (
+    MAX_INSTRUCTIONS_CHARS,
+    MAX_RESOURCE_CHARS,
+    SKILL_ROUTER_TIMEOUT,
+    get_skill_router_model_spec,
+)
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -35,8 +40,6 @@ SKILL_FILENAME = "SKILL.md"
 
 # Progressive disclosure budgets
 MAX_CATALOG_TOKENS_PER_SKILL = 150   # ~name + description for advertising
-MAX_INSTRUCTIONS_CHARS = 20000       # loaded skill body limit
-MAX_RESOURCE_CHARS = 30000           # single reference file limit
 
 # ─── SKILL.md Parser ─────────────────────────────────────────────────────────
 
@@ -363,10 +366,13 @@ class SkillManager:
         if not skill:
             return None
 
-        skill_dir = skill["skill_dir"]
-        # Security: prevent path traversal
-        resource_path = os.path.normpath(os.path.join(skill_dir, relative_path))
-        if not resource_path.startswith(skill_dir):
+        skill_dir = os.path.realpath(skill["skill_dir"])
+        # Security: prevent path traversal and symlink escapes
+        resource_path = os.path.realpath(os.path.join(skill_dir, relative_path))
+        try:
+            if os.path.commonpath([skill_dir, resource_path]) != skill_dir:
+                return None
+        except ValueError:
             return None
 
         try:
@@ -401,7 +407,7 @@ class SkillManager:
         Automatically activate relevant skills based on user query.
         
         Strategy:
-          1. Try LLM routing (Haiku — fast, cheap, smart)
+          1. Try LLM routing (configured router model)
           2. Fallback to keyword matching if LLM fails or is unavailable
         
         Returns list of newly activated skill names.
