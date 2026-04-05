@@ -3,6 +3,8 @@
 import os
 import sys
 import time
+import logging
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from jyagent.registry import get_registry
 from jyagent.tools.subagent import dispatch_agent
 import jyagent.tools.subagent as subagent
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextmanager
+def _capture_logger(name, level=logging.INFO):
+    target = logging.getLogger(name)
+    handler = _ListHandler()
+    original_level = target.level
+    original_propagate = target.propagate
+    target.setLevel(level)
+    target.propagate = False
+    target.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(original_level)
+        target.propagate = original_propagate
 
 
 class _DummySpinner:
@@ -194,7 +222,8 @@ class TestDispatchAgent:
         monkeypatch.setattr(subagent, "_get_client", lambda: client)
 
         try:
-            result = dispatch_agent("analyze", max_steps=3, tool_whitelist=[tool_name])
+            with _capture_logger("jyagent.tools.subagent") as records:
+                result = dispatch_agent("analyze", max_steps=3, tool_whitelist=[tool_name])
         finally:
             get_registry().unregister(tool_name)
 
@@ -202,6 +231,9 @@ class TestDispatchAgent:
         assert "Error: Sub-agent API failure at step 2: backend unavailable" in result.content
         assert "Partial output:" in result.content
         assert "working notes" in result.content
+        assert [record.event for record in records] == ["subagent.api_failure"]
+        assert records[0].payload["task_preview"] == "analyze"
+        assert "request" not in records[0].payload
 
     def test_max_steps_returns_hard_error_and_best_effort_answer(self, monkeypatch):
         tool_name = "_test_subagent_max_steps_tool"

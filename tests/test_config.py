@@ -15,6 +15,7 @@ from jyagent.config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, DEFAULT_TOOL_TIMEOUT,
     MEMORY_DIR, TOPICS_DIR, MEMORY_MD_FILE,
+    AGENT_LOG_LEVEL, AGENT_LOG_FILE, AGENT_LOG_LLM_FAILURE_PAYLOADS, AGENT_LOG_MAX_TEXT_CHARS,
     CHARS_PER_TOKEN,
 )
 
@@ -49,6 +50,12 @@ class TestConfig:
 
     def test_chars_per_token(self):
         assert CHARS_PER_TOKEN == 4
+
+    def test_logging_defaults(self):
+        assert AGENT_LOG_LEVEL == "INFO"
+        assert AGENT_LOG_FILE.endswith("data/logs/jyagent.jsonl")
+        assert AGENT_LOG_LLM_FAILURE_PAYLOADS is True
+        assert AGENT_LOG_MAX_TEXT_CHARS == 4000
 
     def test_provider_neutral_envs(self, monkeypatch):
         monkeypatch.setenv("AGENT_PROVIDER", "openai")
@@ -133,3 +140,15 @@ class TestConfig:
 
         with pytest.raises(ValueError, match="must be an integer"):
             cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096)
+
+    def test_logging_envs_parse(self, monkeypatch):
+        monkeypatch.setenv("AGENT_LOG_LEVEL", "debug")
+        monkeypatch.setenv("AGENT_LOG_FILE", "/tmp/jyagent-test.jsonl")
+        monkeypatch.setenv("AGENT_LOG_LLM_FAILURE_PAYLOADS", "0")
+        monkeypatch.setenv("AGENT_LOG_MAX_TEXT_CHARS", "256")
+        cfg = _reload_config()
+
+        assert cfg.AGENT_LOG_LEVEL == "DEBUG"
+        assert cfg.AGENT_LOG_FILE == "/tmp/jyagent-test.jsonl"
+        assert cfg.AGENT_LOG_LLM_FAILURE_PAYLOADS is False
+        assert cfg.AGENT_LOG_MAX_TEXT_CHARS == 256

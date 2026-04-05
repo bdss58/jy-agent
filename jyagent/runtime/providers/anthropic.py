@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
 import anthropic
 import httpx
 
+from ...observability import LLMCallLogger, new_call_id, summarize_runtime_context
 from ..core import register_adapter
 from ..history import transform_messages_for_target
 from ..reasoning import validate_anthropic_thinking
 from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream, Usage
+
+
+logger = logging.getLogger(__name__)
 
 
 def _usage_from_response(usage: Any) -> Usage:
@@ -146,28 +151,54 @@ def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
 
 
 class _AnthropicStream(RuntimeStream):
-    def __init__(self, stream_cm: Any, model_spec: ModelSpec):
+    def __init__(self, stream_cm: Any, model_spec: ModelSpec, call_logger: LLMCallLogger | None = None):
         self._stream_cm = stream_cm
-        self._stream = stream_cm.__enter__()
+        self._call_logger = call_logger
+        try:
+            self._stream = stream_cm.__enter__()
+        except Exception as err:
+            if self._call_logger is not None:
+                self._call_logger.failed(err, stage="stream_enter")
+            raise
         self._model_spec = model_spec
         self._final_message: AssistantMessage | None = None
+        self._event_count = 0
+        self._text_delta_chars = 0
+        self._thinking_delta_chars = 0
+        self._tool_call_delta_chars = 0
         self._closed = False
 
     def __iter__(self):
-        for event in self._stream:
-            if getattr(event, "type", None) != "content_block_delta":
-                continue
-            delta = event.delta
-            if hasattr(delta, "text"):
-                yield {"type": "text_delta", "text": delta.text}
-            elif getattr(delta, "type", None) == "thinking_delta":
-                yield {"type": "thinking_delta", "text": delta.thinking}
-            elif getattr(delta, "type", None) == "input_json_delta":
-                yield {"type": "tool_call_delta", "delta": delta.partial_json}
+        try:
+            for event in self._stream:
+                self._event_count += 1
+                if getattr(event, "type", None) != "content_block_delta":
+                    continue
+                delta = event.delta
+                if hasattr(delta, "text"):
+                    self._text_delta_chars += len(getattr(delta, "text", "") or "")
+                    yield {"type": "text_delta", "text": delta.text}
+                elif getattr(delta, "type", None) == "thinking_delta":
+                    self._thinking_delta_chars += len(getattr(delta, "thinking", "") or "")
+                    yield {"type": "thinking_delta", "text": delta.thinking}
+                elif getattr(delta, "type", None) == "input_json_delta":
+                    self._tool_call_delta_chars += len(getattr(delta, "partial_json", "") or "")
+                    yield {"type": "tool_call_delta", "delta": delta.partial_json}
+        except Exception as err:
+            if self._call_logger is not None:
+                self._call_logger.failed(err, stage="stream_iter", stream_state=self.log_snapshot())
+            raise
 
     def get_final_message(self) -> AssistantMessage:
         if self._final_message is None:
-            self._final_message = _assistant_from_response(self._model_spec, self._stream.get_final_message())
+            try:
+                self._final_message = _assistant_from_response(self._model_spec, self._stream.get_final_message())
+            except Exception as err:
+                if self._call_logger is not None:
+                    self._call_logger.failed(err, stage="final_message", stream_state=self.log_snapshot())
+                raise
+            if self._call_logger is not None:
+                self._call_logger.succeeded(self._final_message, stream_state=self.log_snapshot())
         return self._final_message
 
     def close(self) -> None:
@@ -175,6 +206,14 @@ class _AnthropicStream(RuntimeStream):
             return
         self._stream_cm.__exit__(None, None, None)
         self._closed = True
+
+    def log_snapshot(self) -> dict[str, Any]:
+        return {
+            "event_count": self._event_count,
+            "text_delta_chars": self._text_delta_chars,
+            "thinking_delta_chars": self._thinking_delta_chars,
+            "tool_call_delta_chars": self._tool_call_delta_chars,
+        }
 
 
 class AnthropicAdapter:
@@ -212,10 +251,27 @@ class AnthropicAdapter:
         return kwargs
 
     def stream(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> RuntimeStream:
-        client = self._client()
+        options = options or RuntimeOptions()
         kwargs = self._request_kwargs(model_spec, context, options)
-        timeout = None if options is None else options.timeout
-        return _AnthropicStream(client.messages.stream(**kwargs, timeout=timeout), model_spec)
+        timeout = options.timeout
+        call_logger = LLMCallLogger(
+            logger,
+            call_id=new_call_id(),
+            provider=self.provider,
+            api=self.api_name,
+            model=model_spec.model,
+            metadata=options.metadata or {},
+            request_summary=summarize_runtime_context(context, options),
+            request_payload=kwargs,
+        )
+        call_logger.started()
+        try:
+            client = self._client()
+            stream_cm = client.messages.stream(**kwargs, timeout=timeout)
+        except Exception as err:
+            call_logger.failed(err, stage="stream_open")
+            raise
+        return _AnthropicStream(stream_cm, model_spec, call_logger=call_logger)
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
         stream = self.stream(model_spec, context, options)

@@ -5,6 +5,18 @@
 
 import os
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    text = value.strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
 # ─── API & Model ──────────────────────────────────────────────────────────────
 
 DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
@@ -22,6 +34,13 @@ MAX_WORKING_TOKENS = int(os.environ.get("AGENT_MAX_WORKING_TOKENS", "100000"))
 DEFAULT_TOOL_TIMEOUT = int(os.environ.get("AGENT_TOOL_TIMEOUT", "120"))
 STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
+
+# ─── Logging / Observability ──────────────────────────────────────────────────
+
+AGENT_LOG_LEVEL = (os.environ.get("AGENT_LOG_LEVEL") or "INFO").strip().upper() or "INFO"
+AGENT_LOG_FILE = (os.environ.get("AGENT_LOG_FILE") or os.path.join("data", "logs", "jyagent.jsonl")).strip() or os.path.join("data", "logs", "jyagent.jsonl")
+AGENT_LOG_LLM_FAILURE_PAYLOADS = _env_bool("AGENT_LOG_LLM_FAILURE_PAYLOADS", True)
+AGENT_LOG_MAX_TEXT_CHARS = int(os.environ.get("AGENT_LOG_MAX_TEXT_CHARS", "4000"))
 
 # ─── Memory ───────────────────────────────────────────────────────────────────
 

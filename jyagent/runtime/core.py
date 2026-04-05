@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..config import get_reasoning_config_for_provider
 from .types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
@@ -66,6 +66,7 @@ class RuntimeOwner:
         max_output_tokens: int | None = None,
         model_spec: ModelSpec | None = None,
         timeout: float | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         message = self.complete(
             {
@@ -79,6 +80,11 @@ class RuntimeOwner:
                     (model_spec or self._model_spec).provider,
                     max_output_tokens=max_output_tokens,
                 ),
+                metadata={
+                    "component": "runtime_owner",
+                    "mode": "complete_text",
+                    **(metadata or {}),
+                },
             ),
             model_spec=model_spec,
         )

@@ -3,10 +3,12 @@
 import sys
 import time
 import atexit
+import logging
 import threading
 import traceback
 import concurrent.futures
 from dataclasses import dataclass
+from .observability import format_traceback, log_event, scrub_string
 from .registry import get_registry
 from .toolresult import ToolResult
 from .validation import validate_tool_input
@@ -34,6 +36,8 @@ COLOR_RED = "\033[1;31m"
 COLOR_GREEN = "\033[0;32m"
 COLOR_MAGENTA = "\033[0;35m"
 COLOR_DIM_YELLOW = "\033[2;33m"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -510,7 +514,12 @@ def _is_truncated_tool_call(stop_reason: str, tool_use_blocks: list[_ToolCallReq
 
 # ─── Streaming helper ────────────────────────────────────────────────────────
 
-def _stream_response(runtime_owner: RuntimeOwner, context: dict, max_output_tokens: int) -> tuple:
+def _stream_response(
+    runtime_owner: RuntimeOwner,
+    context: dict,
+    max_output_tokens: int,
+    metadata: dict | None = None,
+) -> tuple:
     """
     Stream a single runtime response with thinking spinner and token tracking.
     Returns (step_text, tool_use_blocks, stop_reason, final_message).
@@ -533,6 +542,7 @@ def _stream_response(runtime_owner: RuntimeOwner, context: dict, max_output_toke
                     runtime_owner.model_spec.provider,
                     max_output_tokens=max_output_tokens,
                 ),
+                metadata=metadata,
             ),
         )
         for event in stream:
@@ -592,7 +602,17 @@ def _stream_with_retry(
     """
     for attempt in range(_STREAM_MAX_RETRIES + 1):
         try:
-            return _stream_response(runtime_owner, context, max_output_tokens)
+            return _stream_response(
+                runtime_owner,
+                context,
+                max_output_tokens,
+                metadata={
+                    "component": "planner",
+                    "mode": "stream",
+                    "step": step + 1,
+                    "attempt": attempt + 1,
+                },
+            )
         except KeyboardInterrupt:
             _interrupted_msg()
             msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
@@ -605,12 +625,36 @@ def _stream_with_retry(
             ])
             if is_transient and attempt < _STREAM_MAX_RETRIES:
                 retry_delay = 2 ** (attempt + 1)  # 2s, 4s
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "planner.stream.retry",
+                    component="planner",
+                    step=step + 1,
+                    attempt=attempt + 1,
+                    retry_in_seconds=retry_delay,
+                    transient=True,
+                    error_type=type(stream_err).__name__,
+                    error_message=scrub_string(str(stream_err), max_text_chars=500),
+                )
                 retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {retry_delay}s... (attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
                 sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
                 sys.stdout.flush()
                 time.sleep(retry_delay)  # responds to KeyboardInterrupt
                 continue
             # Non-transient error or retries exhausted
+            log_event(
+                logger,
+                logging.ERROR,
+                "planner.stream.failed",
+                component="planner",
+                step=step + 1,
+                attempt=attempt + 1,
+                transient=is_transient,
+                error_type=type(stream_err).__name__,
+                error_message=scrub_string(str(stream_err), max_text_chars=500),
+                traceback=scrub_string(format_traceback(stream_err), max_text_chars=4000),
+            )
             error_msg = f"\n[Stream error at step {step+1}: {stream_err}]\n"
             sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
             sys.stdout.flush()
@@ -790,6 +834,12 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
                         runtime_owner.model_spec.provider,
                         max_output_tokens=DEFAULT_MAX_TOKENS,
                     ),
+                    metadata={
+                        "component": "planner",
+                        "mode": "fallback_complete",
+                        "step": max_steps,
+                        "fallback": True,
+                    },
                 ),
             )
             stats.record_usage(
@@ -809,6 +859,17 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
             msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
             return (msg, "", working_messages)
         except Exception as fallback_err:
+            log_event(
+                logger,
+                logging.ERROR,
+                "planner.fallback.failed",
+                component="planner",
+                step=max_steps,
+                fallback=True,
+                error_type=type(fallback_err).__name__,
+                error_message=scrub_string(str(fallback_err), max_text_chars=500),
+                traceback=scrub_string(format_traceback(fallback_err), max_text_chars=4000),
+            )
             sys.stdout.write(f"{COLOR_RED}\n  Fallback response failed: {fallback_err}{COLOR_RESET}\n")
             sys.stdout.flush()
 
@@ -822,6 +883,15 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
         return (msg, "", working_messages)
     except Exception as e:
         error_detail = traceback.format_exc()
+        log_event(
+            logger,
+            logging.ERROR,
+            "planner.unhandled_exception",
+            component="planner",
+            error_type=type(e).__name__,
+            error_message=scrub_string(str(e), max_text_chars=500),
+            traceback=scrub_string(format_traceback(e), max_text_chars=4000),
+        )
         sys.stdout.write(f"{COLOR_RED}\nFatal error in planner: {e}\n{error_detail}{COLOR_RESET}\n")
         sys.stdout.flush()
         return (f"Error during planning: {e}", "", working_messages)

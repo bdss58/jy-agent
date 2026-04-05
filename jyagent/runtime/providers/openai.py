@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any
@@ -8,10 +9,14 @@ from typing import Any
 import httpx
 from openai import OpenAI
 
+from ...observability import LLMCallLogger, new_call_id, summarize_runtime_context
 from ..core import register_adapter
 from ..history import transform_messages_for_target
 from ..reasoning import validate_openai_reasoning
 from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream
+
+
+logger = logging.getLogger(__name__)
 
 
 def _response_usage(response: Any) -> dict[str, int]:
@@ -190,31 +195,61 @@ def _assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantM
 class _OpenAIStream(RuntimeStream):
     _MISSING_COMPLETED_EVENT = "Didn't receive a `response.completed` event."
 
-    def __init__(self, manager: Any, model_spec: ModelSpec, responses_api: Any, timeout: float | None = None):
+    def __init__(
+        self,
+        manager: Any,
+        model_spec: ModelSpec,
+        responses_api: Any,
+        timeout: float | None = None,
+        call_logger: LLMCallLogger | None = None,
+    ):
         self._manager = manager
-        self._stream = manager.__enter__()
+        self._call_logger = call_logger
+        try:
+            self._stream = manager.__enter__()
+        except Exception as err:
+            if self._call_logger is not None:
+                self._call_logger.failed(err, stage="stream_enter")
+            raise
         self._model_spec = model_spec
         self._responses_api = responses_api
         self._timeout = timeout
         self._final_message: AssistantMessage | None = None
         self._response_id = ""
         self._incomplete_details = None
+        self._event_count = 0
+        self._text_delta_chars = 0
+        self._tool_call_delta_chars = 0
+        self._recovery_method = ""
         self._closed = False
 
     def __iter__(self):
-        for event in self._stream:
-            event_type = getattr(event, "type", "")
-            response = getattr(event, "response", None)
-            if response is not None and not self._response_id:
-                self._response_id = getattr(response, "id", "") or self._response_id
-            if event_type == "response.incomplete":
-                self._incomplete_details = getattr(response, "incomplete_details", None)
-                if self._incomplete_details is None:
-                    self._incomplete_details = getattr(event, "incomplete_details", None)
-            if event_type == "response.output_text.delta":
-                yield {"type": "text_delta", "text": event.delta}
-            elif event_type == "response.function_call_arguments.delta":
-                yield {"type": "tool_call_delta", "delta": event.delta}
+        try:
+            for event in self._stream:
+                self._event_count += 1
+                event_type = getattr(event, "type", "")
+                response = getattr(event, "response", None)
+                if response is not None and not self._response_id:
+                    self._response_id = getattr(response, "id", "") or self._response_id
+                if event_type == "response.incomplete":
+                    self._incomplete_details = getattr(response, "incomplete_details", None)
+                    if self._incomplete_details is None:
+                        self._incomplete_details = getattr(event, "incomplete_details", None)
+                if event_type == "response.output_text.delta":
+                    self._text_delta_chars += len(getattr(event, "delta", "") or "")
+                    yield {"type": "text_delta", "text": event.delta}
+                elif event_type == "response.function_call_arguments.delta":
+                    self._tool_call_delta_chars += len(getattr(event, "delta", "") or "")
+                    yield {"type": "tool_call_delta", "delta": event.delta}
+        except Exception as err:
+            if self._call_logger is not None:
+                self._call_logger.failed(
+                    err,
+                    stage="stream_iter",
+                    response_id=self._response_id,
+                    stream_state=self.log_snapshot(),
+                )
+            raise
 
     def get_final_message(self) -> AssistantMessage:
         if self._final_message is None:
@@ -224,10 +259,28 @@ class _OpenAIStream(RuntimeStream):
             except RuntimeError as err:
                 recovered = self._recover_response(err)
                 if recovered is None:
+                    if self._call_logger is not None:
+                        self._call_logger.failed(
+                            err,
+                            stage="final_response",
+                            response_id=self._response_id,
+                            stream_state=self.log_snapshot(),
+                        )
                     raise
                 response, warning = recovered
                 self._final_message = _assistant_from_response(self._model_spec, response)
                 self._final_message["runtime_warnings"] = [warning]
+            except Exception as err:
+                if self._call_logger is not None:
+                    self._call_logger.failed(
+                        err,
+                        stage="final_response",
+                        response_id=self._response_id,
+                        stream_state=self.log_snapshot(),
+                    )
+                raise
+            if self._call_logger is not None:
+                self._call_logger.succeeded(self._final_message, stream_state=self.log_snapshot())
         return self._final_message
 
     def close(self) -> None:
@@ -236,12 +289,26 @@ class _OpenAIStream(RuntimeStream):
         self._manager.__exit__(None, None, None)
         self._closed = True
 
+    def log_snapshot(self) -> dict[str, Any]:
+        incomplete_reason = None
+        if self._incomplete_details is not None:
+            incomplete_reason = getattr(self._incomplete_details, "reason", None) or str(self._incomplete_details)
+        return {
+            "response_id": self._response_id,
+            "event_count": self._event_count,
+            "text_delta_chars": self._text_delta_chars,
+            "tool_call_delta_chars": self._tool_call_delta_chars,
+            "incomplete_reason": incomplete_reason,
+            "recovery_method": self._recovery_method or None,
+        }
+
     def _recover_response(self, error: RuntimeError) -> tuple[Any, str] | None:
         if self._MISSING_COMPLETED_EVENT not in str(error):
             return None
 
         retrieved = self._retrieve_response()
         if retrieved is not None:
+            self._recovery_method = "responses.retrieve"
             return (
                 retrieved,
                 "Recovered OpenAI stream after missing terminal event via responses.retrieve().",
@@ -249,6 +316,7 @@ class _OpenAIStream(RuntimeStream):
 
         snapshot = self._snapshot_response()
         if snapshot is not None:
+            self._recovery_method = "stream_snapshot"
             return (
                 snapshot,
                 "Recovered OpenAI stream after missing terminal event from partial stream snapshot.",
@@ -330,10 +398,33 @@ class OpenAIAdapter:
         return kwargs
 
     def stream(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> RuntimeStream:
-        client = self._client()
+        options = options or RuntimeOptions()
         kwargs = self._request_kwargs(model_spec, context, options)
-        timeout = None if options is None else options.timeout
-        return _OpenAIStream(client.responses.stream(**kwargs, timeout=timeout), model_spec, client.responses, timeout=timeout)
+        timeout = options.timeout
+        call_logger = LLMCallLogger(
+            logger,
+            call_id=new_call_id(),
+            provider=self.provider,
+            api=self.api_name,
+            model=model_spec.model,
+            metadata=options.metadata or {},
+            request_summary=summarize_runtime_context(context, options),
+            request_payload=kwargs,
+        )
+        call_logger.started()
+        try:
+            client = self._client()
+            manager = client.responses.stream(**kwargs, timeout=timeout)
+        except Exception as err:
+            call_logger.failed(err, stage="stream_open")
+            raise
+        return _OpenAIStream(
+            manager,
+            model_spec,
+            client.responses,
+            timeout=timeout,
+            call_logger=call_logger,
+        )
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
         stream = self.stream(model_spec, context, options)

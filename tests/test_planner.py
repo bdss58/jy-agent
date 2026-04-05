@@ -2,7 +2,8 @@
 
 import os
 import sys
-import pytest
+import logging
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -14,6 +15,32 @@ from jyagent.planner import (
 from jyagent.registry import get_registry
 from jyagent.runtime import RuntimeOwner, get_adapter
 from jyagent.runtime.types import ModelSpec
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextmanager
+def _capture_logger(name, level=logging.INFO):
+    target = logging.getLogger(name)
+    handler = _ListHandler()
+    original_level = target.level
+    original_propagate = target.propagate
+    target.setLevel(level)
+    target.propagate = False
+    target.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(original_level)
+        target.propagate = original_propagate
 
 
 class TestToolResult:
@@ -450,3 +477,117 @@ class TestPlannerWarnings:
         assert dummy_stats.recorded_usage == [
             ({"input_tokens": 4, "output_tokens": 5}, "openai", "gpt-5-mini")
         ]
+
+
+class TestPlannerLogging:
+    def test_stream_retry_logs_attempt_context(self, monkeypatch):
+        attempts = {"count": 0}
+
+        def _fake_stream_response(runtime_owner, context, max_output_tokens, metadata=None):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("timeout from backend")
+            return ("ok", [], "stop", {"role": "assistant", "content": []})
+
+        monkeypatch.setattr(planner, "_stream_response", _fake_stream_response)
+        monkeypatch.setattr(planner.time, "sleep", lambda _seconds: None)
+
+        with _capture_logger("jyagent.planner") as records:
+            result = planner._stream_with_retry(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                {"messages": []},
+                2048,
+                0,
+                "",
+                [],
+            )
+
+        assert result[0] == "ok"
+        assert [record.event for record in records] == ["planner.stream.retry"]
+        assert records[0].payload["step"] == 1
+        assert records[0].payload["attempt"] == 1
+        assert records[0].payload["retry_in_seconds"] == 2
+
+    def test_fatal_stream_failure_logs_and_preserves_return_shape(self, monkeypatch):
+        class _FakeOwner:
+            model_spec = ModelSpec("openai", "gpt-5-mini")
+
+        monkeypatch.setattr(
+            planner,
+            "_stream_response",
+            lambda runtime_owner, context, max_output_tokens, metadata=None: (_ for _ in ()).throw(RuntimeError("bad request")),
+        )
+
+        with _capture_logger("jyagent.planner") as records:
+            result, final_text, working_messages = plan_next_action(_FakeOwner(), [], "system prompt", max_steps=1)
+
+        assert result == "Error during streaming: bad request"
+        assert final_text == ""
+        assert working_messages == []
+        assert [record.event for record in records] == ["planner.stream.failed"]
+        assert records[0].payload["step"] == 1
+        assert records[0].payload["attempt"] == 1
+
+    def test_fallback_failure_logs_context(self, monkeypatch):
+        tool_name = "_test_planner_fallback_failure_tool"
+
+        def _tool():
+            return "tool output"
+
+        schema = {
+            "name": tool_name,
+            "description": "planner fallback tool",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        reg = get_registry()
+        reg.register(tool_name, _tool, schema)
+
+        class _DummyStats:
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                pass
+
+            def record_tool_call(self):
+                pass
+
+        def _fake_stream_with_retry(runtime_owner, context, max_output_tokens, step, all_text, working_messages):
+            return (
+                "",
+                [planner._ToolCallRequest(id="call_1", name=tool_name, input={})],
+                "tool_use",
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_call", "id": "call_1", "name": tool_name, "arguments": {}}],
+                    "provider": "openai",
+                    "model": "gpt-5-mini",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "stop_reason": "tool_use",
+                },
+            )
+
+        monkeypatch.setattr(planner, "_stream_with_retry", _fake_stream_with_retry)
+        monkeypatch.setattr(planner, "get_stats", lambda: _DummyStats())
+        monkeypatch.setattr(
+            get_adapter("openai"),
+            "stream",
+            lambda model_spec, context, options=None: (_ for _ in ()).throw(RuntimeError("fallback exploded")),
+        )
+
+        try:
+            with _capture_logger("jyagent.planner") as records:
+                result, final_text, working_messages = plan_next_action(
+                    RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                    [],
+                    "system prompt",
+                    max_steps=1,
+                )
+        finally:
+            reg.unregister(tool_name)
+
+        assert result == "I've reached my maximum reasoning steps. Please try rephrasing your request."
+        assert final_text == ""
+        assert working_messages[-1]["tool_name"] == tool_name
+        assert [record.event for record in records] == ["planner.fallback.failed"]
+        assert records[0].payload["fallback"] is True

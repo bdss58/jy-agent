@@ -1,8 +1,10 @@
 # Tests for provider-neutral runtime transforms and adapters.
 
 import json
+import logging
 import os
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +24,32 @@ from jyagent.runtime.providers.openai import (
     _convert_messages as openai_convert_messages,
 )
 from jyagent.runtime.types import ModelSpec
+
+
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextmanager
+def _capture_logger(name, level=logging.INFO):
+    target = logging.getLogger(name)
+    handler = _ListHandler()
+    original_level = target.level
+    original_propagate = target.propagate
+    target.setLevel(level)
+    target.propagate = False
+    target.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(original_level)
+        target.propagate = original_propagate
 
 
 class _AnthropicBlock:
@@ -655,6 +683,125 @@ class TestRuntimeAdapters:
         assert responses_api.retrieve_calls[0]["response_id"] == "resp_recovered_text"
         assert manager.exited is True
 
+    def test_openai_success_logging_stays_summary_only(self, monkeypatch):
+        final_response = SimpleNamespace(
+            id="resp_text",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=11, output_tokens=5, total_tokens=16),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_text",
+                    phase="final_answer",
+                    content=[_OpenAIItem("output_text", text="hello from stream")],
+                ),
+            ],
+        )
+        managed_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.output_text.delta", delta="hello ")],
+            final_response,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.openai") as records:
+            adapter.complete(
+                ModelSpec("openai", "gpt-5-mini"),
+                {"messages": [{"role": "user", "content": "secret prompt"}]},
+                RuntimeOptions(metadata={"component": "planner", "mode": "stream", "step": 1}),
+            )
+
+        assert [record.event for record in records] == ["llm.request.started", "llm.request.succeeded"]
+        started_payload = records[0].payload
+        success_payload = records[1].payload
+        assert started_payload["message_count"] == 1
+        assert started_payload["metadata"] == {"component": "planner", "mode": "stream", "step": 1}
+        assert "request" not in started_payload
+        assert success_payload["output_text_chars"] == len("hello from stream")
+        assert success_payload["tool_call_names"] == []
+        serialized = json.dumps([record.payload for record in records], ensure_ascii=False)
+        assert "secret prompt" not in serialized
+
+    def test_openai_failure_logging_redacts_and_truncates_payloads(self, monkeypatch):
+        secret = "sk-test-secret-123456789"
+        long_prompt = f"prefix {secret} " + ("x" * 200)
+
+        class _FailingResponsesAPI:
+            def stream(self, **kwargs):
+                raise RuntimeError(f"backend rejected {secret}")
+
+        adapter = OpenAIAdapter()
+        monkeypatch.setenv("OPENAI_API_KEY", secret)
+        monkeypatch.setenv("AGENT_LOG_MAX_TEXT_CHARS", "80")
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=_FailingResponsesAPI()),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.openai") as records:
+            with pytest.raises(RuntimeError, match="backend rejected"):
+                adapter.complete(
+                    ModelSpec("openai", "gpt-5-mini"),
+                    {"messages": [{"role": "user", "content": long_prompt}]},
+                )
+
+        assert [record.event for record in records] == ["llm.request.started", "llm.request.failed"]
+        failure_payload = records[1].payload
+        serialized = json.dumps(failure_payload, ensure_ascii=False)
+        assert secret not in serialized
+        assert "[REDACTED]" in serialized
+        assert "[truncated " in serialized
+
+    def test_openai_recovery_logs_success_without_failure(self, monkeypatch):
+        retrieved_response = SimpleNamespace(
+            id="resp_recovered_text",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=9, output_tokens=4, total_tokens=13),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_recovered_text",
+                    phase="final_answer",
+                    content=[_OpenAIItem("output_text", text="recovered text")],
+                ),
+            ],
+        )
+        missing_completed = RuntimeError("Didn't receive a `response.completed` event.")
+        managed_stream = _FakeOpenAIManagedStream(
+            [
+                SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_recovered_text")),
+                SimpleNamespace(type="response.output_text.delta", delta="recover"),
+            ],
+            None,
+            final_error=missing_completed,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        responses_api = _FakeOpenAIResponsesAPI(manager, retrieve_result=retrieved_response)
+        adapter = OpenAIAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(responses=responses_api),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.openai") as records:
+            message = adapter.complete(ModelSpec("openai", "gpt-5-mini"), {"messages": []})
+
+        assert message["runtime_warnings"] == [
+            "Recovered OpenAI stream after missing terminal event via responses.retrieve()."
+        ]
+        assert [record.event for record in records] == ["llm.request.started", "llm.request.succeeded"]
+        assert records[1].payload["runtime_warnings"] == message["runtime_warnings"]
+
     def test_openai_complete_recovers_tool_call_via_retrieve(self, monkeypatch):
         retrieved_response = SimpleNamespace(
             id="resp_recovered_tool",
@@ -812,6 +959,39 @@ class TestRuntimeAdapters:
         assert managed_stream.iterated is True
         assert manager.exited is True
         assert messages_api.create_calls == []
+
+    def test_anthropic_success_logging_stays_summary_only(self, monkeypatch):
+        final_response = SimpleNamespace(
+            id="msg_text",
+            stop_reason="end_turn",
+            usage=SimpleNamespace(input_tokens=10, output_tokens=4),
+            content=[_AnthropicBlock("text", text="hello from stream")],
+        )
+        managed_stream = _FakeAnthropicManagedStream(
+            [SimpleNamespace(type="content_block_delta", delta=SimpleNamespace(text="hello "))],
+            final_response,
+        )
+        manager = _FakeStreamManager(managed_stream)
+        messages_api = _FakeAnthropicMessagesAPI(manager)
+        adapter = AnthropicAdapter()
+        monkeypatch.setattr(
+            adapter,
+            "_client",
+            lambda: SimpleNamespace(messages=messages_api),
+        )
+
+        with _capture_logger("jyagent.runtime.providers.anthropic") as records:
+            adapter.complete(
+                ModelSpec("anthropic", "claude-sonnet-4"),
+                {"messages": [{"role": "user", "content": "private prompt"}]},
+                RuntimeOptions(metadata={"component": "subagent", "mode": "loop_complete", "step": 2}),
+            )
+
+        assert [record.event for record in records] == ["llm.request.started", "llm.request.succeeded"]
+        assert records[0].payload["message_count"] == 1
+        assert records[0].payload["metadata"] == {"component": "subagent", "mode": "loop_complete", "step": 2}
+        serialized = json.dumps([record.payload for record in records], ensure_ascii=False)
+        assert "private prompt" not in serialized
 
     def test_runtime_owner_complete_text_uses_stream_backed_complete(self, monkeypatch):
         class _FakeRuntimeStream:
