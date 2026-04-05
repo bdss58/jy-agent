@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 from openai import OpenAI
 
-from ...observability import LLMCallLogger, new_call_id, summarize_runtime_context
+from ...observability import LLMCallLogger, log_event, new_call_id, summarize_runtime_context
 from ..core import register_adapter
 from ..history import transform_messages_for_target
 from ..reasoning import validate_openai_reasoning
@@ -57,6 +57,58 @@ def _response_usage(response: Any) -> dict[str, int]:
         "cache_read_input_tokens": getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0) or 0,
         "total_tokens": getattr(usage, "total_tokens", 0) or 0,
     }
+
+
+def _parse_tool_call_arguments(arguments: Any) -> dict[str, Any] | None:
+    if not isinstance(arguments, str) or not arguments.strip():
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _snapshot_discard_reason(response: Any) -> str | None:
+    output = getattr(response, "output", None) or []
+    if not output:
+        return "snapshot contains no output items"
+
+    saw_message = False
+    saw_function_call = False
+    saw_reasoning = False
+    saw_unknown = False
+
+    for item in output:
+        item_type = getattr(item, "type", "")
+        if item_type == "message":
+            saw_message = True
+            for part in getattr(item, "content", None) or []:
+                part_type = getattr(part, "type", "")
+                if part_type == "output_text" and str(getattr(part, "text", "") or "").strip():
+                    return None
+                if part_type == "refusal" and str(getattr(part, "refusal", "") or "").strip():
+                    return None
+        elif item_type == "function_call":
+            saw_function_call = True
+            if _parse_tool_call_arguments(getattr(item, "arguments", None)) is not None:
+                return None
+        elif item_type == "reasoning":
+            saw_reasoning = True
+        else:
+            saw_unknown = True
+
+    if saw_function_call:
+        return "snapshot function_call arguments were missing, non-object, or invalid JSON"
+    if saw_message:
+        return "snapshot message items contained no assistant-visible text"
+    if saw_reasoning:
+        return "snapshot contained reasoning-only output"
+    if saw_unknown:
+        return "snapshot contained unsupported output items only"
+    return "snapshot contained no usable assistant output"
 
 
 def _message_item(message_id: str, texts: list[str], phase: str | None = None) -> dict[str, Any]:
@@ -306,6 +358,22 @@ class _OpenAIStream(RuntimeStream):
                         )
                     raise
                 response, warning = recovered
+                self._response_id = getattr(response, "id", "") or self._response_id
+                if self._recovery_method == "stream_snapshot":
+                    discard_reason = _snapshot_discard_reason(response)
+                    if discard_reason is not None:
+                        self._log_discarded_recovery(discard_reason)
+                        if self._call_logger is not None:
+                            self._call_logger.failed(
+                                err,
+                                stage=self._stream_error_stage or "final_response",
+                                response_id=self._response_id,
+                                stream_state=self.log_snapshot(),
+                                recovery_method=self._recovery_method,
+                                discard_reason=discard_reason,
+                                **_json_error_details(err),
+                            )
+                        raise
                 self._final_message = _assistant_from_response(self._model_spec, response)
                 self._final_message["runtime_warnings"] = [warning]
             except Exception as err:
@@ -326,6 +394,21 @@ class _OpenAIStream(RuntimeStream):
             return
         self._manager.__exit__(None, None, None)
         self._closed = True
+
+    def _log_discarded_recovery(self, reason: str) -> None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "llm.request.recovery_discarded",
+            call_id=self._call_logger.call_id if self._call_logger is not None else "",
+            provider=self._model_spec.provider,
+            api="openai-responses",
+            model=self._model_spec.model,
+            response_id=self._response_id,
+            recovery_method=self._recovery_method or None,
+            reason=reason,
+            stream_state=self.log_snapshot(),
+        )
 
     def log_snapshot(self) -> dict[str, Any]:
         incomplete_reason = None

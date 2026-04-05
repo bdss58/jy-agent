@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -42,6 +43,63 @@ def _capture_logger(name, level=logging.INFO):
         target.removeHandler(handler)
         target.setLevel(original_level)
         target.propagate = original_propagate
+
+
+class _OpenAIItem:
+    def __init__(self, item_type, **kwargs):
+        self.type = item_type
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _FakeOpenAIManagedStream:
+    def __init__(self, events, final_response, *, final_error=None, state=None, iter_error=None):
+        self._events = list(events)
+        self._final_response = final_response
+        self._final_error = final_error
+        self._state = state if state is not None else SimpleNamespace()
+        self._iter_error = iter_error
+
+    def __iter__(self):
+        yield from self._events
+        if self._iter_error is not None:
+            raise self._iter_error
+
+    def get_final_response(self):
+        if self._final_error is not None:
+            raise self._final_error
+        return self._final_response
+
+
+class _FakeStreamManager:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def __enter__(self):
+        return self._stream
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeOpenAIResponsesAPI:
+    def __init__(self, managers, *, retrieve_error=None):
+        self._managers = list(managers)
+        self._retrieve_error = retrieve_error
+        self.stream_calls = []
+        self.retrieve_calls = []
+
+    def stream(self, **kwargs):
+        self.stream_calls.append(kwargs)
+        if not self._managers:
+            raise AssertionError("No fake stream managers left")
+        return self._managers.pop(0)
+
+    def retrieve(self, **kwargs):
+        self.retrieve_calls.append(kwargs)
+        if self._retrieve_error is not None:
+            raise self._retrieve_error
+        raise AssertionError("retrieve() should not succeed in this test")
 
 
 class TestToolResult:
@@ -539,6 +597,194 @@ class TestPlannerLogging:
         assert [record.event for record in records] == ["planner.stream.retry"]
         assert records[0].payload["transient"] is True
         assert records[0].payload["error_type"] == "JSONDecodeError"
+
+    def test_plan_next_action_retries_after_discarded_snapshot_recovery(self, monkeypatch):
+        class _DummySpinner:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class _DummyStats:
+            def __init__(self):
+                self.recorded_usage = []
+
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                self.recorded_usage.append((usage, provider, model))
+
+            def record_tool_call(self):
+                pass
+
+        json_error = json.JSONDecodeError(
+            "Expecting ',' delimiter",
+            '{"type":"response.created","response":{"id":"resp_retry_bad""}}',
+            60,
+        )
+        discarded_snapshot = SimpleNamespace(
+            id="resp_retry_bad",
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_retry_bad",
+                    content=[_OpenAIItem("output_text", text="")],
+                ),
+            ],
+            usage=None,
+            error=None,
+            incomplete_details=None,
+        )
+        bad_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.created", response=SimpleNamespace(id="resp_retry_bad"))],
+            None,
+            iter_error=json_error,
+            state=SimpleNamespace(_ResponseStreamState__current_snapshot=discarded_snapshot),
+        )
+        good_response = SimpleNamespace(
+            id="resp_retry_good",
+            error=None,
+            incomplete_details=None,
+            usage=SimpleNamespace(input_tokens=3, output_tokens=2, total_tokens=5),
+            output=[
+                _OpenAIItem(
+                    "message",
+                    id="msg_retry_good",
+                    content=[_OpenAIItem("output_text", text="retried answer")],
+                ),
+            ],
+        )
+        good_stream = _FakeOpenAIManagedStream(
+            [SimpleNamespace(type="response.output_text.delta", delta="retried answer")],
+            good_response,
+        )
+        responses_api = _FakeOpenAIResponsesAPI(
+            [_FakeStreamManager(bad_stream), _FakeStreamManager(good_stream)],
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = get_adapter("openai")
+        dummy_stats = _DummyStats()
+
+        monkeypatch.setattr(adapter, "_client", lambda: SimpleNamespace(responses=responses_api))
+        monkeypatch.setattr(planner, "_ThinkingSpinner", _DummySpinner)
+        monkeypatch.setattr(planner, "get_stats", lambda: dummy_stats)
+        monkeypatch.setattr(planner.time, "sleep", lambda _seconds: None)
+
+        with _capture_logger("jyagent.planner") as planner_records, _capture_logger(
+            "jyagent.runtime.providers.openai"
+        ) as provider_records:
+            result, final_text, working_messages = plan_next_action(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                [],
+                "system prompt",
+                max_steps=1,
+            )
+
+        assert result == "retried answer"
+        assert final_text == "retried answer"
+        assert working_messages[-1]["content"] == [{"type": "text", "text": "retried answer"}]
+        assert dummy_stats.recorded_usage == [
+            ({"input_tokens": 3, "output_tokens": 2, "cache_read_input_tokens": 0, "total_tokens": 5}, "openai", "gpt-5-mini")
+        ]
+        assert [record.event for record in planner_records] == ["planner.stream.retry"]
+        assert [record.event for record in provider_records] == [
+            "llm.request.started",
+            "llm.request.recovery_discarded",
+            "llm.request.failed",
+            "llm.request.started",
+            "llm.request.succeeded",
+        ]
+        assert responses_api.retrieve_calls[0]["response_id"] == "resp_retry_bad"
+
+    def test_plan_next_action_surfaces_error_after_discarded_snapshot_recovery_retries_exhausted(self, monkeypatch):
+        class _DummySpinner:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class _DummyStats:
+            def new_turn(self):
+                pass
+
+            def record_usage(self, usage, provider="", model=""):
+                pass
+
+            def record_tool_call(self):
+                pass
+
+        def _bad_manager(response_id: str):
+            json_error = json.JSONDecodeError(
+                "Expecting ',' delimiter",
+                f'{{"type":"response.created","response":{{"id":"{response_id}""}}}}',
+                len(response_id) + 46,
+            )
+            discarded_snapshot = SimpleNamespace(
+                id=response_id,
+                output=[
+                    _OpenAIItem(
+                        "function_call",
+                        call_id=f"call_{response_id}",
+                        name="echo",
+                        arguments='{"value":',
+                    ),
+                ],
+                usage=None,
+                error=None,
+                incomplete_details=None,
+            )
+            stream = _FakeOpenAIManagedStream(
+                [SimpleNamespace(type="response.created", response=SimpleNamespace(id=response_id))],
+                None,
+                iter_error=json_error,
+                state=SimpleNamespace(_ResponseStreamState__current_snapshot=discarded_snapshot),
+            )
+            return _FakeStreamManager(stream)
+
+        responses_api = _FakeOpenAIResponsesAPI(
+            [_bad_manager("resp_bad_1"), _bad_manager("resp_bad_2"), _bad_manager("resp_bad_3")],
+            retrieve_error=RuntimeError("retrieve failed"),
+        )
+        adapter = get_adapter("openai")
+
+        monkeypatch.setattr(adapter, "_client", lambda: SimpleNamespace(responses=responses_api))
+        monkeypatch.setattr(planner, "_ThinkingSpinner", _DummySpinner)
+        monkeypatch.setattr(planner, "get_stats", lambda: _DummyStats())
+        monkeypatch.setattr(planner.time, "sleep", lambda _seconds: None)
+
+        with _capture_logger("jyagent.planner") as planner_records, _capture_logger(
+            "jyagent.runtime.providers.openai"
+        ) as provider_records:
+            result, final_text, working_messages = plan_next_action(
+                RuntimeOwner(ModelSpec("openai", "gpt-5-mini")),
+                [],
+                "system prompt",
+                max_steps=1,
+            )
+
+        assert result.startswith("Error during streaming: Expecting ',' delimiter")
+        assert final_text == ""
+        assert working_messages == []
+        assert [record.event for record in planner_records] == [
+            "planner.stream.retry",
+            "planner.stream.retry",
+            "planner.stream.failed",
+        ]
+        assert [record.event for record in provider_records] == [
+            "llm.request.started",
+            "llm.request.recovery_discarded",
+            "llm.request.failed",
+            "llm.request.started",
+            "llm.request.recovery_discarded",
+            "llm.request.failed",
+            "llm.request.started",
+            "llm.request.recovery_discarded",
+            "llm.request.failed",
+        ]
+        assert len(responses_api.retrieve_calls) == 3
 
     def test_fatal_stream_failure_logs_and_preserves_return_shape(self, monkeypatch):
         class _FakeOwner:
