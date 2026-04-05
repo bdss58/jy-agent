@@ -31,7 +31,6 @@ def _message_item(message_id: str, texts: list[str], phase: str | None = None) -
         "id": message_id,
         "type": "message",
         "role": "assistant",
-        "status": "completed",
         "content": [{"type": "output_text", "text": text} for text in texts],
     }
     if phase:
@@ -66,7 +65,6 @@ def _assistant_items(message: dict[str, Any], sequence_prefix: str) -> list[dict
                 "id": block.get("id") or f"rs_{sequence_prefix}_{len(items)}",
                 "type": "reasoning",
                 "summary": summary,
-                "status": "completed",
             }
             if block.get("thinking", "").strip():
                 reasoning_item["content"] = [{"type": "reasoning_text", "text": block["thinking"]}]
@@ -79,7 +77,6 @@ def _assistant_items(message: dict[str, Any], sequence_prefix: str) -> list[dict
                 "call_id": block["id"],
                 "name": block["name"],
                 "arguments": json.dumps(block.get("arguments", {}), ensure_ascii=False),
-                "status": "completed",
             })
     flush_text()
     return items

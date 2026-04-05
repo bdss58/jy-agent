@@ -227,6 +227,92 @@ class TestRuntimeAdapters:
         assert converted[0]["type"] == "function_call_output"
         assert converted[0]["output"].startswith("Error: boom")
 
+    def test_openai_replayed_assistant_items_omit_status(self):
+        messages = [
+            {
+                "role": "assistant",
+                "id": "msg_tool_turn",
+                "provider": "openai",
+                "model": "gpt-5-mini",
+                "stop_reason": "tool_use",
+                "phase": "commentary",
+                "content": [
+                    {"type": "text", "text": "I will inspect the directory."},
+                    {
+                        "type": "thinking",
+                        "id": "rs_tool_turn",
+                        "thinking": "Need the file count.",
+                        "summary": ["Check current directory"],
+                        "encrypted_content": "opaque-reasoning",
+                    },
+                    {"type": "tool_call", "id": "call_dir", "name": "list_directory", "arguments": {"path": "."}},
+                ],
+            },
+            {
+                "role": "tool_result",
+                "tool_call_id": "call_dir",
+                "tool_name": "list_directory",
+                "content": "📁 jy-agent/",
+                "is_error": False,
+            },
+        ]
+
+        converted = openai_convert_messages(ModelSpec("openai", "gpt-5-mini"), messages)
+
+        assert [item["type"] for item in converted] == ["message", "reasoning", "function_call", "function_call_output"]
+        assert all("status" not in item for item in converted)
+        assert converted[0]["id"] == "msg_tool_turn"
+        assert converted[0]["phase"] == "commentary"
+        assert converted[1]["id"] == "rs_tool_turn"
+        assert converted[1]["summary"] == [{"type": "summary_text", "text": "Check current directory"}]
+        assert converted[1]["encrypted_content"] == "opaque-reasoning"
+        assert converted[2]["call_id"] == "call_dir"
+        assert converted[2]["arguments"] == json.dumps({"path": "."}, ensure_ascii=False)
+
+    def test_openai_post_tool_replay_preserves_context_without_status(self):
+        messages = [
+            {"role": "user", "content": "Count the current directory entries."},
+            {
+                "role": "assistant",
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "id": "rs_followup",
+                        "thinking": "",
+                        "summary": [],
+                        "encrypted_content": "opaque-followup",
+                        "redacted": True,
+                    },
+                    {"type": "tool_call", "id": "call_followup", "name": "list_directory", "arguments": {"path": "."}},
+                ],
+            },
+            {
+                "role": "tool_result",
+                "tool_call_id": "call_followup",
+                "tool_name": "list_directory",
+                "content": "📁 jy-agent/ (13 entries)",
+                "is_error": False,
+            },
+        ]
+
+        converted = openai_convert_messages(ModelSpec("openai", "gpt-5.4"), messages)
+
+        assert [item["type"] for item in converted] == ["message", "reasoning", "function_call", "function_call_output"]
+        assert all("status" not in item for item in converted)
+        assert converted[1]["id"] == "rs_followup"
+        assert converted[1]["encrypted_content"] == "opaque-followup"
+        assert converted[2]["call_id"] == "call_followup"
+        assert converted[2]["name"] == "list_directory"
+        assert converted[2]["arguments"] == json.dumps({"path": "."}, ensure_ascii=False)
+        assert converted[3] == {
+            "type": "function_call_output",
+            "call_id": "call_followup",
+            "output": "📁 jy-agent/ (13 entries)",
+        }
+
     def test_anthropic_response_normalizes_to_assistant_message_shape(self):
         response = SimpleNamespace(
             id="msg_1",
