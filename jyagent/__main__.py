@@ -9,21 +9,22 @@ Usage:
 
 import os
 
-from .config import get_active_model_spec
 from .runtime import RuntimeOwner
 
 
 def create_runtime_owner() -> RuntimeOwner:
     """Create the default runtime owner from environment configuration."""
+    from .config import get_active_model_spec
+
     return RuntimeOwner(get_active_model_spec())
 
 
-def main():
-    """Main entry point."""
-    # Load .env if present (from project dir or current dir)
+def _load_dotenv() -> None:
+    """Load .env before importing env-backed config."""
     try:
         from dotenv import load_dotenv
-        # First try project dir .env, then cwd .env
+
+        # First try project dir .env, then cwd .env.
         project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env_file = os.path.join(project_dir, ".env")
         if os.path.exists(env_file):
@@ -32,6 +33,11 @@ def main():
             load_dotenv(".env")
     except ImportError:
         pass  # python-dotenv not installed, rely on shell env
+
+
+def main():
+    """Main entry point."""
+    _load_dotenv()
 
     # Capture launch directory
     if "LAUNCH_DIR" not in os.environ:
