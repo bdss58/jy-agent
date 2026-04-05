@@ -41,7 +41,6 @@ CHARS_PER_TOKEN = 4
 
 # ─── Skills ───────────────────────────────────────────────────────────────────
 
-SKILLS_DIR = os.environ.get("AGENT_SKILLS_DIR", "skills")
 MAX_INSTRUCTIONS_CHARS = int(os.environ.get("AGENT_MAX_SKILL_CHARS", "8000"))
 MAX_RESOURCE_CHARS = int(os.environ.get("AGENT_MAX_RESOURCE_CHARS", "10000"))
 SKILL_ROUTER_PROVIDER = os.environ.get("SKILL_ROUTER_PROVIDER", AGENT_PROVIDER)
