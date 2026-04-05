@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -99,3 +100,19 @@ class TestSkillResources:
     def test_skill_limits_are_sourced_from_config(self):
         assert skills.MAX_INSTRUCTIONS_CHARS == config.MAX_INSTRUCTIONS_CHARS
         assert skills.MAX_RESOURCE_CHARS == config.MAX_RESOURCE_CHARS
+
+
+class TestSkillDocs:
+    def test_claude_and_codex_docs_include_run_shell_600_policy(self):
+        repo_root = Path(__file__).resolve().parents[1]
+
+        claude_text = (repo_root / "skills" / "claude-code" / "SKILL.md").read_text(encoding="utf-8").lower()
+        assert "run_shell" in claude_text
+        assert "timeout=600" in claude_text
+        assert "claude -p" in claude_text
+
+        codex_text = (repo_root / "skills" / "codex-cli" / "SKILL.md").read_text(encoding="utf-8").lower()
+        assert "run_shell" in codex_text
+        assert "timeout=600" in codex_text
+        assert "codex exec" in codex_text
+        assert "codex review" in codex_text

@@ -22,6 +22,18 @@ Delegate coding tasks to the local Codex CLI from inside `jy-agent`.
 Keep this skill narrow: it is for Codex-specific delegation, not for every
 coding request.
 
+## `run_shell` Timeout Policy
+
+When `jy-agent` launches Codex CLI through `run_shell`, explicitly pass
+`timeout=600` for `codex exec`, `codex review`, `codex exec resume --last`,
+and structured-output runs. Do not rely on the default `60s` shell timeout for
+delegated Codex work.
+
+Use `timeout=60` only for lightweight preflight checks such as
+`run_shell("which codex && codex --version", timeout=60)`.
+If a `timeout=600` Codex run still times out, narrow the task, reduce the file
+set, or split verification instead of retrying the same broad command.
+
 ## Decision Tree: Should Codex Handle This?
 
 ```
@@ -84,7 +96,7 @@ How much access should Codex get?
 Confirm Codex is available before delegating:
 
 ```python
-run_shell("which codex && codex --version")
+run_shell("which codex && codex --version", timeout=60)
 ```
 
 If Codex is missing or not authenticated enough to run, fail fast and say so.
@@ -130,27 +142,32 @@ result in the `Done when` section. After it returns, summarize:
 
 Use `codex exec` in read-only mode when the user wants investigation, design,
 or the smallest viable fix before any file changes.
+- From `jy-agent`, launch the shell command via `run_shell("<codex exec command>", timeout=600)`.
 
 ### Pattern B: Implementation
 
 Use `codex exec` in `workspace-write` mode when edits are intended. Keep the
 prompt scoped to the exact change and include concrete verification.
+- From `jy-agent`, launch the shell command via `run_shell("<codex exec command>", timeout=600)`.
 
 ### Pattern C: Review
 
 Use `codex review` when the user wants findings about uncommitted work, a branch
 diff, or a commit. This is the cleanest match for review-style tasks.
+- From `jy-agent`, launch the shell command via `run_shell("<codex review command>", timeout=600)`.
 
 ### Pattern D: Follow-up on the same Codex task
 
 Use `codex exec resume --last` when the user wants to continue or refine the
 most recent Codex run instead of starting from scratch.
+- From `jy-agent`, launch the shell command via `run_shell("<codex exec resume command>", timeout=600)`.
 
 ### Pattern E: Structured output
 
 If jy-agent needs machine-readable results, provide a JSON Schema file and use
 `codex exec --output-schema <file>`. This works well for issue lists, migration
 plans, or other outputs jy-agent will post-process.
+- From `jy-agent`, launch the shell command via `run_shell("<codex exec command>", timeout=600)`.
 
 ## Anti-Patterns
 

@@ -5,7 +5,7 @@ CORE_TOOLS = [
     # --- run_shell ---
     {
         "name": "run_shell",
-        "description": "Execute a shell command and return the output. Use the timeout parameter for long-running commands like installs, downloads, or compilations.",
+        "description": "Execute a shell command and return the output. Defaults to 60 seconds when timeout is omitted. Use timeout=600 for long-running commands such as agent CLIs (`claude -p`, `codex exec`, `codex review`), installs, builds, and test runs. If a 600-second command still times out, retry with a narrower scope instead of repeating the same broad command.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -17,7 +17,7 @@ CORE_TOOLS = [
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 600,
-                    "description": "Timeout in seconds (1-600). Defaults to 60. Use 300 for installs/downloads."
+                    "description": "Timeout in seconds (1-600). Defaults to 60 when omitted. Use timeout=600 for agent CLIs, installs, builds, test runs, and other long-running commands. If 600 seconds is still not enough, narrow the task and retry."
                 }
             },
             "required": ["command"]

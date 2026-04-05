@@ -21,6 +21,18 @@ metadata:
 Delegate coding tasks to Claude Code (`claude -p`) as a sub-agent.
 jy-agent plans and orchestrates; Claude Code implements.
 
+## `run_shell` Timeout Policy
+
+When `jy-agent` launches Claude Code through `run_shell`, explicitly pass
+`timeout=600` for every real Claude invocation in this skill. Do not rely on
+the default `60s` shell timeout for `claude -p`, `claude -p --continue`,
+structured-output runs, reviews, or implementation work.
+
+Use `timeout=60` only for lightweight preflight checks such as
+`run_shell("which claude && claude --version", timeout=60)`.
+If a `timeout=600` Claude run still times out, narrow the prompt, reduce the
+file set, or split verification instead of retrying the same broad command.
+
 ## Decision Tree: Self-Do vs Delegate
 
 ```
@@ -50,6 +62,7 @@ User wants a code change →
 echo "TASK_DESCRIPTION" | claude -p --bare
 ```
 
+- From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
 - `--bare` skips hooks, plugins, CLAUDE.md auto-discovery → fast, deterministic
 - Let the configured default model apply unless the task explicitly needs an override
 - Pipe the task via stdin for multi-line prompts
@@ -62,6 +75,7 @@ claude -p \
   "Refactor the auth middleware in src/auth.py to use JWT. Run tests after."
 ```
 
+- From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
 - `--allowedTools` auto-approves listed tools, blocks everything else
 - Always include a **verification step** in the prompt ("run tests", "check types")
 
@@ -72,6 +86,7 @@ claude -p --max-budget-usd 0.50 --max-turns 10 \
   "Fix the failing test in tests/test_api.py"
 ```
 
+- From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
 - `--max-budget-usd` caps spending (prevents runaway)
 - `--max-turns` limits back-and-forth iterations
 
@@ -83,6 +98,7 @@ claude -p --output-format json \
   "Review src/main.py and summarize issues"
 ```
 
+- From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
 - Use when you need to parse Claude Code's output programmatically
 
 ### Pattern E: Continuation
@@ -95,6 +111,8 @@ claude -p "implement the user login feature"
 claude -p --continue "now add rate limiting to the login endpoint"
 ```
 
+- From `jy-agent`, invoke each call as `run_shell("<claude command>", timeout=600)`.
+
 ### Pattern F: Fan-Out (parallel bulk tasks)
 
 ```bash
@@ -102,6 +120,7 @@ claude -p --continue "now add rate limiting to the login endpoint"
 cat task_list.txt | xargs -P 4 -I {} claude -p --bare "{}"
 ```
 
+- From `jy-agent`, invoke the orchestration shell command as `run_shell("<claude command>", timeout=600)`.
 - Use git worktrees if tasks modify overlapping files
 - See [references/advanced-patterns.md](references/advanced-patterns.md)
 

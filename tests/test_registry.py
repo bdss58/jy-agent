@@ -46,6 +46,18 @@ class TestRegistry:
             assert 'description' in schema, f"Schema for '{schema['name']}' missing description"
             assert len(schema['description']) > 0
 
+    def test_run_shell_schema_documents_600s_for_agent_clis(self):
+        reg = get_registry()
+        schema = reg.get_schema('run_shell')
+        assert schema is not None
+
+        timeout_desc = schema['input_schema']['properties']['timeout']['description']
+        combined = f"{schema['description']}\n{timeout_desc}".lower()
+
+        assert 'timeout=600' in combined
+        assert 'claude' in combined
+        assert 'codex' in combined
+
     def test_register_unregister(self):
         reg = get_registry()
         # Register a test tool
