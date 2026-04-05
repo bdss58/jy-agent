@@ -592,7 +592,7 @@ def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars:
     return "\n".join(lines)
 
 
-def _is_openai_stream_transport_error(runtime_owner: RuntimeOwner, error: BaseException) -> bool:
+def _is_terminal_openai_stream_error(runtime_owner: RuntimeOwner, error: BaseException) -> bool:
     if runtime_owner.model_spec.provider != "openai":
         return False
     if isinstance(error, json.JSONDecodeError):
@@ -600,7 +600,7 @@ def _is_openai_stream_transport_error(runtime_owner: RuntimeOwner, error: BaseEx
     return "response.completed" in str(error).lower()
 
 
-def _stream_transport_error_reason(error: BaseException) -> str:
+def _terminal_openai_stream_error_reason(error: BaseException) -> str:
     if isinstance(error, json.JSONDecodeError):
         return "malformed SSE JSON"
     if "response.completed" in str(error).lower():
@@ -608,27 +608,20 @@ def _stream_transport_error_reason(error: BaseException) -> str:
     return "stream transport failure"
 
 
-def _complete_response(
-    runtime_owner: RuntimeOwner,
-    context: dict,
-    max_output_tokens: int,
-    metadata: dict | None = None,
-) -> tuple:
-    """Run a single non-stream runtime response and render any final text."""
-    final_message = runtime_owner.complete(
-        context,
-        options=_runtime_options(runtime_owner, max_output_tokens, metadata),
-    )
-    for warning in final_message.get("runtime_warnings", []):
-        _runtime_warning(warning)
+class _StreamFailure(Exception):
+    """Raised when a streamed response fails after emitting partial output."""
 
-    step_text = _assistant_text(final_message)
-    if step_text:
-        _stream_write(step_text)
-    stop_reason = final_message.get("stop_reason", "stop")
-    tool_use_blocks = _assistant_tool_calls(final_message)
-    _record_response_usage(final_message)
-    return step_text, tool_use_blocks, stop_reason, final_message
+    def __init__(self, error: BaseException, partial_text: str):
+        super().__init__(str(error))
+        self.error = error
+        self.partial_text = partial_text
+
+
+def _stream_abort_text(existing_text: str, step: int, error: BaseException) -> str:
+    error_text = f"[Error: streaming interrupted at step {step + 1}: {error}]"
+    if existing_text:
+        return existing_text + "\n\n" + error_text
+    return error_text
 
 def _stream_response(
     runtime_owner: RuntimeOwner,
@@ -672,6 +665,10 @@ def _stream_response(
         stop_reason = final_message.get("stop_reason", "stop")
         tool_use_blocks = _assistant_tool_calls(final_message)
         _record_response_usage(final_message)
+    except KeyboardInterrupt:
+        raise
+    except Exception as err:
+        raise _StreamFailure(err, "".join(text_parts)) from err
     finally:
         if stream is not None:
             try:
@@ -719,106 +716,15 @@ def _stream_with_retry(
             _interrupted_msg()
             msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
             raise _StreamAbort(msg, "", working_messages)
+        except _StreamFailure as stream_failure:
+            stream_err = stream_failure.error
+            partial_step_text = stream_failure.partial_text
         except Exception as stream_err:
-            if _is_openai_stream_transport_error(runtime_owner, stream_err):
-                reason = _stream_transport_error_reason(stream_err)
-                diagnostics_text = _format_stream_error_diagnostics(stream_err)
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "planner.stream.nonstream_fallback",
-                    component="planner",
-                    step=step + 1,
-                    attempt=attempt + 1,
-                    error_type=type(stream_err).__name__,
-                    error_message=scrub_string(str(stream_err), max_text_chars=500),
-                    fallback_reason=reason,
-                    **_stream_error_log_fields(stream_err),
-                )
-                warning_msg = (
-                    f"OpenAI stream transport failed ({reason}); retrying this step with non-stream response."
-                )
-                if diagnostics_text:
-                    warning_msg += f"\n{diagnostics_text}"
-                _runtime_warning(warning_msg)
-                try:
-                    return _complete_response(
-                        runtime_owner,
-                        context,
-                        max_output_tokens,
-                        metadata={
-                            "component": "planner",
-                            "mode": "complete",
-                            "step": step + 1,
-                            "attempt": attempt + 1,
-                            "stream_fallback": True,
-                            "stream_failure": reason,
-                        },
-                    )
-                except KeyboardInterrupt:
-                    _interrupted_msg()
-                    msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
-                    raise _StreamAbort(msg, "", working_messages)
-                except Exception as fallback_err:
-                    log_event(
-                        logger,
-                        logging.ERROR,
-                        "planner.stream.nonstream_fallback_failed",
-                        component="planner",
-                        step=step + 1,
-                        attempt=attempt + 1,
-                        error_type=type(stream_err).__name__,
-                        error_message=scrub_string(str(stream_err), max_text_chars=500),
-                        fallback_error_type=type(fallback_err).__name__,
-                        fallback_error_message=scrub_string(str(fallback_err), max_text_chars=500),
-                        traceback=scrub_string(format_traceback(fallback_err), max_text_chars=4000),
-                        **_stream_error_log_fields(stream_err),
-                    )
-                    error_msg = (
-                        f"\n[Stream error at step {step+1}: {stream_err}]"
-                        + (f"\n{diagnostics_text}" if diagnostics_text else "")
-                        + f"\n[Non-stream fallback failed: {fallback_err}]\n"
-                    )
-                    sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
-                    sys.stdout.flush()
-                    combined_error = (
-                        f"Error during streaming: {stream_err}; "
-                        f"non-stream fallback failed: {fallback_err}"
-                    )
-                    if all_text:
-                        raise _StreamAbort(
-                            all_text
-                            + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}; "
-                            + f"non-stream fallback failed: {fallback_err}]",
-                            "",
-                            working_messages,
-                        )
-                    raise _StreamAbort(combined_error, "", working_messages)
-            is_transient = isinstance(stream_err, json.JSONDecodeError) or any(kw in str(stream_err).lower() for kw in [
-                "incomplete", "peer closed", "connection reset", "timeout",
-                "eof", "broken pipe", "overloaded", "529", "server_error",
-                "response.completed",  # OpenAI stream missing terminal event
-            ])
-            if is_transient and attempt < _STREAM_MAX_RETRIES:
-                retry_delay = 2 ** (attempt + 1)  # 2s, 4s
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "planner.stream.retry",
-                    component="planner",
-                    step=step + 1,
-                    attempt=attempt + 1,
-                    retry_in_seconds=retry_delay,
-                    transient=True,
-                    error_type=type(stream_err).__name__,
-                    error_message=scrub_string(str(stream_err), max_text_chars=500),
-                )
-                retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {retry_delay}s... (attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
-                sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
-                sys.stdout.flush()
-                time.sleep(retry_delay)  # responds to KeyboardInterrupt
-                continue
-            # Non-transient error or retries exhausted
+            partial_step_text = ""
+
+        if _is_terminal_openai_stream_error(runtime_owner, stream_err):
+            reason = _terminal_openai_stream_error_reason(stream_err)
+            diagnostics_text = _format_stream_error_diagnostics(stream_err)
             log_event(
                 logger,
                 logging.ERROR,
@@ -826,25 +732,78 @@ def _stream_with_retry(
                 component="planner",
                 step=step + 1,
                 attempt=attempt + 1,
-                transient=is_transient,
+                transient=False,
+                terminal_openai_stream_error=True,
+                partial_step_chars=len(partial_step_text),
                 error_type=type(stream_err).__name__,
                 error_message=scrub_string(str(stream_err), max_text_chars=500),
+                stream_failure_reason=reason,
                 traceback=scrub_string(format_traceback(stream_err), max_text_chars=4000),
                 **_stream_error_log_fields(stream_err),
             )
-            diagnostics_text = _format_stream_error_diagnostics(stream_err)
             error_msg = f"\n[Stream error at step {step+1}: {stream_err}]"
             if diagnostics_text:
                 error_msg += f"\n{diagnostics_text}"
             error_msg += "\n"
             sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
             sys.stdout.flush()
-            if all_text:
-                raise _StreamAbort(
-                    all_text + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}]",
-                    "", working_messages
-                )
-            raise _StreamAbort(f"Error during streaming: {stream_err}", "", working_messages)
+            raise _StreamAbort(
+                _stream_abort_text(all_text + partial_step_text, step, stream_err),
+                "",
+                working_messages,
+            )
+
+        is_transient = isinstance(stream_err, json.JSONDecodeError) or any(kw in str(stream_err).lower() for kw in [
+            "incomplete", "peer closed", "connection reset", "timeout",
+            "eof", "broken pipe", "overloaded", "529", "server_error",
+            "response.completed",  # OpenAI stream missing terminal event
+        ])
+        if is_transient and attempt < _STREAM_MAX_RETRIES:
+            retry_delay = 2 ** (attempt + 1)  # 2s, 4s
+            log_event(
+                logger,
+                logging.WARNING,
+                "planner.stream.retry",
+                component="planner",
+                step=step + 1,
+                attempt=attempt + 1,
+                retry_in_seconds=retry_delay,
+                transient=True,
+                error_type=type(stream_err).__name__,
+                error_message=scrub_string(str(stream_err), max_text_chars=500),
+            )
+            retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {retry_delay}s... (attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
+            sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
+            sys.stdout.flush()
+            time.sleep(retry_delay)  # responds to KeyboardInterrupt
+            continue
+        # Non-transient error or retries exhausted
+        log_event(
+            logger,
+            logging.ERROR,
+            "planner.stream.failed",
+            component="planner",
+            step=step + 1,
+            attempt=attempt + 1,
+            transient=is_transient,
+            error_type=type(stream_err).__name__,
+            error_message=scrub_string(str(stream_err), max_text_chars=500),
+            traceback=scrub_string(format_traceback(stream_err), max_text_chars=4000),
+            **_stream_error_log_fields(stream_err),
+        )
+        diagnostics_text = _format_stream_error_diagnostics(stream_err)
+        error_msg = f"\n[Stream error at step {step+1}: {stream_err}]"
+        if diagnostics_text:
+            error_msg += f"\n{diagnostics_text}"
+        error_msg += "\n"
+        sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
+        sys.stdout.flush()
+        if all_text:
+            raise _StreamAbort(
+                all_text + f"\n\n[Error: streaming interrupted at step {step+1}: {stream_err}]",
+                "", working_messages
+            )
+        raise _StreamAbort(f"Error during streaming: {stream_err}", "", working_messages)
 
 
 class _StreamAbort(Exception):

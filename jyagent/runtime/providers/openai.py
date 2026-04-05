@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
 from openai import OpenAI
 
-from ...observability import LLMCallLogger, log_event, new_call_id, scrub_string, summarize_runtime_context
+from ...observability import LLMCallLogger, new_call_id, scrub_string, summarize_runtime_context
 from ..core import register_adapter
 from ..history import transform_messages_for_target
 from ..reasoning import validate_openai_reasoning
@@ -109,58 +108,6 @@ def _response_usage(response: Any) -> dict[str, int]:
         "cache_read_input_tokens": getattr(getattr(usage, "input_tokens_details", None), "cached_tokens", 0) or 0,
         "total_tokens": getattr(usage, "total_tokens", 0) or 0,
     }
-
-
-def _parse_tool_call_arguments(arguments: Any) -> dict[str, Any] | None:
-    if not isinstance(arguments, str) or not arguments.strip():
-        return None
-    try:
-        parsed = json.loads(arguments)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return parsed
-
-
-def _snapshot_discard_reason(response: Any) -> str | None:
-    output = getattr(response, "output", None) or []
-    if not output:
-        return "snapshot contains no output items"
-
-    saw_message = False
-    saw_function_call = False
-    saw_reasoning = False
-    saw_unknown = False
-
-    for item in output:
-        item_type = getattr(item, "type", "")
-        if item_type == "message":
-            saw_message = True
-            for part in getattr(item, "content", None) or []:
-                part_type = getattr(part, "type", "")
-                if part_type == "output_text" and str(getattr(part, "text", "") or "").strip():
-                    return None
-                if part_type == "refusal" and str(getattr(part, "refusal", "") or "").strip():
-                    return None
-        elif item_type == "function_call":
-            saw_function_call = True
-            if _parse_tool_call_arguments(getattr(item, "arguments", None)) is not None:
-                return None
-        elif item_type == "reasoning":
-            saw_reasoning = True
-        else:
-            saw_unknown = True
-
-    if saw_function_call:
-        return "snapshot function_call arguments were missing, non-object, or invalid JSON"
-    if saw_message:
-        return "snapshot message items contained no assistant-visible text"
-    if saw_reasoning:
-        return "snapshot contained reasoning-only output"
-    if saw_unknown:
-        return "snapshot contained unsupported output items only"
-    return "snapshot contained no usable assistant output"
 
 
 def _message_item(message_id: str, texts: list[str], phase: str | None = None) -> dict[str, Any]:
@@ -334,8 +281,6 @@ class _OpenAIStream(RuntimeStream):
         self,
         manager: Any,
         model_spec: ModelSpec,
-        responses_api: Any,
-        timeout: float | None = None,
         call_logger: LLMCallLogger | None = None,
     ):
         self._manager = manager
@@ -347,15 +292,12 @@ class _OpenAIStream(RuntimeStream):
                 self._call_logger.failed(err, stage="stream_enter")
             raise
         self._model_spec = model_spec
-        self._responses_api = responses_api
-        self._timeout = timeout
         self._final_message: AssistantMessage | None = None
         self._response_id = ""
         self._incomplete_details = None
         self._event_count = 0
         self._text_delta_chars = 0
         self._tool_call_delta_chars = 0
-        self._recovery_method = ""
         self._stream_error: BaseException | None = None
         self._stream_error_stage = ""
         self._closed = False
@@ -405,48 +347,20 @@ class _OpenAIStream(RuntimeStream):
                 response = self._stream.get_final_response()
                 self._final_message = _assistant_from_response(self._model_spec, response)
             except (RuntimeError, json.JSONDecodeError) as err:
-                recovered = self._recover_response(err)
-                if recovered is None:
-                    _attach_stream_error_diagnostics(
+                _attach_stream_error_diagnostics(
+                    err,
+                    response_id=self._response_id,
+                    stage=self._stream_error_stage or "final_response",
+                )
+                if self._call_logger is not None:
+                    self._call_logger.failed(
                         err,
-                        response_id=self._response_id,
                         stage=self._stream_error_stage or "final_response",
+                        response_id=self._response_id,
+                        stream_state=self.log_snapshot(),
+                        **_json_error_details(err),
                     )
-                    if self._call_logger is not None:
-                        self._call_logger.failed(
-                            err,
-                            stage=self._stream_error_stage or "final_response",
-                            response_id=self._response_id,
-                            stream_state=self.log_snapshot(),
-                            **_json_error_details(err),
-                        )
-                    raise
-                response, warning = recovered
-                self._response_id = getattr(response, "id", "") or self._response_id
-                if self._recovery_method == "stream_snapshot":
-                    discard_reason = _snapshot_discard_reason(response)
-                    if discard_reason is not None:
-                        _attach_stream_error_diagnostics(
-                            err,
-                            response_id=self._response_id,
-                            stage=self._stream_error_stage or "final_response",
-                            recovery_method=self._recovery_method,
-                            discard_reason=discard_reason,
-                        )
-                        self._log_discarded_recovery(discard_reason)
-                        if self._call_logger is not None:
-                            self._call_logger.failed(
-                                err,
-                                stage=self._stream_error_stage or "final_response",
-                                response_id=self._response_id,
-                                stream_state=self.log_snapshot(),
-                                recovery_method=self._recovery_method,
-                                discard_reason=discard_reason,
-                                **_json_error_details(err),
-                            )
-                        raise
-                self._final_message = _assistant_from_response(self._model_spec, response)
-                self._final_message["runtime_warnings"] = [warning]
+                raise
             except Exception as err:
                 if self._call_logger is not None:
                     self._call_logger.failed(
@@ -466,21 +380,6 @@ class _OpenAIStream(RuntimeStream):
         self._manager.__exit__(None, None, None)
         self._closed = True
 
-    def _log_discarded_recovery(self, reason: str) -> None:
-        log_event(
-            logger,
-            logging.WARNING,
-            "llm.request.recovery_discarded",
-            call_id=self._call_logger.call_id if self._call_logger is not None else "",
-            provider=self._model_spec.provider,
-            api="openai-responses",
-            model=self._model_spec.model,
-            response_id=self._response_id,
-            recovery_method=self._recovery_method or None,
-            reason=reason,
-            stream_state=self.log_snapshot(),
-        )
-
     def log_snapshot(self) -> dict[str, Any]:
         incomplete_reason = None
         if self._incomplete_details is not None:
@@ -491,84 +390,7 @@ class _OpenAIStream(RuntimeStream):
             "text_delta_chars": self._text_delta_chars,
             "tool_call_delta_chars": self._tool_call_delta_chars,
             "incomplete_reason": incomplete_reason,
-            "recovery_method": self._recovery_method or None,
         }
-
-    def _recover_response(self, error: BaseException) -> tuple[Any, str] | None:
-        if isinstance(error, json.JSONDecodeError):
-            retrieved = self._retrieve_response()
-            if retrieved is not None:
-                self._recovery_method = "responses.retrieve"
-                return (
-                    retrieved,
-                    "Recovered OpenAI stream after malformed SSE JSON via responses.retrieve().",
-                )
-
-            snapshot = self._snapshot_response()
-            if snapshot is not None:
-                self._recovery_method = "stream_snapshot"
-                return (
-                    snapshot,
-                    "Recovered OpenAI stream after malformed SSE JSON from partial stream snapshot.",
-                )
-
-            return None
-
-        if self._MISSING_COMPLETED_EVENT not in str(error):
-            return None
-
-        retrieved = self._retrieve_response()
-        if retrieved is not None:
-            self._recovery_method = "responses.retrieve"
-            return (
-                retrieved,
-                "Recovered OpenAI stream after missing terminal event via responses.retrieve().",
-            )
-
-        snapshot = self._snapshot_response()
-        if snapshot is not None:
-            self._recovery_method = "stream_snapshot"
-            return (
-                snapshot,
-                "Recovered OpenAI stream after missing terminal event from partial stream snapshot.",
-            )
-
-        return None
-
-    def _retrieve_response(self) -> Any | None:
-        if not self._response_id:
-            return None
-        retrieve = getattr(self._responses_api, "retrieve", None)
-        if not callable(retrieve):
-            return None
-        try:
-            return retrieve(response_id=self._response_id, timeout=self._timeout)
-        except Exception:
-            return None
-
-    def _snapshot_response(self) -> Any | None:
-        state = getattr(self._stream, "_state", None)
-        if state is None:
-            return None
-        snapshot = getattr(state, "_ResponseStreamState__current_snapshot", None)
-        if snapshot is None:
-            return None
-
-        output = getattr(snapshot, "output", None) or []
-        response_id = getattr(snapshot, "id", "") or self._response_id
-        if not output:
-            return None
-
-        return SimpleNamespace(
-            id=response_id,
-            output=output,
-            usage=getattr(snapshot, "usage", None),
-            error=getattr(snapshot, "error", None),
-            incomplete_details=(
-                getattr(snapshot, "incomplete_details", None)
-                or self._incomplete_details
-            ),
-        )
 
 
 class OpenAIAdapter:
@@ -633,8 +455,6 @@ class OpenAIAdapter:
         return _OpenAIStream(
             manager,
             model_spec,
-            client.responses,
-            timeout=timeout,
             call_logger=call_logger,
         )
 
