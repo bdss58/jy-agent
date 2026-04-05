@@ -94,3 +94,41 @@ def get_subagent_model_spec(tier: str, active_spec=None):
     provider = (os.environ.get(f"SUBAGENT_{tier_key}_PROVIDER") or active_spec.provider).strip() or active_spec.provider
     model = (os.environ.get(f"SUBAGENT_{tier_key}_MODEL") or active_spec.model).strip() or active_spec.model
     return ModelSpec(provider=provider, model=model)
+
+
+def get_reasoning_config_for_provider(provider: str, *, max_output_tokens: int | None = None):
+    from .runtime.reasoning import validate_anthropic_thinking, validate_openai_reasoning
+
+    provider = (provider or "").strip()
+
+    if provider == "openai":
+        config = {}
+        effort = (os.environ.get("OPENAI_REASONING_EFFORT") or "").strip()
+        summary = (os.environ.get("OPENAI_REASONING_SUMMARY") or "").strip()
+        if effort:
+            config["effort"] = effort
+        if summary:
+            config["summary"] = summary
+        if not config:
+            return None
+        return validate_openai_reasoning(config)
+
+    if provider == "anthropic":
+        config = {}
+        thinking_type = (os.environ.get("ANTHROPIC_THINKING_TYPE") or "").strip()
+        display = (os.environ.get("ANTHROPIC_THINKING_DISPLAY") or "").strip()
+        budget_tokens = (os.environ.get("ANTHROPIC_THINKING_BUDGET_TOKENS") or "").strip()
+        if thinking_type:
+            config["type"] = thinking_type
+        if display:
+            config["display"] = display
+        if budget_tokens:
+            try:
+                config["budget_tokens"] = int(budget_tokens)
+            except ValueError as exc:
+                raise ValueError("ANTHROPIC_THINKING_BUDGET_TOKENS must be an integer.") from exc
+        if not config:
+            return None
+        return validate_anthropic_thinking(config, max_output_tokens=max_output_tokens)
+
+    return None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from ..config import get_reasoning_config_for_provider
 from .types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
 
 
@@ -71,7 +72,14 @@ class RuntimeOwner:
                 "system_prompt": system_prompt,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            options=RuntimeOptions(max_output_tokens=max_output_tokens, timeout=timeout),
+            options=RuntimeOptions(
+                max_output_tokens=max_output_tokens,
+                timeout=timeout,
+                reasoning=get_reasoning_config_for_provider(
+                    (model_spec or self._model_spec).provider,
+                    max_output_tokens=max_output_tokens,
+                ),
+            ),
             model_spec=model_spec,
         )
         parts = []
@@ -79,4 +87,3 @@ class RuntimeOwner:
             if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(block.get("text", ""))
         return "".join(parts)
-

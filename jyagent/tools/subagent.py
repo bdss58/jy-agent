@@ -14,18 +14,22 @@ import concurrent.futures
 
 try:
     from ..config import (
-        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_subagent_model_spec,
+        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
+        get_subagent_model_spec,
     )
     from ..registry import get_registry
+    from ..runtime.reasoning import validate_anthropic_thinking
     from ..runtime import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
     from ..validation import validate_tool_input
     from ..session_stats import get_stats
 except ImportError:
     from jyagent.config import (
-        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_subagent_model_spec,
+        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
+        get_subagent_model_spec,
     )
     from jyagent.registry import get_registry
+    from jyagent.runtime.reasoning import validate_anthropic_thinking
     from jyagent.runtime import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
     from jyagent.validation import validate_tool_input
@@ -95,6 +99,8 @@ class _LegacyClientRuntimeOwner:
             "system": context.get("system_prompt", ""),
             "messages": self._convert_messages(context.get("messages", [])),
         }
+        if options is not None and options.reasoning is not None:
+            kwargs["thinking"] = validate_anthropic_thinking(options.reasoning, max_output_tokens=max_tokens)
         if context.get("tools"):
             kwargs["tools"] = context["tools"]
         stream_fn = getattr(self._client.messages, "stream", None)
@@ -355,6 +361,10 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
         options=RuntimeOptions(
             max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
             timeout=STREAM_TIMEOUT,
+            reasoning=get_reasoning_config_for_provider(
+                model_spec.provider,
+                max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+            ),
         ),
         model_spec=model_spec,
     )
@@ -399,6 +409,10 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
                 options=RuntimeOptions(
                     max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
                     timeout=STREAM_TIMEOUT,
+                    reasoning=get_reasoning_config_for_provider(
+                        model_spec.provider,
+                        max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
+                    ),
                 ),
                 model_spec=model_spec,
             )

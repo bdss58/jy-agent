@@ -10,6 +10,7 @@ from openai import OpenAI
 
 from ..core import register_adapter
 from ..history import transform_messages_for_target
+from ..reasoning import validate_openai_reasoning
 from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream
 
 
@@ -324,6 +325,8 @@ class OpenAIAdapter:
             "max_output_tokens": options.max_output_tokens,
             "parallel_tool_calls": True,
         }
+        if options.reasoning is not None:
+            kwargs["reasoning"] = validate_openai_reasoning(options.reasoning)
         kwargs = {k: v for k, v in kwargs.items() if v not in (None, [], {})}
         if options.tool_choice is not None:
             kwargs["tool_choice"] = options.tool_choice

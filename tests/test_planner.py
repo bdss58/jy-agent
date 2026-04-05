@@ -207,6 +207,65 @@ class TestToolInputValidation:
 
 
 class TestPlannerFallback:
+    def test_stream_response_uses_configured_reasoning(self, monkeypatch):
+        class _DummySpinner:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class _DummyStats:
+            def record_usage(self, usage, provider="", model=""):
+                self.recorded = (usage, provider, model)
+
+        class _FakeRuntimeStream:
+            def __init__(self, final_message):
+                self._final_message = final_message
+                self.closed = False
+
+            def __iter__(self):
+                yield {"type": "text_delta", "text": "answer"}
+
+            def get_final_message(self):
+                return self._final_message
+
+            def close(self):
+                self.closed = True
+
+        captured = {}
+        final_message = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "answer"}],
+            "provider": "openai",
+            "model": "gpt-5-mini",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "stop_reason": "stop",
+        }
+        fake_stream = _FakeRuntimeStream(final_message)
+
+        class _FakeOwner:
+            model_spec = ModelSpec("openai", "gpt-5-mini")
+
+            def stream(self, context, options=None):
+                captured["options"] = options
+                return fake_stream
+
+        monkeypatch.setattr(planner, "_ThinkingSpinner", _DummySpinner)
+        monkeypatch.setattr(planner, "_stream_write", lambda _text: None)
+        monkeypatch.setattr(planner, "get_stats", lambda: _DummyStats())
+        monkeypatch.setattr(
+            planner,
+            "get_reasoning_config_for_provider",
+            lambda provider, *, max_output_tokens=None: {"effort": "high", "summary": "concise"},
+        )
+
+        result = planner._stream_response(_FakeOwner(), {"messages": []}, 2048)
+
+        assert captured["options"].reasoning == {"effort": "high", "summary": "concise"}
+        assert result[0] == "answer"
+        assert fake_stream.closed is True
+
     def test_max_steps_fallback_uses_stream_backed_complete(self, monkeypatch):
         tool_name = "_test_planner_fallback_tool"
 
@@ -265,6 +324,7 @@ class TestPlannerFallback:
         }
         fake_stream = _FakeRuntimeStream(final_message)
         adapter = get_adapter("openai")
+        captured = {}
 
         def _fake_stream_with_retry(runtime_owner, context, max_output_tokens, step, all_text, working_messages):
             return (
@@ -285,9 +345,19 @@ class TestPlannerFallback:
         monkeypatch.setattr(planner, "get_stats", lambda: dummy_stats)
         monkeypatch.setattr(planner, "_stream_write", written.append)
         monkeypatch.setattr(
+            planner,
+            "get_reasoning_config_for_provider",
+            lambda provider, *, max_output_tokens=None: {"effort": "high"},
+        )
+
+        def _fake_adapter_stream(model_spec, context, options=None):
+            captured["options"] = options
+            return fake_stream
+
+        monkeypatch.setattr(
             adapter,
             "stream",
-            lambda model_spec, context, options=None: fake_stream,
+            _fake_adapter_stream,
         )
 
         try:
@@ -304,6 +374,7 @@ class TestPlannerFallback:
         assert final_text == "fallback answer"
         assert working_messages[-1]["content"] == [{"type": "text", "text": "fallback answer"}]
         assert written == ["fallback answer"]
+        assert captured["options"].reasoning == {"effort": "high"}
         assert fake_stream.iterated is True
         assert fake_stream.closed is True
         assert dummy_stats.recorded_usage == [

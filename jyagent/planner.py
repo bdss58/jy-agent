@@ -16,7 +16,7 @@ from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
     MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, STREAM_TIMEOUT,
-    COMPACT_TOOL_RESULT_CHARS,
+    COMPACT_TOOL_RESULT_CHARS, get_reasoning_config_for_provider,
 )
 
 # Shared executor for tool timeouts.  max_workers=4 so a hung tool doesn't
@@ -526,7 +526,14 @@ def _stream_response(runtime_owner: RuntimeOwner, context: dict, max_output_toke
     try:
         stream = runtime_owner.stream(
             context,
-            options=RuntimeOptions(max_output_tokens=max_output_tokens, timeout=STREAM_TIMEOUT),
+            options=RuntimeOptions(
+                max_output_tokens=max_output_tokens,
+                timeout=STREAM_TIMEOUT,
+                reasoning=get_reasoning_config_for_provider(
+                    runtime_owner.model_spec.provider,
+                    max_output_tokens=max_output_tokens,
+                ),
+            ),
         )
         for event in stream:
             event_type = event.get("type")
@@ -594,6 +601,7 @@ def _stream_with_retry(
             is_transient = any(kw in str(stream_err).lower() for kw in [
                 "incomplete", "peer closed", "connection reset", "timeout",
                 "eof", "broken pipe", "overloaded", "529", "server_error",
+                "response.completed",  # OpenAI stream missing terminal event
             ])
             if is_transient and attempt < _STREAM_MAX_RETRIES:
                 retry_delay = 2 ** (attempt + 1)  # 2s, 4s
@@ -775,7 +783,14 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
                     "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
                     "messages": working_messages,
                 },
-                options=RuntimeOptions(max_output_tokens=DEFAULT_MAX_TOKENS, timeout=STREAM_TIMEOUT),
+                options=RuntimeOptions(
+                    max_output_tokens=DEFAULT_MAX_TOKENS,
+                    timeout=STREAM_TIMEOUT,
+                    reasoning=get_reasoning_config_for_provider(
+                        runtime_owner.model_spec.provider,
+                        max_output_tokens=DEFAULT_MAX_TOKENS,
+                    ),
+                ),
             )
             stats.record_usage(
                 final_message.get("usage", {}),

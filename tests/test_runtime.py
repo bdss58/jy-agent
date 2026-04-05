@@ -5,9 +5,12 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from jyagent.runtime import RuntimeOwner, get_adapter
+import jyagent.runtime.core as runtime_core
+from jyagent.runtime import RuntimeOptions, RuntimeOwner, get_adapter
 from jyagent.runtime.history import normalize_anthropic_tool_call_id, transform_messages_for_target
 from jyagent.runtime.providers.anthropic import (
     AnthropicAdapter,
@@ -275,6 +278,178 @@ class TestRuntimeAdapters:
         assert message["content"][0] == {"type": "text", "text": "hello"}
         assert message["content"][1]["type"] == "tool_call"
         assert message["content"][1]["arguments"] == {"value": "x"}
+
+    def test_openai_request_kwargs_accept_reasoning_effort(self):
+        adapter = OpenAIAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("openai", "gpt-5-mini"),
+            {"messages": []},
+            RuntimeOptions(reasoning={"effort": "high"}),
+        )
+
+        assert kwargs["reasoning"] == {"effort": "high"}
+
+    def test_openai_request_kwargs_accept_reasoning_summary(self):
+        adapter = OpenAIAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("openai", "gpt-5-mini"),
+            {"messages": []},
+            RuntimeOptions(reasoning={"summary": "concise"}),
+        )
+
+        assert kwargs["reasoning"] == {"summary": "concise"}
+
+    def test_openai_request_kwargs_accept_combined_reasoning_config(self):
+        adapter = OpenAIAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("openai", "gpt-5-mini"),
+            {"messages": []},
+            RuntimeOptions(reasoning={"effort": "medium", "summary": "detailed"}),
+        )
+
+        assert kwargs["reasoning"] == {"effort": "medium", "summary": "detailed"}
+
+    def test_openai_request_kwargs_reject_anthropic_reasoning_shape(self):
+        adapter = OpenAIAdapter()
+
+        with pytest.raises(ValueError, match="unsupported keys"):
+            adapter._request_kwargs(
+                ModelSpec("openai", "gpt-5-mini"),
+                {"messages": []},
+                RuntimeOptions(reasoning={"type": "adaptive"}),
+            )
+
+    def test_openai_request_kwargs_reject_deprecated_generate_summary(self):
+        adapter = OpenAIAdapter()
+
+        with pytest.raises(ValueError, match="generate_summary"):
+            adapter._request_kwargs(
+                ModelSpec("openai", "gpt-5-mini"),
+                {"messages": []},
+                RuntimeOptions(reasoning={"generate_summary": "concise"}),  # type: ignore[arg-type]
+            )
+
+    def test_openai_request_kwargs_reject_unknown_reasoning_keys(self):
+        adapter = OpenAIAdapter()
+
+        with pytest.raises(ValueError, match="unsupported keys"):
+            adapter._request_kwargs(
+                ModelSpec("openai", "gpt-5-mini"),
+                {"messages": []},
+                RuntimeOptions(reasoning={"effort": "low", "foo": "bar"}),  # type: ignore[arg-type]
+            )
+
+    def test_anthropic_request_kwargs_accept_disabled_thinking(self):
+        adapter = AnthropicAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("anthropic", "claude-sonnet-4"),
+            {"messages": []},
+            RuntimeOptions(max_output_tokens=2048, reasoning={"type": "disabled"}),
+        )
+
+        assert kwargs["thinking"] == {"type": "disabled"}
+
+    def test_anthropic_request_kwargs_accept_adaptive_thinking(self):
+        adapter = AnthropicAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("anthropic", "claude-sonnet-4"),
+            {"messages": []},
+            RuntimeOptions(max_output_tokens=2048, reasoning={"type": "adaptive"}),
+        )
+
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    def test_anthropic_request_kwargs_accept_adaptive_thinking_with_display(self):
+        adapter = AnthropicAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("anthropic", "claude-sonnet-4"),
+            {"messages": []},
+            RuntimeOptions(
+                max_output_tokens=2048,
+                reasoning={"type": "adaptive", "display": "omitted"},
+            ),
+        )
+
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "omitted"}
+
+    def test_anthropic_request_kwargs_accept_enabled_thinking(self):
+        adapter = AnthropicAdapter()
+
+        kwargs = adapter._request_kwargs(
+            ModelSpec("anthropic", "claude-sonnet-4"),
+            {"messages": []},
+            RuntimeOptions(
+                max_output_tokens=4096,
+                reasoning={"type": "enabled", "budget_tokens": 1024, "display": "summarized"},
+            ),
+        )
+
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 1024, "display": "summarized"}
+
+    def test_anthropic_request_kwargs_reject_openai_reasoning_shape(self):
+        adapter = AnthropicAdapter()
+
+        with pytest.raises(ValueError, match="unsupported keys"):
+            adapter._request_kwargs(
+                ModelSpec("anthropic", "claude-sonnet-4"),
+                {"messages": []},
+                RuntimeOptions(max_output_tokens=2048, reasoning={"effort": "high"}),
+            )
+
+    def test_anthropic_request_kwargs_reject_enabled_thinking_without_budget(self):
+        adapter = AnthropicAdapter()
+
+        with pytest.raises(ValueError, match="requires 'budget_tokens'"):
+            adapter._request_kwargs(
+                ModelSpec("anthropic", "claude-sonnet-4"),
+                {"messages": []},
+                RuntimeOptions(
+                    max_output_tokens=2048,
+                    reasoning={"type": "enabled"},  # type: ignore[arg-type]
+                ),
+            )
+
+    def test_anthropic_request_kwargs_reject_enabled_thinking_below_min_budget(self):
+        adapter = AnthropicAdapter()
+
+        with pytest.raises(ValueError, match="must be >= 1024"):
+            adapter._request_kwargs(
+                ModelSpec("anthropic", "claude-sonnet-4"),
+                {"messages": []},
+                RuntimeOptions(
+                    max_output_tokens=2048,
+                    reasoning={"type": "enabled", "budget_tokens": 512},
+                ),
+            )
+
+    def test_anthropic_request_kwargs_reject_enabled_thinking_budget_at_or_above_max_output_tokens(self):
+        adapter = AnthropicAdapter()
+
+        with pytest.raises(ValueError, match="less than max_output_tokens"):
+            adapter._request_kwargs(
+                ModelSpec("anthropic", "claude-sonnet-4"),
+                {"messages": []},
+                RuntimeOptions(
+                    max_output_tokens=1024,
+                    reasoning={"type": "enabled", "budget_tokens": 1024},
+                ),
+            )
+
+    def test_anthropic_request_kwargs_reject_enabled_thinking_without_max_output_tokens(self):
+        adapter = AnthropicAdapter()
+
+        with pytest.raises(ValueError, match="requires RuntimeOptions.max_output_tokens"):
+            adapter._request_kwargs(
+                ModelSpec("anthropic", "claude-sonnet-4"),
+                {"messages": []},
+                RuntimeOptions(reasoning={"type": "enabled", "budget_tokens": 1024}),
+            )
 
     def test_openai_complete_uses_stream_for_text_response(self, monkeypatch):
         final_response = SimpleNamespace(
@@ -579,15 +754,22 @@ class TestRuntimeAdapters:
         }
         fake_stream = _FakeRuntimeStream(final_message)
         adapter = get_adapter("openai")
+        captured = {}
+        monkeypatch.setattr(
+            runtime_core,
+            "get_reasoning_config_for_provider",
+            lambda provider, *, max_output_tokens=None: {"effort": "high"},
+        )
         monkeypatch.setattr(
             adapter,
             "stream",
-            lambda model_spec, context, options=None: fake_stream,
+            lambda model_spec, context, options=None: (captured.__setitem__("options", options), fake_stream)[1],
         )
 
         owner = RuntimeOwner(ModelSpec("openai", "gpt-5-mini"))
         text = owner.complete_text("hello", system_prompt="system")
 
         assert text == "silent answer"
+        assert captured["options"].reasoning == {"effort": "high"}
         assert fake_stream.iterated is True
         assert fake_stream.closed is True

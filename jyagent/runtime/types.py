@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, Protocol, TypedDict
+from typing import Any, Iterator, Literal, Protocol, Required, TypedDict
 
 
 ProviderName = Literal["anthropic", "openai"]
@@ -95,6 +95,34 @@ class ToolCallDeltaEvent(TypedDict):
 StreamEvent = TextDeltaEvent | ThinkingDeltaEvent | ToolCallDeltaEvent
 
 
+class OpenAIReasoningConfig(TypedDict, total=False):
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+    summary: Literal["auto", "concise", "detailed"]
+
+
+class AnthropicThinkingDisabledConfig(TypedDict):
+    type: Literal["disabled"]
+
+
+class AnthropicThinkingAdaptiveConfig(TypedDict, total=False):
+    type: Required[Literal["adaptive"]]
+    display: Literal["summarized", "omitted"]
+
+
+class AnthropicThinkingEnabledConfig(TypedDict, total=False):
+    type: Required[Literal["enabled"]]
+    budget_tokens: Required[int]
+    display: Literal["summarized", "omitted"]
+
+
+ReasoningConfig = (
+    OpenAIReasoningConfig
+    | AnthropicThinkingDisabledConfig
+    | AnthropicThinkingAdaptiveConfig
+    | AnthropicThinkingEnabledConfig
+)
+
+
 @dataclass(frozen=True)
 class ModelSpec:
     provider: str
@@ -108,7 +136,7 @@ class ModelSpec:
 class RuntimeOptions:
     max_output_tokens: int | None = None
     timeout: float | None = None
-    reasoning: str | None = None
+    reasoning: ReasoningConfig | None = None
     metadata: dict[str, Any] | None = None
     tool_choice: Any = None
 

@@ -8,6 +8,7 @@ import httpx
 
 from ..core import register_adapter
 from ..history import transform_messages_for_target
+from ..reasoning import validate_anthropic_thinking
 from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream, Usage
 
 
@@ -197,6 +198,11 @@ class AnthropicAdapter:
             "max_tokens": options.max_output_tokens,
             "messages": _convert_messages(model_spec, context.get("messages", [])),
         }
+        if options.reasoning is not None:
+            kwargs["thinking"] = validate_anthropic_thinking(
+                options.reasoning,
+                max_output_tokens=options.max_output_tokens,
+            )
         if context.get("system_prompt"):
             kwargs["system"] = context["system_prompt"]
         tools = _convert_tools(context.get("tools"))

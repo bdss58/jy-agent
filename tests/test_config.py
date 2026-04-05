@@ -4,6 +4,8 @@ import os
 import sys
 import importlib
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import jyagent.config as config_module
@@ -90,3 +92,44 @@ class TestConfig:
         assert router.model == "gpt-5-mini"
         assert subagent_fast.provider == "openai"
         assert subagent_fast.model == "gpt-5-mini"
+
+    def test_openai_reasoning_envs_parse_to_structured_config(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_REASONING_EFFORT", "high")
+        monkeypatch.setenv("OPENAI_REASONING_SUMMARY", "concise")
+        cfg = _reload_config()
+
+        assert cfg.get_reasoning_config_for_provider("openai") == {
+            "effort": "high",
+            "summary": "concise",
+        }
+
+    def test_anthropic_reasoning_envs_parse_to_structured_config(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_THINKING_TYPE", "enabled")
+        monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "2048")
+        monkeypatch.setenv("ANTHROPIC_THINKING_DISPLAY", "omitted")
+        cfg = _reload_config()
+
+        assert cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096) == {
+            "type": "enabled",
+            "budget_tokens": 2048,
+            "display": "omitted",
+        }
+
+    def test_reasoning_config_returns_none_when_unset(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
+        monkeypatch.delenv("OPENAI_REASONING_SUMMARY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_THINKING_TYPE", raising=False)
+        monkeypatch.delenv("ANTHROPIC_THINKING_BUDGET_TOKENS", raising=False)
+        monkeypatch.delenv("ANTHROPIC_THINKING_DISPLAY", raising=False)
+        cfg = _reload_config()
+
+        assert cfg.get_reasoning_config_for_provider("openai") is None
+        assert cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096) is None
+
+    def test_anthropic_reasoning_budget_env_must_be_integer(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_THINKING_TYPE", "enabled")
+        monkeypatch.setenv("ANTHROPIC_THINKING_BUDGET_TOKENS", "not-an-int")
+        cfg = _reload_config()
+
+        with pytest.raises(ValueError, match="must be an integer"):
+            cfg.get_reasoning_config_for_provider("anthropic", max_output_tokens=4096)
