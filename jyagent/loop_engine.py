@@ -58,6 +58,10 @@ class LoopCallbacks:
     on_compaction: Callable[[int, int], None] | None = None  # (before_len, after_len)
     on_usage: Callable[[dict], None] | None = None  # raw Usage dict from response
     on_step_progress: Callable[[int, int], None] | None = None  # (step, max_steps)
+    on_assistant_message: Callable[[dict], dict] | None = None  # transform before append
+    on_warning: Callable[[str], None] | None = None  # runtime warnings
+    on_truncation: Callable[[], None] | None = None  # response truncated, retrying
+    on_tool_batch: Callable[[int], None] | None = None  # number of tools in batch
 
 
 @dataclass
@@ -437,6 +441,10 @@ class AgentLoop:
                     context, opts, step,
                 )
 
+                # Fire runtime warnings
+                for warning in final_message.get("runtime_warnings", []):
+                    self._fire("on_warning", warning)
+
                 # Accumulate usage
                 usage = final_message.get("usage", {})
                 total_input_tokens += usage.get("input_tokens", 0)
@@ -451,6 +459,10 @@ class AgentLoop:
                     if not step_text:
                         final_text = _extract_text(final_message)
                         all_text = final_text or all_text
+                    # Allow caller to transform before append
+                    cb_am = self._callbacks.on_assistant_message
+                    if cb_am is not None:
+                        final_message = cb_am(final_message) or final_message
                     messages.append(final_message)
                     result_text = all_text if all_text else "I processed your request but had no text response to return."
                     return LoopResult(
@@ -466,6 +478,7 @@ class AgentLoop:
 
                 # Truncation detection → scale up and retry step
                 if cfg.auto_scale_on_truncation and _is_truncated(stop_reason, tool_call_blocks):
+                    self._fire("on_truncation")
                     current_max_tokens = min(
                         current_max_tokens * cfg.token_scale_factor,
                         cfg.max_tokens_cap,
@@ -474,8 +487,15 @@ class AgentLoop:
                     all_text = all_text[: -len(step_text)] if step_text else all_text
                     continue
 
-                # Append assistant message
+                # Append assistant message (allow caller to transform)
+                cb_am = self._callbacks.on_assistant_message
+                if cb_am is not None:
+                    final_message = cb_am(final_message) or final_message
                 messages.append(final_message)
+
+                # Fire on_tool_batch for multi-tool batches
+                if len(tool_call_blocks) > 1:
+                    self._fire("on_tool_batch", len(tool_call_blocks))
 
                 # Fire on_tool_start for all tool calls BEFORE execution
                 for block in tool_call_blocks:
