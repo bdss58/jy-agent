@@ -44,7 +44,7 @@ _TOOL_METADATA = {
     "grep_files":      {"parallel_safe": True},
     "run_shell":       {"parallel_safe": False, "timeout_hint": "from_input"},
     "write_file":      {"parallel_safe": False, "large_input_keys": {"content"}},
-    "edit_file":       {"parallel_safe": False, "large_input_keys": {"content", "new_text", "old_text"}},
+    "edit_file":       {"parallel_safe": False, "large_input_keys": {"new_text", "old_text"}},
     "manage_memory":   {"parallel_safe": False},
     "manage_skills":   {"parallel_safe": False},
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180},

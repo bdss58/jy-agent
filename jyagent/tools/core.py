@@ -31,6 +31,14 @@ def atomic_write(path: str, content: str, encoding: str = "utf-8") -> None:
     dirname = os.path.dirname(path) or "."
     os.makedirs(dirname, exist_ok=True)
 
+    # Preserve original file permissions (mkstemp defaults to 0o600)
+    import stat as _stat
+    original_mode = None
+    try:
+        original_mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        pass
+
     fd = None
     tmp_path = None
     try:
@@ -41,6 +49,8 @@ def atomic_write(path: str, content: str, encoding: str = "utf-8") -> None:
         os.fsync(fd.fileno())
         fd.close()
         fd = None
+        if original_mode is not None:
+            os.chmod(tmp_path, _stat.S_IMODE(original_mode))
         os.replace(tmp_path, path)
         tmp_path = None
     finally:
@@ -106,7 +116,7 @@ def read_file(path: str, offset: int = 0, limit: int = 0, line_numbers: bool = F
         _, ext = os.path.splitext(path)
         if ext.lower() in BINARY_EXTS:
             size = os.path.getsize(path)
-            return f"[Binary file: {path} ({size} bytes)]"
+            return ToolResult(f"[Binary file: {path} ({size} bytes)]")
 
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             all_lines = f.readlines()
@@ -398,18 +408,9 @@ def edit_file(
         new_content = '\n'.join(new_lines)
         atomic_write(path, new_content)
 
-        # Show context
-        ctx_start = max(0, idx - 1)
-        ctx_end = min(len(new_lines), idx + n_inserted + 1)
-        context = '\n'.join(
-            f"  {'>' if idx <= j < idx + n_inserted else ' '} "
-            f"L{j + 1}: {new_lines[j]}"
-            for j in range(ctx_start, ctx_end)
-        )
-
         return ToolResult(
             f"Inserted {n_inserted} lines before L{insert_at_line} in {path} "
-            f"(now {len(new_lines)} lines)\n{context}"
+            f"(now {len(new_lines)} lines)"
         )
 
     # --- Append mode ---
@@ -431,6 +432,9 @@ def edit_file(
         return _diagnose_multi_match(path, content, old_text, count)
 
     # Exactly one match — perform the replacement
+    if old_text == new_text:
+        return ToolResult(f"No change needed: old_text and new_text are identical in {path}")
+
     new_content = content.replace(old_text, new_text, 1)
 
     # Calculate edit stats
@@ -455,19 +459,9 @@ def edit_file(
     total_lines = new_content.count('\n') + 1
     delta_str = f"+{delta}" if delta > 0 else str(delta)
 
-    # Show context around the edit
-    result_lines = new_content.split('\n')
-    ctx_start = max(0, edit_line - 2)
-    ctx_end = min(len(result_lines), edit_line + new_line_count + 1)
-    context = '\n'.join(
-        f"  {'>' if edit_line <= (j + 1) <= edit_line + new_line_count - 1 else ' '} "
-        f"L{j + 1}: {result_lines[j]}"
-        for j in range(ctx_start, ctx_end)
-    )
-
     return ToolResult(
         f"Edited {path}: replaced {old_line_count} lines with {new_line_count} lines "
-        f"at L{edit_line} ({delta_str}), total {total_lines} lines\n{context}"
+        f"at L{edit_line} ({delta_str}), total {total_lines} lines"
     )
 
 
@@ -500,12 +494,15 @@ def _diagnose_no_match(path: str, content: str, old_text: str) -> ToolResult:
     n_lines = len(old_lines)
     all_lines = content.split('\n')
 
-    if n_lines <= len(all_lines) and n_lines > 0:
+    if n_lines <= len(all_lines) and n_lines > 0 and len(all_lines) <= 5000:
         best_ratio = 0.0
         best_start = 0
         for i in range(len(all_lines) - n_lines + 1):
             candidate = '\n'.join(all_lines[i:i + n_lines])
-            ratio = difflib.SequenceMatcher(None, old_text, candidate).ratio()
+            sm = difflib.SequenceMatcher(None, old_text, candidate)
+            if sm.quick_ratio() < best_ratio:
+                continue
+            ratio = sm.ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_start = i
