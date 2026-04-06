@@ -10,8 +10,13 @@ from .types import (
     ReasoningConfig,
     RuntimeOptions,
     StopReason,
+    StreamDoneEvent,
+    StreamErrorEvent,
+    StreamEvent,
+    ToolChoice,
     ToolResultMessage,
     Usage,
+    compute_total_tokens,
 )
 
 # Import provider modules for registration side effects.
@@ -29,8 +34,13 @@ __all__ = [
     "RuntimeOptions",
     "RuntimeOwner",
     "StopReason",
+    "StreamDoneEvent",
+    "StreamErrorEvent",
+    "StreamEvent",
+    "ToolChoice",
     "ToolResultMessage",
     "Usage",
+    "compute_total_tokens",
     "get_adapter",
     "list_adapters",
     "register_adapter",

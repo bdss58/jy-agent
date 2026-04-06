@@ -20,6 +20,7 @@ try:
     )
     from ..registry import get_registry
     from ..runtime.reasoning import build_anthropic_request_reasoning
+    from ..runtime.providers._anthropic_helpers import assistant_from_response, convert_messages
     from ..runtime import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
     from ..validation import validate_tool_input
@@ -32,6 +33,7 @@ except ImportError:
     )
     from jyagent.registry import get_registry
     from jyagent.runtime.reasoning import build_anthropic_request_reasoning
+    from jyagent.runtime.providers._anthropic_helpers import assistant_from_response, convert_messages
     from jyagent.runtime import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
     from jyagent.validation import validate_tool_input
@@ -122,71 +124,10 @@ class _LegacyClientRuntimeOwner:
         return self._normalize_response(model_spec, response)
 
     def _convert_messages(self, messages):
-        out = []
-        idx = 0
-        while idx < len(messages):
-            message = messages[idx]
-            role = message.get("role")
-            if role == "user":
-                out.append({"role": "user", "content": message.get("content", "")})
-                idx += 1
-                continue
-            if role == "assistant":
-                blocks = []
-                for block in message.get("content", []):
-                    if block.get("type") == "text":
-                        blocks.append({"type": "text", "text": block.get("text", "")})
-                    elif block.get("type") == "tool_call":
-                        blocks.append({
-                            "type": "tool_use",
-                            "id": block["id"],
-                            "name": block["name"],
-                            "input": block.get("arguments", {}),
-                        })
-                out.append({"role": "assistant", "content": blocks})
-                idx += 1
-                continue
-
-            tool_results = []
-            while idx < len(messages) and messages[idx].get("role") == "tool_result":
-                tool_result = messages[idx]
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_result["tool_call_id"],
-                    "content": tool_result["content"],
-                    "is_error": tool_result["is_error"],
-                })
-                idx += 1
-            out.append({"role": "user", "content": tool_results})
-        return out
+        return convert_messages(self.model_spec, messages)
 
     def _normalize_response(self, model_spec, response):
-        content = []
-        stop_reason = "stop"
-        for block in response.content:
-            if getattr(block, "type", None) == "text":
-                content.append({"type": "text", "text": getattr(block, "text", "")})
-            elif getattr(block, "type", None) == "tool_use":
-                stop_reason = "tool_use"
-                content.append({
-                    "type": "tool_call",
-                    "id": getattr(block, "id", ""),
-                    "name": getattr(block, "name", ""),
-                    "arguments": getattr(block, "input", {}) or {},
-                })
-        usage = getattr(response, "usage", None)
-        return {
-            "role": "assistant",
-            "content": content,
-            "provider": model_spec.provider,
-            "api": "anthropic-messages",
-            "model": model_spec.model,
-            "stop_reason": stop_reason,
-            "usage": {
-                "input_tokens": getattr(usage, "input_tokens", 0) if usage else 0,
-                "output_tokens": getattr(usage, "output_tokens", 0) if usage else 0,
-            },
-        }
+        return assistant_from_response(model_spec, response)
 
 
 def _get_runtime_owner():

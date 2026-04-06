@@ -9,157 +9,49 @@ import httpx
 
 from ...observability import LLMCallLogger, new_call_id, summarize_runtime_context
 from ..core import register_adapter
-from ..history import transform_messages_for_target
-from ..reasoning import build_anthropic_request_reasoning
-from ..types import AssistantMessage, Context, Message, ModelSpec, RuntimeOptions, RuntimeStream, Usage
+from ..types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
+from ._anthropic_helpers import (
+    assistant_from_response,
+    build_request_kwargs,
+    make_error_assistant_message,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-def _usage_from_response(usage: Any) -> Usage:
-    return {
-        "input_tokens": getattr(usage, "input_tokens", 0) or 0,
-        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
-        "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
-        "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
-    }
+# ─── _ErrorStream ─────────────────────────────────────────────────────────────
+
+class _ErrorStream:
+    """A ``RuntimeStream`` that immediately yields a terminal error event."""
+
+    def __init__(self, model_spec: ModelSpec, error: BaseException) -> None:
+        self._message = make_error_assistant_message(model_spec, error)
+
+    def __iter__(self):
+        yield {"type": "start"}
+        yield {"type": "error", "message": self._message}
+
+    def get_final_message(self) -> AssistantMessage:
+        return self._message
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self) -> _ErrorStream:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        pass
 
 
-def _map_stop_reason(reason: str | None) -> str:
-    if reason == "max_tokens":
-        return "length"
-    if reason == "tool_use":
-        return "tool_use"
-    if reason in {"end_turn", "stop_sequence", "pause_turn", None}:
-        return "stop"
-    if reason in {"refusal", "sensitive"}:
-        return "error"
-    return "error"
-
-
-def _thinking_block(block: Any) -> dict[str, Any]:
-    if block.type == "redacted_thinking":
-        return {
-            "type": "thinking",
-            "thinking": "",
-            "signature": getattr(block, "data", ""),
-            "redacted": True,
-        }
-    return {
-        "type": "thinking",
-        "thinking": getattr(block, "thinking", ""),
-        "signature": getattr(block, "signature", ""),
-    }
-
-
-def _assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMessage:
-    content = []
-    message_id = getattr(response, "id", "")
-    for block in response.content:
-        if block.type == "text":
-            content.append({"type": "text", "text": block.text})
-        elif block.type in {"thinking", "redacted_thinking"}:
-            content.append(_thinking_block(block))
-        elif block.type == "tool_use":
-            content.append({
-                "type": "tool_call",
-                "id": block.id,
-                "name": block.name,
-                "arguments": block.input or {},
-            })
-    return {
-        "role": "assistant",
-        "content": content,
-        "provider": model_spec.provider,
-        "api": "anthropic-messages",
-        "model": model_spec.model,
-        "stop_reason": _map_stop_reason(getattr(response, "stop_reason", None)),
-        "usage": _usage_from_response(getattr(response, "usage", None)),
-        "response_id": message_id,
-        "id": message_id,
-    }
-
-
-def _convert_assistant_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
-    blocks = []
-    for block in message.get("content", []):
-        block_type = block.get("type")
-        if block_type == "text":
-            blocks.append({"type": "text", "text": block.get("text", "")})
-        elif block_type == "thinking":
-            if block.get("redacted") and block.get("signature"):
-                blocks.append({"type": "redacted_thinking", "data": block["signature"]})
-            elif block.get("signature"):
-                blocks.append({
-                    "type": "thinking",
-                    "thinking": block.get("thinking", ""),
-                    "signature": block["signature"],
-                })
-            elif block.get("thinking", "").strip():
-                blocks.append({"type": "text", "text": block["thinking"]})
-        elif block_type == "tool_call":
-            blocks.append({
-                "type": "tool_use",
-                "id": block["id"],
-                "name": block["name"],
-                "input": block.get("arguments", {}),
-            })
-    return blocks
-
-
-def _convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dict[str, Any]]:
-    transformed = transform_messages_for_target(messages, model_spec)
-    out: list[dict[str, Any]] = []
-    idx = 0
-    while idx < len(transformed):
-        message = transformed[idx]
-        role = message.get("role")
-        if role == "user":
-            out.append({"role": "user", "content": message.get("content", "")})
-            idx += 1
-            continue
-        if role == "assistant":
-            out.append({"role": "assistant", "content": _convert_assistant_blocks(message)})
-            idx += 1
-            continue
-        tool_results = []
-        while idx < len(transformed) and transformed[idx].get("role") == "tool_result":
-            tool_result = transformed[idx]
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tool_result["tool_call_id"],
-                "content": tool_result["content"],
-                "is_error": tool_result["is_error"],
-            })
-            idx += 1
-        out.append({"role": "user", "content": tool_results})
-    return out
-
-
-def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    if not tools:
-        return []
-    return [
-        {
-            "name": tool["name"],
-            "description": tool.get("description", ""),
-            "input_schema": tool.get("input_schema", {"type": "object", "properties": {}}),
-        }
-        for tool in tools
-    ]
-
+# ─── _AnthropicStream ────────────────────────────────────────────────────────
 
 class _AnthropicStream(RuntimeStream):
     def __init__(self, stream_cm: Any, model_spec: ModelSpec, call_logger: LLMCallLogger | None = None):
         self._stream_cm = stream_cm
         self._call_logger = call_logger
-        try:
-            self._stream = stream_cm.__enter__()
-        except Exception as err:
-            if self._call_logger is not None:
-                self._call_logger.failed(err, stage="stream_enter")
-            raise
+        self._stream: Any = None
         self._model_spec = model_spec
         self._final_message: AssistantMessage | None = None
         self._event_count = 0
@@ -169,36 +61,92 @@ class _AnthropicStream(RuntimeStream):
         self._closed = False
 
     def __iter__(self):
+        # Enter the SDK context manager at iteration start so failures
+        # are captured as error events rather than raised from __init__.
+        if self._stream is None:
+            try:
+                self._stream = self._stream_cm.__enter__()
+            except Exception as err:
+                if self._call_logger is not None:
+                    self._call_logger.failed(err, stage="stream_enter")
+                self._final_message = make_error_assistant_message(self._model_spec, err)
+                yield {"type": "start"}
+                yield {"type": "error", "message": self._final_message}
+                return
+
+        yield {"type": "start"}
+
+        block_types: dict[int, str] = {}
+
         try:
             for event in self._stream:
                 self._event_count += 1
-                if getattr(event, "type", None) != "content_block_delta":
-                    continue
-                delta = event.delta
-                if hasattr(delta, "text"):
-                    self._text_delta_chars += len(getattr(delta, "text", "") or "")
-                    yield {"type": "text_delta", "text": delta.text}
-                elif getattr(delta, "type", None) == "thinking_delta":
-                    self._thinking_delta_chars += len(getattr(delta, "thinking", "") or "")
-                    yield {"type": "thinking_delta", "text": delta.thinking}
-                elif getattr(delta, "type", None) == "input_json_delta":
-                    self._tool_call_delta_chars += len(getattr(delta, "partial_json", "") or "")
-                    yield {"type": "tool_call_delta", "delta": delta.partial_json}
+                etype = getattr(event, "type", None)
+
+                if etype == "content_block_start":
+                    idx = event.index
+                    block = event.content_block
+                    btype = getattr(block, "type", "")
+                    block_types[idx] = btype
+                    if btype == "text":
+                        yield {"type": "text_start", "content_index": idx}
+                    elif btype in ("thinking", "redacted_thinking"):
+                        yield {"type": "thinking_start", "content_index": idx}
+                    elif btype == "tool_use":
+                        yield {"type": "tool_call_start", "content_index": idx}
+
+                elif etype == "content_block_delta":
+                    idx = event.index
+                    delta = event.delta
+                    if hasattr(delta, "text"):
+                        self._text_delta_chars += len(getattr(delta, "text", "") or "")
+                        yield {"type": "text_delta", "text": delta.text, "content_index": idx}
+                    elif getattr(delta, "type", None) == "thinking_delta":
+                        self._thinking_delta_chars += len(getattr(delta, "thinking", "") or "")
+                        yield {"type": "thinking_delta", "text": delta.thinking, "content_index": idx}
+                    elif getattr(delta, "type", None) == "input_json_delta":
+                        self._tool_call_delta_chars += len(getattr(delta, "partial_json", "") or "")
+                        yield {"type": "tool_call_delta", "delta": delta.partial_json, "content_index": idx}
+
+                elif etype == "content_block_stop":
+                    idx = event.index
+                    btype = block_types.get(idx, "")
+                    if btype == "text":
+                        yield {"type": "text_end", "content_index": idx}
+                    elif btype in ("thinking", "redacted_thinking"):
+                        yield {"type": "thinking_end", "content_index": idx}
+                    elif btype == "tool_use":
+                        yield {"type": "tool_call_end", "content_index": idx}
+
         except Exception as err:
             if self._call_logger is not None:
                 self._call_logger.failed(err, stage="stream_iter", stream_state=self.log_snapshot())
-            raise
+            self._final_message = make_error_assistant_message(self._model_spec, err)
+            yield {"type": "error", "message": self._final_message}
+            return
+
+        # Successful completion — resolve final message from the SDK.
+        try:
+            raw_final = self._stream.get_final_message()
+            self._final_message = assistant_from_response(self._model_spec, raw_final)
+        except Exception as err:
+            if self._call_logger is not None:
+                self._call_logger.failed(err, stage="final_message", stream_state=self.log_snapshot())
+            self._final_message = make_error_assistant_message(self._model_spec, err)
+            yield {"type": "error", "message": self._final_message}
+            return
+
+        if self._call_logger is not None:
+            self._call_logger.succeeded(self._final_message, stream_state=self.log_snapshot())
+        yield {"type": "done", "message": self._final_message}
 
     def get_final_message(self) -> AssistantMessage:
-        if self._final_message is None:
-            try:
-                self._final_message = _assistant_from_response(self._model_spec, self._stream.get_final_message())
-            except Exception as err:
-                if self._call_logger is not None:
-                    self._call_logger.failed(err, stage="final_message", stream_state=self.log_snapshot())
-                raise
-            if self._call_logger is not None:
-                self._call_logger.succeeded(self._final_message, stream_state=self.log_snapshot())
+        if self._final_message is not None:
+            return self._final_message
+        # Drive iteration to completion — terminal event always sets _final_message.
+        for _ in self:
+            pass
+        assert self._final_message is not None
         return self._final_message
 
     def close(self) -> None:
@@ -206,6 +154,12 @@ class _AnthropicStream(RuntimeStream):
             return
         self._stream_cm.__exit__(None, None, None)
         self._closed = True
+
+    def __enter__(self) -> _AnthropicStream:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
 
     def log_snapshot(self) -> dict[str, Any]:
         return {
@@ -216,47 +170,39 @@ class _AnthropicStream(RuntimeStream):
         }
 
 
+# ─── Adapter ──────────────────────────────────────────────────────────────────
+
 class AnthropicAdapter:
     provider = "anthropic"
     api_name = "anthropic-messages"
 
+    def __init__(self) -> None:
+        self._cached_client: anthropic.Anthropic | None = None
+        self._cached_base_url: str | None = None
+        self._cached_auth_token: str | None = None
+
     def _client(self) -> anthropic.Anthropic:
-        kwargs: dict[str, Any] = {"http_client": httpx.Client(verify=False)}
         base_url = os.environ.get("ANTHROPIC_BASE_URL")
         auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+        if (
+            self._cached_client is not None
+            and self._cached_base_url == base_url
+            and self._cached_auth_token == auth_token
+        ):
+            return self._cached_client
+        kwargs: dict[str, Any] = {"http_client": httpx.Client(verify=False)}
         if base_url:
             kwargs["base_url"] = base_url
         if auth_token:
             kwargs["api_key"] = auth_token
-        return anthropic.Anthropic(**kwargs)
-
-    def _request_kwargs(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> dict[str, Any]:
-        options = options or RuntimeOptions()
-        kwargs: dict[str, Any] = {
-            "model": model_spec.model,
-            "max_tokens": options.max_output_tokens,
-            "messages": _convert_messages(model_spec, context.get("messages", [])),
-        }
-        if options.reasoning is not None:
-            thinking, output_config = build_anthropic_request_reasoning(
-                options.reasoning,
-                model=model_spec.model,
-            )
-            if thinking is not None:
-                kwargs["thinking"] = thinking
-            if output_config is not None:
-                kwargs["output_config"] = output_config
-        if context.get("system_prompt"):
-            kwargs["system"] = context["system_prompt"]
-        tools = _convert_tools(context.get("tools"))
-        if tools:
-            kwargs["tools"] = tools
-        kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        return kwargs
+        self._cached_client = anthropic.Anthropic(**kwargs)
+        self._cached_base_url = base_url
+        self._cached_auth_token = auth_token
+        return self._cached_client
 
     def stream(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> RuntimeStream:
         options = options or RuntimeOptions()
-        kwargs = self._request_kwargs(model_spec, context, options)
+        kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
         call_logger = LLMCallLogger(
             logger,
@@ -274,17 +220,33 @@ class AnthropicAdapter:
             stream_cm = client.messages.stream(**kwargs, timeout=timeout)
         except Exception as err:
             call_logger.failed(err, stage="stream_open")
-            raise
+            return _ErrorStream(model_spec, err)
         return _AnthropicStream(stream_cm, model_spec, call_logger=call_logger)
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
-        stream = self.stream(model_spec, context, options)
+        options = options or RuntimeOptions()
+        kwargs = build_request_kwargs(model_spec, context, options)
+        timeout = options.timeout
+        call_logger = LLMCallLogger(
+            logger,
+            call_id=new_call_id(),
+            provider=self.provider,
+            api=self.api_name,
+            model=model_spec.model,
+            metadata=options.metadata or {},
+            request_summary=summarize_runtime_context(context, options),
+            request_payload=kwargs,
+        )
+        call_logger.started()
         try:
-            for _event in stream:
-                pass
-            return stream.get_final_message()
-        finally:
-            stream.close()
+            client = self._client()
+            response = client.messages.create(**kwargs, timeout=timeout)
+        except Exception as err:
+            call_logger.failed(err, stage="complete")
+            raise
+        message = assistant_from_response(model_spec, response)
+        call_logger.succeeded(message)
+        return message
 
 
 register_adapter(AnthropicAdapter())

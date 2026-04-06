@@ -15,6 +15,10 @@ class Usage(TypedDict, total=False):
     total_tokens: int
 
 
+def compute_total_tokens(usage: Usage) -> int:
+    return usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+
+
 class TextBlock(TypedDict):
     type: Literal["text"]
     text: str
@@ -57,6 +61,7 @@ class AssistantMessage(TypedDict, total=False):
     id: str
     phase: Literal["commentary", "final_answer"]
     runtime_warnings: list[str]
+    error_message: str
 
 
 class ToolResultMessage(TypedDict):
@@ -76,23 +81,80 @@ class Context(TypedDict, total=False):
     tools: list[dict[str, Any]]
 
 
+# ─── Stream events ────────────────────────────────────────────────────────────
+
+class StreamStartEvent(TypedDict):
+    type: Literal["start"]
+
+
+class TextStartEvent(TypedDict):
+    type: Literal["text_start"]
+    content_index: int
+
+
 class TextDeltaEvent(TypedDict):
     type: Literal["text_delta"]
     text: str
+    content_index: int
+
+
+class TextEndEvent(TypedDict):
+    type: Literal["text_end"]
+    content_index: int
+
+
+class ThinkingStartEvent(TypedDict):
+    type: Literal["thinking_start"]
+    content_index: int
 
 
 class ThinkingDeltaEvent(TypedDict):
     type: Literal["thinking_delta"]
     text: str
+    content_index: int
+
+
+class ThinkingEndEvent(TypedDict):
+    type: Literal["thinking_end"]
+    content_index: int
+
+
+class ToolCallStartEvent(TypedDict):
+    type: Literal["tool_call_start"]
+    content_index: int
 
 
 class ToolCallDeltaEvent(TypedDict):
     type: Literal["tool_call_delta"]
     delta: str
+    content_index: int
 
 
-StreamEvent = TextDeltaEvent | ThinkingDeltaEvent | ToolCallDeltaEvent
+class ToolCallEndEvent(TypedDict):
+    type: Literal["tool_call_end"]
+    content_index: int
 
+
+class StreamDoneEvent(TypedDict):
+    type: Literal["done"]
+    message: AssistantMessage
+
+
+class StreamErrorEvent(TypedDict):
+    type: Literal["error"]
+    message: AssistantMessage
+
+
+StreamEvent = (
+    StreamStartEvent
+    | TextStartEvent | TextDeltaEvent | TextEndEvent
+    | ThinkingStartEvent | ThinkingDeltaEvent | ThinkingEndEvent
+    | ToolCallStartEvent | ToolCallDeltaEvent | ToolCallEndEvent
+    | StreamDoneEvent | StreamErrorEvent
+)
+
+
+# ─── Reasoning config ────────────────────────────────────────────────────────
 
 class AnthropicThinkingDisabledConfig(TypedDict):
     type: Literal["disabled"]
@@ -110,6 +172,30 @@ AnthropicReasoningConfig = AnthropicThinkingDisabledConfig | AnthropicThinkingAd
 ReasoningConfig = AnthropicReasoningConfig
 
 
+# ─── Tool choice ──────────────────────────────────────────────────────────────
+
+class ToolChoiceAuto(TypedDict):
+    type: Literal["auto"]
+
+
+class ToolChoiceAny(TypedDict):
+    type: Literal["any"]
+
+
+class ToolChoiceNone(TypedDict):
+    type: Literal["none"]
+
+
+class ToolChoiceTool(TypedDict):
+    type: Literal["tool"]
+    name: str
+
+
+ToolChoice = ToolChoiceAuto | ToolChoiceAny | ToolChoiceNone | ToolChoiceTool
+
+
+# ─── Model / options / stream ────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class ModelSpec:
     provider: str
@@ -125,10 +211,22 @@ class RuntimeOptions:
     timeout: float | None = None
     reasoning: ReasoningConfig | None = None
     metadata: dict[str, Any] | None = None
-    tool_choice: Any = None
+    tool_choice: ToolChoice | None = None
 
 
 class RuntimeStream(Protocol):
+    """Sync streaming interface.
+
+    Contract:
+    - ``__iter__`` always emits exactly one terminal event (``done`` or ``error``)
+      as the last yielded value.
+    - After a terminal event, ``get_final_message()`` returns the corresponding
+      ``AssistantMessage`` and **never raises**.
+    - Provider/network failures after ``stream()`` returns are represented as
+      ``error`` events.  Only local validation errors may raise before stream
+      creation.
+    """
+
     def __iter__(self) -> Iterator[StreamEvent]:
         ...
 
@@ -136,4 +234,10 @@ class RuntimeStream(Protocol):
         ...
 
     def close(self) -> None:
+        ...
+
+    def __enter__(self) -> RuntimeStream:
+        ...
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         ...

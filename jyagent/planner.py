@@ -595,10 +595,11 @@ def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars:
 class _StreamFailure(Exception):
     """Raised when a streamed response fails after emitting partial output."""
 
-    def __init__(self, error: BaseException, partial_text: str):
+    def __init__(self, error: BaseException, partial_text: str, final_message: dict | None = None):
         super().__init__(str(error))
         self.error = error
         self.partial_text = partial_text
+        self.final_message = final_message
 
 
 def _stream_abort_text(existing_text: str, step: int, error: BaseException) -> str:
@@ -638,18 +639,32 @@ def _stream_response(
                     first_token = False
                 _stream_write(event.get("text", ""))
                 text_parts.append(event.get("text", ""))
-            elif event_type in {"tool_call_delta", "thinking_delta"}:
+            elif event_type in ("tool_call_delta", "thinking_delta"):
                 if first_token:
                     spinner.stop()
                     first_token = False
+            elif event_type == "done":
+                final_message = event["message"]
+            elif event_type == "error":
+                final_message = event["message"]
+            # Silently ignore: start, *_start, *_end
 
-        final_message = stream.get_final_message()
+        if final_message is None:
+            final_message = stream.get_final_message()
+
         for warning in final_message.get("runtime_warnings", []):
             _runtime_warning(warning)
         stop_reason = final_message.get("stop_reason", "stop")
+
+        if stop_reason == "error":
+            error_msg = final_message.get("error_message", "Unknown streaming error")
+            raise _StreamFailure(Exception(error_msg), "".join(text_parts), final_message=final_message)
+
         tool_use_blocks = _assistant_tool_calls(final_message)
         _record_response_usage(final_message)
     except KeyboardInterrupt:
+        raise
+    except _StreamFailure:
         raise
     except Exception as err:
         raise _StreamFailure(err, "".join(text_parts)) from err
