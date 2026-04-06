@@ -9,17 +9,13 @@ keepalive pings and tools/list_changed notification handling.
 
 import atexit
 import json
-import logging
 import os
 import re
 import threading
-import time
 from typing import Optional
 from .mcp_client import MCPClient
 from .registry import get_registry
 from .toolresult import ToolResult
-
-logger = logging.getLogger(__name__)
 
 # Module version marker — bump this to confirm reloads are taking effect
 _MODULE_VERSION = "2.1.0"
@@ -54,8 +50,7 @@ def load_config() -> dict:
         with open(config_path, "r") as f:
             config = json.load(f)
         return config
-    except (json.JSONDecodeError, IOError) as e:
-        logger.warning(f"Failed to load MCP config from {config_path}: {e}")
+    except (json.JSONDecodeError, IOError):
         return {"mcpServers": {}}
 
 
@@ -284,8 +279,7 @@ class MCPManager:
         
         try:
             mcp_tools = client.list_tools()
-        except Exception as e:
-            logger.warning(f"Failed to list tools from MCP server '{server_name}': {e}")
+        except Exception:
             return 0
 
         count = 0
@@ -367,10 +361,6 @@ class MCPManager:
             # MCP stdio pipe still alive — keepalive pings pass, tool calls fail).
             # If so, force-reconnect (disconnect + connect) and retry once.
             if self._is_dead_server_error(error_msg):
-                logger.warning(
-                    f"MCP server '{server_name}' appears dead ({error_msg[:80]}...), "
-                    f"attempting auto-reconnect..."
-                )
                 try:
                     self.disconnect(server_name)
                     self.load_servers()  # Reload config in case it changed
@@ -384,7 +374,6 @@ class MCPManager:
                     client = self._clients.get(server_name)
                     # Retry the tool call once
                     result = client.call_tool(mcp_tool_name, arguments, timeout=timeout)
-                    logger.info(f"MCP server '{server_name}' auto-reconnected, retry succeeded")
                     return ToolResult(_extract_mcp_result(result))
                 except Exception as retry_err:
                     return ToolResult(
@@ -446,11 +435,8 @@ class MCPManager:
         Runs on the MCP client's event loop thread, so we need to be thread-safe.
         Re-registers tools by unregistering old ones and fetching the new list.
         """
-        logger.info(f"Tools changed for server '{server_name}', refreshing registrations...")
-        
         client = self._clients.get(server_name)
         if client is None or not client.is_connected:
-            logger.warning(f"Cannot refresh tools for '{server_name}': not connected")
             return
         
         server_config = self._configs.get(server_name, {})
@@ -459,8 +445,7 @@ class MCPManager:
             # Unregister old tools
             self._unregister_server_tools(server_name)
             # Re-register with fresh tool list (cache was already invalidated by MCPClient)
-            count = self._register_server_tools(server_name, client, server_config)
-            logger.info(f"Refreshed tools for '{server_name}': {count} tools registered")
+            self._register_server_tools(server_name, client, server_config)
 
     # ─── P2: Background keepalive ─────────────────────────────────────────────
 
@@ -476,7 +461,6 @@ class MCPManager:
             name="mcp-keepalive",
         )
         self._keepalive_thread.start()
-        logger.debug("MCP keepalive thread started")
 
     def _stop_keepalive(self):
         """Stop the background keepalive thread."""
@@ -484,7 +468,6 @@ class MCPManager:
         if self._keepalive_thread is not None:
             self._keepalive_thread.join(timeout=5)
             self._keepalive_thread = None
-        logger.debug("MCP keepalive thread stopped")
 
     def _keepalive_loop(self):
         """Background loop that pings all connected servers periodically.
@@ -506,15 +489,9 @@ class MCPManager:
                     else:
                         failures = self._ping_failures.get(server_name, 0) + 1
                         self._ping_failures[server_name] = failures
-                        if failures >= KEEPALIVE_MAX_FAILURES:
-                            logger.warning(
-                                f"MCP server '{server_name}' failed {failures} consecutive pings — "
-                                f"server may be dead. Will attempt reconnect on next tool call."
-                            )
-                except Exception as e:
+                except Exception:
                     failures = self._ping_failures.get(server_name, 0) + 1
                     self._ping_failures[server_name] = failures
-                    logger.debug(f"Ping error for '{server_name}': {e} (failure #{failures})")
 
     # ─── Chrome high-level helpers ────────────────────────────────────────────
     # These encapsulate common Chrome operations so both the web_fetch Chrome
@@ -541,8 +518,6 @@ class MCPManager:
         if health.is_error:
             error_msg = health.content or ""
             if self._is_dead_server_error(error_msg):
-                logger.warning("Chrome health check failed (%s), forcing reconnect...",
-                               error_msg[:80])
                 self.disconnect(server)
                 result = self.connect(server)
                 if result.get("status") not in ("connected", "already_connected"):
@@ -583,7 +558,6 @@ class MCPManager:
             # If WE connected Chrome, disconnect to clean up
             # (kills Chrome process, no leftover blank tabs)
             if not was_connected and self.is_connected("chrome"):
-                logger.info("chrome_fetch_page connected Chrome — disconnecting to clean up")
                 try:
                     self.disconnect("chrome")
                 except Exception:
@@ -732,10 +706,6 @@ def get_manager() -> MCPManager:
         _manager.load_servers()
     elif getattr(_manager, '_module_version', None) != _MODULE_VERSION:
         # Module was reloaded — recreate manager to pick up code changes
-        logger.info(
-            f"MCP manager module reloaded (v{getattr(_manager, '_module_version', '?')} → v{_MODULE_VERSION}), "
-            f"recreating manager..."
-        )
         old_clients = dict(_manager._clients)
         old_configs = dict(_manager._configs)
         _manager._stop_keepalive()
@@ -748,9 +718,8 @@ def get_manager() -> MCPManager:
         for server_name, client in old_clients.items():
             if client.is_connected:
                 server_config = old_configs.get(server_name, {})
-                count = _manager._register_server_tools(server_name, client, server_config)
+                _manager._register_server_tools(server_name, client, server_config)
                 _manager._ping_failures[server_name] = 0
-                logger.info(f"Re-registered {count} tools for '{server_name}' after module reload")
         if old_clients:
             _manager._start_keepalive()
     return _manager

@@ -18,11 +18,8 @@ Usage (as native tool):
 """
 
 import re
-import logging
 from urllib.parse import urlparse
 from ..toolresult import ToolResult
-
-logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -243,9 +240,11 @@ def _is_low_quality(content: str, url: str = "") -> str | None:
 
     # ── Pattern 5: Title-only or URL-source-only pages ──
     # Jina sometimes returns just "Title:\nURL Source:\n" with no body
-    lines = [l.strip() for l in content_stripped.split('\n') if l.strip()]
-    non_meta_lines = [l for l in lines
-                      if not l.lower().startswith(('title:', 'url source:', 'url:', 'source:'))]
+    lines = [line.strip() for line in content_stripped.split('\n') if line.strip()]
+    non_meta_lines = [
+        line for line in lines
+        if not line.lower().startswith(('title:', 'url source:', 'url:', 'source:'))
+    ]
     if len(non_meta_lines) < 3 and content_len < 500:
         return f"metadata-only response ({len(non_meta_lines)} content lines)"
 
@@ -466,7 +465,6 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
 
         # 4. If JS extraction got too little, fall back to take_snapshot
         if len(content) < 100:
-            logger.info("Chrome evaluate_script returned little text (%d chars), falling back to take_snapshot", len(content))
             snapshot_result = manager._call_mcp_tool("chrome", "take_snapshot", {})
             if not snapshot_result.is_error:
                 content = snapshot_result.content.strip()

@@ -4,17 +4,16 @@ import json
 import sys
 import time
 import atexit
-import logging
 import threading
 import traceback
 import concurrent.futures
 from dataclasses import dataclass
-from .observability import format_traceback, log_event, scrub_string
 from .registry import get_registry
 from .toolresult import ToolResult
 from .validation import validate_tool_input
 from .session_stats import get_stats
 from .runtime import RuntimeOwner, RuntimeOptions
+from .text_utils import scrub_string
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
@@ -37,8 +36,6 @@ COLOR_RED = "\033[1;31m"
 COLOR_GREEN = "\033[0;32m"
 COLOR_MAGENTA = "\033[0;35m"
 COLOR_DIM_YELLOW = "\033[2;33m"
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -384,8 +381,13 @@ def _execute_tool(tool_name: str, tool_input: dict, tool_functions: dict) -> Too
     except KeyboardInterrupt:
         raise
     except Exception as e:
+        error_text = scrub_string(str(e), max_text_chars=500)
+        error_detail = scrub_string(
+            "".join(traceback.format_exception(type(e), e, e.__traceback__)),
+            max_text_chars=4000,
+        )
         return ToolResult(
-            f"Error calling tool {tool_name}: {e}\n{traceback.format_exc()}",
+            f"Error calling tool {tool_name}: {error_text}\n{error_detail}",
             is_error=True
         )
 
@@ -474,8 +476,13 @@ def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
                 try:
                     results[idx] = (block, future.result())
                 except Exception as exc:
+                    error_text = scrub_string(str(exc), max_text_chars=500)
+                    error_detail = scrub_string(
+                        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                        max_text_chars=4000,
+                    )
                     results[idx] = (block, ToolResult(
-                        f"Error calling tool {block.name}: {exc}\n{traceback.format_exc()}",
+                        f"Error calling tool {block.name}: {error_text}\n{error_detail}",
                         is_error=True
                     ))
         else:
@@ -548,15 +555,6 @@ def _stream_error_diagnostics(error: BaseException) -> dict:
     return {}
 
 
-def _stream_error_log_fields(error: BaseException) -> dict:
-    diagnostics = _stream_error_diagnostics(error)
-    return {
-        key: value
-        for key, value in diagnostics.items()
-        if value not in (None, "")
-    }
-
-
 def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars: int = 220) -> str:
     diagnostics = _stream_error_diagnostics(error)
     if not diagnostics:
@@ -603,7 +601,10 @@ class _StreamFailure(Exception):
 
 
 def _stream_abort_text(existing_text: str, step: int, error: BaseException) -> str:
-    error_text = f"[Error: streaming interrupted at step {step + 1}: {error}]"
+    error_text = (
+        f"[Error: streaming interrupted at step {step + 1}: "
+        f"{scrub_string(str(error), max_text_chars=500)}]"
+    )
     if existing_text:
         return existing_text + "\n\n" + error_text
     return error_text
@@ -728,47 +729,36 @@ def _stream_with_retry(
         ])
         if is_transient and attempt < _STREAM_MAX_RETRIES:
             retry_delay = 2 ** (attempt + 1)  # 2s, 4s
-            log_event(
-                logger,
-                logging.WARNING,
-                "planner.stream.retry",
-                component="planner",
-                step=step + 1,
-                attempt=attempt + 1,
-                retry_in_seconds=retry_delay,
-                transient=True,
-                error_type=type(stream_err).__name__,
-                error_message=scrub_string(str(stream_err), max_text_chars=500),
+            retry_msg = (
+                "\n⚡ Stream interrupted "
+                f"({scrub_string(str(stream_err), max_text_chars=500)}), "
+                f"retrying in {retry_delay}s... "
+                f"(attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
             )
-            retry_msg = f"\n⚡ Stream interrupted ({stream_err}), retrying in {retry_delay}s... (attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
             sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
             sys.stdout.flush()
             time.sleep(retry_delay)  # responds to KeyboardInterrupt
             continue
         # Non-transient error or retries exhausted
-        log_event(
-            logger,
-            logging.ERROR,
-            "planner.stream.failed",
-            component="planner",
-            step=step + 1,
-            attempt=attempt + 1,
-            transient=is_transient,
-            error_type=type(stream_err).__name__,
-            error_message=scrub_string(str(stream_err), max_text_chars=500),
-            traceback=scrub_string(format_traceback(stream_err), max_text_chars=4000),
-            **_stream_error_log_fields(stream_err),
-        )
+        error_text = scrub_string(str(stream_err), max_text_chars=500)
+        error_msg = f"\n[Stream error at step {step+1}: {error_text}]"
         diagnostics_text = _format_stream_error_diagnostics(stream_err)
-        error_msg = f"\n[Stream error at step {step+1}: {stream_err}]"
         if diagnostics_text:
             error_msg += f"\n{diagnostics_text}"
         error_msg += "\n"
         sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
         sys.stdout.flush()
         if all_text or partial_step_text:
-            raise _StreamAbort(_stream_abort_text(all_text + partial_step_text, step, stream_err), "", working_messages)
-        raise _StreamAbort(f"Error during streaming: {stream_err}", "", working_messages)
+            raise _StreamAbort(
+                _stream_abort_text(
+                    all_text + partial_step_text,
+                    step,
+                    stream_err,
+                ),
+                "",
+                working_messages,
+            )
+        raise _StreamAbort(f"Error during streaming: {error_text}", "", working_messages)
 
 
 class _StreamAbort(Exception):
@@ -965,18 +955,11 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
             msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
             return (msg, "", working_messages)
         except Exception as fallback_err:
-            log_event(
-                logger,
-                logging.ERROR,
-                "planner.fallback.failed",
-                component="planner",
-                step=max_steps,
-                fallback=True,
-                error_type=type(fallback_err).__name__,
-                error_message=scrub_string(str(fallback_err), max_text_chars=500),
-                traceback=scrub_string(format_traceback(fallback_err), max_text_chars=4000),
+            sys.stdout.write(
+                f"{COLOR_RED}\n  Fallback response failed: "
+                f"{scrub_string(str(fallback_err), max_text_chars=500)}"
+                f"{COLOR_RESET}\n"
             )
-            sys.stdout.write(f"{COLOR_RED}\n  Fallback response failed: {fallback_err}{COLOR_RESET}\n")
             sys.stdout.flush()
 
         return ("I've reached my maximum reasoning steps. Please try rephrasing your request.", "", working_messages)
@@ -988,16 +971,11 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
         msg = all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]"
         return (msg, "", working_messages)
     except Exception as e:
-        error_detail = traceback.format_exc()
-        log_event(
-            logger,
-            logging.ERROR,
-            "planner.unhandled_exception",
-            component="planner",
-            error_type=type(e).__name__,
-            error_message=scrub_string(str(e), max_text_chars=500),
-            traceback=scrub_string(format_traceback(e), max_text_chars=4000),
+        error_text = scrub_string(str(e), max_text_chars=500)
+        error_detail = scrub_string(
+            "".join(traceback.format_exception(type(e), e, e.__traceback__)),
+            max_text_chars=4000,
         )
-        sys.stdout.write(f"{COLOR_RED}\nFatal error in planner: {e}\n{error_detail}{COLOR_RESET}\n")
+        sys.stdout.write(f"{COLOR_RED}\nFatal error in planner: {error_text}\n{error_detail}{COLOR_RESET}\n")
         sys.stdout.flush()
-        return (f"Error during planning: {e}", "", working_messages)
+        return (f"Error during planning: {error_text}", "", working_messages)

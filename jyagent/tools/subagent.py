@@ -9,7 +9,6 @@
 import sys
 import time
 import traceback
-import logging
 import threading
 import concurrent.futures
 
@@ -25,7 +24,7 @@ try:
     from ..toolresult import ToolResult
     from ..validation import validate_tool_input
     from ..session_stats import get_stats
-    from ..observability import format_traceback, log_event, scrub_string, truncate_text
+    from ..text_utils import scrub_string
 except ImportError:
     from jyagent.config import (
         MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
@@ -38,7 +37,7 @@ except ImportError:
     from jyagent.toolresult import ToolResult
     from jyagent.validation import validate_tool_input
     from jyagent.session_stats import get_stats
-    from jyagent.observability import format_traceback, log_event, scrub_string, truncate_text
+    from jyagent.text_utils import scrub_string
 
 
 # ─── Model tiers ──────────────────────────────────────────────────────────────
@@ -53,7 +52,6 @@ _SUBAGENT_STATUS_API_ERROR = "api_error"
 # Track nesting to prevent runaway recursion
 _nesting_depth = threading.local()
 _MAX_NESTING = 2  # sub-agent can spawn sub-sub-agent, but no deeper
-logger = logging.getLogger(__name__)
 
 
 # ─── Runtime owner access ─────────────────────────────────────────────────────
@@ -349,7 +347,6 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
     total_input_tokens = 0
     total_output_tokens = 0
     tool_calls_count = 0
-    task_preview = truncate_text(" ".join(task.split()), max_chars=120)
 
     for step in range(max_steps):
         runtime_context = {
@@ -380,20 +377,9 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
             )
         except Exception as e:
             step_num = step + 1
-            log_event(
-                logger,
-                logging.ERROR,
-                "subagent.api_failure",
-                component="subagent",
-                model=f"{model_spec.provider}:{model_spec.model}",
-                step=step_num,
-                task_preview=task_preview,
-                error_type=type(e).__name__,
-                error_message=scrub_string(str(e), max_text_chars=500),
-                traceback=scrub_string(format_traceback(e), max_text_chars=4000),
-            )
+            error_text = scrub_string(str(e), max_text_chars=500)
             content = _format_subagent_failure(
-                f"Error: Sub-agent API failure at step {step_num}: {e}",
+                f"Error: Sub-agent API failure at step {step_num}: {error_text}",
                 partial_output=all_text,
             )
             return _make_subagent_outcome(
@@ -403,7 +389,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
                 total_input_tokens,
                 total_output_tokens,
                 tool_calls_count,
-                error=str(e),
+                error=error_text,
             )
 
         # Track tokens
@@ -587,15 +573,6 @@ def dispatch_agent(
                 outcome = future.result(timeout=_SUBAGENT_TIMEOUT)
             except concurrent.futures.TimeoutError:
                 future.cancel()
-                log_event(
-                    logger,
-                    logging.ERROR,
-                    "subagent.timeout",
-                    component="subagent",
-                    model=f"{model_spec.provider}:{model_spec.model}",
-                    timeout_seconds=_SUBAGENT_TIMEOUT,
-                    task_preview=truncate_text(" ".join(task.split()), max_chars=120),
-                )
                 return ToolResult(
                     f"Error: Sub-agent timed out after {_SUBAGENT_TIMEOUT}s. "
                     f"Task may be too complex — try breaking it down further.",
@@ -606,19 +583,13 @@ def dispatch_agent(
         raise
     except Exception as e:
         spinner.stop()
-        log_event(
-            logger,
-            logging.ERROR,
-            "subagent.failed",
-            component="subagent",
-            model=f"{model_spec.provider}:{model_spec.model}",
-            task_preview=truncate_text(" ".join(task.split()), max_chars=120),
-            error_type=type(e).__name__,
-            error_message=scrub_string(str(e), max_text_chars=500),
-            traceback=scrub_string(format_traceback(e), max_text_chars=4000),
+        error_text = scrub_string(str(e), max_text_chars=500)
+        error_detail = scrub_string(
+            "".join(traceback.format_exception(type(e), e, e.__traceback__)),
+            max_text_chars=4000,
         )
         return ToolResult(
-            f"Error: Sub-agent failed: {e}\n{traceback.format_exc()}",
+            f"Error: Sub-agent failed: {error_text}\n{error_detail}",
             is_error=True,
         )
     finally:

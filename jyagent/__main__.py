@@ -43,9 +43,6 @@ def _load_dotenv() -> None:
 def main():
     """Main entry point."""
     _load_dotenv()
-    from .observability import setup_logging
-
-    setup_logging()
 
     # Capture launch directory
     if "LAUNCH_DIR" not in os.environ:

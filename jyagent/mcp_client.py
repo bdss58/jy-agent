@@ -4,13 +4,12 @@ MCP Client — Sync wrapper around the official MCP Python SDK (v1.26.0+).
 Architecture: Background thread runs asyncio event loop. A long-lived session task
 holds transport + session context managers open while a call queue processes requests.
 
-Features: tools/list_changed notification, subprocess stderr redirection to log file,
+Features: tools/list_changed notification, subprocess stderr redirection away from the terminal,
 structured content extraction, all transports (stdio/HTTP/SSE).
 """
 
 import asyncio
 import io
-import logging
 import os
 import signal
 import threading
@@ -23,13 +22,11 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-logger = logging.getLogger(__name__)
-
 
 # ─── P5: PID-capturing stdio_client wrapper ──────────────────────────────────
 
 @asynccontextmanager
-async def _stdio_client_with_pid(params: StdioServerParameters, errlog, pid_callback):
+async def _stdio_client_with_pid(params: StdioServerParameters, stderr_sink, pid_callback):
     """Wrap stdio_client to capture the subprocess PID.
 
     The MCP library's stdio_client spawns a subprocess but doesn't expose its PID.
@@ -55,7 +52,7 @@ async def _stdio_client_with_pid(params: StdioServerParameters, errlog, pid_call
 
     pids_before = _get_child_pids()
 
-    async with stdio_client(params, errlog=errlog) as (read, write):
+    async with stdio_client(params, errlog=stderr_sink) as (read, write):
         # Find the new child PID(s)
         pids_after = _get_child_pids()
         new_pids = pids_after - pids_before
@@ -63,26 +60,16 @@ async def _stdio_client_with_pid(params: StdioServerParameters, errlog, pid_call
             # Pick the lowest PID (the direct child, npm or the server)
             child_pid = min(new_pids)
             pid_callback(child_pid)
-            logger.debug(f"MCP subprocess PID captured: {child_pid} (new PIDs: {new_pids})")
 
         yield read, write
 
 
-# ─── P4: MCP subprocess stderr log file ──────────────────────────────────────
+# ─── P4: MCP subprocess stderr sink ──────────────────────────────────────────
 
-def _get_mcp_stderr_log(server_name: str) -> io.TextIOWrapper:
-    """Get a file object for redirecting MCP subprocess stderr.
-    
-    Instead of letting MCP subprocess stderr go to sys.stderr (which corrupts
-    the prompt_toolkit terminal), redirect it to a log file under data/logs/.
-    
-    This prevents messages like "Assertion failed" from the Chrome DevTools MCP
-    Node.js process from appearing inside the CLI input prompt.
-    """
-    log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"mcp-{server_name}-stderr.log")
-    return open(log_path, "a", encoding="utf-8", buffering=1)  # line-buffered
+def _get_mcp_stderr_sink(server_name: str) -> io.TextIOWrapper:
+    """Get a sink for redirecting MCP subprocess stderr away from the terminal."""
+    del server_name
+    return open(os.devnull, "a", encoding="utf-8", buffering=1)
 
 
 # ─── P1: Extended ClientSession with notification handling ────────────────────
@@ -107,12 +94,11 @@ class AgentClientSession(ClientSession):
 
         # P1: Handle tools/list_changed
         if isinstance(notification.root, types.ToolListChangedNotification):
-            logger.info("Received tools/list_changed notification from server")
             if self._tools_list_changed_callback:
                 try:
                     self._tools_list_changed_callback()
-                except Exception as e:
-                    logger.warning(f"tools_list_changed callback error: {e}")
+                except Exception:
+                    pass
 
 
 class MCPClient:
@@ -148,8 +134,8 @@ class MCPClient:
         self._lifecycle_task = None
         self._connected = False
 
-        # P4: stderr log file for MCP subprocess
-        self._stderr_log: Optional[io.TextIOWrapper] = None
+        # P4: stderr sink for MCP subprocess
+        self._stderr_sink: Optional[io.TextIOWrapper] = None
 
         # P5: Track subprocess PID for force-kill on disconnect timeout
         self._subprocess_pid: Optional[int] = None
@@ -180,15 +166,14 @@ class MCPClient:
         
         Runs on the MCP event loop thread. Must be thread-safe.
         """
-        logger.info(f"MCP server '{self.name}': tools/list_changed — invalidating cache")
         self._tools_cache = None  # Invalidate cache
         self._tools_changed = True
         # Invoke external callback (MCPManager) if registered
         if self._on_tools_changed_callback:
             try:
                 self._on_tools_changed_callback(self.name)
-            except Exception as e:
-                logger.warning(f"tools_changed callback error for '{self.name}': {e}")
+            except Exception:
+                pass
 
     def _start_loop(self):
         """Start the background event loop thread."""
@@ -263,15 +248,13 @@ class MCPClient:
                             env=process_env, cwd=cwd,
                         )
                         
-                        # P4: Redirect MCP subprocess stderr to log file
-                        # instead of sys.stderr (which corrupts prompt_toolkit terminal).
-                        # This prevents "Assertion failed" and other subprocess stderr
-                        # messages from appearing inside the CLI input prompt.
-                        self._stderr_log = _get_mcp_stderr_log(self.name)
+                        # P4: Redirect MCP subprocess stderr away from sys.stderr
+                        # so prompt_toolkit output does not get corrupted.
+                        self._stderr_sink = _get_mcp_stderr_sink(self.name)
                         
                         read, write = await exit_stack.enter_async_context(
                             _stdio_client_with_pid(
-                                params, errlog=self._stderr_log,
+                                params, stderr_sink=self._stderr_sink,
                                 pid_callback=lambda pid: setattr(self, '_subprocess_pid', pid)
                             )
                         )
@@ -322,8 +305,6 @@ class MCPClient:
                 if not connect_done.is_set():
                     connect_error[0] = e
                     connect_done.set()
-                else:
-                    logger.error(f"MCP session '{self.name}' error: {e}")
             finally:
                 self._session = None
                 self._connected = False
@@ -434,7 +415,6 @@ class MCPClient:
 
         # Capture PID before we start cleanup (it gets cleared below)
         subprocess_pid = self._subprocess_pid
-        graceful_ok = False
 
         # Signal disconnect
         if self._loop and self._disconnect_event:
@@ -444,9 +424,8 @@ class MCPClient:
         if self._lifecycle_task:
             try:
                 self._lifecycle_task.result(timeout=15)
-                graceful_ok = True
-            except Exception as e:
-                logger.debug(f"Lifecycle task ended for '{self.name}': {e}")
+            except Exception:
+                pass
             self._lifecycle_task = None
 
         self._session = None
@@ -458,13 +437,13 @@ class MCPClient:
         self._call_queue = None
         self._disconnect_event = None
 
-        # P4: Close stderr log file
-        if self._stderr_log:
+        # P4: Close stderr sink
+        if self._stderr_sink:
             try:
-                self._stderr_log.close()
+                self._stderr_sink.close()
             except Exception:
                 pass
-            self._stderr_log = None
+            self._stderr_sink = None
 
         # Stop the background event loop
         self._stop_loop()
@@ -530,11 +509,6 @@ class MCPClient:
                 pass
 
         try:
-            logger.info(
-                f"MCP '{self.name}': force-killing subprocess tree to ensure "
-                f"no orphan processes (root PID {pid})"
-            )
-
             # Collect all process group IDs in the tree
             all_descendants = _get_descendants(pid)
             all_pids = {pid} | all_descendants
@@ -544,8 +518,6 @@ class MCPClient:
                     pgids.add(os.getpgid(p))
                 except (ProcessLookupError, OSError):
                     pass
-
-            logger.debug(f"MCP '{self.name}': killing PGIDs {pgids} (PIDs: {all_pids})")
 
             # SIGTERM all process groups
             for pgid in pgids:
@@ -571,11 +543,8 @@ class MCPClient:
             # Still alive — SIGKILL all process groups
             for pgid in pgids:
                 _kill_pgid(pgid, signal.SIGKILL)
-
-            logger.warning(f"MCP '{self.name}': sent SIGKILL to process groups {pgids}")
-
-        except Exception as e:
-            logger.warning(f"MCP '{self.name}': force-kill failed for PID {pid}: {e}")
+        except Exception:
+            pass
 
     # ─── Public API ──────────────────────────────────────────────────────────
 
