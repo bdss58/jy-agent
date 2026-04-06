@@ -82,13 +82,12 @@ claude -p \
 ### Pattern C: Budget-Controlled
 
 ```bash
-claude -p --max-budget-usd 0.50 --max-turns 10 \
+claude -p --max-budget-usd 0.50 \
   "Fix the failing test in tests/test_api.py"
 ```
 
 - From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
 - `--max-budget-usd` caps spending (prevents runaway)
-- `--max-turns` limits back-and-forth iterations
 
 ### Pattern D: Structured Output
 

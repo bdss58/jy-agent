@@ -98,7 +98,7 @@ Combine repository pattern (Claude Code) with per-endpoint rollout (Codex):
 
 After Claude Code finishes the Repository layer:
 ```bash
-codex exec --profile careful \
+codex exec --sandbox read-only \
   "Review the Repository abstraction in src/repositories/. Check that DynamoDB
    access patterns are correct for our query needs: <list queries>"
 ```

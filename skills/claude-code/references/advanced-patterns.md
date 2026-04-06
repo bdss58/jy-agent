@@ -90,15 +90,15 @@ For tasks that exceed a single context window:
 
 ```bash
 # First chunk
-claude -p --model sonnet --max-turns 15 \
+claude -p --model sonnet \
   "Migrate files in src/handlers/ from REST to GraphQL. Start with user.py and auth.py."
 
 # Continue where it left off
-claude -p --model sonnet --continue --max-turns 15 \
+claude -p --model sonnet --continue \
   "Continue the migration. Do billing.py and orders.py next."
 
 # Final chunk
-claude -p --model sonnet --continue --max-turns 15 \
+claude -p --model sonnet --continue \
   "Finish migration: update router, tests, and docs. Run full test suite."
 ```
 

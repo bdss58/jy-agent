@@ -77,7 +77,7 @@ claude -p --model sonnet --bare \
    TASK: <problem statement>" > /tmp/plan_claude.txt 2>&1 &
 
 # Codex — plan only
-codex exec \
+codex exec --sandbox read-only \
   "PLAN ONLY — do not implement. Analyze this task and produce a detailed
    execution plan with: (1) approach summary, (2) files to change,
    (3) step sequence, (4) risks/tradeoffs, (5) testing strategy.
@@ -137,8 +137,8 @@ claude -p --model sonnet --bare --allowedTools "Read" \
    Check for bugs, edge cases, deviations."
 
 # Claude Code implemented → Codex reviews
-codex exec --profile careful \
-  "/review the changes since last commit against this plan: <plan>"
+codex exec --sandbox read-only \
+  "Review the changes since last commit against this plan: <plan>"
 ```
 
 This catches blind spots — each model has different failure modes.

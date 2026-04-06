@@ -18,7 +18,6 @@ Complete reference for `claude` CLI flags relevant to programmatic use.
 |------|-------------|---------|
 | `--model MODEL` | Select model: `haiku`, `sonnet`, `opus` | `--model sonnet` |
 | `--max-budget-usd N` | Maximum spend cap in USD. Aborts if exceeded. | `--max-budget-usd 1.00` |
-| `--max-turns N` | Maximum agentic turns (tool use rounds). | `--max-turns 20` |
 
 ## Output Format
 
@@ -43,7 +42,9 @@ Complete reference for `claude` CLI flags relevant to programmatic use.
 | Flag | Description | Example |
 |------|-------------|---------|
 | `--allowedTools TOOLS...` | Auto-approve specific tools. Others require confirmation. | `--allowedTools "Read" "Edit" "Bash(npm test)"` |
+| `--permission-mode MODE` | Set permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions`, `auto`. | `--permission-mode plan` |
 | `--dangerously-skip-permissions` | Skip ALL permission prompts. **Only use in sandboxes.** | `--dangerously-skip-permissions` |
+| `--effort LEVEL` | Set effort level: `low`, `medium`, `high`, `max`. | `--effort high` |
 
 ### Tool name patterns for `--allowedTools`:
 - `Read` — read files
@@ -80,7 +81,7 @@ claude -p "explain this code" < src/complex.py
 ### Safe CI/CD task
 ```bash
 claude -p --bare --model sonnet \
-  --max-budget-usd 0.50 --max-turns 10 \
+  --max-budget-usd 0.50 \
   --allowedTools "Read" "Edit" "Bash(npm test)" \
   "Fix lint errors in src/. Run npm test to verify."
 ```

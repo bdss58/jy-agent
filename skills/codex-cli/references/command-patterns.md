@@ -20,7 +20,6 @@ Use this for repo exploration, debugging, design, and planning:
 
 ```bash
 cat <<'EOF' | codex exec \
-  --ask-for-approval never \
   --sandbox read-only \
   -C /absolute/path/to/repo \
   -
@@ -37,7 +36,6 @@ Use this when edits are intended inside the repo:
 
 ```bash
 cat <<'EOF' | codex exec \
-  --ask-for-approval never \
   --sandbox workspace-write \
   -C /absolute/path/to/repo \
   -
@@ -119,7 +117,6 @@ cat <<'EOF' >/tmp/codex-issues-schema.json
 EOF
 
 cat <<'EOF' | codex exec \
-  --ask-for-approval never \
   --sandbox read-only \
   --output-schema /tmp/codex-issues-schema.json \
   -C /absolute/path/to/repo \

@@ -79,10 +79,10 @@ What does the user need?
 ```
 How much access should Codex get?
 ├─ Repo exploration, diagnosis, planning, review, or read-only analysis
-│  → `codex exec --ask-for-approval never --sandbox read-only`
+│  → `codex exec --sandbox read-only`
 │
 ├─ Intended code edits inside the repo
-│  → `codex exec --ask-for-approval never --sandbox workspace-write`
+│  → `codex exec --sandbox workspace-write`  (or `--full-auto`)
 │
 └─ Anything that sounds like "just give it full access"
    → Push back unless the environment is already externally sandboxed.
