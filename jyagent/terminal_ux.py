@@ -6,7 +6,6 @@ import time
 import threading
 from .registry import get_registry
 from .loop_engine import LoopCallbacks
-from .config import MAX_TOOL_USE_INPUT_CHARS
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 
@@ -211,35 +210,6 @@ def _runtime_warning(msg: str):
     sys.stdout.flush()
 
 
-# ─── Working-message size management ────────────────────────────────────────
-
-def _truncate_tool_call_blocks(blocks: list) -> list:
-    """Truncate large tool_call argument fields in normalized assistant content."""
-    registry = get_registry()
-    out = []
-    for block in blocks:
-        if isinstance(block, dict) and block.get("type") == "tool_call":
-            large_keys = registry.get_large_input_keys(block.get("name", ""))
-            if large_keys:
-                inp = block.get("arguments", {})
-                truncated_inp = {}
-                did_truncate = False
-                for k, v in inp.items():
-                    if k in large_keys and isinstance(v, str) and len(v) > MAX_TOOL_USE_INPUT_CHARS:
-                        truncated_inp[k] = (
-                            v[:MAX_TOOL_USE_INPUT_CHARS]
-                            + f"\n[... truncated, {len(v)} chars total ...]"
-                        )
-                        did_truncate = True
-                    else:
-                        truncated_inp[k] = v
-                if did_truncate:
-                    block = dict(block)
-                    block["arguments"] = truncated_inp
-        out.append(block)
-    return out
-
-
 # ─── Streaming callbacks factory ────────────────────────────────────────────
 
 def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, ThinkingSpinner]:
@@ -299,12 +269,6 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
     def _on_compaction(before_len: int, after_len: int):
         pass  # silent — could add diagnostic output here
 
-    def _on_assistant_message(msg: dict) -> dict:
-        """Truncate large tool_call inputs before the engine appends to messages."""
-        msg = dict(msg)
-        msg["content"] = _truncate_tool_call_blocks(msg.get("content", []))
-        return msg
-
     def _on_warning(warning: str):
         _runtime_warning(warning)
 
@@ -324,7 +288,6 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
         on_usage=_on_usage,
         on_step_progress=_on_step_progress,
         on_compaction=_on_compaction,
-        on_assistant_message=_on_assistant_message,
         on_warning=_on_warning,
         on_truncation=_on_truncation,
         on_tool_batch=_on_tool_batch,

@@ -18,7 +18,7 @@ from typing import Any, Callable
 
 from .runtime import RuntimeOwner, RuntimeOptions
 from .runtime.types import ModelSpec
-from .config import get_reasoning_config_for_provider, STREAM_TIMEOUT
+from .config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from .registry import get_registry
 from .toolresult import ToolResult
 from .validation import validate_tool_input
@@ -44,6 +44,8 @@ class LoopConfig:
     compact_tool_result_chars: int = 2000
     max_tool_result_chars: int = 8000
     streaming: bool = False
+    truncate_large_inputs: bool = True
+    fallback_on_max_steps: bool = False
 
 
 @dataclass
@@ -180,6 +182,33 @@ def _compact_messages(
             compacted[i]["content"] = new_blocks
 
     return compacted
+
+
+def _truncate_tool_call_blocks(blocks: list) -> list:
+    """Truncate large tool_call argument fields in normalized assistant content."""
+    registry = get_registry()
+    out = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "tool_call":
+            large_keys = registry.get_large_input_keys(block.get("name", ""))
+            if large_keys:
+                inp = block.get("arguments", {})
+                truncated_inp = {}
+                did_truncate = False
+                for k, v in inp.items():
+                    if k in large_keys and isinstance(v, str) and len(v) > MAX_TOOL_USE_INPUT_CHARS:
+                        truncated_inp[k] = (
+                            v[:MAX_TOOL_USE_INPUT_CHARS]
+                            + f"\n[... truncated, {len(v)} chars total ...]"
+                        )
+                        did_truncate = True
+                    else:
+                        truncated_inp[k] = v
+                if did_truncate:
+                    block = dict(block)
+                    block["arguments"] = truncated_inp
+        out.append(block)
+    return out
 
 
 def _execute_tool(
@@ -459,6 +488,13 @@ class AgentLoop:
                     if not step_text:
                         final_text = _extract_text(final_message)
                         all_text = final_text or all_text
+
+                    # Apply truncation if enabled
+                    if cfg.truncate_large_inputs:
+                        content = final_message.get("content", [])
+                        final_message = dict(final_message)
+                        final_message["content"] = _truncate_tool_call_blocks(content)
+
                     # Allow caller to transform before append
                     cb_am = self._callbacks.on_assistant_message
                     if cb_am is not None:
@@ -488,6 +524,11 @@ class AgentLoop:
                     continue
 
                 # Append assistant message (allow caller to transform)
+                if cfg.truncate_large_inputs:
+                    content = final_message.get("content", [])
+                    final_message = dict(final_message)
+                    final_message["content"] = _truncate_tool_call_blocks(content)
+
                 cb_am = self._callbacks.on_assistant_message
                 if cb_am is not None:
                     final_message = cb_am(final_message) or final_message
@@ -525,6 +566,69 @@ class AgentLoop:
                     })
 
             # Max steps reached
+            if cfg.fallback_on_max_steps and not final_text:
+                # Try one more streaming call with system instruction to avoid tools
+                try:
+                    fallback_context = dict(context)
+                    fallback_system = context["system_prompt"] + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]"
+                    fallback_context["system_prompt"] = fallback_system
+
+                    # Create fallback options with tool_choice=none
+                    _base = _build_runtime_options(
+                        self._runtime_owner,
+                        cfg.initial_max_tokens,
+                        model_spec=self._model_spec,
+                        metadata={"component": "loop_engine", "step": cfg.max_steps + 1, "fallback": True},
+                    )
+                    fallback_opts = RuntimeOptions(
+                        max_output_tokens=_base.max_output_tokens,
+                        timeout=_base.timeout,
+                        reasoning=_base.reasoning,
+                        metadata=_base.metadata,
+                        tool_choice={"type": "none"},
+                    )
+
+                    # Remove tools from fallback context to ensure no tool use
+                    if "tools" in fallback_context:
+                        del fallback_context["tools"]
+
+                    if cfg.streaming:
+                        fallback_text, _, _, fallback_message = self._call_streaming(fallback_context, fallback_opts)
+                    else:
+                        fallback_text, _, _, fallback_message = self._call_complete(fallback_context, fallback_opts)
+
+                    # Accumulate usage
+                    usage = fallback_message.get("usage", {})
+                    total_input_tokens += usage.get("input_tokens", 0)
+                    total_output_tokens += usage.get("output_tokens", 0)
+                    self._fire("on_usage", usage)
+
+                    # Apply truncation if enabled
+                    if cfg.truncate_large_inputs:
+                        content = fallback_message.get("content", [])
+                        fallback_message = dict(fallback_message)
+                        fallback_message["content"] = _truncate_tool_call_blocks(content)
+
+                    # Append fallback response
+                    messages.append(fallback_message)
+
+                    # Return completed since we got a final answer
+                    return LoopResult(
+                        status="completed",
+                        text=fallback_text or all_text,
+                        final_text=fallback_text,
+                        messages=messages,
+                        steps=cfg.max_steps,
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        tool_calls_count=tool_calls_count,
+                    )
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    # If fallback fails, fall through to normal max_steps handling
+                    pass
+
             return LoopResult(
                 status="max_steps",
                 text=all_text or "",

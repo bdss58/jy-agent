@@ -7,16 +7,16 @@ from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context,
 )
-from .terminal_ux import build_streaming_callbacks, ThinkingSpinner, COLOR_YELLOW, COLOR_RED, COLOR_RESET, _interrupted_msg
+from .terminal_ux import build_streaming_callbacks, COLOR_YELLOW, COLOR_RED, COLOR_RESET, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
-from .runtime import RuntimeOwner, RuntimeOptions
+from .runtime import RuntimeOwner
 from .session_stats import get_stats
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
-    MAX_TOOL_RESULT_CHARS, MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, STREAM_TIMEOUT,
-    COMPACT_TOOL_RESULT_CHARS, get_reasoning_config_for_provider,
+    MAX_TOOL_RESULT_CHARS, MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT,
+    COMPACT_TOOL_RESULT_CHARS,
 )
 
 
@@ -236,70 +236,6 @@ def _graceful_exit(cli):
 _cached_memory_context: str | None = None
 
 
-def _fallback_completion(
-    runtime_owner: RuntimeOwner,
-    system_prompt: str,
-    working_messages: list,
-    max_steps: int,
-) -> tuple:
-    """Try a final non-tool response when max_steps is reached."""
-    from .terminal_ux import _stream_write
-    stats = get_stats()
-    fallback_text = ""
-    try:
-        final_message = runtime_owner.complete(
-            {
-                "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
-                "messages": working_messages,
-            },
-            options=RuntimeOptions(
-                max_output_tokens=DEFAULT_MAX_TOKENS,
-                timeout=STREAM_TIMEOUT,
-                reasoning=get_reasoning_config_for_provider(
-                    runtime_owner.model_spec.provider,
-                    max_output_tokens=DEFAULT_MAX_TOKENS,
-                    model=runtime_owner.model_spec.model,
-                ),
-                metadata={
-                    "component": "planner",
-                    "mode": "fallback_complete",
-                    "step": max_steps,
-                    "fallback": True,
-                },
-            ),
-        )
-        stats.record_usage(
-            final_message.get("usage", {}),
-            provider=final_message.get("provider", ""),
-            model=final_message.get("model", ""),
-        )
-        # Extract text from fallback response
-        fallback_text = "".join(
-            block.get("text", "")
-            for block in final_message.get("content", [])
-            if isinstance(block, dict) and block.get("type") == "text"
-        )
-        if fallback_text:
-            _stream_write(fallback_text)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-        working_messages.append(final_message)
-        return (fallback_text, fallback_text, working_messages)
-    except KeyboardInterrupt:
-        _interrupted_msg()
-        msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
-        return (msg, "", working_messages)
-    except Exception as fallback_err:
-        sys.stdout.write(
-            f"{COLOR_RED}\n  Fallback response failed: "
-            f"{fallback_err}"
-            f"{COLOR_RESET}\n"
-        )
-        sys.stdout.flush()
-
-    return ("I've reached my maximum reasoning steps. Please try rephrasing your request.", "", working_messages)
-
-
 def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: RuntimeOwner,
                               force_rebuild: bool = False) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
@@ -440,6 +376,8 @@ def run(runtime_owner: RuntimeOwner) -> None:
                         compact_tool_result_chars=COMPACT_TOOL_RESULT_CHARS,
                         max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
                         streaming=True,
+                        truncate_large_inputs=True,
+                        fallback_on_max_steps=True,
                     )
 
                     # Build streaming callbacks
@@ -474,13 +412,9 @@ def run(runtime_owner: RuntimeOwner) -> None:
                         sys.stdout.write(f"{COLOR_YELLOW}{max_step_msg}{COLOR_RESET}\n")
                         sys.stdout.flush()
 
-                        if result.text:
-                            response = result.text + max_step_msg
-                            final_text = result.final_text
-                            planner_messages = result.messages
-                        else:
-                            # Try a final non-tool response
-                            response, final_text, planner_messages = _fallback_completion(runtime_owner, full_system_prompt, result.messages, config.max_steps)
+                        response = result.text or "I've reached my maximum reasoning steps. Please try rephrasing your request."
+                        final_text = result.final_text
+                        planner_messages = result.messages
                     elif result.status == "interrupted":
                         _interrupted_msg()
                         response = result.text
