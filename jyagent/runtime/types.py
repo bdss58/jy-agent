@@ -164,8 +164,13 @@ from .providers._anthropic_reasoning import (
     AnthropicReasoningConfig,
 )
 
+
+class OpenAIReasoningConfig(TypedDict, total=False):
+    effort: Literal["low", "medium", "high"]
+
+
 # Union of all provider reasoning configs — extend as providers are added.
-ReasoningConfig = AnthropicReasoningConfig
+ReasoningConfig = AnthropicReasoningConfig | OpenAIReasoningConfig
 
 
 # ─── Tool choice ──────────────────────────────────────────────────────────────

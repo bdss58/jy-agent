@@ -147,8 +147,15 @@ def get_reasoning_config_for_provider(
             resolved_model = AGENT_MODEL if AGENT_PROVIDER == "anthropic" else DEFAULT_ANTHROPIC_MODEL
         return validate_anthropic_reasoning(config, model=resolved_model)
 
-    # Future providers: add elif branches here
-    # elif provider == "openai":
-    #     ...
+    elif provider == "openai":
+        effort = (os.environ.get("OPENAI_REASONING_EFFORT") or "").strip().lower()
+        if not effort:
+            return None
+        valid_efforts = {"low", "medium", "high"}
+        if effort not in valid_efforts:
+            raise ValueError(
+                f"OPENAI_REASONING_EFFORT must be one of: {sorted(valid_efforts)}. Got '{effort}'."
+            )
+        return {"effort": effort}
 
     return None
