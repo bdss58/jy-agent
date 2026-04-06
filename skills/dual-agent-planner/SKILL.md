@@ -69,7 +69,7 @@ Run both agents in plan-only mode. Use `&` to run them simultaneously:
 
 ```bash
 # Claude Code — plan only
-claude -p --model sonnet --bare \
+claude -p --bare \
   "PLAN ONLY — do not implement. Analyze this task and produce a detailed
    execution plan with: (1) approach summary, (2) files to change,
    (3) step sequence, (4) risks/tradeoffs, (5) testing strategy.
@@ -121,7 +121,7 @@ Assign to the best-fit agent:
 | Needs sandbox safety | Codex | OS-level sandbox (Seatbelt/Landlock) |
 | CI/CD integration | Codex | Native `codex exec`, GitHub Action |
 | Security audit / review | Claude Code | `--allowedTools "Read"` is precise |
-| Quick / cost-sensitive | Codex | `--profile fast` + mini model |
+| Quick / cost-sensitive | Codex | Lightweight model via config |
 | Hard reasoning | Claude Code | Opus model for toughest problems |
 
 Or split work: one implements backend, other does frontend. One codes, other tests.
@@ -132,7 +132,7 @@ Use the OTHER agent to review the implementation:
 
 ```bash
 # Codex implemented → Claude Code reviews
-claude -p --model sonnet --bare --allowedTools "Read" \
+claude -p --bare --allowedTools "Read" \
   "Review the changes in the last commit against this plan: <plan>. 
    Check for bugs, edge cases, deviations."
 
@@ -178,9 +178,9 @@ Not worth it when:
 - Task is well-scoped and mechanical
 
 To control costs:
-- Use `--model sonnet` (not opus) for planning phase
+- Let the configured default model handle planning (avoid unnecessary opus overrides)
 - Use `--max-budget-usd 0.50` per agent for planning
-- Save opus/xhigh reasoning for execution of the hardest subtask only
+- Save `--model opus` override for execution of the hardest subtask only
 
 ## Anti-Patterns
 

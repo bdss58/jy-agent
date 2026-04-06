@@ -6,12 +6,12 @@ Two Claude Code instances: one writes, one reviews.
 
 ```bash
 # Step 1: Implement
-claude -p --model sonnet --bare \
+claude -p --bare \
   --allowedTools "Read" "Edit" "Write" "Bash(pytest *)" \
   "Implement feature X in src/feature.py. Run tests after."
 
 # Step 2: Review (read-only, different perspective)
-claude -p --model sonnet --bare \
+claude -p --bare \
   --allowedTools "Read" "Bash(grep *)" \
   "Review the recent changes in src/feature.py. Check for:
    - Logic errors
@@ -37,10 +37,10 @@ EOF
 
 # Fan out to parallel Claude Code instances
 cat /tmp/tasks.txt | xargs -P 4 -I {} \
-  claude -p --bare --model haiku --allowedTools "Read" "Edit" "{}"
+  claude -p --bare --allowedTools "Read" "Edit" "{}"
 ```
 
-- Use `haiku` for repetitive mechanical tasks (fast, cheap)
+- Use the configured default model for repetitive mechanical tasks
 - `-P 4` = 4 parallel workers (adjust based on rate limits)
 - Each instance gets its own context — no interference
 
@@ -64,10 +64,11 @@ git worktree remove /tmp/worker-2
 
 ## 3. Explore-Plan-Implement Pipeline
 
-Three-phase delegation for complex tasks:
+Three-phase delegation for complex tasks. This is an example of intentional
+model-tier overrides — cheap model to explore, stronger model to plan and implement:
 
 ```bash
-# Phase 1: Explore (cheap, read-only)
+# Phase 1: Explore (cheap, read-only — override to haiku intentionally)
 ANALYSIS=$(claude -p --model haiku --bare \
   --allowedTools "Read" "Bash(find *)" "Bash(grep *)" \
   "Analyze the codebase structure for auth-related code. 
@@ -90,15 +91,15 @@ For tasks that exceed a single context window:
 
 ```bash
 # First chunk
-claude -p --model sonnet \
+claude -p \
   "Migrate files in src/handlers/ from REST to GraphQL. Start with user.py and auth.py."
 
 # Continue where it left off
-claude -p --model sonnet --continue \
+claude -p --continue \
   "Continue the migration. Do billing.py and orders.py next."
 
 # Final chunk
-claude -p --model sonnet --continue \
+claude -p --continue \
   "Finish migration: update router, tests, and docs. Run full test suite."
 ```
 
@@ -108,7 +109,7 @@ Use Claude Code to analyze, return structured data, then act on it:
 
 ```bash
 # Step 1: Analyze and return structured findings
-ISSUES=$(claude -p --model sonnet --bare --output-format json \
+ISSUES=$(claude -p --bare --output-format json \
   --json-schema '{
     "type": "object",
     "properties": {

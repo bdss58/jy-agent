@@ -105,7 +105,7 @@ codex exec --sandbox read-only \
 
 After Codex finishes the DualWrite layer:
 ```bash
-claude -p --model sonnet --bare --allowedTools "Read" \
+claude -p --bare --allowedTools "Read" \
   "Review the dual-write and shadow-read implementation. Verify data consistency
    guarantees and check for race conditions."
 ```

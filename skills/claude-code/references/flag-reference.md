@@ -16,7 +16,7 @@ Complete reference for `claude` CLI flags relevant to programmatic use.
 
 | Flag | Description | Example |
 |------|-------------|---------|
-| `--model MODEL` | Select model: `haiku`, `sonnet`, `opus` | `--model sonnet` |
+| `--model MODEL` | Override the configured model. Only needed for intentional tier changes. | `--model opus` |
 | `--max-budget-usd N` | Maximum spend cap in USD. Aborts if exceeded. | `--max-budget-usd 1.00` |
 
 ## Output Format
@@ -80,36 +80,36 @@ claude -p "explain this code" < src/complex.py
 
 ### Safe CI/CD task
 ```bash
-claude -p --bare --model sonnet \
+claude -p --bare \
   --max-budget-usd 0.50 \
   --allowedTools "Read" "Edit" "Bash(npm test)" \
   "Fix lint errors in src/. Run npm test to verify."
 ```
 
-### Deep review (read-only, high-quality)
+### Deep review (read-only, high-quality — override to opus intentionally)
 ```bash
 claude -p --model opus --bare \
   --allowedTools "Read" "Bash(grep *)" "Bash(find *)" \
   "Security audit src/auth/. Report vulnerabilities with severity ratings."
 ```
 
-### Quick format/cleanup (cheap, fast)
+### Quick format/cleanup
 ```bash
-claude -p --model haiku --bare \
+claude -p --bare \
   --allowedTools "Read" "Edit" \
   "Add docstrings to all public functions in src/utils.py"
 ```
 
 ### Structured analysis
 ```bash
-claude -p --model sonnet --bare --output-format json \
+claude -p --bare --output-format json \
   --json-schema '{"type":"object","properties":{"score":{"type":"integer"},"issues":{"type":"array","items":{"type":"string"}}}}' \
   "Rate the code quality of src/main.py on a scale of 1-10 and list issues."
 ```
 
 ### Git commit message
 ```bash
-git diff --staged | claude -p --bare --model haiku \
+git diff --staged | claude -p --bare \
   --allowedTools "Bash(git commit *)" \
   "Create a conventional commit with an appropriate message for these changes."
 ```

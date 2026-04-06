@@ -11,7 +11,7 @@
 | Safety / sandboxing | Codex | OS-level sandbox (Seatbelt/Landlock) |
 | CI/CD automation | Codex | Native GitHub Action, `codex exec` |
 | Security audit | Claude Code | `--allowedTools "Read"` for read-only review |
-| Speed / cost | Codex | `--profile fast` + mini model |
+| Speed / cost | Codex | Lightweight model via config |
 | Hardest reasoning | Claude Code | Opus model for toughest problems |
 | Parallel features | Codex | Desktop App worktree isolation |
 | Cloud/async | Codex | Codex Cloud (fire-and-forget) |
