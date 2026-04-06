@@ -12,7 +12,12 @@ AGENT_PROVIDER = (os.environ.get("AGENT_PROVIDER") or "anthropic").strip() or "a
 AGENT_MODEL = os.environ.get("AGENT_MODEL", DEFAULT_ANTHROPIC_MODEL)
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
 MAX_TOKENS_CAP = int(os.environ.get("AGENT_MAX_TOKENS_CAP", "128000"))
-SUPPORTED_RUNTIME_PROVIDERS = ("anthropic",)
+SUPPORTED_RUNTIME_PROVIDERS: set[str] = {"anthropic"}
+
+
+def register_provider(name: str) -> None:
+    """Register an additional runtime provider name as valid."""
+    SUPPORTED_RUNTIME_PROVIDERS.add(name)
 
 # ─── Planner / Tool dispatch ─────────────────────────────────────────────────
 
@@ -80,17 +85,12 @@ def validate_runtime_provider(provider: str, *, source: str) -> str:
     resolved = (provider or "").strip()
     if not resolved:
         raise ValueError(
-            f"{source} is empty. Anthropic is now the only supported provider; use 'anthropic'."
-        )
-    if resolved == "openai":
-        raise ValueError(
-            f"{source} selects removed provider 'openai'. "
-            "OpenAI support was removed; Anthropic is now the only supported provider."
+            f"{source} is empty. Set a supported provider: {sorted(SUPPORTED_RUNTIME_PROVIDERS)}."
         )
     if resolved not in SUPPORTED_RUNTIME_PROVIDERS:
         raise ValueError(
             f"{source} has unsupported provider '{resolved}'. "
-            "Anthropic is now the only supported provider."
+            f"Available providers: {sorted(SUPPORTED_RUNTIME_PROVIDERS)}."
         )
     return resolved
 
@@ -122,7 +122,7 @@ def get_reasoning_config_for_provider(
     max_output_tokens: int | None = None,
     model: str | None = None,
 ):
-    from .runtime.reasoning import validate_anthropic_reasoning
+    from .runtime.providers._anthropic_reasoning import validate_anthropic_reasoning
 
     provider = validate_runtime_provider(provider, source="reasoning provider")
 
@@ -146,5 +146,9 @@ def get_reasoning_config_for_provider(
         if not resolved_model:
             resolved_model = AGENT_MODEL if AGENT_PROVIDER == "anthropic" else DEFAULT_ANTHROPIC_MODEL
         return validate_anthropic_reasoning(config, model=resolved_model)
+
+    # Future providers: add elif branches here
+    # elif provider == "openai":
+    #     ...
 
     return None

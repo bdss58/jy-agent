@@ -155,20 +155,16 @@ StreamEvent = (
 
 
 # ─── Reasoning config ────────────────────────────────────────────────────────
+# Anthropic-specific types are defined in providers/_anthropic_reasoning.py
+# and re-exported here for backward compatibility.
 
-class AnthropicThinkingDisabledConfig(TypedDict):
-    type: Literal["disabled"]
+from .providers._anthropic_reasoning import (
+    AnthropicThinkingDisabledConfig,
+    AnthropicThinkingAdaptiveConfig,
+    AnthropicReasoningConfig,
+)
 
-
-class AnthropicThinkingAdaptiveConfig(TypedDict, total=False):
-    type: Literal["adaptive"]
-    display: Literal["summarized", "omitted"]
-    effort: Literal["low", "medium", "high", "max"]
-
-
-AnthropicReasoningConfig = AnthropicThinkingDisabledConfig | AnthropicThinkingAdaptiveConfig
-
-
+# Union of all provider reasoning configs — extend as providers are added.
 ReasoningConfig = AnthropicReasoningConfig
 
 
