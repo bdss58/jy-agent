@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jyagent"
 version = "1.0.0"
-description = "JY Agent — Personal AI assistant powered by Claude, with self-evolution, MCP integration, and persistent memory"
+description = "JY Agent — Personal AI assistant powered by Claude, with self-evolution, MCP integration, and cross-session markdown memory"
 readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}

@@ -4,7 +4,7 @@ import sys
 from .registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
-    ConversationMemory, PersistentMemory, summarize_if_needed,
+    ConversationMemory, summarize_if_needed,
     build_memory_context,
 )
 from .terminal_ux import build_streaming_callbacks, _interrupted_msg
@@ -277,8 +277,6 @@ def run(runtime_owner: RuntimeOwner) -> None:
         cli.print_banner(runtime_owner.label())
 
         conversation = ConversationMemory()
-        persistent = PersistentMemory()
-        interaction_count = 0
 
         # Initialize Agent Skills
         skill_mgr = init_skills()
@@ -326,14 +324,12 @@ def run(runtime_owner: RuntimeOwner) -> None:
                         cli=cli,
                         runtime_owner=runtime_owner,
                         conversation=conversation,
-                        persistent=persistent,
                         state=state,
                         user_input=user_input,
                     )
                     continue
 
                 # ─── Regular interaction ──────────────
-                interaction_count += 1
                 conversation.add_message("user", user_input)
 
                 # Auto-compact check (token-based, with memory re-injection callback)
