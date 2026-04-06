@@ -13,7 +13,7 @@ description: >-
   another agent.
 metadata:
   author: jy-agent
-  version: "1.0"
+  version: "1.1"
 ---
 
 # Codex CLI Delegation
@@ -136,40 +136,98 @@ result in the `Done when` section. After it returns, summarize:
 - what verification it claims to have run
 - any open risks or follow-up needed
 
+## ⚠️ Critical CLI Syntax Rules
+
+**The prompt is a POSITIONAL argument, not a flag.** Get this wrong and the
+command fails or misinterprets your intent.
+
+```bash
+# ✅ CORRECT — prompt is a bare positional arg (quote the string)
+codex exec --sandbox read-only "Analyze the auth module"
+
+# ✅ CORRECT — multi-line prompt via stdin heredoc
+cat <<'EOF' | codex exec --sandbox read-only -
+Goal: Analyze the auth module.
+Done when: Return a summary.
+EOF
+
+# ❌ WRONG — -p is --profile, NOT prompt
+codex exec --sandbox read-only -p "Analyze the auth module"
+
+# ❌ WRONG — -q does not exist
+codex exec -q "Analyze the auth module"
+```
+
+### Key flags (from `codex exec --help`)
+
+| Flag | Meaning |
+|------|---------|
+| `-s, --sandbox <MODE>` | `read-only`, `workspace-write`, `danger-full-access` |
+| `-C, --cd <DIR>` | Working directory for the agent |
+| `-m, --model <MODEL>` | Override model |
+| `-p, --profile <NAME>` | Config profile (⚠️ NOT prompt!) |
+| `--full-auto` | Alias for `-a on-request --sandbox workspace-write` |
+| `--output-schema <FILE>` | JSON Schema for structured output |
+| `-o, --output-last-message <FILE>` | Write last agent message to file |
+| `--json` | Print JSONL events to stdout |
+| `-` (as PROMPT) | Read prompt from stdin |
+
+### Flags that DO NOT exist
+
+Do not hallucinate these: `-q`, `--quiet`, `--bare`, `--max-budget-usd`.
+These are Claude Code flags, not Codex flags.
+
 ## Core Invocation Patterns
 
 ### Pattern A: Read-only analysis or planning
 
-Use `codex exec` in read-only mode when the user wants investigation, design,
-or the smallest viable fix before any file changes.
-- From `jy-agent`, launch the shell command via `run_shell("<codex exec command>", timeout=600)`.
+```python
+run_shell('codex exec --sandbox read-only -C /path/to/repo "Analyze X and suggest a fix"', timeout=600)
+```
+
+For multi-line prompts, use a heredoc:
+
+```python
+run_shell("""cat <<'EOF' | codex exec --sandbox read-only -C /path/to/repo -
+Goal: Analyze the auth module.
+Context: JWT header parsing fails on empty input.
+Done when: Return diagnosis and recommended fix.
+EOF""", timeout=600)
+```
 
 ### Pattern B: Implementation
 
-Use `codex exec` in `workspace-write` mode when edits are intended. Keep the
-prompt scoped to the exact change and include concrete verification.
-- From `jy-agent`, launch the shell command via `run_shell("<codex exec command>", timeout=600)`.
+```python
+run_shell('codex exec --sandbox workspace-write -C /path/to/repo "Fix the null pointer in parse_config and run tests"', timeout=600)
+```
 
 ### Pattern C: Review
 
-Use `codex review` when the user wants findings about uncommitted work, a branch
-diff, or a commit. This is the cleanest match for review-style tasks.
-- From `jy-agent`, launch the shell command via `run_shell("<codex review command>", timeout=600)`.
+```python
+run_shell('codex review --uncommitted', timeout=600)
+# or with a base branch:
+run_shell('codex review --base main', timeout=600)
+```
 
 ### Pattern D: Follow-up on the same Codex task
 
-Use `codex exec resume --last` when the user wants to continue or refine the
-most recent Codex run instead of starting from scratch.
-- From `jy-agent`, launch the shell command via `run_shell("<codex exec resume command>", timeout=600)`.
+```python
+run_shell('codex exec resume --last "Now add regression tests for the fix"', timeout=600)
+```
 
 ### Pattern E: Structured output
 
-If jy-agent needs machine-readable results, provide a JSON Schema file and use
-`codex exec --output-schema <file>`. This works well for issue lists, migration
-plans, or other outputs jy-agent will post-process.
-- From `jy-agent`, launch the shell command via `run_shell("<codex exec command>", timeout=600)`.
+```python
+run_shell('codex exec --sandbox read-only --output-schema /tmp/schema.json "Review the auth layer"', timeout=600)
+```
 
 ## Anti-Patterns
+
+❌ **Don't** use `-p` to pass the prompt — `-p` is `--profile` (config profile selection)
+✅ **Do** pass the prompt as a bare positional argument: `codex exec --sandbox read-only "your prompt"`
+
+❌ **Don't** hallucinate Claude Code flags (`-q`, `--quiet`, `--bare`, `--max-budget-usd`) — they don't exist in Codex
+✅ **Do** check `codex exec --help` if unsure about a flag
 
 ❌ **Don't** activate this skill for every coding request
 ✅ **Do** keep it Codex-specific so it does not overlap with `claude-code`

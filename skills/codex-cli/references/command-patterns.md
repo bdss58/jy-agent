@@ -3,6 +3,26 @@
 Concrete shell recipes for delegating from `jy-agent` to local Codex CLI.
 Use these patterns as templates and fill in the task-specific prompt content.
 
+## ⚠️ Flag Quick Reference
+
+The **prompt is a positional argument** — never use `-p` for it (`-p` = `--profile`).
+
+```bash
+# One-liner (most common from jy-agent)
+codex exec --sandbox read-only "Your prompt here"
+
+# Multi-line via heredoc
+cat <<'EOF' | codex exec --sandbox read-only -
+Your multi-line prompt here.
+EOF
+```
+
+**Flags that exist:** `-s/--sandbox`, `-C/--cd`, `-m/--model`, `-p/--profile`,
+`--full-auto`, `--output-schema`, `-o/--output-last-message`, `--json`, `-i/--image`
+
+**Flags that DO NOT exist (Claude Code only):** `-q`, `--quiet`, `--bare`,
+`--max-budget-usd`, `--allowedTools`
+
 ## 1. Preflight
 
 Check that Codex exists before delegating:
