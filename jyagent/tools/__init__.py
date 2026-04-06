@@ -5,7 +5,6 @@
 #   search.py      — glob_files, grep_files
 #   facades.py     — manage_memory, manage_skills (thin wrappers)
 #   schemas.py     — CORE_TOOLS JSON schema definitions
-#   utils.py       — strip_unsupported_schema_keys, shared helpers
 
 from ..registry import get_registry
 
@@ -20,7 +19,6 @@ from .subagent import dispatch_agent, set_client as set_subagent_client, TOOL_SC
 
 # Re-export constants from config (backward compat)
 from ..config import SKIP_DIRS, BINARY_EXTS
-from .utils import strip_unsupported_schema_keys
 
 # ─── Register core tools ──────────────────────────────────────────────────────
 

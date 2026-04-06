@@ -7,7 +7,11 @@ from ..config import (
     MEMORY_MD_FILE, TOPICS_DIR,
     MAX_MEMORY_INDEX_LINES, MAX_MEMORY_INDEX_BYTES,
 )
-from .utils import ensure_dirs
+
+
+def ensure_dirs() -> None:
+    os.makedirs(os.path.dirname(MEMORY_MD_FILE), exist_ok=True)
+    os.makedirs(TOPICS_DIR, exist_ok=True)
 
 
 # ─── MEMORY.md operations ─────────────────────────────────────────────────────

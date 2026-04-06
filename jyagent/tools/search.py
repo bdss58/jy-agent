@@ -14,8 +14,7 @@ import fnmatch
 import time
 
 from ..toolresult import ToolResult
-from ._fileutils import should_skip_dir, is_binary_ext
-from .core import _format_size
+from .core import _format_size, is_binary_ext, should_skip_dir
 
 
 def _format_mtime(mtime: float) -> str:

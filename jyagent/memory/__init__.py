@@ -1,9 +1,8 @@
 # memory/ package — Self-use memory system (MEMORY.md, topics, compaction).
 #
 # Replaces the monolithic self_memory.py (912 lines) with focused modules:
-#   utils.py        — atomic writes, JSON loading, token estimation
-#   conversation.py — ConversationMemory (in-memory chat history)
-#   persistent.py   — PersistentMemory (file-backed KV store)
+#   conversation.py — ConversationMemory + token estimation helpers
+#   persistent.py   — PersistentMemory + JSON file persistence helpers
 #   compaction.py   — Conversation compaction (Claude Code /compact)
 #   operations.py   — MEMORY.md + topic file CRUD + remember/forget/show
 #   context.py      — build_memory_context (system prompt injection)
@@ -19,4 +18,4 @@ from .operations import (
     remember, forget, show_memory,
 )
 from .context import build_memory_context
-from .utils import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
+from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens

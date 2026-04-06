@@ -24,7 +24,6 @@ try:
     from ..toolresult import ToolResult
     from ..validation import validate_tool_input
     from ..session_stats import get_stats
-    from ..text_utils import scrub_string
 except ImportError:
     from jyagent.config import (
         MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
@@ -37,7 +36,6 @@ except ImportError:
     from jyagent.toolresult import ToolResult
     from jyagent.validation import validate_tool_input
     from jyagent.session_stats import get_stats
-    from jyagent.text_utils import scrub_string
 
 
 # ─── Model tiers ──────────────────────────────────────────────────────────────
@@ -377,7 +375,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
             )
         except Exception as e:
             step_num = step + 1
-            error_text = scrub_string(str(e), max_text_chars=500)
+            error_text = str(e)
             content = _format_subagent_failure(
                 f"Error: Sub-agent API failure at step {step_num}: {error_text}",
                 partial_output=all_text,
@@ -583,11 +581,8 @@ def dispatch_agent(
         raise
     except Exception as e:
         spinner.stop()
-        error_text = scrub_string(str(e), max_text_chars=500)
-        error_detail = scrub_string(
-            "".join(traceback.format_exception(type(e), e, e.__traceback__)),
-            max_text_chars=4000,
-        )
+        error_text = str(e)
+        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         return ToolResult(
             f"Error: Sub-agent failed: {error_text}\n{error_detail}",
             is_error=True,

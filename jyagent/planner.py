@@ -13,7 +13,6 @@ from .toolresult import ToolResult
 from .validation import validate_tool_input
 from .session_stats import get_stats
 from .runtime import RuntimeOwner, RuntimeOptions
-from .text_utils import scrub_string
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
@@ -381,11 +380,8 @@ def _execute_tool(tool_name: str, tool_input: dict, tool_functions: dict) -> Too
     except KeyboardInterrupt:
         raise
     except Exception as e:
-        error_text = scrub_string(str(e), max_text_chars=500)
-        error_detail = scrub_string(
-            "".join(traceback.format_exception(type(e), e, e.__traceback__)),
-            max_text_chars=4000,
-        )
+        error_text = str(e)
+        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         return ToolResult(
             f"Error calling tool {tool_name}: {error_text}\n{error_detail}",
             is_error=True
@@ -476,11 +472,8 @@ def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
                 try:
                     results[idx] = (block, future.result())
                 except Exception as exc:
-                    error_text = scrub_string(str(exc), max_text_chars=500)
-                    error_detail = scrub_string(
-                        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-                        max_text_chars=4000,
-                    )
+                    error_text = str(exc)
+                    error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                     results[idx] = (block, ToolResult(
                         f"Error calling tool {block.name}: {error_text}\n{error_detail}",
                         is_error=True
@@ -555,7 +548,7 @@ def _stream_error_diagnostics(error: BaseException) -> dict:
     return {}
 
 
-def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars: int = 220) -> str:
+def _format_stream_error_diagnostics(error: BaseException) -> str:
     diagnostics = _stream_error_diagnostics(error)
     if not diagnostics:
         return ""
@@ -585,7 +578,7 @@ def _format_stream_error_diagnostics(error: BaseException, *, max_snippet_chars:
 
     snippet = diagnostics.get("json_error_snippet")
     if snippet:
-        lines.append(f"    snippet: {scrub_string(str(snippet), max_text_chars=max_snippet_chars)}")
+        lines.append(f"    snippet: {snippet}")
 
     return "\n".join(lines)
 
@@ -603,7 +596,7 @@ class _StreamFailure(Exception):
 def _stream_abort_text(existing_text: str, step: int, error: BaseException) -> str:
     error_text = (
         f"[Error: streaming interrupted at step {step + 1}: "
-        f"{scrub_string(str(error), max_text_chars=500)}]"
+        f"{error}]"
     )
     if existing_text:
         return existing_text + "\n\n" + error_text
@@ -731,7 +724,7 @@ def _stream_with_retry(
             retry_delay = 2 ** (attempt + 1)  # 2s, 4s
             retry_msg = (
                 "\n⚡ Stream interrupted "
-                f"({scrub_string(str(stream_err), max_text_chars=500)}), "
+                f"({stream_err}), "
                 f"retrying in {retry_delay}s... "
                 f"(attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
             )
@@ -740,7 +733,7 @@ def _stream_with_retry(
             time.sleep(retry_delay)  # responds to KeyboardInterrupt
             continue
         # Non-transient error or retries exhausted
-        error_text = scrub_string(str(stream_err), max_text_chars=500)
+        error_text = str(stream_err)
         error_msg = f"\n[Stream error at step {step+1}: {error_text}]"
         diagnostics_text = _format_stream_error_diagnostics(stream_err)
         if diagnostics_text:
@@ -957,7 +950,7 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
         except Exception as fallback_err:
             sys.stdout.write(
                 f"{COLOR_RED}\n  Fallback response failed: "
-                f"{scrub_string(str(fallback_err), max_text_chars=500)}"
+                f"{fallback_err}"
                 f"{COLOR_RESET}\n"
             )
             sys.stdout.flush()
@@ -971,11 +964,8 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
         msg = all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]"
         return (msg, "", working_messages)
     except Exception as e:
-        error_text = scrub_string(str(e), max_text_chars=500)
-        error_detail = scrub_string(
-            "".join(traceback.format_exception(type(e), e, e.__traceback__)),
-            max_text_chars=4000,
-        )
+        error_text = str(e)
+        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         sys.stdout.write(f"{COLOR_RED}\nFatal error in planner: {error_text}\n{error_detail}{COLOR_RESET}\n")
         sys.stdout.flush()
         return (f"Error during planning: {error_text}", "", working_messages)

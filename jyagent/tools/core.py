@@ -1,12 +1,74 @@
-# Core file/shell tools: run_shell, read_file, write_file, list_directory
+# Core file/shell tools and shared path/file helpers.
 
 import os
-import subprocess
 import difflib
+import fnmatch
+import subprocess
+import tempfile
 
 from ..config import SKIP_DIRS, BINARY_EXTS
 from ..toolresult import ToolResult
-from ._fileutils import atomic_write, resolve_path, should_skip_dir, is_binary_ext
+
+_SKIP_EXACT: set[str] = set()
+_SKIP_PATTERNS: list[str] = []
+for _entry in SKIP_DIRS:
+    if any(char in _entry for char in ("*", "?", "[")):
+        _SKIP_PATTERNS.append(_entry)
+    else:
+        _SKIP_EXACT.add(_entry)
+
+
+def resolve_path(path: str, root: str | None = None) -> str:
+    """Resolve a path to absolute, expanding ~ and relative segments."""
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(root or os.getcwd(), path)
+    return os.path.abspath(path)
+
+
+def atomic_write(path: str, content: str, encoding: str = "utf-8") -> None:
+    """Write content to a temp file, then atomically replace the target."""
+    dirname = os.path.dirname(path) or "."
+    os.makedirs(dirname, exist_ok=True)
+
+    fd = None
+    tmp_path = None
+    try:
+        fd_int, tmp_path = tempfile.mkstemp(dir=dirname, prefix=".tmp_", suffix=".write")
+        fd = os.fdopen(fd_int, "w", encoding=encoding)
+        fd.write(content)
+        fd.flush()
+        os.fsync(fd.fileno())
+        fd.close()
+        fd = None
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if fd is not None:
+            try:
+                fd.close()
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def should_skip_dir(dirname: str) -> bool:
+    """Return True when traversal should skip this directory name."""
+    if dirname.startswith("."):
+        return True
+    if dirname in _SKIP_EXACT:
+        return True
+    return any(fnmatch.fnmatch(dirname, pattern) for pattern in _SKIP_PATTERNS)
+
+
+def is_binary_ext(path: str) -> bool:
+    """Return True if the path has a configured binary extension."""
+    _, ext = os.path.splitext(path)
+    return ext.lower() in BINARY_EXTS
 
 
 def run_shell(command: str, timeout: int = 60) -> ToolResult:
