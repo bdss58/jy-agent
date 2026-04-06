@@ -14,27 +14,27 @@ import concurrent.futures
 
 try:
     from ..config import (
-        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
+        STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
         get_subagent_model_spec,
     )
+    from ..loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from ..registry import get_registry
     from ..runtime.reasoning import build_anthropic_request_reasoning
     from ..runtime.providers._anthropic_helpers import assistant_from_response, convert_messages
     from ..runtime import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
-    from ..validation import validate_tool_input
     from ..session_stats import get_stats
 except ImportError:
     from jyagent.config import (
-        MAX_TOOL_RESULT_CHARS, STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
+        STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
         get_subagent_model_spec,
     )
+    from jyagent.loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from jyagent.registry import get_registry
     from jyagent.runtime.reasoning import build_anthropic_request_reasoning
     from jyagent.runtime.providers._anthropic_helpers import assistant_from_response, convert_messages
     from jyagent.runtime import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
-    from jyagent.validation import validate_tool_input
     from jyagent.session_stats import get_stats
 
 
@@ -211,51 +211,7 @@ Rules:
 6. Stay focused on your assigned task. Do not go off on tangents.
 7. If you cannot complete the task, explain what you tried and why it failed."""
 
-_SUBAGENT_FINAL_NO_TOOLS_SUFFIX = (
-    "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. "
-    "Provide your best answer now WITHOUT using any tools.]"
-)
-
-
-# ─── Silent tool loop (the sub-agent engine) ─────────────────────────────────
-
-def _execute_tool_silent(tool_name, tool_input, tool_functions):
-    """Execute a single tool call. Same as planner._execute_tool but standalone."""
-    fn = tool_functions.get(tool_name)
-    if fn is None:
-        return ToolResult(
-            f"Error: Unknown tool '{tool_name}'. Available: {sorted(tool_functions.keys())[:20]}",
-            is_error=True,
-        )
-
-    tool_schema = get_registry().get_schema(tool_name)
-    validation_error = validate_tool_input(tool_name, tool_input, fn, tool_schema)
-    if validation_error:
-        return ToolResult(validation_error, is_error=True)
-
-    try:
-        if tool_input is None:
-            tool_input = {}
-        raw = fn(**tool_input)
-        if isinstance(raw, ToolResult):
-            return raw
-        return ToolResult(str(raw))
-    except Exception as e:
-        return ToolResult(f"Error calling tool {tool_name}: {e}", is_error=True)
-
-
-def _truncate(text, max_chars=MAX_TOOL_RESULT_CHARS):
-    """Truncate text for context management."""
-    if len(text) <= max_chars:
-        return text
-    head = int(max_chars * 0.85)
-    tail = int(max_chars * 0.10)
-    return (
-        text[:head]
-        + f"\n\n[... truncated {len(text) - head - tail} chars ...]\n\n"
-        + text[-tail:]
-    )
-
+# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _extract_text_blocks(message):
     """Extract concatenated text from a normalized assistant message."""
@@ -298,9 +254,13 @@ def _format_subagent_failure(message, partial_output="", final_answer=""):
 
 def _best_effort_final_answer(runtime_owner, messages, model_spec):
     """Ask the model for one last no-tools answer after max-step exhaustion."""
+    _FINAL_SUFFIX = (
+        "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. "
+        "Provide your best answer now WITHOUT using any tools.]"
+    )
     response = runtime_owner.complete(
         {
-            "system_prompt": _SUBAGENT_SYSTEM_PROMPT + _SUBAGENT_FINAL_NO_TOOLS_SUFFIX,
+            "system_prompt": _SUBAGENT_SYSTEM_PROMPT + _FINAL_SUFFIX,
             "messages": messages,
         },
         options=RuntimeOptions(
@@ -326,11 +286,10 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
 
 
 def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions):
-    """Run a sub-agent's tool loop to completion.
+    """Run a sub-agent's tool loop to completion via AgentLoop engine.
 
-    This is the core engine for silent sub-agent execution.
-    Provider transport may still stream under the hood.
-    Runs entirely in the calling thread (no terminal output).
+    Delegates the entire step loop, tool execution, retry, context compaction,
+    and truncation recovery to the shared engine.  Runs silently (no callbacks).
     """
     runtime_owner = _get_runtime_owner()
 
@@ -338,127 +297,102 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
     user_content = task
     if context:
         user_content = f"Context:\n{context}\n\nTask:\n{task}"
-
     messages = [{"role": "user", "content": user_content}]
 
-    all_text = ""
-    total_input_tokens = 0
-    total_output_tokens = 0
-    tool_calls_count = 0
+    # Pre-filtered tool source (closure over the whitelist-filtered lists)
+    def tool_source():
+        return tool_schemas, tool_functions
 
-    for step in range(max_steps):
-        runtime_context = {
-            "system_prompt": _SUBAGENT_SYSTEM_PROMPT,
-            "messages": messages,
-        }
-        if tool_schemas:
-            runtime_context["tools"] = tool_schemas
+    # Configure the engine — conservative settings for sub-agents
+    config = LoopConfig(
+        max_steps=max_steps,
+        initial_max_tokens=16_384,
+        auto_scale_on_truncation=True,
+        concurrent_tools=True,
+        max_tool_workers=2,
+        compact_messages=True,
+        retry_attempts=2,
+        streaming=False,
+    )
 
+    # Silent mode — all callbacks are None
+    callbacks = LoopCallbacks()
+
+    loop = AgentLoop(
+        runtime_owner=runtime_owner,
+        config=config,
+        callbacks=callbacks,
+        tool_source=tool_source,
+        model_spec=model_spec,
+    )
+    result = loop.run(_SUBAGENT_SYSTEM_PROMPT, messages)
+
+    # ── Convert LoopResult → outcome dict ────────────────────────────────
+
+    if result.status == "completed":
+        content = result.text or "[Sub-agent completed but produced no text output]"
+        return _make_subagent_outcome(
+            _SUBAGENT_STATUS_COMPLETED,
+            content,
+            result.steps,
+            result.total_input_tokens,
+            result.total_output_tokens,
+            result.tool_calls_count,
+        )
+
+    if result.status == "max_steps":
+        final_answer = ""
+        extra_in = extra_out = 0
         try:
-            response = runtime_owner.complete(
-                runtime_context,
-                options=RuntimeOptions(
-                    max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
-                    timeout=STREAM_TIMEOUT,
-                    reasoning=get_reasoning_config_for_provider(
-                        model_spec.provider,
-                        max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
-                        model=model_spec.model,
-                    ),
-                    metadata={
-                        "component": "subagent",
-                        "mode": "loop_complete",
-                        "step": step + 1,
-                    },
-                ),
-                model_spec=model_spec,
+            final_answer, extra_in, extra_out = _best_effort_final_answer(
+                runtime_owner, messages, model_spec,
             )
-        except Exception as e:
-            step_num = step + 1
-            error_text = str(e)
-            content = _format_subagent_failure(
-                f"Error: Sub-agent API failure at step {step_num}: {error_text}",
-                partial_output=all_text,
-            )
-            return _make_subagent_outcome(
-                _SUBAGENT_STATUS_API_ERROR,
-                content,
-                step_num,
-                total_input_tokens,
-                total_output_tokens,
-                tool_calls_count,
-                error=error_text,
-            )
+        except Exception:
+            pass
 
-        # Track tokens
-        usage = response.get("usage", {})
-        total_input_tokens += usage.get("input_tokens", 0)
-        total_output_tokens += usage.get("output_tokens", 0)
+        content = _format_subagent_failure(
+            f"Error: Sub-agent reached max_steps ({max_steps}).",
+            partial_output=result.text,
+            final_answer=final_answer,
+        )
+        return _make_subagent_outcome(
+            _SUBAGENT_STATUS_MAX_STEPS,
+            content,
+            max_steps,
+            result.total_input_tokens + extra_in,
+            result.total_output_tokens + extra_out,
+            result.tool_calls_count,
+            error=f"max_steps:{max_steps}",
+        )
 
-        # Extract text and tool_call blocks
-        text_parts = []
-        tool_use_blocks = []
-        for block in response.get("content", []):
-            if block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif block.get("type") == "tool_call":
-                tool_use_blocks.append(block)
+    if result.status == "error":
+        content = _format_subagent_failure(
+            f"Error: Sub-agent API failure: {result.error}",
+            partial_output=result.text,
+        )
+        return _make_subagent_outcome(
+            _SUBAGENT_STATUS_API_ERROR,
+            content,
+            result.steps,
+            result.total_input_tokens,
+            result.total_output_tokens,
+            result.tool_calls_count,
+            error=result.error,
+        )
 
-        step_text = "\n".join(text_parts)
-        all_text += step_text
-
-        # No tool calls → sub-agent is done
-        if not tool_use_blocks:
-            if not all_text:
-                all_text = "[Sub-agent completed but produced no text output]"
-            return _make_subagent_outcome(
-                _SUBAGENT_STATUS_COMPLETED,
-                all_text,
-                step + 1,
-                total_input_tokens,
-                total_output_tokens,
-                tool_calls_count,
-            )
-
-        # Execute tool calls and build results
-        messages.append(response)
-
-        tool_results = []
-        for block in tool_use_blocks:
-            tool_calls_count += 1
-            result = _execute_tool_silent(block["name"], block.get("arguments", {}), tool_functions)
-            content_str = _truncate(result.content)
-            tool_results.append({
-                "role": "tool_result",
-                "tool_call_id": block["id"],
-                "tool_name": block["name"],
-                "content": content_str,
-                "is_error": result.is_error,
-            })
-
-        messages.extend(tool_results)
-
-    final_answer = ""
-    try:
-        final_answer, extra_in, extra_out = _best_effort_final_answer(runtime_owner, messages, model_spec)
-        total_input_tokens += extra_in
-        total_output_tokens += extra_out
-    except Exception:
-        pass
-
+    # interrupted or unknown status
     content = _format_subagent_failure(
-        f"Error: Sub-agent reached max_steps ({max_steps}).",
-        partial_output=all_text,
-        final_answer=final_answer,
+        "Error: Sub-agent was interrupted.",
+        partial_output=result.text,
     )
     return _make_subagent_outcome(
-        _SUBAGENT_STATUS_MAX_STEPS,
+        _SUBAGENT_STATUS_API_ERROR,
         content,
-        max_steps,
-        total_input_tokens,
-        total_output_tokens,
-        tool_calls_count,
-        error=f"max_steps:{max_steps}",
+        result.steps,
+        result.total_input_tokens,
+        result.total_output_tokens,
+        result.tool_calls_count,
+        error=result.status,
     )
 
 
