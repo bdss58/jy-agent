@@ -10,7 +10,13 @@ from __future__ import annotations
 from typing import Any, cast
 
 from ._anthropic_reasoning import build_anthropic_request_reasoning
-from ..messages import assistant_text, inject_missing_tool_results  # noqa: F401 — re-export
+from ..messages import (  # noqa: F401 — re-export for backward compat
+    assistant_text,
+    inject_missing_tool_results,
+    normalize_anthropic_tool_call_id,
+    thinking_to_text_block,
+    transform_messages_for_target,
+)
 from ..types import (
     AssistantMessage,
     Context,
@@ -24,83 +30,6 @@ from ..types import (
     Usage,
     compute_total_tokens,
 )
-
-
-# ─── Tool-call ID normalisation ──────────────────────────────────────────────
-
-def normalize_anthropic_tool_call_id(tool_call_id: str) -> str:
-    normalized = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in tool_call_id)
-    return normalized[:64] or "tool_call"
-
-
-# ─── Thinking → text fallback ────────────────────────────────────────────────
-
-def thinking_to_text_block(block: ThinkingBlock) -> TextBlock | None:
-    thinking = block.get("thinking", "").strip()
-    if not thinking:
-        return None
-    return {
-        "type": "text",
-        "text": f"<thinking>\n{thinking}\n</thinking>",
-    }
-
-
-# ─── Cross-model message normalisation ───────────────────────────────────────
-
-def transform_messages_for_target(messages: list[Message], target: ModelSpec) -> list[Message]:
-    tool_call_id_map: dict[str, str] = {}
-    transformed: list[Message] = []
-
-    for message in messages:
-        role = message.get("role")
-        if role == "user":
-            transformed.append(message)
-            continue
-
-        if role == "tool_result":
-            tool_result = cast(ToolResultMessage, dict(message))
-            mapped = tool_call_id_map.get(tool_result["tool_call_id"])
-            if mapped and mapped != tool_result["tool_call_id"]:
-                tool_result["tool_call_id"] = mapped
-            transformed.append(tool_result)
-            continue
-
-        assistant = cast(AssistantMessage, dict(message))
-        same_model = assistant.get("provider") == target.provider and assistant.get("model") == target.model
-        new_blocks = []
-        for raw_block in assistant.get("content", []):
-            if not isinstance(raw_block, dict):
-                continue
-            block_type = raw_block.get("type")
-            if block_type == "text":
-                new_blocks.append(raw_block)
-                continue
-            if block_type == "thinking":
-                thinking_block_data = cast(ThinkingBlock, raw_block)
-                if same_model:
-                    new_blocks.append(thinking_block_data)
-                else:
-                    if thinking_block_data.get("redacted") or (
-                        thinking_block_data.get("encrypted_content") and not thinking_block_data.get("thinking", "").strip()
-                    ):
-                        continue
-                    text_block = thinking_to_text_block(thinking_block_data)
-                    if text_block:
-                        new_blocks.append(text_block)
-                continue
-            if block_type == "tool_call":
-                tool_call = cast(ToolCallBlock, dict(raw_block))
-                if target.provider == "anthropic":
-                    normalized_id = normalize_anthropic_tool_call_id(tool_call["id"])
-                    if normalized_id != tool_call["id"]:
-                        tool_call_id_map[tool_call["id"]] = normalized_id
-                        tool_call["id"] = normalized_id
-                new_blocks.append(tool_call)
-
-        assistant["content"] = new_blocks
-        transformed.append(assistant)
-
-    return inject_missing_tool_results(transformed)
 
 
 # ─── Response normalisation ──────────────────────────────────────────────────
@@ -172,22 +101,6 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
     }
 
 
-def make_error_assistant_message(
-    model_spec: ModelSpec,
-    error: BaseException,
-    partial_content: list[dict[str, Any]] | None = None,
-) -> AssistantMessage:
-    usage: Usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-    return {
-        "role": "assistant",
-        "content": partial_content or [],
-        "provider": model_spec.provider,
-        "api": "anthropic-messages",
-        "model": model_spec.model,
-        "stop_reason": "error",
-        "usage": usage,
-        "error_message": str(error),
-    }
 
 
 # ─── Request building ────────────────────────────────────────────────────────

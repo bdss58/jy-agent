@@ -1,4 +1,5 @@
 from .core import RuntimeOwner, get_adapter, list_adapters, register_adapter
+from .streams import ErrorStream, make_error_assistant_message
 from .types import (
     AssistantMessage,
     AnthropicReasoningConfig,
@@ -38,6 +39,7 @@ __all__ = [
     "AnthropicThinkingAdaptiveConfig",
     "AnthropicThinkingDisabledConfig",
     "Context",
+    "ErrorStream",
     "Message",
     "ModelSpec",
     "ReasoningConfig",
@@ -53,5 +55,6 @@ __all__ = [
     "compute_total_tokens",
     "get_adapter",
     "list_adapters",
+    "make_error_assistant_message",
     "register_adapter",
 ]

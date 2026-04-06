@@ -19,8 +19,6 @@ try:
     )
     from ..loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from ..registry import get_registry
-    from ..runtime.reasoning import build_anthropic_request_reasoning
-    from ..runtime.providers._anthropic_helpers import assistant_from_response, convert_messages
     from ..runtime import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
     from ..session_stats import get_stats
@@ -31,8 +29,6 @@ except ImportError:
     )
     from jyagent.loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from jyagent.registry import get_registry
-    from jyagent.runtime.reasoning import build_anthropic_request_reasoning
-    from jyagent.runtime.providers._anthropic_helpers import assistant_from_response, convert_messages
     from jyagent.runtime import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
     from jyagent.session_stats import get_stats
@@ -81,13 +77,24 @@ def _get_client():
 
 
 class _LegacyClientRuntimeOwner:
-    """Compatibility shim for tests that still provide a fake Anthropic client."""
+    """Compatibility shim for tests that still provide a fake Anthropic client.
+
+    DEPRECATED: Tests should use RuntimeOwner with mock adapters instead
+    of injecting raw Anthropic SDK clients. This shim exists only to keep
+    existing tests working during the migration.
+    """
 
     def __init__(self, client):
         self._client = client
         self.model_spec = get_active_model_spec()
 
     def complete(self, context, options=None, model_spec=None):
+        # Lazy imports: only needed when running through the legacy shim
+        from ..runtime.reasoning import build_anthropic_request_reasoning
+        from ..runtime.providers._anthropic_helpers import (
+            assistant_from_response, convert_messages,
+        )
+
         model_spec = model_spec or self.model_spec
         max_tokens = _DEFAULT_MAX_TOKENS_PER_RESPONSE
         timeout = STREAM_TIMEOUT
@@ -99,7 +106,7 @@ class _LegacyClientRuntimeOwner:
             "model": model_spec.model,
             "max_tokens": max_tokens,
             "system": context.get("system_prompt", ""),
-            "messages": self._convert_messages(context.get("messages", [])),
+            "messages": convert_messages(model_spec, context.get("messages", [])),
         }
         if options is not None and options.reasoning is not None:
             thinking, output_config = build_anthropic_request_reasoning(options.reasoning, model=model_spec.model)
@@ -117,12 +124,6 @@ class _LegacyClientRuntimeOwner:
                 response = stream.get_final_message()
         else:
             response = self._client.messages.create(**kwargs, timeout=timeout)
-        return self._normalize_response(model_spec, response)
-
-    def _convert_messages(self, messages):
-        return convert_messages(self.model_spec, messages)
-
-    def _normalize_response(self, model_spec, response):
         return assistant_from_response(model_spec, response)
 
 

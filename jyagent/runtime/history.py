@@ -1,13 +1,12 @@
 """Message-history helpers — re-exports for backward compatibility.
 
-``assistant_text`` is now provided by the provider-neutral ``messages`` module.
-Anthropic-specific helpers remain in ``providers._anthropic_helpers``.
+All functions now live in the provider-neutral ``messages`` module.
 """
 
 from __future__ import annotations
 
-from .messages import assistant_text
-from .providers._anthropic_helpers import (
+from .messages import (
+    assistant_text,
     normalize_anthropic_tool_call_id,
     transform_messages_for_target,
 )

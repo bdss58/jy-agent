@@ -7,37 +7,12 @@ import anthropic
 import httpx
 
 from ..core import register_adapter
+from ..streams import ErrorStream, make_error_assistant_message
 from ..types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
 from ._anthropic_helpers import (
     assistant_from_response,
     build_request_kwargs,
-    make_error_assistant_message,
 )
-
-
-# ─── _ErrorStream ─────────────────────────────────────────────────────────────
-
-class _ErrorStream:
-    """A ``RuntimeStream`` that immediately yields a terminal error event."""
-
-    def __init__(self, model_spec: ModelSpec, error: BaseException) -> None:
-        self._message = make_error_assistant_message(model_spec, error)
-
-    def __iter__(self):
-        yield {"type": "start"}
-        yield {"type": "error", "message": self._message}
-
-    def get_final_message(self) -> AssistantMessage:
-        return self._message
-
-    def close(self) -> None:
-        pass
-
-    def __enter__(self) -> _ErrorStream:
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        pass
 
 
 # ─── _AnthropicStream ────────────────────────────────────────────────────────
@@ -176,7 +151,7 @@ class AnthropicAdapter:
             client = self._client()
             stream_cm = client.messages.stream(**kwargs, timeout=timeout)
         except Exception as err:
-            return _ErrorStream(model_spec, err)
+            return ErrorStream(model_spec, err)
         return _AnthropicStream(stream_cm, model_spec)
 
     def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
