@@ -224,26 +224,6 @@ def _runtime_warning(msg: str):
 
 # ─── Working-message size management ────────────────────────────────────────
 
-def _truncate_tool_result(result: str, is_error: bool = False, max_chars: int = None) -> str:
-    """Truncate a tool result for working_messages if it exceeds max_chars.
-
-    Error messages are never truncated (they're usually short and critical).
-    """
-    if max_chars is None:
-        max_chars = MAX_TOOL_RESULT_CHARS
-    if len(result) <= max_chars or is_error:
-        return result
-
-    head = int(max_chars * 0.85)
-    tail = int(max_chars * 0.10)
-    return (
-        result[:head]
-        + f"\n\n[... truncated {len(result) - head - tail} chars "
-        + f"(total: {len(result)} chars) ...]\n\n"
-        + result[-tail:]
-    )
-
-
 def _truncate_tool_call_blocks(blocks: list) -> list:
     """Truncate large tool_call argument fields in normalized assistant content."""
     registry = get_registry()
