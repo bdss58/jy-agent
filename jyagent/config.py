@@ -151,7 +151,19 @@ def get_reasoning_config_for_provider(
         effort = (os.environ.get("OPENAI_REASONING_EFFORT") or "").strip().lower()
         if not effort:
             return None
-        valid_efforts = {"low", "medium", "high"}
+        resolved_model = (model or "").strip()
+        if not resolved_model and AGENT_PROVIDER == "openai":
+            resolved_model = AGENT_MODEL
+        normalized_model = resolved_model.lower()
+        if not (
+            normalized_model == "gpt-5.4"
+            or normalized_model.startswith("gpt-5.4-")
+        ):
+            raise ValueError(
+                "OPENAI_REASONING_EFFORT is only supported for OpenAI model "
+                f"'gpt-5.4' and its variants, not '{resolved_model or '<unset>'}'."
+            )
+        valid_efforts = {"none", "low", "medium", "high", "xhigh"}
         if effort not in valid_efforts:
             raise ValueError(
                 f"OPENAI_REASONING_EFFORT must be one of: {sorted(valid_efforts)}. Got '{effort}'."

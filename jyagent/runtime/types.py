@@ -166,7 +166,7 @@ from .providers._anthropic_reasoning import (
 
 
 class OpenAIReasoningConfig(TypedDict, total=False):
-    effort: Literal["low", "medium", "high"]
+    effort: Literal["none", "low", "medium", "high", "xhigh"]
 
 
 # Union of all provider reasoning configs — extend as providers are added.

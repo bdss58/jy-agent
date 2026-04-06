@@ -1,7 +1,7 @@
 """Shared OpenAI helpers — pure functions for request/response/message transforms.
 
 No side effects, no client creation, no adapter registration.
-Used by ``providers/openai.py`` (OpenAI Chat Completions adapter).
+Used by ``providers/openai.py`` (OpenAI Responses API adapter).
 """
 
 from __future__ import annotations
@@ -25,31 +25,50 @@ from ..types import (
 )
 
 
-# ─── Reasoning-model detection ─────────────────────────────────────────────
+# ─── Model capability detection ─────────────────────────────────────────────
 
-_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
+_OPENAI_LEGACY_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
+_OPENAI_REASONING_EFFORT_MODEL_PREFIX = "gpt-5.4"
 
 
-def _is_reasoning_model(model: str) -> bool:
-    """Return True for reasoning-series models (o1, o3, o4-*)."""
+def supports_openai_reasoning_effort(model: str) -> bool:
+    """Return True for GPT-5.4 models that accept reasoning_effort."""
     normalized = model.strip().lower()
-    return any(normalized.startswith(p) for p in _REASONING_MODEL_PREFIXES)
+    return normalized == _OPENAI_REASONING_EFFORT_MODEL_PREFIX or normalized.startswith(
+        f"{_OPENAI_REASONING_EFFORT_MODEL_PREFIX}-"
+    )
+
+
+def uses_openai_legacy_reasoning_transport(model: str) -> bool:
+    """Return True for o-series models that require transport quirks.
+
+    In the Responses API, o-series models are natively supported and
+    ``instructions`` works normally.  The only remaining quirk is that
+    temperature is not supported for these models.
+    """
+    normalized = model.strip().lower()
+    return any(normalized.startswith(p) for p in _OPENAI_LEGACY_REASONING_MODEL_PREFIXES)
 
 
 # ─── Response normalisation ────────────────────────────────────────────────
 
 def usage_from_response(usage: Any) -> Usage:
-    """Extract a normalized Usage from an OpenAI response usage object."""
+    """Extract a normalized Usage from an OpenAI Responses API usage object.
+
+    The Responses API ``ResponseUsage`` exposes ``input_tokens``,
+    ``output_tokens``, ``total_tokens``, and
+    ``input_tokens_details.cached_tokens``.
+    """
     if usage is None:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    output_tokens = getattr(usage, "completion_tokens", 0) or 0
+    input_tokens = getattr(usage, "input_tokens", 0) or 0
+    output_tokens = getattr(usage, "output_tokens", 0) or 0
 
     cache_read = 0
-    prompt_details = getattr(usage, "prompt_tokens_details", None)
-    if prompt_details is not None:
-        cache_read = getattr(prompt_details, "cached_tokens", 0) or 0
+    input_details = getattr(usage, "input_tokens_details", None)
+    if input_details is not None:
+        cache_read = getattr(input_details, "cached_tokens", 0) or 0
 
     raw: Usage = {
         "input_tokens": input_tokens,
@@ -60,77 +79,108 @@ def usage_from_response(usage: Any) -> Usage:
     return raw
 
 
-def map_stop_reason(finish_reason: str | None) -> str:
-    """Map OpenAI finish_reason to normalized stop reason."""
-    if finish_reason == "stop":
-        return "stop"
-    if finish_reason == "length":
+def map_stop_reason(status: str | None, has_tool_calls: bool = False) -> str:
+    """Map a Responses API ``response.status`` to a normalized stop reason.
+
+    Parameters
+    ----------
+    status:
+        One of ``"completed"``, ``"incomplete"``, ``"failed"``, or ``None``.
+    has_tool_calls:
+        Whether the response output contains any ``function_call`` items.
+    """
+    if status == "completed":
+        return "tool_use" if has_tool_calls else "stop"
+    if status == "incomplete":
         return "length"
-    if finish_reason == "tool_calls":
-        return "tool_use"
-    if finish_reason == "content_filter":
+    if status == "failed":
         return "error"
-    if finish_reason is None:
+    if status is None:
         return "stop"
     return "error"
 
 
 def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMessage:
-    """Build an AssistantMessage from a non-streaming OpenAI ChatCompletion response."""
-    choice = response.choices[0]
-    message = choice.message
+    """Build an AssistantMessage from an OpenAI Responses API ``Response`` object."""
     content: list[dict[str, Any]] = []
+    has_tool_calls = False
 
-    # Text content
-    if message.content:
-        content.append({"type": "text", "text": message.content})
+    for item in getattr(response, "output", []):
+        item_type = getattr(item, "type", None)
 
-    # Tool calls
-    if message.tool_calls:
-        for tc in message.tool_calls:
-            arguments = tc.function.arguments or "{}"
+        if item_type == "message":
+            # Extract text from message content parts
+            for part in getattr(item, "content", []):
+                part_type = getattr(part, "type", None)
+                if part_type == "output_text":
+                    text = getattr(part, "text", "")
+                    if text:
+                        content.append({"type": "text", "text": text})
+
+        elif item_type == "function_call":
+            has_tool_calls = True
+            arguments_str = getattr(item, "arguments", "") or "{}"
             try:
-                parsed_args = json.loads(arguments)
+                parsed_args = json.loads(arguments_str)
             except (json.JSONDecodeError, TypeError):
                 parsed_args = {}
             content.append({
                 "type": "tool_call",
-                "id": tc.id,
-                "name": tc.function.name,
+                "id": getattr(item, "call_id", ""),
+                "name": getattr(item, "name", ""),
                 "arguments": parsed_args,
             })
 
+        elif item_type == "reasoning":
+            # Preserve reasoning/thinking output if available
+            summary_parts = getattr(item, "summary", None) or []
+            summary_texts: list[str] = []
+            for sp in summary_parts:
+                text = getattr(sp, "text", "") if not isinstance(sp, str) else sp
+                if text:
+                    summary_texts.append(text)
+            if summary_texts:
+                content.append({
+                    "type": "thinking",
+                    "thinking": "\n".join(summary_texts),
+                    "summary": summary_texts,
+                })
+
     usage = usage_from_response(getattr(response, "usage", None))
     response_id = getattr(response, "id", "")
+    status = getattr(response, "status", None)
 
     return {
         "role": "assistant",
         "content": content,
         "provider": model_spec.provider,
-        "api": "openai-chat",
+        "api": "openai-responses",
         "model": model_spec.model,
-        "stop_reason": map_stop_reason(getattr(choice, "finish_reason", None)),
+        "stop_reason": map_stop_reason(status, has_tool_calls),
         "usage": usage,
         "response_id": response_id,
         "id": response_id,
     }
 
 
-# ─── Request building — messages ───────────────────────────────────────────
+# ─── Request building — messages (Responses API input items) ──────────────
 
-def _convert_assistant_blocks(message: dict[str, Any]) -> dict[str, Any]:
-    """Convert a normalized AssistantMessage to OpenAI chat format."""
+def _convert_assistant_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert a normalized AssistantMessage to Responses API input items.
+
+    An assistant message may expand to multiple items:
+    - An ``EasyInputMessage`` with role ``"assistant"`` for any text content.
+    - One ``function_call`` item per tool call.
+    """
     text_parts: list[str] = []
-    tool_calls: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
 
     for block in message.get("content", []):
         block_type = block.get("type")
         if block_type == "text":
             text_parts.append(block.get("text", ""))
         elif block_type == "thinking":
-            # Cross-model thinking: already converted to <thinking> text by
-            # transform_messages_for_target, but if same-model thinking blocks
-            # survive, wrap them.
+            # Cross-model thinking: wrap in <thinking> text for replay.
             if block.get("redacted"):
                 continue  # drop redacted thinking
             thinking_text = block.get("thinking", "").strip()
@@ -142,30 +192,31 @@ def _convert_assistant_blocks(message: dict[str, Any]) -> dict[str, Any]:
                 args_str = arguments
             else:
                 args_str = json.dumps(arguments)
-            tool_calls.append({
-                "id": block["id"],
-                "type": "function",
-                "function": {
-                    "name": block["name"],
-                    "arguments": args_str,
-                },
+            items.append({
+                "type": "function_call",
+                "call_id": block["id"],
+                "name": block["name"],
+                "arguments": args_str,
             })
 
-    result: dict[str, Any] = {"role": "assistant"}
+    # Emit an assistant message item for text content (before tool calls)
     combined_text = "".join(text_parts)
     if combined_text:
-        result["content"] = combined_text
-    else:
-        result["content"] = None
-    if tool_calls:
-        result["tool_calls"] = tool_calls
-    return result
+        items.insert(0, {"role": "assistant", "content": combined_text})
+    elif not items:
+        # No text and no tool calls — emit empty assistant message
+        items.append({"role": "assistant", "content": ""})
+
+    return items
 
 
 def convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dict[str, Any]]:
-    """Transform normalized messages to OpenAI Chat Completions format.
+    """Transform normalized messages to OpenAI Responses API input items.
 
-    Calls transform_messages_for_target() first for cross-model normalization.
+    Calls ``transform_messages_for_target()`` first for cross-model normalization.
+
+    Returns a list suitable for the ``input`` parameter of
+    ``client.responses.create()``.
     """
     transformed = transform_messages_for_target(messages, model_spec)
     out: list[dict[str, Any]] = []
@@ -177,7 +228,7 @@ def convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dic
             out.append({"role": "user", "content": message.get("content", "")})
 
         elif role == "assistant":
-            out.append(_convert_assistant_blocks(message))
+            out.extend(_convert_assistant_to_input_items(message))
 
         elif role == "tool_result":
             tool_result = cast(ToolResultMessage, message)
@@ -185,15 +236,15 @@ def convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dic
             if tool_result.get("is_error"):
                 content = f"[ERROR] {content}"
             out.append({
-                "role": "tool",
-                "tool_call_id": tool_result["tool_call_id"],
-                "content": content,
+                "type": "function_call_output",
+                "call_id": tool_result["tool_call_id"],
+                "output": content,
             })
 
     return out
 
 
-# ─── Request building — tools ──────────────────────────────────────────────
+# ─── Request building — tools (Responses API format) ─────────────────────
 
 def _add_additional_properties_false(schema: dict[str, Any]) -> dict[str, Any]:
     """Recursively add "additionalProperties": false to schemas that have "properties".
@@ -218,7 +269,11 @@ def _add_additional_properties_false(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Convert normalized tool definitions to OpenAI function calling format."""
+    """Convert normalized tool definitions to OpenAI Responses API function tool format.
+
+    In the Responses API, tools are flat objects (not nested under ``function``):
+    ``{"type": "function", "name": ..., "description": ..., "parameters": ..., "strict": ...}``
+    """
     if not tools:
         return []
     result = []
@@ -227,20 +282,18 @@ def convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         parameters = _add_additional_properties_false(parameters)
         result.append({
             "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool.get("description", ""),
-                "parameters": parameters,
-                "strict": True,
-            },
+            "name": tool["name"],
+            "description": tool.get("description", ""),
+            "parameters": parameters,
+            "strict": True,
         })
     return result
 
 
-# ─── Request building — tool_choice ────────────────────────────────────────
+# ─── Request building — tool_choice (Responses API format) ───────────────
 
 def convert_tool_choice(tool_choice: dict[str, Any] | None) -> str | dict[str, Any] | None:
-    """Map normalized ToolChoice to OpenAI tool_choice parameter."""
+    """Map normalized ToolChoice to OpenAI Responses API tool_choice parameter."""
     if tool_choice is None:
         return None
     tc_type = tool_choice.get("type")
@@ -251,48 +304,46 @@ def convert_tool_choice(tool_choice: dict[str, Any] | None) -> str | dict[str, A
     if tc_type == "none":
         return "none"
     if tc_type == "tool":
-        return {"type": "function", "function": {"name": tool_choice["name"]}}
+        return {"type": "function", "name": tool_choice["name"]}
     return None
 
 
-# ─── Request building — full kwargs ────────────────────────────────────────
+# ─── Request building — full kwargs for client.responses.create() ────────
 
 def build_request_kwargs(
     model_spec: ModelSpec,
     context: Context,
     options: RuntimeOptions,
 ) -> dict[str, Any]:
-    """Build the kwargs dict for client.chat.completions.create()."""
-    is_reasoning = _is_reasoning_model(model_spec.model)
+    """Build the kwargs dict for ``client.responses.create()`` / ``.stream()``.
 
-    openai_messages = convert_messages(model_spec, context.get("messages", []))
+    The Responses API uses ``input`` instead of ``messages``,
+    ``instructions`` instead of a system message, and
+    ``max_output_tokens`` for all models.
+    """
+    is_o_series = uses_openai_legacy_reasoning_transport(model_spec.model)
+    supports_reasoning = supports_openai_reasoning_effort(model_spec.model)
 
-    # System prompt handling
-    system_prompt = context.get("system_prompt", "")
-    if system_prompt:
-        if is_reasoning:
-            # Reasoning models don't support system messages; prepend as user message
-            openai_messages.insert(0, {
-                "role": "user",
-                "content": f"[System]\n{system_prompt}",
-            })
-        else:
-            openai_messages.insert(0, {
-                "role": "system",
-                "content": system_prompt,
-            })
+    input_items = convert_messages(model_spec, context.get("messages", []))
 
     kwargs: dict[str, Any] = {
         "model": model_spec.model,
-        "messages": openai_messages,
+        "input": input_items,
+        "store": False,
     }
 
-    # max_output_tokens -> max_completion_tokens (reasoning models) or max_tokens
+    # System prompt → instructions (works for all models in Responses API,
+    # including o-series — no more user-message hack needed).
+    system_prompt = context.get("system_prompt", "")
+    if system_prompt:
+        kwargs["instructions"] = system_prompt
+
+    # max_output_tokens (Responses API uses this for all models)
     if options.max_output_tokens is not None:
-        if is_reasoning:
-            kwargs["max_completion_tokens"] = options.max_output_tokens
-        else:
-            kwargs["max_tokens"] = options.max_output_tokens
+        kwargs["max_output_tokens"] = options.max_output_tokens
+
+    # Temperature — o-series models do not support it
+    # (skipped for o-series; other models get it if set in options metadata)
 
     # Tools
     tools = convert_tools(context.get("tools"))
@@ -305,11 +356,11 @@ def build_request_kwargs(
         if tc is not None:
             kwargs["tool_choice"] = tc
 
-    # Reasoning effort (for o1/o3/o4 models)
+    # Reasoning config → reasoning parameter
     if options.reasoning is not None and isinstance(options.reasoning, dict):
         effort = options.reasoning.get("effort")
-        if effort and is_reasoning:
-            kwargs["reasoning_effort"] = effort
+        if effort and supports_reasoning:
+            kwargs["reasoning"] = {"effort": effort}
 
     return kwargs
 
@@ -321,5 +372,7 @@ __all__ = [
     "convert_tool_choice",
     "convert_tools",
     "map_stop_reason",
+    "supports_openai_reasoning_effort",
     "usage_from_response",
+    "uses_openai_legacy_reasoning_transport",
 ]
