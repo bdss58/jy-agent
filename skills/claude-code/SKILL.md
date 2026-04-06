@@ -79,17 +79,7 @@ claude -p \
 - `--allowedTools` auto-approves listed tools, blocks everything else
 - Always include a **verification step** in the prompt ("run tests", "check types")
 
-### Pattern C: Budget-Controlled
-
-```bash
-claude -p --max-budget-usd 0.50 \
-  "Fix the failing test in tests/test_api.py"
-```
-
-- From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
-- `--max-budget-usd` caps spending (prevents runaway)
-
-### Pattern D: Structured Output
+### Pattern C: Structured Output
 
 ```bash
 claude -p --output-format json \
@@ -100,7 +90,7 @@ claude -p --output-format json \
 - From `jy-agent`, invoke this as `run_shell("<claude command>", timeout=600)`.
 - Use when you need to parse Claude Code's output programmatically
 
-### Pattern E: Continuation
+### Pattern D: Continuation
 
 ```bash
 # First call
@@ -112,7 +102,7 @@ claude -p --continue "now add rate limiting to the login endpoint"
 
 - From `jy-agent`, invoke each call as `run_shell("<claude command>", timeout=600)`.
 
-### Pattern F: Fan-Out (parallel bulk tasks)
+### Pattern E: Fan-Out (parallel bulk tasks)
 
 ```bash
 # Generate task list, then parallelize
@@ -184,9 +174,6 @@ When Claude Code returns output via `run_shell`:
 
 ❌ **Don't** retry the same failing prompt — if it failed twice, the prompt is the problem
 ✅ **Do** rewrite with more context, tighter scope, or escalate to a better model
-
-❌ **Don't** forget `--max-budget-usd` for experimental/exploratory tasks
-✅ **Do** set a budget cap to prevent cost surprises
 
 ❌ **Don't** use `--dangerously-skip-permissions` outside of sandboxed environments
 ✅ **Do** use `--allowedTools` to grant specific permissions safely

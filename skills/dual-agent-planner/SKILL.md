@@ -179,7 +179,6 @@ Not worth it when:
 
 To control costs:
 - Let the configured default model handle planning (avoid unnecessary opus overrides)
-- Use `--max-budget-usd 0.50` per agent for planning
 - Save `--model opus` override for execution of the hardest subtask only
 
 ## Anti-Patterns
