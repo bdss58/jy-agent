@@ -4,26 +4,24 @@
 import sys
 import time
 import threading
+from dataclasses import dataclass
 from .registry import get_registry
 from .loop_engine import LoopCallbacks
+from .cli import console
 
-# ─── Colors ──────────────────────────────────────────────────────────────────
 
-TOOL_COLOR = "\033[0;33m"  # yellow for tool info
-COLOR_RESET = "\033[0m"
-COLOR_DIM = "\033[2m"
-COLOR_YELLOW = "\033[1;33m"
-COLOR_CYAN = "\033[1;36m"
-COLOR_RED = "\033[1;31m"
-COLOR_GREEN = "\033[0;32m"
-COLOR_MAGENTA = "\033[0;35m"
-COLOR_DIM_YELLOW = "\033[2;33m"
+# ─── Stream state ────────────────────────────────────────────────────────────
+
+@dataclass
+class StreamState:
+    """Typed state shared between streaming callbacks."""
+    needs_newline: bool = False
 
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
 
 def _stream_write(text: str):
-    """Write streamed text to stdout."""
+    """Write streamed text to stdout (char-level streaming — Rich can't do this)."""
     sys.stdout.write(text)
     sys.stdout.flush()
 
@@ -34,7 +32,7 @@ class ThinkingSpinner:
     """Animated spinner shown while waiting for the first token.
 
     Uses a background thread to animate; call stop() when the first
-    text/tool_use delta arrives.  Thread-safe.
+    text/tool_use delta arrives.  Thread-safe and idempotent.
     """
     _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -69,7 +67,7 @@ class ThinkingSpinner:
         while not self._stop_event.is_set():
             elapsed = time.time() - t0
             frame = self._FRAMES[idx % len(self._FRAMES)]
-            sys.stdout.write(f"\r{COLOR_DIM}  {frame} {self._label}... ({elapsed:.1f}s){COLOR_RESET}")
+            sys.stdout.write(f"\r\033[2m  {frame} {self._label}... ({elapsed:.1f}s)\033[0m")
             sys.stdout.flush()
             idx += 1
             self._stop_event.wait(0.08)
@@ -87,8 +85,9 @@ _TOOL_ICONS = {
 
 def _tool_info(msg: str):
     """Print a visible tool/status message."""
-    sys.stdout.write(f"\n{TOOL_COLOR}  🔧 {msg}{COLOR_RESET}\n")
+    # Flush raw stdout first to maintain ordering with Rich output
     sys.stdout.flush()
+    console.print(f"\n  🔧 {msg}", style="yellow")
 
 
 def _tool_call_header(tool_name: str, tool_input: dict):
@@ -96,11 +95,14 @@ def _tool_call_header(tool_name: str, tool_input: dict):
     icon = _TOOL_ICONS.get(tool_name, "🔧")
     # Build compact arg summary
     args_preview = _format_tool_args(tool_name, tool_input)
-    sys.stdout.write(f"\n{TOOL_COLOR}  {icon} {tool_name}{COLOR_RESET}")
-    if args_preview:
-        sys.stdout.write(f"{COLOR_DIM} {args_preview}{COLOR_RESET}")
-    sys.stdout.write("\n")
+    # Flush raw stdout first to maintain ordering with Rich output
     sys.stdout.flush()
+    from rich.text import Text
+    text = Text()
+    text.append(f"\n  {icon} {tool_name}", style="yellow")
+    if args_preview:
+        text.append(f" {args_preview}", style="dim")
+    console.print(text)
 
 
 def _format_tool_args(tool_name: str, tool_input: dict) -> str:
@@ -148,6 +150,10 @@ def _format_tool_args(tool_name: str, tool_input: dict) -> str:
 
 def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = False):
     """Print a compact tool result summary with smart formatting."""
+    from rich.text import Text
+    # Flush raw stdout to maintain ordering with Rich output
+    sys.stdout.flush()
+
     lines = result_str.split('\n')
     n_lines = len(lines)
     n_chars = len(result_str)
@@ -157,8 +163,8 @@ def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = 
         preview = result_str[:300].replace('\n', ' ↵ ')
         if n_chars > 300:
             preview += "..."
-        sys.stdout.write(f"{COLOR_RED}  ✗ {preview}{COLOR_RESET}\n")
-        sys.stdout.flush()
+        text = Text(f"  ✗ {preview}", style="bold red")
+        console.print(text)
         return
 
     # Detect edit_file diffs and show them nicely
@@ -172,42 +178,49 @@ def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = 
         first_line = first_line[:147] + "..."
 
     size_info = f"{n_chars} chars" if n_lines <= 1 else f"{n_lines} lines, {n_chars} chars"
-    sys.stdout.write(f"{COLOR_GREEN}  ✓{COLOR_RESET} {first_line}")
-    sys.stdout.write(f" {COLOR_DIM}({size_info}){COLOR_RESET}\n")
-    sys.stdout.flush()
+    text = Text()
+    text.append("  ✓", style="green")
+    text.append(f" {first_line}")
+    text.append(f" ({size_info})", style="dim")
+    console.print(text)
 
 
 def _render_edit_diff(result_str: str):
-    """Render edit_file output with color-coded diff lines."""
+    """Render edit_file output with color-coded diff lines using Rich Text."""
+    from rich.text import Text
+    # Flush raw stdout to maintain ordering with Rich output
+    sys.stdout.flush()
+
     lines = result_str.split('\n')
     # First line is the summary (e.g. "Edited foo.py: replaced 3 lines...")
     summary = lines[0] if lines else ""
-    sys.stdout.write(f"{COLOR_GREEN}  ✓ {summary}{COLOR_RESET}\n")
+    console.print(Text(f"  ✓ {summary}", style="green"))
 
     # Render context lines with diff coloring
     for line in lines[1:]:
         stripped = line.strip()
         if stripped.startswith(">"):
             # Changed line — highlight in green
-            sys.stdout.write(f"\033[32m    {line}{COLOR_RESET}\n")
+            console.print(Text(f"    {line}", style="green"))
         elif stripped.startswith("L") or stripped.startswith(" "):
             # Context line — dim
-            sys.stdout.write(f"{COLOR_DIM}    {line}{COLOR_RESET}\n")
+            console.print(Text(f"    {line}", style="dim"))
         elif line.strip():
-            sys.stdout.write(f"    {line}\n")
-    sys.stdout.flush()
+            console.print(f"    {line}")
 
 
 def _interrupted_msg():
     """Print interruption message."""
-    sys.stdout.write(f"\n{COLOR_YELLOW}⚠ Interrupted by Ctrl-C{COLOR_RESET}\n")
     sys.stdout.flush()
+    console.print("\n[bold yellow]⚠ Interrupted by Ctrl-C[/bold yellow]")
 
 
 def _runtime_warning(msg: str):
     """Print a short runtime recovery warning without aborting the turn."""
-    sys.stdout.write(f"\n{COLOR_DIM_YELLOW}  ⚠ {msg}{COLOR_RESET}\n")
     sys.stdout.flush()
+    from rich.text import Text
+    text = Text(f"\n  ⚠ {msg}", style="dim yellow")
+    console.print(text)
 
 
 # ─── Streaming callbacks factory ────────────────────────────────────────────
@@ -219,12 +232,12 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
     """
     # Mutable state shared by callbacks
     spinner = ThinkingSpinner()
-    state = {"needs_newline": False}  # True when text was streamed and tools/completion follow
+    stream_state = StreamState()
 
     def _on_text_delta(text: str):
         spinner.stop()
         _stream_write(text)
-        state["needs_newline"] = True
+        stream_state.needs_newline = True
 
     def _on_thinking_start():
         spinner.start()
@@ -234,10 +247,10 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
 
     def _on_tool_start(name: str, tool_input: dict):
         spinner.stop()
-        if state["needs_newline"]:
+        if stream_state.needs_newline:
             sys.stdout.write("\n")
             sys.stdout.flush()
-            state["needs_newline"] = False
+            stream_state.needs_newline = False
         _tool_call_header(name, tool_input)
 
     def _on_tool_end(name: str, content: str, is_error: bool):
@@ -245,13 +258,11 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
         _tool_result_preview(content, tool_name=name, is_error=is_error)
 
     def _on_retry(attempt: int, error: Exception):
-        retry_msg = (
-            f"\n⚡ Stream interrupted ({error}), "
-            f"retrying... "
-            f"(attempt {attempt + 1})\n"
-        )
-        sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
         sys.stdout.flush()
+        console.print(
+            f"\n⚡ Stream interrupted ({error}), retrying... (attempt {attempt + 1})",
+            style="bold yellow",
+        )
 
     def _on_usage(usage: dict):
         stats.record_usage(
@@ -261,10 +272,10 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
         )
 
     def _on_step_progress(step: int, max_steps_val: int):
-        state["needs_newline"] = False
+        stream_state.needs_newline = False
         if step >= 5:
-            sys.stdout.write(f"{COLOR_DIM}  [Step {step + 1}/{max_steps_val}]{COLOR_RESET}\n")
             sys.stdout.flush()
+            console.print(f"  [Step {step + 1}/{max_steps_val}]", style="dim")
 
     def _on_compaction(before_len: int, after_len: int):
         pass  # silent — could add diagnostic output here
@@ -293,7 +304,7 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
         on_tool_batch=_on_tool_batch,
     )
 
-    # Attach the state to the callbacks object for access
-    callbacks._state = state
+    # Attach the stream state to the callbacks object for access by caller
+    callbacks._stream_state = stream_state
 
     return callbacks, spinner

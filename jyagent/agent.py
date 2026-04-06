@@ -7,7 +7,7 @@ from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context,
 )
-from .terminal_ux import build_streaming_callbacks, COLOR_YELLOW, COLOR_RED, COLOR_RESET, _interrupted_msg
+from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
@@ -401,7 +401,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
 
                     # Handle LoopResult status branches
                     if result.status == "completed":
-                        if callbacks._state["needs_newline"]:
+                        if callbacks._stream_state.needs_newline:
                             sys.stdout.write("\n")
                             sys.stdout.flush()
                         response = result.text
@@ -409,8 +409,8 @@ def run(runtime_owner: RuntimeOwner) -> None:
                         planner_messages = result.messages
                     elif result.status == "max_steps":
                         max_step_msg = f"\n\n⚠️ Reached maximum reasoning steps ({config.max_steps}). My response may be incomplete."
-                        sys.stdout.write(f"{COLOR_YELLOW}{max_step_msg}{COLOR_RESET}\n")
                         sys.stdout.flush()
+                        console.print(f"[bold yellow]{max_step_msg}[/bold yellow]")
 
                         response = result.text or "I've reached my maximum reasoning steps. Please try rephrasing your request."
                         final_text = result.final_text
@@ -421,9 +421,9 @@ def run(runtime_owner: RuntimeOwner) -> None:
                         final_text = ""
                         planner_messages = result.messages
                     elif result.status == "error":
-                        error_msg = f"\n[Error: {result.error}]\n"
-                        sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
+                        error_msg = f"\n[Error: {result.error}]"
                         sys.stdout.flush()
+                        console.print(error_msg, style="bold red", markup=False)
                         if result.text:
                             response = result.text + f"\n\n[Error: {result.error}]"
                         else:
