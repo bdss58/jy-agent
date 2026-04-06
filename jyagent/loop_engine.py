@@ -1,0 +1,674 @@
+# loop_engine.py — Reusable agentic tool-use loop engine.
+#
+# Shared algorithm for both planner (streaming, full-featured) and sub-agent
+# (non-streaming, silent).  Callers configure behaviour via LoopConfig and
+# LoopCallbacks; the engine never writes to stdout directly.
+#
+# Phase 1 — standalone module, no callers yet.
+
+from __future__ import annotations
+
+import atexit
+import concurrent.futures
+import json
+import time
+import traceback
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+from .runtime import RuntimeOwner, RuntimeOptions
+from .runtime.types import ModelSpec
+from .config import get_reasoning_config_for_provider, STREAM_TIMEOUT
+from .registry import get_registry
+from .toolresult import ToolResult
+from .validation import validate_tool_input
+from .memory.conversation import estimate_conversation_tokens
+
+
+# ─── Core types ──────────────────────────────────────────────────────────────
+
+@dataclass
+class LoopConfig:
+    max_steps: int = 50
+    initial_max_tokens: int = 16_384
+    max_tokens_cap: int = 128_000
+    auto_scale_on_truncation: bool = True
+    token_scale_factor: int = 2
+    concurrent_tools: bool = True
+    max_tool_workers: int = 4
+    tool_timeout: int = 120
+    retry_attempts: int = 3
+    retry_base_delay: float = 1.0
+    compact_messages: bool = True
+    max_working_tokens: int = 100_000
+    compact_tool_result_chars: int = 2000
+    max_tool_result_chars: int = 8000
+    streaming: bool = False
+
+
+@dataclass
+class LoopCallbacks:
+    # All Optional[Callable].  None = silent (sub-agent mode).
+    on_text_delta: Callable[[str], None] | None = None
+    on_thinking_start: Callable[[], None] | None = None
+    on_thinking_stop: Callable[[], None] | None = None
+    on_tool_start: Callable[[str, dict], None] | None = None
+    on_tool_end: Callable[[str, str, bool], None] | None = None  # (name, content, is_error)
+    on_retry: Callable[[int, Exception], None] | None = None  # (attempt, error)
+    on_compaction: Callable[[int, int], None] | None = None  # (before_len, after_len)
+    on_usage: Callable[[dict], None] | None = None  # raw Usage dict from response
+    on_step_progress: Callable[[int, int], None] | None = None  # (step, max_steps)
+
+
+@dataclass
+class LoopResult:
+    status: str  # "completed" | "max_steps" | "error" | "interrupted"
+    text: str
+    final_text: str
+    messages: list
+    steps: int
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    tool_calls_count: int = 0
+    error: str | None = None
+
+
+@dataclass
+class ToolCallRequest:
+    id: str
+    name: str
+    input: dict
+
+
+# Type alias: returns (schemas_list, functions_dict)
+ToolSource = Callable[[], tuple[list[dict], dict[str, Callable]]]
+
+
+# ─── Shared executor ─────────────────────────────────────────────────────────
+
+_tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+atexit.register(_tool_executor.shutdown, wait=False)
+
+
+# ─── Private helpers ─────────────────────────────────────────────────────────
+
+def _extract_text(message: dict) -> str:
+    """Extract concatenated text blocks from an AssistantMessage."""
+    return "".join(
+        block.get("text", "")
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _extract_tool_calls(message: dict) -> list[ToolCallRequest]:
+    """Extract tool_call blocks from an AssistantMessage."""
+    return [
+        ToolCallRequest(
+            id=block["id"],
+            name=block["name"],
+            input=block.get("arguments", {}),
+        )
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_call"
+    ]
+
+
+def _is_truncated(stop_reason: str, tool_calls: list[ToolCallRequest]) -> bool:
+    """Detect if a response was truncated while emitting tool calls."""
+    return stop_reason == "length" and bool(tool_calls)
+
+
+def _truncate_result(content: str, max_chars: int, is_error: bool = False) -> str:
+    """Truncate a tool result string.  Error results are never truncated."""
+    if len(content) <= max_chars or is_error:
+        return content
+    head = int(max_chars * 0.85)
+    tail = int(max_chars * 0.10)
+    return (
+        content[:head]
+        + f"\n\n[... truncated {len(content) - head - tail} chars "
+        + f"(total: {len(content)} chars) ...]\n\n"
+        + content[-tail:]
+    )
+
+
+def _compact_messages(
+    messages: list,
+    max_tokens: int,
+    compact_chars: int,
+) -> list:
+    """Aggressively truncate older tool results when context is too large.
+
+    Keeps the last 2 messages intact so the LLM can reason about the most
+    recent tool output.
+    """
+    estimated = estimate_conversation_tokens(messages)
+    if estimated <= max_tokens:
+        return messages
+
+    compacted = [dict(m) for m in messages]  # shallow copy each message
+
+    for i in range(len(compacted) - 2):
+        msg = compacted[i]
+        if msg.get("role") == "tool_result":
+            result_text = str(msg.get("content", ""))
+            if len(result_text) > compact_chars:
+                compacted[i]["content"] = (
+                    result_text[:compact_chars]
+                    + f"\n[... compacted from {len(result_text)} chars ...]"
+                )
+            continue
+
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    result_text = str(block.get("content", ""))
+                    if len(result_text) > compact_chars:
+                        block = dict(block)
+                        block["content"] = (
+                            result_text[:compact_chars]
+                            + f"\n[... compacted from {len(result_text)} chars ...]"
+                        )
+                new_blocks.append(block)
+            compacted[i]["content"] = new_blocks
+
+    return compacted
+
+
+def _execute_tool(
+    name: str,
+    tool_input: dict,
+    functions: dict[str, Callable],
+    registry,
+) -> ToolResult:
+    """Execute a single tool call with validation.  Always returns ToolResult."""
+    fn = functions.get(name)
+    if fn is None:
+        return ToolResult(
+            f"Error: Unknown tool '{name}'. Available: {sorted(functions.keys())[:20]}",
+            is_error=True,
+        )
+
+    tool_schema = registry.get_schema(name)
+    validation_error = validate_tool_input(name, tool_input, fn, tool_schema)
+    if validation_error:
+        return ToolResult(validation_error, is_error=True)
+
+    try:
+        if tool_input is None:
+            tool_input = {}
+        raw = fn(**tool_input)
+        if isinstance(raw, ToolResult):
+            return raw
+        return ToolResult(str(raw))
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        return ToolResult(
+            f"Error calling tool {name}: {e}\n{error_detail}",
+            is_error=True,
+        )
+
+
+def _execute_tools(
+    blocks: list[ToolCallRequest],
+    functions: dict[str, Callable],
+    registry,
+    concurrent_mode: bool,
+    max_workers: int,
+    timeout: int,
+) -> list[tuple[ToolCallRequest, ToolResult]]:
+    """Execute tool calls with selective parallelisation.
+
+    Parallel-safe tools run concurrently; state-mutating tools run sequentially
+    as barriers between parallel batches.  Results are always in original order.
+    """
+    if not blocks:
+        return []
+
+    # Fast path: single tool or concurrency disabled
+    if len(blocks) <= 1 or not concurrent_mode:
+        results = []
+        for block in blocks:
+            result = _execute_tool_with_timeout(block.name, block.input, functions, registry, timeout)
+            results.append((block, result))
+        return results
+
+    # Check if any tool is parallel-safe
+    if not any(registry.is_parallel_safe(b.name) for b in blocks):
+        results = []
+        for block in blocks:
+            result = _execute_tool_with_timeout(block.name, block.input, functions, registry, timeout)
+            results.append((block, result))
+        return results
+
+    # Partition into contiguous groups
+    results_arr: list[tuple[ToolCallRequest, ToolResult] | None] = [None] * len(blocks)
+    i = 0
+    while i < len(blocks):
+        if registry.is_parallel_safe(blocks[i].name):
+            parallel_batch = []
+            while i < len(blocks) and registry.is_parallel_safe(blocks[i].name):
+                parallel_batch.append((i, blocks[i]))
+                i += 1
+
+            futures = {
+                _tool_executor.submit(
+                    _execute_tool, block.name, block.input, functions, registry
+                ): (idx, block)
+                for idx, block in parallel_batch
+            }
+            for future in concurrent.futures.as_completed(futures):
+                idx, block = futures[future]
+                try:
+                    results_arr[idx] = (block, future.result())
+                except Exception as exc:
+                    error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                    results_arr[idx] = (block, ToolResult(
+                        f"Error calling tool {block.name}: {exc}\n{error_detail}",
+                        is_error=True,
+                    ))
+        else:
+            block = blocks[i]
+            result = _execute_tool_with_timeout(block.name, block.input, functions, registry, timeout)
+            results_arr[i] = (block, result)
+            i += 1
+
+    return results_arr  # type: ignore[return-value]
+
+
+def _execute_tool_with_timeout(
+    name: str,
+    tool_input: dict,
+    functions: dict[str, Callable],
+    registry,
+    default_timeout: int,
+) -> ToolResult:
+    """Execute a tool via the shared executor with a timeout."""
+    timeout = default_timeout
+    hint = registry.get_timeout_hint(name)
+    if hint is not None:
+        timeout = max(timeout, hint)
+
+    # run_shell manages its own timeout — give extra slack
+    if name == "run_shell":
+        user_timeout = (tool_input or {}).get("timeout", 60)
+        timeout = max(timeout, int(user_timeout) + 10)
+
+    future = _tool_executor.submit(_execute_tool, name, tool_input, functions, registry)
+    try:
+        return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        return ToolResult(
+            f"Error: Tool '{name}' timed out after {timeout}s. "
+            f"Consider breaking the operation into smaller steps.",
+            is_error=True,
+        )
+    except KeyboardInterrupt:
+        future.cancel()
+        raise
+
+
+def _is_transient_error(error: BaseException) -> bool:
+    """Return True if the error is likely transient and worth retrying."""
+    if isinstance(error, json.JSONDecodeError):
+        return True
+    msg = str(error).lower()
+    transient_keywords = [
+        "incomplete", "peer closed", "connection reset", "timeout",
+        "eof", "broken pipe", "overloaded", "529", "server_error",
+    ]
+    return any(kw in msg for kw in transient_keywords)
+
+
+def _build_runtime_options(
+    runtime_owner: RuntimeOwner,
+    max_output_tokens: int,
+    model_spec: ModelSpec | None = None,
+    metadata: dict | None = None,
+) -> RuntimeOptions:
+    """Build RuntimeOptions with reasoning config for the active provider."""
+    spec = model_spec or runtime_owner.model_spec
+    return RuntimeOptions(
+        max_output_tokens=max_output_tokens,
+        timeout=STREAM_TIMEOUT,
+        reasoning=get_reasoning_config_for_provider(
+            spec.provider,
+            max_output_tokens=max_output_tokens,
+            model=spec.model,
+        ),
+        metadata=metadata,
+    )
+
+
+# ─── AgentLoop ───────────────────────────────────────────────────────────────
+
+class AgentLoop:
+    """Reusable agentic tool-use loop engine.
+
+    Supports both streaming and non-streaming modes, concurrent tool execution,
+    context compaction, truncation recovery, and transient-error retry.
+    """
+
+    def __init__(
+        self,
+        runtime_owner: RuntimeOwner,
+        config: LoopConfig,
+        callbacks: LoopCallbacks | None = None,
+        tool_source: ToolSource | None = None,
+        model_spec: ModelSpec | None = None,
+    ):
+        self._runtime_owner = runtime_owner
+        self._config = config
+        self._callbacks = callbacks or LoopCallbacks()
+        self._tool_source = tool_source
+        self._model_spec = model_spec  # override for sub-agent model tier
+
+    # ── callback helpers (no-op when callback is None) ────────────────────
+
+    def _fire(self, name: str, *args: Any) -> None:
+        cb = getattr(self._callbacks, name, None)
+        if cb is not None:
+            cb(*args)
+
+    # ── public entry point ────────────────────────────────────────────────
+
+    def run(self, system_prompt: str, messages: list) -> LoopResult:
+        """Run the agentic tool-use loop.  *messages* is mutated in-place."""
+        cfg = self._config
+        all_text = ""
+        final_text = ""
+        current_max_tokens = cfg.initial_max_tokens
+        total_input_tokens = 0
+        total_output_tokens = 0
+        tool_calls_count = 0
+        registry = get_registry()
+        step = 0
+
+        # Resolve tools
+        tool_schemas: list[dict] = []
+        tool_functions: dict[str, Callable] = {}
+
+        reg_version: int | None = None
+
+        try:
+            for step in range(cfg.max_steps):
+                self._fire("on_step_progress", step, cfg.max_steps)
+
+                # Refresh tool source each step
+                if self._tool_source is not None:
+                    tool_schemas, tool_functions = self._tool_source()
+                elif step == 0 or (reg_version is not None and registry.version != reg_version):
+                    reg_version, tool_schemas, tool_functions = registry.snapshot()
+
+                # Context compaction
+                if cfg.compact_messages:
+                    before_len = len(messages)
+                    messages_maybe = _compact_messages(
+                        messages, cfg.max_working_tokens, cfg.compact_tool_result_chars,
+                    )
+                    if messages_maybe is not messages:
+                        after_len = len(messages_maybe)
+                        messages[:] = messages_maybe
+                        self._fire("on_compaction", before_len, after_len)
+
+                # Build context dict
+                context: dict[str, Any] = {
+                    "system_prompt": system_prompt,
+                    "messages": messages,
+                }
+                if tool_schemas:
+                    context["tools"] = tool_schemas
+
+                # LLM call with retry
+                opts = _build_runtime_options(
+                    self._runtime_owner,
+                    current_max_tokens,
+                    model_spec=self._model_spec,
+                    metadata={"component": "loop_engine", "step": step + 1},
+                )
+
+                step_text, tool_call_blocks, stop_reason, final_message = self._call_llm_with_retry(
+                    context, opts, step,
+                )
+
+                # Accumulate usage
+                usage = final_message.get("usage", {})
+                total_input_tokens += usage.get("input_tokens", 0)
+                total_output_tokens += usage.get("output_tokens", 0)
+                self._fire("on_usage", usage)
+
+                all_text += step_text
+                final_text = step_text
+
+                # No tool calls → done
+                if not tool_call_blocks:
+                    if not step_text:
+                        final_text = _extract_text(final_message)
+                        all_text = final_text or all_text
+                    messages.append(final_message)
+                    result_text = all_text if all_text else "I processed your request but had no text response to return."
+                    return LoopResult(
+                        status="completed",
+                        text=result_text,
+                        final_text=final_text,
+                        messages=messages,
+                        steps=step + 1,
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        tool_calls_count=tool_calls_count,
+                    )
+
+                # Truncation detection → scale up and retry step
+                if cfg.auto_scale_on_truncation and _is_truncated(stop_reason, tool_call_blocks):
+                    current_max_tokens = min(
+                        current_max_tokens * cfg.token_scale_factor,
+                        cfg.max_tokens_cap,
+                    )
+                    # Remove the partial step text
+                    all_text = all_text[: -len(step_text)] if step_text else all_text
+                    continue
+
+                # Append assistant message
+                messages.append(final_message)
+
+                # Fire on_tool_start for all tool calls BEFORE execution
+                for block in tool_call_blocks:
+                    self._fire("on_tool_start", block.name, block.input)
+
+                # Execute tools
+                tool_results_tuples = _execute_tools(
+                    tool_call_blocks,
+                    tool_functions,
+                    registry,
+                    cfg.concurrent_tools,
+                    cfg.max_tool_workers,
+                    cfg.tool_timeout,
+                )
+
+                for block, result in tool_results_tuples:
+                    tool_calls_count += 1
+                    content_str = _truncate_result(result.content, cfg.max_tool_result_chars, result.is_error)
+                    self._fire("on_tool_end", block.name, content_str, result.is_error)
+
+                    messages.append({
+                        "role": "tool_result",
+                        "tool_call_id": block.id,
+                        "tool_name": block.name,
+                        "content": content_str,
+                        "is_error": result.is_error,
+                    })
+
+            # Max steps reached
+            return LoopResult(
+                status="max_steps",
+                text=all_text or "",
+                final_text=final_text,
+                messages=messages,
+                steps=cfg.max_steps,
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                tool_calls_count=tool_calls_count,
+            )
+
+        except KeyboardInterrupt:
+            return LoopResult(
+                status="interrupted",
+                text=all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]",
+                final_text="",
+                messages=messages,
+                steps=step + 1 if step else 1,
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                tool_calls_count=tool_calls_count,
+            )
+        except Exception as e:
+            return LoopResult(
+                status="error",
+                text=all_text or "",
+                final_text="",
+                messages=messages,
+                steps=step + 1 if step else 1,
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                tool_calls_count=tool_calls_count,
+                error=str(e),
+            )
+
+    # ── LLM call with retry ──────────────────────────────────────────────
+
+    def _call_llm_with_retry(
+        self,
+        context: dict,
+        options: RuntimeOptions,
+        step: int,
+    ) -> tuple[str, list[ToolCallRequest], str, dict]:
+        """Call the LLM (streaming or complete) with transient-error retry.
+
+        Returns (step_text, tool_call_blocks, stop_reason, final_message).
+        """
+        cfg = self._config
+        last_error: BaseException | None = None
+
+        for attempt in range(cfg.retry_attempts + 1):
+            try:
+                if cfg.streaming:
+                    return self._call_streaming(context, options)
+                else:
+                    return self._call_complete(context, options)
+            except KeyboardInterrupt:
+                raise
+            except Exception as err:
+                last_error = err
+                if _is_transient_error(err) and attempt < cfg.retry_attempts:
+                    delay = cfg.retry_base_delay * (2 ** attempt)
+                    self._fire("on_retry", attempt + 1, err)
+                    time.sleep(delay)
+                    continue
+                raise
+
+        # Should not reach here, but just in case:
+        raise last_error  # type: ignore[misc]
+
+    # ── non-streaming call ───────────────────────────────────────────────
+
+    def _call_complete(
+        self,
+        context: dict,
+        options: RuntimeOptions,
+    ) -> tuple[str, list[ToolCallRequest], str, dict]:
+        """Non-streaming: runtime_owner.complete() -> extract text/tool_calls."""
+        final_message = self._runtime_owner.complete(
+            context, options=options, model_spec=self._model_spec,
+        )
+        stop_reason = final_message.get("stop_reason", "stop")
+
+        if stop_reason == "error":
+            error_msg = final_message.get("error_message", "Unknown error")
+            raise RuntimeError(error_msg)
+
+        step_text = _extract_text(final_message)
+        if step_text:
+            self._fire("on_text_delta", step_text)
+
+        tool_calls = _extract_tool_calls(final_message)
+        return step_text, tool_calls, stop_reason, final_message
+
+    # ── streaming call ───────────────────────────────────────────────────
+
+    def _call_streaming(
+        self,
+        context: dict,
+        options: RuntimeOptions,
+    ) -> tuple[str, list[ToolCallRequest], str, dict]:
+        """Streaming: consume RuntimeStream events and fire callbacks."""
+        text_parts: list[str] = []
+        final_message: dict | None = None
+        thinking_active = False
+        stream = None
+
+        try:
+            stream = self._runtime_owner.stream(
+                context, options=options, model_spec=self._model_spec,
+            )
+            for event in stream:
+                etype = event.get("type")
+
+                if etype == "text_delta":
+                    text = event.get("text", "")
+                    if thinking_active:
+                        thinking_active = False
+                        self._fire("on_thinking_stop")
+                    self._fire("on_text_delta", text)
+                    text_parts.append(text)
+
+                elif etype == "thinking_start":
+                    if not thinking_active:
+                        thinking_active = True
+                        self._fire("on_thinking_start")
+
+                elif etype == "thinking_delta":
+                    if not thinking_active:
+                        thinking_active = True
+                        self._fire("on_thinking_start")
+
+                elif etype in ("tool_call_start", "tool_call_delta"):
+                    if thinking_active:
+                        thinking_active = False
+                        self._fire("on_thinking_stop")
+
+                elif etype == "thinking_end":
+                    if thinking_active:
+                        thinking_active = False
+                        self._fire("on_thinking_stop")
+
+                elif etype == "done":
+                    final_message = event["message"]
+
+                elif etype == "error":
+                    final_message = event["message"]
+
+            if final_message is None:
+                final_message = stream.get_final_message()
+
+            stop_reason = final_message.get("stop_reason", "stop")
+            if stop_reason == "error":
+                error_msg = final_message.get("error_message", "Unknown streaming error")
+                raise RuntimeError(error_msg)
+
+            tool_calls = _extract_tool_calls(final_message)
+            return "".join(text_parts), tool_calls, stop_reason, final_message
+
+        finally:
+            if thinking_active:
+                self._fire("on_thinking_stop")
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
