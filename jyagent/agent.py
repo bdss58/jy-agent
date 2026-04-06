@@ -7,11 +7,17 @@ from .memory import (
     ConversationMemory, PersistentMemory, summarize_if_needed,
     build_memory_context,
 )
-from .planner import plan_next_action
+from .terminal_ux import build_streaming_callbacks, ThinkingSpinner, COLOR_YELLOW, COLOR_RED, COLOR_RESET, _interrupted_msg
+from .loop_engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
-from .runtime import RuntimeOwner
+from .runtime import RuntimeOwner, RuntimeOptions
 from .session_stats import get_stats
+from .config import (
+    DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
+    MAX_TOOL_RESULT_CHARS, MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT, STREAM_TIMEOUT,
+    COMPACT_TOOL_RESULT_CHARS, get_reasoning_config_for_provider,
+)
 
 
 # ─── System prompt (externalized from run()) ──────────────────────────────────
@@ -230,6 +236,70 @@ def _graceful_exit(cli):
 _cached_memory_context: str | None = None
 
 
+def _fallback_completion(
+    runtime_owner: RuntimeOwner,
+    system_prompt: str,
+    working_messages: list,
+    max_steps: int,
+) -> tuple:
+    """Try a final non-tool response when max_steps is reached."""
+    from .terminal_ux import _stream_write
+    stats = get_stats()
+    fallback_text = ""
+    try:
+        final_message = runtime_owner.complete(
+            {
+                "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
+                "messages": working_messages,
+            },
+            options=RuntimeOptions(
+                max_output_tokens=DEFAULT_MAX_TOKENS,
+                timeout=STREAM_TIMEOUT,
+                reasoning=get_reasoning_config_for_provider(
+                    runtime_owner.model_spec.provider,
+                    max_output_tokens=DEFAULT_MAX_TOKENS,
+                    model=runtime_owner.model_spec.model,
+                ),
+                metadata={
+                    "component": "planner",
+                    "mode": "fallback_complete",
+                    "step": max_steps,
+                    "fallback": True,
+                },
+            ),
+        )
+        stats.record_usage(
+            final_message.get("usage", {}),
+            provider=final_message.get("provider", ""),
+            model=final_message.get("model", ""),
+        )
+        # Extract text from fallback response
+        fallback_text = "".join(
+            block.get("text", "")
+            for block in final_message.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        if fallback_text:
+            _stream_write(fallback_text)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        working_messages.append(final_message)
+        return (fallback_text, fallback_text, working_messages)
+    except KeyboardInterrupt:
+        _interrupted_msg()
+        msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
+        return (msg, "", working_messages)
+    except Exception as fallback_err:
+        sys.stdout.write(
+            f"{COLOR_RED}\n  Fallback response failed: "
+            f"{fallback_err}"
+            f"{COLOR_RESET}\n"
+        )
+        sys.stdout.flush()
+
+    return ("I've reached my maximum reasoning steps. Please try rephrasing your request.", "", working_messages)
+
+
 def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: RuntimeOwner,
                               force_rebuild: bool = False) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
@@ -353,7 +423,85 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 sys.stdout.flush()
 
                 try:
-                    response, final_text, planner_messages = plan_next_action(runtime_owner, messages, full_system_prompt)
+                    # Build LoopConfig inline
+                    config = LoopConfig(
+                        max_steps=DEFAULT_MAX_STEPS,
+                        initial_max_tokens=DEFAULT_MAX_TOKENS,
+                        max_tokens_cap=MAX_TOKENS_CAP,
+                        auto_scale_on_truncation=True,
+                        token_scale_factor=2,
+                        concurrent_tools=True,
+                        max_tool_workers=4,
+                        tool_timeout=DEFAULT_TOOL_TIMEOUT,
+                        retry_attempts=2,
+                        retry_base_delay=2.0,
+                        compact_messages=True,
+                        max_working_tokens=MAX_WORKING_TOKENS,
+                        compact_tool_result_chars=COMPACT_TOOL_RESULT_CHARS,
+                        max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
+                        streaming=True,
+                    )
+
+                    # Build streaming callbacks
+                    stats = get_stats()
+                    stats.new_turn()
+                    callbacks, spinner = build_streaming_callbacks(stats, runtime_owner)
+
+                    # Create tool source factory
+                    registry = get_registry()
+                    tool_source = lambda: registry.snapshot()[1:]  # (schemas, functions) — skip version
+
+                    # Create AgentLoop and run
+                    loop = AgentLoop(runtime_owner, config, callbacks=callbacks, tool_source=tool_source)
+                    try:
+                        result: LoopResult = loop.run(full_system_prompt, messages)
+                    except KeyboardInterrupt:
+                        spinner.stop()
+                        raise
+                    finally:
+                        spinner.stop()  # ensure spinner is always cleaned up
+
+                    # Handle LoopResult status branches
+                    if result.status == "completed":
+                        if callbacks._state["needs_newline"]:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                        response = result.text
+                        final_text = result.final_text
+                        planner_messages = result.messages
+                    elif result.status == "max_steps":
+                        max_step_msg = f"\n\n⚠️ Reached maximum reasoning steps ({config.max_steps}). My response may be incomplete."
+                        sys.stdout.write(f"{COLOR_YELLOW}{max_step_msg}{COLOR_RESET}\n")
+                        sys.stdout.flush()
+
+                        if result.text:
+                            response = result.text + max_step_msg
+                            final_text = result.final_text
+                            planner_messages = result.messages
+                        else:
+                            # Try a final non-tool response
+                            response, final_text, planner_messages = _fallback_completion(runtime_owner, full_system_prompt, result.messages, config.max_steps)
+                    elif result.status == "interrupted":
+                        _interrupted_msg()
+                        response = result.text
+                        final_text = ""
+                        planner_messages = result.messages
+                    elif result.status == "error":
+                        error_msg = f"\n[Error: {result.error}]\n"
+                        sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
+                        sys.stdout.flush()
+                        if result.text:
+                            response = result.text + f"\n\n[Error: {result.error}]"
+                        else:
+                            response = f"Error during planning: {result.error}"
+                        final_text = ""
+                        planner_messages = result.messages
+                    else:
+                        # Fallback — should not happen
+                        response = result.text or "Unknown error"
+                        final_text = ""
+                        planner_messages = result.messages
+
                 except KeyboardInterrupt:
                     cli.print_system("\n⚠ Interrupted — returning to prompt.")
                     response = "[Response interrupted by user]"
