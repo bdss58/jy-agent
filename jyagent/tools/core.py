@@ -371,6 +371,14 @@ def edit_file(
         else:
             return ToolResult(f"Error: File not found: {path} (set create_if_missing=True to create)", is_error=True)
 
+    # --- Explicit create on existing file → overwrite (not append) ---
+    if operation == "create":
+        if dry_run:
+            return ToolResult(f"[DRY RUN] Would overwrite {path} ({len(new_text)} chars)")
+        atomic_write(path, new_text)
+        lines = new_text.count('\n') + (1 if new_text and not new_text.endswith('\n') else 0)
+        return ToolResult(f"Overwrote {path} ({lines} lines, {len(new_text)} chars)")
+
     # --- Binary guard ---
     if is_binary_ext(path):
         return ToolResult(f"Error: Cannot edit binary file: {path}", is_error=True)
