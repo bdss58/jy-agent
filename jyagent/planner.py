@@ -1,18 +1,17 @@
-# Planner — Streaming tool-use loop with structured results, concurrent execution, unified timeouts.
-# Honesty rules are in the main SYSTEM_PROMPT (agent.py), not duplicated here.
-import json
+# Planner — Thin wrapper around AgentLoop engine.
+# Wires terminal UX (spinner, headers, previews) to the loop via callbacks.
 import sys
 import time
-import atexit
 import threading
-import traceback
-import concurrent.futures
-from dataclasses import dataclass
 from .registry import get_registry
-from .toolresult import ToolResult
-from .validation import validate_tool_input
 from .session_stats import get_stats
 from .runtime import RuntimeOwner, RuntimeOptions
+from .loop_engine import (
+    AgentLoop,
+    LoopCallbacks,
+    LoopConfig,
+    LoopResult,
+)
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_TOOL_USE_INPUT_CHARS,
@@ -20,11 +19,7 @@ from .config import (
     COMPACT_TOOL_RESULT_CHARS, get_reasoning_config_for_provider,
 )
 
-# Shared executor for tool timeouts.  max_workers=4 so a hung tool doesn't
-# block subsequent calls.  NOTE: future.cancel() can't stop a *running* thread,
-# so 4 hung tools would exhaust this pool.  atexit ensures clean shutdown.
-_tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-atexit.register(_tool_executor.shutdown, wait=False)
+# ─── Colors ──────────────────────────────────────────────────────────────────
 
 TOOL_COLOR = "\033[0;33m"  # yellow for tool info
 COLOR_RESET = "\033[0m"
@@ -37,30 +32,7 @@ COLOR_MAGENTA = "\033[0;35m"
 COLOR_DIM_YELLOW = "\033[2;33m"
 
 
-@dataclass
-class _ToolCallRequest:
-    id: str
-    name: str
-    input: dict
-
-
-def _is_error_result(result) -> bool:
-    """Detect if a tool result indicates an error."""
-    if isinstance(result, ToolResult):
-        return result.is_error
-    # Fallback for any non-ToolResult values
-    s = str(result)
-    return s.startswith("Error:") or s.startswith("Error calling tool")
-
-
-def _result_content(result) -> str:
-    """Extract string content from a tool result."""
-    if isinstance(result, ToolResult):
-        return result.content
-    return str(result)
-
-
-# ─── Output helpers ───────────────────────────────────────────────────────────
+# ─── Output helpers ──────────────────────────────────────────────────────────
 
 def _stream_write(text: str):
     """Write streamed text to stdout."""
@@ -68,7 +40,7 @@ def _stream_write(text: str):
     sys.stdout.flush()
 
 
-# ─── Thinking spinner ────────────────────────────────────────────────────────
+# ─── Thinking spinner ───────────────────────────────────────────────────────
 
 class _ThinkingSpinner:
     """Animated spinner shown while waiting for the first token.
@@ -115,7 +87,7 @@ class _ThinkingSpinner:
             self._stop_event.wait(0.08)
 
 
-# ─── Tool output formatting ──────────────────────────────────────────────────
+# ─── Tool output formatting ─────────────────────────────────────────────────
 
 _TOOL_ICONS = {
     "run_shell": "⚡", "read_file": "📄", "write_file": "📝",
@@ -299,518 +271,7 @@ def _truncate_tool_call_blocks(blocks: list) -> list:
     return out
 
 
-def _compact_working_messages(messages: list, max_tokens: int = None) -> list:
-    """Aggressively truncate older tool results when working_messages is too large.
-
-    Keeps the last 2 messages (most recent tool call + result) intact so Claude
-    can reason about the latest tool output.
-    """
-    if max_tokens is None:
-        max_tokens = MAX_WORKING_TOKENS
-
-    from .memory import estimate_conversation_tokens
-    estimated = estimate_conversation_tokens(messages)
-    if estimated <= max_tokens:
-        return messages
-
-    AGGRESSIVE_LIMIT = COMPACT_TOOL_RESULT_CHARS
-    compacted = [dict(m) for m in messages]  # shallow copy each message
-
-    # Work from oldest, skip the last 2 messages
-    for i in range(len(compacted) - 2):
-        msg = compacted[i]
-        if msg.get("role") == "tool_result":
-            result_text = str(msg.get("content", ""))
-            if len(result_text) > AGGRESSIVE_LIMIT:
-                compacted[i]["content"] = (
-                    result_text[:AGGRESSIVE_LIMIT]
-                    + f"\n[... compacted from {len(result_text)} chars ...]"
-                )
-            continue
-
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            new_blocks = []
-            for block in _truncate_tool_call_blocks(content):
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    result_text = str(block.get("content", ""))
-                    if len(result_text) > AGGRESSIVE_LIMIT:
-                        block = dict(block)
-                        block["content"] = (
-                            result_text[:AGGRESSIVE_LIMIT]
-                            + f"\n[... compacted from {len(result_text)} chars ...]"
-                        )
-                new_blocks.append(block)
-            compacted[i]["content"] = new_blocks
-
-    return compacted
-
-
-# ─── Tool execution ─────────────────────────────────────────────────────────
-
-def _execute_tool(tool_name: str, tool_input: dict, tool_functions: dict) -> ToolResult:
-    """Execute a tool call and return a ToolResult.
-    
-    Returns ToolResult with is_error=True for:
-    - Unknown tool names
-    - Missing required parameters
-    - Exceptions during execution
-    - Timeout exceeded
-    """
-    fn = tool_functions.get(tool_name)
-    if fn is None:
-        return ToolResult(
-            f"Error: Unknown tool '{tool_name}'. Available: {sorted(tool_functions.keys())[:20]}",
-            is_error=True
-        )
-
-    tool_schema = get_registry().get_schema(tool_name)
-    validation_error = validate_tool_input(tool_name, tool_input, fn, tool_schema)
-    if validation_error:
-        return ToolResult(validation_error, is_error=True)
-
-    try:
-        if tool_input is None:
-            tool_input = {}
-        raw_result = fn(**tool_input)
-        # All tools should return ToolResult; wrap legacy string returns for safety
-        if isinstance(raw_result, ToolResult):
-            return raw_result
-        return ToolResult(str(raw_result))
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        error_text = str(e)
-        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        return ToolResult(
-            f"Error calling tool {tool_name}: {error_text}\n{error_detail}",
-            is_error=True
-        )
-
-
-def _execute_tool_with_timeout(tool_name: str, tool_input: dict, tool_functions: dict,
-                                timeout: int = None) -> ToolResult:
-    """Execute a tool with a unified timeout.
-
-    Timeout is determined from registry metadata (timeout_hint).
-    Tools without a hint use DEFAULT_TOOL_TIMEOUT.
-    run_shell is special: its timeout comes from its own input parameter.
-    """
-    if timeout is None:
-        timeout = DEFAULT_TOOL_TIMEOUT
-
-    registry = get_registry()
-    hint = registry.get_timeout_hint(tool_name)
-    if hint is not None:
-        timeout = max(timeout, hint)
-
-    # run_shell manages its own timeout — give it extra slack
-    if tool_name == "run_shell":
-        user_timeout = tool_input.get("timeout", 60)
-        timeout = max(timeout, int(user_timeout) + 10)
-
-    future = _tool_executor.submit(_execute_tool, tool_name, tool_input, tool_functions)
-    try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        future.cancel()
-        return ToolResult(
-            f"Error: Tool '{tool_name}' timed out after {timeout}s. "
-            f"Consider breaking the operation into smaller steps.",
-            is_error=True
-        )
-    except KeyboardInterrupt:
-        future.cancel()
-        raise
-
-
-# ─── Multi-tool dispatch ─────────────────────────────────────────────────────
-
-def _execute_tools(tool_blocks: list, tool_functions: dict) -> list:
-    """Execute tool calls with selective parallelization.
-
-    Parallel-safe tools (read_file, glob_files, etc.) run concurrently.
-    State-mutating tools run sequentially in original order.
-    Sequential tools act as barriers between parallel batches.
-    Results are always returned in original order.
-    """
-    registry = get_registry()
-
-    # Fast path: single tool or no parallel-safe tools → sequential
-    if len(tool_blocks) <= 1 or not any(
-        registry.is_parallel_safe(b.name) for b in tool_blocks
-    ):
-        results = []
-        for block in tool_blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, tool_functions)
-            results.append((block, result))
-        return results
-
-    # Partition into contiguous groups and execute
-    results = [None] * len(tool_blocks)
-    i = 0
-    while i < len(tool_blocks):
-        if registry.is_parallel_safe(tool_blocks[i].name):
-            # Collect contiguous parallel-safe tools
-            parallel_batch = []
-            while i < len(tool_blocks) and registry.is_parallel_safe(tool_blocks[i].name):
-                parallel_batch.append((i, tool_blocks[i]))
-                i += 1
-
-            # Execute batch concurrently via the shared executor
-            # (_execute_tool_with_timeout already submits to _tool_executor for
-            # timeout enforcement, so we call _execute_tool directly here to
-            # avoid a double thread-pool layer.)
-            futures = {
-                _tool_executor.submit(
-                    _execute_tool, block.name, block.input, tool_functions
-                ): (idx, block)
-                for idx, block in parallel_batch
-            }
-            for future in concurrent.futures.as_completed(futures):
-                idx, block = futures[future]
-                try:
-                    results[idx] = (block, future.result())
-                except Exception as exc:
-                    error_text = str(exc)
-                    error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                    results[idx] = (block, ToolResult(
-                        f"Error calling tool {block.name}: {error_text}\n{error_detail}",
-                        is_error=True
-                    ))
-        else:
-            # Sequential tool — execute immediately as a barrier
-            block = tool_blocks[i]
-            result = _execute_tool_with_timeout(block.name, block.input, tool_functions)
-            results[i] = (block, result)
-            i += 1
-
-    return results
-
-
-def _assistant_tool_calls(message: dict) -> list[_ToolCallRequest]:
-    return [
-        _ToolCallRequest(
-            id=block["id"],
-            name=block["name"],
-            input=block.get("arguments", {}),
-        )
-        for block in message.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "tool_call"
-    ]
-
-
-def _assistant_text(message: dict) -> str:
-    return "".join(
-        block.get("text", "")
-        for block in message.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
-
-
-def _is_truncated_tool_call(stop_reason: str, tool_use_blocks: list[_ToolCallRequest]) -> bool:
-    """Detect if a response likely stopped while emitting tool calls."""
-    return stop_reason == "length" and bool(tool_use_blocks)
-
-
-# ─── Streaming helper ────────────────────────────────────────────────────────
-
-def _runtime_options(
-    runtime_owner: RuntimeOwner,
-    max_output_tokens: int,
-    metadata: dict | None = None,
-) -> RuntimeOptions:
-    return RuntimeOptions(
-        max_output_tokens=max_output_tokens,
-        timeout=STREAM_TIMEOUT,
-        reasoning=get_reasoning_config_for_provider(
-            runtime_owner.model_spec.provider,
-            max_output_tokens=max_output_tokens,
-            model=runtime_owner.model_spec.model,
-        ),
-        metadata=metadata,
-    )
-
-
-def _record_response_usage(final_message: dict):
-    stats = get_stats()
-    stats.record_usage(
-        final_message.get("usage", {}),
-        provider=final_message.get("provider", ""),
-        model=final_message.get("model", ""),
-    )
-
-
-def _stream_error_diagnostics(error: BaseException) -> dict:
-    diagnostics = getattr(error, "stream_diagnostics", None)
-    if isinstance(diagnostics, dict):
-        return diagnostics
-    return {}
-
-
-def _format_stream_error_diagnostics(error: BaseException) -> str:
-    diagnostics = _stream_error_diagnostics(error)
-    if not diagnostics:
-        return ""
-
-    lines = []
-    response_id = diagnostics.get("response_id")
-    if response_id:
-        lines.append(f"    response_id: {response_id}")
-
-    payload_kind = diagnostics.get("stream_payload_kind")
-    payload_summary = diagnostics.get("stream_payload_summary")
-    if payload_kind and payload_summary:
-        lines.append(f"    payload: {payload_kind} ({payload_summary})")
-    elif payload_kind:
-        lines.append(f"    payload: {payload_kind}")
-
-    line = diagnostics.get("json_error_line")
-    column = diagnostics.get("json_error_column")
-    position = diagnostics.get("json_error_position")
-    location_bits = []
-    if line is not None and column is not None:
-        location_bits.append(f"L{line}:C{column}")
-    if position is not None:
-        location_bits.append(f"char {position}")
-    if location_bits:
-        lines.append(f"    location: {'; '.join(location_bits)}")
-
-    snippet = diagnostics.get("json_error_snippet")
-    if snippet:
-        lines.append(f"    snippet: {snippet}")
-
-    return "\n".join(lines)
-
-
-class _StreamFailure(Exception):
-    """Raised when a streamed response fails after emitting partial output."""
-
-    def __init__(self, error: BaseException, partial_text: str, final_message: dict | None = None):
-        super().__init__(str(error))
-        self.error = error
-        self.partial_text = partial_text
-        self.final_message = final_message
-
-
-def _stream_abort_text(existing_text: str, step: int, error: BaseException) -> str:
-    error_text = (
-        f"[Error: streaming interrupted at step {step + 1}: "
-        f"{error}]"
-    )
-    if existing_text:
-        return existing_text + "\n\n" + error_text
-    return error_text
-
-def _stream_response(
-    runtime_owner: RuntimeOwner,
-    context: dict,
-    max_output_tokens: int,
-    metadata: dict | None = None,
-) -> tuple:
-    """
-    Stream a single runtime response with thinking spinner and token tracking.
-    Returns (step_text, tool_use_blocks, stop_reason, final_message).
-    """
-    text_parts = []
-    stop_reason = "stop"
-    final_message = None
-    first_token = True
-    spinner = _ThinkingSpinner()
-    spinner.start()
-    stream = None
-
-    try:
-        stream = runtime_owner.stream(
-            context,
-            options=_runtime_options(runtime_owner, max_output_tokens, metadata),
-        )
-        for event in stream:
-            event_type = event.get("type")
-            if event_type == "text_delta":
-                if first_token:
-                    spinner.stop()
-                    first_token = False
-                _stream_write(event.get("text", ""))
-                text_parts.append(event.get("text", ""))
-            elif event_type in ("tool_call_delta", "thinking_delta"):
-                if first_token:
-                    spinner.stop()
-                    first_token = False
-            elif event_type == "done":
-                final_message = event["message"]
-            elif event_type == "error":
-                final_message = event["message"]
-            # Silently ignore: start, *_start, *_end
-
-        if final_message is None:
-            final_message = stream.get_final_message()
-
-        for warning in final_message.get("runtime_warnings", []):
-            _runtime_warning(warning)
-        stop_reason = final_message.get("stop_reason", "stop")
-
-        if stop_reason == "error":
-            error_msg = final_message.get("error_message", "Unknown streaming error")
-            raise _StreamFailure(Exception(error_msg), "".join(text_parts), final_message=final_message)
-
-        tool_use_blocks = _assistant_tool_calls(final_message)
-        _record_response_usage(final_message)
-    except KeyboardInterrupt:
-        raise
-    except _StreamFailure:
-        raise
-    except Exception as err:
-        raise _StreamFailure(err, "".join(text_parts)) from err
-    finally:
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
-        spinner.stop()  # Ensure spinner is always cleaned up
-
-    return "".join(text_parts), tool_use_blocks, stop_reason, final_message
-
-
-# ─── Main planner loop ───────────────────────────────────────────────────────
-
-_STREAM_MAX_RETRIES = 2
-
-
-def _stream_with_retry(
-    runtime_owner: RuntimeOwner,
-    context: dict,
-    max_output_tokens: int,
-    step: int,
-    all_text: str,
-    working_messages: list,
-):
-    """Stream a response with auto-retry on transient failures.
-
-    Returns (step_text, tool_use_blocks, stop_reason, final_message) on success.
-    Returns None and a tuple (all_text, final_text, working_messages) on fatal error
-    via a special sentinel: raises _StreamAbort with the return tuple.
-    """
-    for attempt in range(_STREAM_MAX_RETRIES + 1):
-        try:
-            return _stream_response(
-                runtime_owner,
-                context,
-                max_output_tokens,
-                metadata={
-                    "component": "planner",
-                    "mode": "stream",
-                    "step": step + 1,
-                    "attempt": attempt + 1,
-                },
-            )
-        except KeyboardInterrupt:
-            _interrupted_msg()
-            msg = all_text + "\n\n[Response interrupted by user]" if all_text else "[Response interrupted by user]"
-            raise _StreamAbort(msg, "", working_messages)
-        except _StreamFailure as stream_failure:
-            stream_err = stream_failure.error
-            partial_step_text = stream_failure.partial_text
-        except Exception as err:
-            stream_err = err
-            partial_step_text = ""
-
-        is_transient = isinstance(stream_err, json.JSONDecodeError) or any(kw in str(stream_err).lower() for kw in [
-            "incomplete", "peer closed", "connection reset", "timeout",
-            "eof", "broken pipe", "overloaded", "529", "server_error",
-        ])
-        if is_transient and attempt < _STREAM_MAX_RETRIES:
-            retry_delay = 2 ** (attempt + 1)  # 2s, 4s
-            retry_msg = (
-                "\n⚡ Stream interrupted "
-                f"({stream_err}), "
-                f"retrying in {retry_delay}s... "
-                f"(attempt {attempt + 2}/{_STREAM_MAX_RETRIES + 1})\n"
-            )
-            sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
-            sys.stdout.flush()
-            time.sleep(retry_delay)  # responds to KeyboardInterrupt
-            continue
-        # Non-transient error or retries exhausted
-        error_text = str(stream_err)
-        error_msg = f"\n[Stream error at step {step+1}: {error_text}]"
-        diagnostics_text = _format_stream_error_diagnostics(stream_err)
-        if diagnostics_text:
-            error_msg += f"\n{diagnostics_text}"
-        error_msg += "\n"
-        sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
-        sys.stdout.flush()
-        if all_text or partial_step_text:
-            raise _StreamAbort(
-                _stream_abort_text(
-                    all_text + partial_step_text,
-                    step,
-                    stream_err,
-                ),
-                "",
-                working_messages,
-            )
-        raise _StreamAbort(f"Error during streaming: {error_text}", "", working_messages)
-
-
-class _StreamAbort(Exception):
-    """Raised by _stream_with_retry to signal an early return from plan_next_action."""
-    def __init__(self, all_text, final_text, working_messages):
-        self.result = (all_text, final_text, working_messages)
-
-
-def _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_text):
-    """Execute tool calls and append results to working_messages.
-
-    Returns the list of normalized tool_result messages.
-    Raises KeyboardInterrupt (with synthetic results already appended) if interrupted.
-    """
-    try:
-        stats = get_stats()
-        n_tools = len(tool_use_blocks)
-        if n_tools > 1:
-            _tool_info(f"Executing {n_tools} tool calls...")
-
-        # Print headers for all tool calls
-        for block in tool_use_blocks:
-            _tool_call_header(block.name, block.input if hasattr(block, 'input') else {})
-
-        executed = _execute_tools(tool_use_blocks, tool_functions)
-
-        tool_results = []
-        for block, result in executed:
-            stats.record_tool_call()
-            content_str = _truncate_tool_result(result.content, is_error=result.is_error)
-            _tool_result_preview(content_str, tool_name=block.name, is_error=result.is_error)
-
-            tool_result_block = {
-                "role": "tool_result",
-                "tool_call_id": block.id,
-                "tool_name": block.name,
-                "content": content_str,
-                "is_error": result.is_error,
-            }
-
-            tool_results.append(tool_result_block)
-
-        return tool_results
-
-    except KeyboardInterrupt:
-        _interrupted_msg()
-        synthetic_results = [
-            {
-                "role": "tool_result",
-                "tool_call_id": b.id,
-                "tool_name": b.name,
-                "content": "[Tool execution interrupted by user]",
-                "is_error": True,
-            }
-            for b in tool_use_blocks
-        ]
-        working_messages.extend(synthetic_results)
-        msg = all_text + "\n\n[Tool execution interrupted by user]" if all_text else "[Tool execution interrupted by user]"
-        raise _StreamAbort(msg, "", working_messages)
+# ─── Main planner entry point ───────────────────────────────────────────────
 
 def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt: str, max_steps: int = None) -> tuple:
     """
@@ -822,150 +283,222 @@ def plan_next_action(runtime_owner: RuntimeOwner, messages: list, system_prompt:
     if max_steps is None:
         max_steps = DEFAULT_MAX_STEPS
 
-    # Defaults for the outer except handler (overwritten inside try)
-    working_messages = []
-    all_text = ""
+    stats = get_stats()
+    stats.new_turn()
+
+    working_messages = messages.copy()
+
+    # ── Mutable state shared by callbacks ──
+    spinner = _ThinkingSpinner()
+    needs_newline = False  # True when text was streamed and tools/completion follow
+
+    def _on_text_delta(text: str):
+        nonlocal needs_newline
+        spinner.stop()
+        _stream_write(text)
+        needs_newline = True
+
+    def _on_thinking_start():
+        spinner.start()
+
+    def _on_thinking_stop():
+        spinner.stop()
+
+    def _on_tool_start(name: str, tool_input: dict):
+        nonlocal needs_newline
+        spinner.stop()
+        if needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            needs_newline = False
+        _tool_call_header(name, tool_input)
+
+    def _on_tool_end(name: str, content: str, is_error: bool):
+        stats.record_tool_call()
+        _tool_result_preview(content, tool_name=name, is_error=is_error)
+
+    def _on_retry(attempt: int, error: Exception):
+        retry_msg = (
+            f"\n⚡ Stream interrupted ({error}), "
+            f"retrying... "
+            f"(attempt {attempt + 1})\n"
+        )
+        sys.stdout.write(f"{COLOR_YELLOW}{retry_msg}{COLOR_RESET}")
+        sys.stdout.flush()
+
+    def _on_usage(usage: dict):
+        stats.record_usage(
+            usage,
+            provider=runtime_owner.model_spec.provider,
+            model=runtime_owner.model_spec.model,
+        )
+
+    def _on_step_progress(step: int, max_steps_val: int):
+        nonlocal needs_newline
+        needs_newline = False
+        if step >= 5:
+            sys.stdout.write(f"{COLOR_DIM}  [Step {step + 1}/{max_steps_val}]{COLOR_RESET}\n")
+            sys.stdout.flush()
+
+    def _on_compaction(before_len: int, after_len: int):
+        pass  # silent — could add diagnostic output here
+
+    def _on_assistant_message(msg: dict) -> dict:
+        """Truncate large tool_call inputs before the engine appends to messages."""
+        msg = dict(msg)
+        msg["content"] = _truncate_tool_call_blocks(msg.get("content", []))
+        return msg
+
+    def _on_warning(warning: str):
+        _runtime_warning(warning)
+
+    def _on_truncation():
+        _tool_info("⚠️ Response truncated (max_tokens hit). Retrying with higher token limit...")
+
+    def _on_tool_batch(n_tools: int):
+        _tool_info(f"Executing {n_tools} tool calls...")
+
+    callbacks = LoopCallbacks(
+        on_text_delta=_on_text_delta,
+        on_thinking_start=_on_thinking_start,
+        on_thinking_stop=_on_thinking_stop,
+        on_tool_start=_on_tool_start,
+        on_tool_end=_on_tool_end,
+        on_retry=_on_retry,
+        on_usage=_on_usage,
+        on_step_progress=_on_step_progress,
+        on_compaction=_on_compaction,
+        on_assistant_message=_on_assistant_message,
+        on_warning=_on_warning,
+        on_truncation=_on_truncation,
+        on_tool_batch=_on_tool_batch,
+    )
+
+    config = LoopConfig(
+        max_steps=max_steps,
+        initial_max_tokens=DEFAULT_MAX_TOKENS,
+        max_tokens_cap=MAX_TOKENS_CAP,
+        auto_scale_on_truncation=True,
+        token_scale_factor=2,
+        concurrent_tools=True,
+        max_tool_workers=4,
+        tool_timeout=DEFAULT_TOOL_TIMEOUT,
+        retry_attempts=2,
+        retry_base_delay=2.0,
+        compact_messages=True,
+        max_working_tokens=MAX_WORKING_TOKENS,
+        compact_tool_result_chars=COMPACT_TOOL_RESULT_CHARS,
+        max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
+        streaming=True,
+    )
+
+    registry = get_registry()
+    tool_source = lambda: registry.snapshot()[1:]  # (schemas, functions) — skip version
+
+    loop = AgentLoop(runtime_owner, config, callbacks=callbacks, tool_source=tool_source)
 
     try:
-        stats = get_stats()
-        stats.new_turn()
-        working_messages = messages.copy()
-        all_text = ""
-        final_text = ""  # Only the last step's text (for markdown rendering)
-        current_max_tokens = DEFAULT_MAX_TOKENS
+        result: LoopResult = loop.run(system_prompt, working_messages)
+    except KeyboardInterrupt:
+        spinner.stop()
+        _interrupted_msg()
+        msg = "\n\n[Interrupted by user]"
+        return (msg, "", working_messages)
 
-        registry = get_registry()
-        reg_version, tool_schemas, tool_functions = registry.snapshot()
+    spinner.stop()  # ensure spinner is always cleaned up
 
-        for step in range(max_steps):
-            # Guard: compact working_messages if token count is too high
-            working_messages = _compact_working_messages(working_messages)
+    # ── Translate LoopResult to the legacy return tuple ──
+    if result.status == "completed":
+        if needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        return (result.text, result.final_text, result.messages)
 
-            context = {
-                "system_prompt": system_prompt,
-                "messages": working_messages,
-            }
-            if tool_schemas:
-                context["tools"] = tool_schemas
-
-            # Stream with auto-retry on transient failures
-            step_text, tool_use_blocks, stop_reason, final_message = _stream_with_retry(
-                runtime_owner, context, current_max_tokens, step, all_text, working_messages
-            )
-
-            all_text += step_text
-            final_text = step_text  # Always track latest step's text
-
-            # If there are no tool calls, we're done
-            if not tool_use_blocks:
-                if not step_text:
-                    final_text = _assistant_text(final_message)
-                    all_text = final_text or all_text
-                if step_text:
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                result = all_text if all_text else "I processed your request but had no text response to return."
-                working_messages.append(final_message)
-                return (result, final_text, working_messages)
-
-            # --- Handle tool calls ---
-            if step_text:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-
-            # Detect truncated responses
-            if _is_truncated_tool_call(stop_reason, tool_use_blocks):
-                _tool_info("⚠️ Response truncated (max_tokens hit). Retrying with higher token limit...")
-                current_max_tokens = min(current_max_tokens * 2, MAX_TOKENS_CAP)
-                all_text = all_text[:-len(step_text)] if step_text else all_text
-                continue
-
-            # Append assistant's full normalized response (with large write inputs truncated)
-            final_message = dict(final_message)
-            final_message["content"] = _truncate_tool_call_blocks(final_message.get("content", []))
-            working_messages.append(final_message)
-
-            # Execute tool calls and build results
-            tool_results = _handle_tool_calls(tool_use_blocks, tool_functions, working_messages, all_text)
-
-            working_messages.extend(tool_results)
-
-            # Refresh tool snapshots if registry changed (e.g. MCP connect mid-turn)
-            if registry.version != reg_version:
-                reg_version, tool_schemas, tool_functions = registry.snapshot()
-
-            # Show step progress for long operations
-            if step >= 5:
-                sys.stdout.write(f"{COLOR_DIM}  [Step {step+1}/{max_steps}]{COLOR_RESET}\n")
-                sys.stdout.flush()
-
-        # Max steps reached
+    if result.status == "max_steps":
         max_step_msg = f"\n\n⚠️ Reached maximum reasoning steps ({max_steps}). My response may be incomplete."
         sys.stdout.write(f"{COLOR_YELLOW}{max_step_msg}{COLOR_RESET}\n")
         sys.stdout.flush()
 
-        if all_text:
-            return (all_text + max_step_msg, final_text, working_messages)
+        if result.text:
+            return (result.text + max_step_msg, result.final_text, result.messages)
 
         # Try a final non-tool response
-        fallback_text = ""
-        try:
-            final_message = runtime_owner.complete(
-                {
-                    "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
-                    "messages": working_messages,
-                },
-                options=RuntimeOptions(
+        return _fallback_completion(runtime_owner, system_prompt, result.messages, max_steps)
+
+    if result.status == "interrupted":
+        _interrupted_msg()
+        return (result.text, "", result.messages)
+
+    if result.status == "error":
+        error_msg = f"\n[Error: {result.error}]\n"
+        sys.stdout.write(f"{COLOR_RED}{error_msg}{COLOR_RESET}")
+        sys.stdout.flush()
+        if result.text:
+            return (result.text + f"\n\n[Error: {result.error}]", "", result.messages)
+        return (f"Error during planning: {result.error}", "", result.messages)
+
+    # Fallback — should not happen
+    return (result.text or "Unknown error", "", result.messages)
+
+
+def _fallback_completion(
+    runtime_owner: RuntimeOwner,
+    system_prompt: str,
+    working_messages: list,
+    max_steps: int,
+) -> tuple:
+    """Try a final non-tool response when max_steps is reached."""
+    stats = get_stats()
+    fallback_text = ""
+    try:
+        final_message = runtime_owner.complete(
+            {
+                "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
+                "messages": working_messages,
+            },
+            options=RuntimeOptions(
+                max_output_tokens=DEFAULT_MAX_TOKENS,
+                timeout=STREAM_TIMEOUT,
+                reasoning=get_reasoning_config_for_provider(
+                    runtime_owner.model_spec.provider,
                     max_output_tokens=DEFAULT_MAX_TOKENS,
-                    timeout=STREAM_TIMEOUT,
-                    reasoning=get_reasoning_config_for_provider(
-                        runtime_owner.model_spec.provider,
-                        max_output_tokens=DEFAULT_MAX_TOKENS,
-                        model=runtime_owner.model_spec.model,
-                    ),
-                    metadata={
-                        "component": "planner",
-                        "mode": "fallback_complete",
-                        "step": max_steps,
-                        "fallback": True,
-                    },
+                    model=runtime_owner.model_spec.model,
                 ),
-            )
-            stats.record_usage(
-                final_message.get("usage", {}),
-                provider=final_message.get("provider", ""),
-                model=final_message.get("model", ""),
-            )
-            fallback_text = _assistant_text(final_message)
-            if fallback_text:
-                _stream_write(fallback_text)
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            working_messages.append(final_message)
-            return (fallback_text, fallback_text, working_messages)
-        except KeyboardInterrupt:
-            _interrupted_msg()
-            msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
-            return (msg, "", working_messages)
-        except Exception as fallback_err:
-            sys.stdout.write(
-                f"{COLOR_RED}\n  Fallback response failed: "
-                f"{fallback_err}"
-                f"{COLOR_RESET}\n"
-            )
-            sys.stdout.flush()
-
-        return ("I've reached my maximum reasoning steps. Please try rephrasing your request.", "", working_messages)
-
-    except _StreamAbort as abort:
-        return abort.result
+                metadata={
+                    "component": "planner",
+                    "mode": "fallback_complete",
+                    "step": max_steps,
+                    "fallback": True,
+                },
+            ),
+        )
+        stats.record_usage(
+            final_message.get("usage", {}),
+            provider=final_message.get("provider", ""),
+            model=final_message.get("model", ""),
+        )
+        # Extract text from fallback response
+        fallback_text = "".join(
+            block.get("text", "")
+            for block in final_message.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        if fallback_text:
+            _stream_write(fallback_text)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        working_messages.append(final_message)
+        return (fallback_text, fallback_text, working_messages)
     except KeyboardInterrupt:
         _interrupted_msg()
-        msg = all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]"
+        msg = fallback_text + "\n\n[Response interrupted by user]" if fallback_text else "[Response interrupted by user]"
         return (msg, "", working_messages)
-    except Exception as e:
-        error_text = str(e)
-        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        sys.stdout.write(f"{COLOR_RED}\nFatal error in planner: {error_text}\n{error_detail}{COLOR_RESET}\n")
+    except Exception as fallback_err:
+        sys.stdout.write(
+            f"{COLOR_RED}\n  Fallback response failed: "
+            f"{fallback_err}"
+            f"{COLOR_RESET}\n"
+        )
         sys.stdout.flush()
-        return (f"Error during planning: {error_text}", "", working_messages)
+
+    return ("I've reached my maximum reasoning steps. Please try rephrasing your request.", "", working_messages)
