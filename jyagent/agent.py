@@ -343,6 +343,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 )
 
                 messages = conversation.get_history()
+                history_len = len(messages)  # snapshot before loop mutates in-place
 
                 # Build system prompt (memory cached, skills always rebuilt)
                 force_rebuild = state.pop("_force_rebuild_context", False)
@@ -442,8 +443,8 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 _cached_memory_context = None
 
                 # Preserve structured tool_use/tool_result messages from the planner loop.
-                # planner_messages starts as messages.copy(), so new entries start after that.
-                new_messages = planner_messages[len(messages):]
+                # loop.run() mutates messages in-place, so use the pre-loop snapshot.
+                new_messages = planner_messages[history_len:]
                 if new_messages:
                     conversation.messages.extend(new_messages)
                 else:
