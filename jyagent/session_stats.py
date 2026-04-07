@@ -49,25 +49,10 @@ def _pricing(
 
 _MODEL_PRICING = {
     "anthropic": {
-        "claude-sonnet-4": _pricing(3.0, 15.0, cache_creation_per_million=3.75, cache_read_per_million=0.30),
-        "claude-3-5-sonnet": _pricing(3.0, 15.0, cache_creation_per_million=3.75, cache_read_per_million=0.30),
-        "claude-3-7-sonnet": _pricing(3.0, 15.0, cache_creation_per_million=3.75, cache_read_per_million=0.30),
-        "claude-3-5-haiku": _pricing(0.80, 4.0, cache_creation_per_million=1.0, cache_read_per_million=0.08),
-        "claude-3-haiku": _pricing(0.25, 1.25, cache_creation_per_million=0.3125, cache_read_per_million=0.025),
-        "claude-3-opus": _pricing(15.0, 75.0, cache_creation_per_million=18.75, cache_read_per_million=1.5),
-        "claude-opus-4": _pricing(15.0, 75.0, cache_creation_per_million=18.75, cache_read_per_million=1.5),
+        "claude-opus-4-6": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
     },
     "openai": {
-        "gpt-4o": _pricing(2.50, 10.0, cache_read_per_million=1.25),
-        "gpt-4o-mini": _pricing(0.15, 0.60, cache_read_per_million=0.075),
-        "gpt-4.1": _pricing(2.0, 8.0, cache_read_per_million=0.50),
-        "gpt-4.1-mini": _pricing(0.40, 1.60, cache_read_per_million=0.10),
-        "gpt-4.1-nano": _pricing(0.10, 0.40, cache_read_per_million=0.025),
-        "o3": _pricing(2.0, 8.0, cache_read_per_million=0.50),
-        "o3-mini": _pricing(1.10, 4.40, cache_read_per_million=0.275),
-        "o4-mini": _pricing(1.10, 4.40, cache_read_per_million=0.275),
-        "o1": _pricing(15.0, 60.0, cache_read_per_million=7.50),
-        "o1-mini": _pricing(1.10, 4.40, cache_read_per_million=0.55),
+        "gpt-5.4": _pricing(2.50, 15.0, cache_read_per_million=0.25),
     },
 }
 
