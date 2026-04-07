@@ -151,8 +151,8 @@ def _cmd_stats(cli, **_):
     """Show detailed session statistics."""
     stats = get_stats()
     model_label = (
-        f"{stats._provider}:{stats._model}"
-        if stats._provider and stats._model
+        f"{stats.provider}:{stats.model}"
+        if stats.provider and stats.model
         else "(none yet)"
     )
     lines = [
@@ -480,7 +480,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
         try:
             console.print("\n[system]⚠ Interrupted.[/system]")
             if cli and conversation:
-                _graceful_exit(runtime_owner, conversation, cli)
+                _graceful_exit(cli)
             else:
                 console.print("[system]👋 Goodbye![/system]")
         except Exception:

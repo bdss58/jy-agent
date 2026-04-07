@@ -144,6 +144,14 @@ class SessionStats:
             self._provider = provider or self._provider
             self._model = model or self._model
 
+    @property
+    def provider(self) -> str:
+        return self._provider
+
+    @property
+    def model(self) -> str:
+        return self._model
+
     def _usage_value(self, usage, key: str) -> int:
         if usage is None:
             return 0

@@ -147,13 +147,15 @@ def _compact_messages(
     """Aggressively truncate older tool results when context is too large.
 
     Keeps the last 2 messages intact so the LLM can reason about the most
-    recent tool output.
+    recent tool output.  Returns the original list unchanged if no truncation
+    was performed.
     """
     estimated = estimate_conversation_tokens(messages)
     if estimated <= max_tokens:
         return messages
 
     compacted = [dict(m) for m in messages]  # shallow copy each message
+    did_compact = False
 
     for i in range(len(compacted) - 2):
         msg = compacted[i]
@@ -164,11 +166,13 @@ def _compact_messages(
                     result_text[:compact_chars]
                     + f"\n[... compacted from {len(result_text)} chars ...]"
                 )
+                did_compact = True
             continue
 
         content = msg.get("content", "")
         if isinstance(content, list):
             new_blocks = []
+            block_changed = False
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     result_text = str(block.get("content", ""))
@@ -178,8 +182,14 @@ def _compact_messages(
                             result_text[:compact_chars]
                             + f"\n[... compacted from {len(result_text)} chars ...]"
                         )
+                        block_changed = True
                 new_blocks.append(block)
-            compacted[i]["content"] = new_blocks
+            if block_changed:
+                compacted[i]["content"] = new_blocks
+                did_compact = True
+
+    if not did_compact:
+        return messages
 
     return compacted
 
@@ -254,6 +264,7 @@ def _execute_tools(
     concurrent_mode: bool,
     max_workers: int,
     timeout: int,
+    executor: concurrent.futures.ThreadPoolExecutor | None = None,
 ) -> list[tuple[ToolCallRequest, ToolResult]]:
     """Execute tool calls with selective parallelisation.
 
@@ -289,9 +300,10 @@ def _execute_tools(
                 parallel_batch.append((i, blocks[i]))
                 i += 1
 
+            pool = executor or _tool_executor
             futures = {
-                _tool_executor.submit(
-                    _execute_tool, block.name, block.input, functions, registry
+                pool.submit(
+                    _execute_tool_with_timeout, block.name, block.input, functions, registry, timeout
                 ): (idx, block)
                 for idx, block in parallel_batch
             }
@@ -320,8 +332,9 @@ def _execute_tool_with_timeout(
     functions: dict[str, Callable],
     registry,
     default_timeout: int,
+    executor: concurrent.futures.ThreadPoolExecutor | None = None,
 ) -> ToolResult:
-    """Execute a tool via the shared executor with a timeout."""
+    """Execute a tool via an executor with a timeout."""
     timeout = default_timeout
     hint = registry.get_timeout_hint(name)
     if hint is not None:
@@ -332,7 +345,8 @@ def _execute_tool_with_timeout(
         user_timeout = (tool_input or {}).get("timeout", 60)
         timeout = max(timeout, int(user_timeout) + 10)
 
-    future = _tool_executor.submit(_execute_tool, name, tool_input, functions, registry)
+    pool = executor or _tool_executor
+    future = pool.submit(_execute_tool, name, tool_input, functions, registry)
     try:
         return future.result(timeout=timeout)
     except concurrent.futures.TimeoutError:
@@ -401,6 +415,10 @@ class AgentLoop:
         self._callbacks = callbacks or LoopCallbacks()
         self._tool_source = tool_source
         self._model_spec = model_spec  # override for sub-agent model tier
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=config.max_tool_workers,
+        )
+        atexit.register(self._executor.shutdown, wait=False)
 
     # ── callback helpers (no-op when callback is None) ────────────────────
 
@@ -550,6 +568,7 @@ class AgentLoop:
                     cfg.concurrent_tools,
                     cfg.max_tool_workers,
                     cfg.tool_timeout,
+                    executor=self._executor,
                 )
 
                 for block, result in tool_results_tuples:
