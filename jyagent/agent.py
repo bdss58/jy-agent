@@ -6,6 +6,8 @@ import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, summarize_if_needed,
     build_memory_context,
+    save_session, load_session, has_saved_session,
+    should_extract, extract_and_remember,
 )
 from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
@@ -190,6 +192,26 @@ def _cmd_model(cli, runtime_owner: RuntimeOwner, user_input: str, **_):
     cli.print_system(f"Switched model to {provider}:{model}")
 
 
+def _cmd_continue(cli, conversation, runtime_owner, **_):
+    """Load the last saved session and continue where we left off."""
+    if not has_saved_session():
+        cli.print_system("No saved session found. Start a new conversation.")
+        return
+
+    if conversation.messages:
+        cli.print_system("⚠ Current conversation is not empty. Use /new first to clear, then /continue.")
+        return
+
+    result = load_session(conversation)
+    if result.get("loaded"):
+        cli.print_system(
+            f"✅ Resumed session from {result['saved_at']} "
+            f"({result['message_count']} messages, ~{conversation.estimated_tokens()} tokens)"
+        )
+    else:
+        cli.print_system(f"Failed to load session: {result.get('error', 'unknown error')}")
+
+
 # Command dispatch table
 COMMAND_TABLE = {
     "/help": _cmd_help,
@@ -197,6 +219,7 @@ COMMAND_TABLE = {
     "/markdown": _cmd_markdown,
     "/history": _cmd_history,
     "/new": _cmd_new,
+    "/continue": _cmd_continue,
     "/tools": _cmd_tools,
     "/skills": _cmd_skills,
     "/stats": _cmd_stats,
@@ -217,9 +240,22 @@ def _print_unexpected_error(cli, error: Exception):
         print(message, file=sys.stderr)
 
 
-def _graceful_exit(cli):
-    """Print goodbye and disconnect background services."""
-    cli.goodbye()  # Say goodbye FIRST — user sees immediate response
+def _graceful_exit(cli, conversation=None):
+    """Print goodbye, save session, and disconnect background services."""
+    # Save session before saying goodbye (fast, silent)
+    if conversation and conversation.messages:
+        try:
+            from .session_stats import get_stats
+            stats = get_stats()
+            save_session(conversation, metadata={
+                "provider": stats.provider or "",
+                "model": stats.model or "",
+            })
+        except Exception:
+            pass  # Don't let session save failure block exit
+
+    cli.goodbye()  # Say goodbye — user sees immediate response
+
     # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as stale processes
     try:
         from .mcp_manager import _manager
@@ -282,6 +318,10 @@ def run(runtime_owner: RuntimeOwner) -> None:
 
         conversation = ConversationMemory()
 
+        # Notify if a previous session can be resumed
+        if has_saved_session():
+            cli.print_system("💾 Previous session available. Type /continue to resume.")
+
         # Initialize Agent Skills
         skill_mgr = init_skills()
         discovered_skills = skill_mgr.list_skills()
@@ -298,7 +338,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 continue
 
             if user_input is None:
-                _graceful_exit(cli)
+                _graceful_exit(cli, conversation)
                 break
 
             user_input = user_input.strip()
@@ -308,7 +348,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
             try:
                 # ─── Quit ─────────────────────────────
                 if user_input == "/quit":
-                    _graceful_exit(cli)
+                    _graceful_exit(cli, conversation)
                     break
 
                 # ─── /skill <name> (prefix match) ─────
@@ -464,6 +504,13 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 else:
                     conversation.add_message("assistant", response)
 
+                # Proactive memory extraction (background, non-blocking)
+                if should_extract(user_input):
+                    from .memory.extraction import _extract_text
+                    asst_text = _extract_text(response) if response else ""
+                    if asst_text:
+                        extract_and_remember(runtime_owner, user_input, asst_text)
+
                 # Render final LLM output (not intermediate tool-use text) with rich markdown
                 if state["use_markdown"] and final_text.strip() and not final_text.strip().startswith("["):
                     try:
@@ -495,7 +542,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
         try:
             console.print("\n[system]⚠ Interrupted.[/system]")
             if cli and conversation:
-                _graceful_exit(cli)
+                _graceful_exit(cli, conversation)
             else:
                 console.print("[system]👋 Goodbye![/system]")
         except Exception:

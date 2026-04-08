@@ -270,6 +270,7 @@ class CLI:
             ("/help", "Show this help message"),
             ("/history", "Show last 10 messages"),
             ("/new", "Clear conversation and start fresh"),
+            ("/continue", "Resume last saved session"),
             ("/tools", "List registered tools"),
             ("/model", "Show or switch provider/model"),
             ("/multi", "Toggle multi-line input mode"),

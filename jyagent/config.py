@@ -41,8 +41,12 @@ SUMMARIZE_THRESHOLD = int(os.environ.get("AGENT_SUMMARIZE_THRESHOLD", "20"))
 MAX_SESSIONS = 50
 MAX_MEMORY_INDEX_LINES = 200
 MAX_MEMORY_INDEX_BYTES = 25 * 1024
-MAX_MEMORY_PROMPT_CHARS = 5000
+MAX_MEMORY_PROMPT_CHARS = int(os.environ.get("AGENT_MAX_MEMORY_PROMPT_CHARS", "10000"))
 CHARS_PER_TOKEN = 4
+
+# Session persistence
+SESSIONS_DIR = os.path.join("data", "sessions")
+LATEST_SESSION_FILE = os.path.join(SESSIONS_DIR, "latest.json")
 
 # ─── Skills ───────────────────────────────────────────────────────────────────
 

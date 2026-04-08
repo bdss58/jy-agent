@@ -1,0 +1,320 @@
+# Tests for Phase 1 memory enhancements.
+#
+# Test targets:
+#   1. Topic frontmatter (timestamps)
+#   2. Session persistence (save/load)
+#   3. MAX_MEMORY_PROMPT_CHARS raised
+#   4. Proactive extraction (should_extract logic)
+
+import json
+import os
+import sys
+import tempfile
+import shutil
+
+# Ensure we import from the worktree, not the main checkout
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Point config at temp directories before importing modules
+_tmpdir = tempfile.mkdtemp(prefix="jy_memory_test_")
+os.environ["AGENT_PROVIDER"] = "anthropic"
+
+# Need to patch config before imports
+import jyagent.config as config
+config.MEMORY_DIR = os.path.join(_tmpdir, "memory")
+config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
+config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
+config.SESSIONS_DIR = os.path.join(_tmpdir, "sessions")
+config.LATEST_SESSION_FILE = os.path.join(_tmpdir, "sessions", "latest.json")
+
+from jyagent.memory.operations import (
+    write_topic, read_topic, read_topic_body, read_topic_meta,
+    list_topics, delete_topic, remember, show_memory,
+    _parse_frontmatter, _build_frontmatter,
+)
+from jyagent.memory.session import (
+    save_session, load_session, has_saved_session, delete_session,
+    _prune_archives,
+)
+from jyagent.memory.conversation import ConversationMemory
+from jyagent.memory.extraction import should_extract, _extract_text
+
+
+def setup():
+    """Clean temp dirs before each test group."""
+    for d in [config.MEMORY_DIR, config.TOPICS_DIR, config.SESSIONS_DIR]:
+        if os.path.exists(d):
+            shutil.rmtree(d)
+        os.makedirs(d, exist_ok=True)
+
+
+def teardown():
+    """Remove temp dirs."""
+    shutil.rmtree(_tmpdir, ignore_errors=True)
+
+
+# ─── Test 1: Topic Frontmatter ───────────────────────────────────────────────
+
+def test_write_topic_adds_frontmatter():
+    setup()
+    write_topic("test-topic", "# Hello\nSome content here.")
+    raw = read_topic("test-topic")
+    assert raw.startswith("---\n"), f"Expected frontmatter, got: {raw[:100]}"
+    meta = read_topic_meta("test-topic")
+    assert "created" in meta, f"Missing 'created' in meta: {meta}"
+    assert "updated" in meta, f"Missing 'updated' in meta: {meta}"
+    body = read_topic_body("test-topic")
+    assert "# Hello" in body, f"Body missing content: {body[:100]}"
+    assert "---" not in body, f"Body should not contain frontmatter: {body[:100]}"
+    print("  ✅ write_topic adds frontmatter with created/updated")
+
+
+def test_write_topic_preserves_created():
+    setup()
+    write_topic("test-preserve", "First version")
+    meta1 = read_topic_meta("test-preserve")
+    created1 = meta1["created"]
+
+    # Write again (update)
+    write_topic("test-preserve", "Second version")
+    meta2 = read_topic_meta("test-preserve")
+    assert meta2["created"] == created1, f"created changed: {created1} -> {meta2['created']}"
+    body = read_topic_body("test-preserve")
+    assert "Second version" in body, f"Body not updated: {body}"
+    print("  ✅ write_topic preserves original created timestamp")
+
+
+def test_write_topic_with_caller_frontmatter():
+    setup()
+    content = "---\nauthor: jianyong\n---\n# My Topic\nContent"
+    write_topic("caller-fm", content)
+    meta = read_topic_meta("caller-fm")
+    assert meta.get("author") == "jianyong", f"Caller meta lost: {meta}"
+    assert "created" in meta, f"Missing timestamps: {meta}"
+    body = read_topic_body("caller-fm")
+    assert "# My Topic" in body
+    print("  ✅ write_topic merges caller frontmatter with timestamps")
+
+
+def test_parse_frontmatter_no_fm():
+    meta, body = _parse_frontmatter("# Hello\nWorld")
+    assert meta == {}
+    assert body == "# Hello\nWorld"
+    print("  ✅ _parse_frontmatter handles no-frontmatter case")
+
+
+def test_parse_frontmatter_with_fm():
+    raw = "---\ncreated: 2025-01-01\nupdated: 2025-06-01\n---\n# Content\nHere"
+    meta, body = _parse_frontmatter(raw)
+    assert meta["created"] == "2025-01-01"
+    assert meta["updated"] == "2025-06-01"
+    assert body.startswith("# Content")
+    print("  ✅ _parse_frontmatter parses YAML frontmatter correctly")
+
+
+def test_show_memory_includes_timestamps():
+    setup()
+    write_topic("ts-test", "Content for timestamp test")
+    result = show_memory()
+    assert "updated" in result, f"show_memory missing timestamp info: {result[:200]}"
+    print("  ✅ show_memory displays topic timestamps")
+
+
+# ─── Test 2: Session Persistence ─────────────────────────────────────────────
+
+def test_save_and_load_session():
+    setup()
+    conv = ConversationMemory()
+    conv.add_message("user", "Hello")
+    conv.add_message("assistant", "Hi there!")
+
+    path = save_session(conv)
+    assert path, "save_session returned empty path"
+    assert os.path.isfile(config.LATEST_SESSION_FILE), "latest.json not created"
+
+    # Load into fresh conversation
+    conv2 = ConversationMemory()
+    result = load_session(conv2)
+    assert result["loaded"] is True, f"Load failed: {result}"
+    assert result["message_count"] == 2
+    assert len(conv2.messages) == 2
+    assert conv2.messages[0]["content"] == "Hello"
+    assert conv2.messages[1]["content"] == "Hi there!"
+    print("  ✅ save_session + load_session roundtrip works")
+
+
+def test_has_saved_session():
+    setup()
+    assert not has_saved_session(), "Should not find session before save"
+    conv = ConversationMemory()
+    conv.add_message("user", "test")
+    save_session(conv)
+    assert has_saved_session(), "Should find session after save"
+    print("  ✅ has_saved_session works correctly")
+
+
+def test_delete_session():
+    setup()
+    conv = ConversationMemory()
+    conv.add_message("user", "test")
+    save_session(conv)
+    assert has_saved_session()
+    deleted = delete_session()
+    assert deleted
+    assert not has_saved_session()
+    print("  ✅ delete_session removes latest.json")
+
+
+def test_load_empty_conversation():
+    setup()
+    conv = ConversationMemory()
+    result = save_session(conv)
+    assert result == "", "Should return empty for empty conversation"
+    print("  ✅ save_session skips empty conversation")
+
+
+def test_load_nonexistent_session():
+    setup()
+    conv = ConversationMemory()
+    result = load_session(conv, path="/nonexistent/path.json")
+    assert result["loaded"] is False
+    assert "error" in result
+    print("  ✅ load_session handles missing file gracefully")
+
+
+def test_session_archive_created():
+    setup()
+    conv = ConversationMemory()
+    conv.add_message("user", "Hello")
+    save_session(conv)
+
+    archive_files = [f for f in os.listdir(config.SESSIONS_DIR) if f != "latest.json"]
+    assert len(archive_files) >= 1, f"No archive created. Files: {os.listdir(config.SESSIONS_DIR)}"
+    print("  ✅ save_session creates timestamped archive")
+
+
+def test_session_prune():
+    setup()
+    # Create many archives
+    for i in range(25):
+        conv = ConversationMemory()
+        conv.add_message("user", f"msg {i}")
+        save_session(conv)
+
+    all_files = [f for f in os.listdir(config.SESSIONS_DIR) if f.endswith('.json') and f != "latest.json"]
+    assert len(all_files) <= 20, f"Prune failed, {len(all_files)} archives remain"
+    print("  ✅ session archive pruning works (keeps <= 20)")
+
+
+def test_session_json_structure():
+    setup()
+    conv = ConversationMemory()
+    conv.add_message("user", "Hello")
+    conv.add_message("assistant", "World")
+    save_session(conv, metadata={"provider": "anthropic", "model": "claude-sonnet-4-6"})
+
+    with open(config.LATEST_SESSION_FILE) as f:
+        data = json.load(f)
+    assert data["version"] == 1
+    assert data["message_count"] == 2
+    assert data["metadata"]["provider"] == "anthropic"
+    assert len(data["messages"]) == 2
+    print("  ✅ session JSON structure is correct")
+
+
+# ─── Test 3: Config Change ──────────────────────────────────────────────────
+
+def test_max_memory_prompt_chars():
+    assert config.MAX_MEMORY_PROMPT_CHARS == 10000, f"Expected 10000, got {config.MAX_MEMORY_PROMPT_CHARS}"
+    print("  ✅ MAX_MEMORY_PROMPT_CHARS raised to 10000")
+
+
+# ─── Test 4: Proactive Extraction Logic ──────────────────────────────────────
+
+def test_extract_text_string():
+    assert _extract_text("hello") == "hello"
+    print("  ✅ _extract_text handles plain string")
+
+
+def test_extract_text_blocks():
+    content = [
+        {"type": "text", "text": "Part 1"},
+        {"type": "tool_use", "name": "read_file"},
+        {"type": "text", "text": "Part 2"},
+    ]
+    result = _extract_text(content)
+    assert "Part 1" in result
+    assert "Part 2" in result
+    print("  ✅ _extract_text handles block content")
+
+
+def test_should_extract_interval():
+    import jyagent.memory.extraction as ext
+    ext._messages_since_extraction = 0
+
+    # First 3 calls should return False (interval = 4)
+    for i in range(3):
+        result = should_extract("x" * 50)
+        assert result is False, f"should_extract returned True at message {i+1}"
+
+    # 4th call should return True
+    result = should_extract("x" * 50)
+    assert result is True, "should_extract should return True at interval"
+    print("  ✅ should_extract respects interval")
+
+
+def test_should_extract_short_message():
+    import jyagent.memory.extraction as ext
+    ext._messages_since_extraction = 3  # at interval boundary
+
+    result = should_extract("hi")  # too short
+    assert result is False, "should_extract should skip short messages"
+    print("  ✅ should_extract skips short messages")
+
+
+# ─── Run all tests ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    tests = [
+        # 1. Frontmatter
+        test_write_topic_adds_frontmatter,
+        test_write_topic_preserves_created,
+        test_write_topic_with_caller_frontmatter,
+        test_parse_frontmatter_no_fm,
+        test_parse_frontmatter_with_fm,
+        test_show_memory_includes_timestamps,
+        # 2. Session persistence
+        test_save_and_load_session,
+        test_has_saved_session,
+        test_delete_session,
+        test_load_empty_conversation,
+        test_load_nonexistent_session,
+        test_session_archive_created,
+        test_session_prune,
+        test_session_json_structure,
+        # 3. Config
+        test_max_memory_prompt_chars,
+        # 4. Extraction
+        test_extract_text_string,
+        test_extract_text_blocks,
+        test_should_extract_interval,
+        test_should_extract_short_message,
+    ]
+
+    print(f"\n🧪 Running {len(tests)} Phase 1 memory tests...\n")
+    passed = 0
+    failed = 0
+    for test in tests:
+        try:
+            test()
+            passed += 1
+        except Exception as e:
+            print(f"  ❌ {test.__name__}: {e}")
+            failed += 1
+
+    teardown()
+    print(f"\n{'='*50}")
+    print(f"Results: {passed} passed, {failed} failed, {len(tests)} total")
+    if failed:
+        sys.exit(1)
+    print("🎉 All tests passed!")
