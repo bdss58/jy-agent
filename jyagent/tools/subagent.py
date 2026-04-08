@@ -193,6 +193,14 @@ TOOL_SCHEMA = {
                     "Empty = all tools available. Example: ['web_fetch', 'read_file']"
                 ),
             },
+            "agent": {
+                "type": "string",
+                "description": (
+                    "Optional named agent definition (from data/agents/*.md). "
+                    "When set, overrides model, max_steps, tool_whitelist, and "
+                    "system_prompt with the agent's definition. Example: 'explorer'."
+                ),
+            },
         },
         "required": ["task"],
     },
@@ -213,6 +221,30 @@ Rules:
 7. If you cannot complete the task, explain what you tried and why it failed."""
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _get_memory_context() -> str:
+    """Load the first 4KB of MEMORY.md and return it as a formatted context block.
+
+    Returns an empty string if the file doesn't exist or is empty.
+    """
+    try:
+        from ..config import MEMORY_MD_FILE
+    except ImportError:
+        from jyagent.config import MEMORY_MD_FILE
+
+    import os
+    if not os.path.isfile(MEMORY_MD_FILE):
+        return ""
+    try:
+        with open(MEMORY_MD_FILE, "r", encoding="utf-8") as f:
+            content = f.read(4096)
+        content = content.strip()
+        if not content:
+            return ""
+        return f"\n\n## Project Memory\n{content}"
+    except Exception:
+        return ""
+
 
 def _extract_text_blocks(message):
     """Extract concatenated text from a normalized assistant message."""
@@ -286,13 +318,18 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
     return _extract_text_blocks(response), input_tokens, output_tokens
 
 
-def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions):
+def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions,
+                  agent_id=None, custom_system_prompt=None):
     """Run a sub-agent's tool loop to completion via AgentLoop engine.
 
     Delegates the entire step loop, tool execution, retry, context compaction,
     and truncation recovery to the shared engine.  Runs silently (no callbacks).
     """
     runtime_owner = _get_runtime_owner()
+
+    # Build system prompt with optional memory context
+    system_prompt = custom_system_prompt or _SUBAGENT_SYSTEM_PROMPT
+    system_prompt += _get_memory_context()
 
     # Build initial messages
     user_content = task
@@ -316,8 +353,12 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         streaming=False,
     )
 
-    # Silent mode — all callbacks are None
-    callbacks = LoopCallbacks()
+    # Step progress callback → update the global tracker
+    def _on_step_progress(step: int, max_s: int) -> None:
+        if agent_id is not None:
+            _subagent_tracker.update_progress(agent_id, step, max_s)
+
+    callbacks = LoopCallbacks(on_step_progress=_on_step_progress)
 
     loop = AgentLoop(
         runtime_owner=runtime_owner,
@@ -326,7 +367,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         tool_source=tool_source,
         model_spec=model_spec,
     )
-    result = loop.run(_SUBAGENT_SYSTEM_PROMPT, messages)
+    result = loop.run(system_prompt, messages)
 
     # ── Convert LoopResult → outcome dict ────────────────────────────────
 
@@ -406,44 +447,123 @@ COLOR_GREEN = "\033[0;32m"
 COLOR_RED = "\033[1;31m"
 COLOR_YELLOW = "\033[1;33m"
 
-_spinner_lock = threading.Lock()
 
+class _SubagentTracker:
+    """Global consolidated spinner for all active sub-agents.
 
-class _SubagentSpinner:
-    """Animated spinner shown while a sub-agent is running."""
+    Thread-safe.  Automatically starts/stops the animation thread when
+    the first/last sub-agent registers/deregisters.
+
+    Single subagent:  "🤖 Sub-agent: task preview (45s)"
+    Multiple:         "🤖 3 sub-agents running (45s)"
+    With steps:       "🤖 Sub-agent: task preview (3/30 steps, 45s)"
+    """
+
     _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    def __init__(self, task_preview):
-        self._preview = task_preview[:60] + "..." if len(task_preview) > 60 else task_preview
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._agents: dict[int, dict] = {}  # id -> {task, t0, step, max_steps}
+        self._next_id = 0
         self._stop = threading.Event()
-        self._thread = None
+        self._thread: threading.Thread | None = None
 
-    def start(self):
+    def add(self, task: str, max_steps: int = 0) -> int:
+        """Register a new sub-agent.  Returns a unique agent id."""
+        preview = task[:60] + "..." if len(task) > 60 else task
+        with self._lock:
+            agent_id = self._next_id
+            self._next_id += 1
+            self._agents[agent_id] = {
+                "task": preview,
+                "t0": time.time(),
+                "step": 0,
+                "max_steps": max_steps,
+            }
+            if len(self._agents) == 1:
+                self._start_animation()
+        return agent_id
+
+    def remove(self, agent_id: int) -> None:
+        """Deregister a completed sub-agent."""
+        with self._lock:
+            self._agents.pop(agent_id, None)
+            if not self._agents:
+                self._stop_animation()
+
+    def update_progress(self, agent_id: int, step: int, max_steps: int = 0) -> None:
+        """Update the step progress for an active sub-agent."""
+        with self._lock:
+            info = self._agents.get(agent_id)
+            if info is not None:
+                info["step"] = step
+                if max_steps:
+                    info["max_steps"] = max_steps
+
+    # ── Animation lifecycle ──────────────────────────────────────────────
+
+    def _start_animation(self):
+        """Start the animation thread.  Caller must hold self._lock."""
+        self._stop.clear()
         self._thread = threading.Thread(target=self._animate, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def _stop_animation(self):
+        """Stop the animation thread.  Caller must hold self._lock."""
         self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=1)
+        t = self._thread
+        self._thread = None
+        if t is not None:
+            # Release the lock during join to avoid deadlock
+            self._lock.release()
+            try:
+                t.join(timeout=1)
+            finally:
+                self._lock.acquire()
 
     def _animate(self):
         idx = 0
-        t0 = time.time()
         while not self._stop.is_set():
-            elapsed = time.time() - t0
+            with self._lock:
+                agents = dict(self._agents)
+
+            if not agents:
+                break
+
             frame = self._FRAMES[idx % len(self._FRAMES)]
-            with _spinner_lock:
-                sys.stdout.write(
-                    f"\r{COLOR_DIM}  {frame} 🤖 Sub-agent: {self._preview} ({elapsed:.0f}s){COLOR_RESET}"
-                )
-                sys.stdout.flush()
+            now = time.time()
+            count = len(agents)
+
+            if count == 1:
+                info = next(iter(agents.values()))
+                elapsed = now - info["t0"]
+                step = info["step"]
+                max_steps = info["max_steps"]
+                if step and max_steps:
+                    time_info = f"({step}/{max_steps} steps, {elapsed:.0f}s)"
+                elif step:
+                    time_info = f"(step {step}, {elapsed:.0f}s)"
+                else:
+                    time_info = f"({elapsed:.0f}s)"
+                line = f"\r{COLOR_DIM}  {frame} 🤖 Sub-agent: {info['task']} {time_info}{COLOR_RESET}"
+            else:
+                # Use the oldest t0 for elapsed
+                oldest_t0 = min(a["t0"] for a in agents.values())
+                elapsed = now - oldest_t0
+                line = f"\r{COLOR_DIM}  {frame} 🤖 {count} sub-agents running ({elapsed:.0f}s){COLOR_RESET}"
+
+            sys.stdout.write(line)
+            sys.stdout.flush()
             idx += 1
             self._stop.wait(0.1)
+
         # Clear the spinner line
-        with _spinner_lock:
-            sys.stdout.write("\r" + " " * 100 + "\r")
-            sys.stdout.flush()
+        sys.stdout.write("\r" + " " * 120 + "\r")
+        sys.stdout.flush()
+
+
+# Global singleton
+_subagent_tracker = _SubagentTracker()
 
 
 # ─── Main tool function ──────────────────────────────────────────────────────
@@ -454,8 +574,29 @@ def dispatch_agent(
     model: str = "default",
     max_steps: int = _DEFAULT_MAX_STEPS,
     tool_whitelist: list = None,
+    agent: str = "",
 ) -> ToolResult:
     """Spawn a sub-agent to handle a focused subtask."""
+    # ── Resolve agent definition if provided ─────────────────────────────
+    custom_system_prompt = None
+    if agent:
+        try:
+            from ..agents import get_agent
+        except ImportError:
+            try:
+                from jyagent.agents import get_agent
+            except ImportError:
+                get_agent = None
+        if get_agent is not None:
+            agent_def = get_agent(agent)
+            if agent_def is not None:
+                model = agent_def.model or model
+                max_steps = agent_def.max_steps or max_steps
+                if agent_def.tools:
+                    tool_whitelist = agent_def.tools
+                if agent_def.system_prompt:
+                    custom_system_prompt = agent_def.system_prompt
+
     # Guard: nesting depth
     depth = getattr(_nesting_depth, "value", 0)
     if depth >= _MAX_NESTING:
@@ -487,9 +628,8 @@ def dispatch_agent(
         tool_schemas = [s for s in tool_schemas if s["name"] != "dispatch_agent"]
         tool_functions = {k: v for k, v in tool_functions.items() if k != "dispatch_agent"}
 
-    # Show spinner
-    spinner = _SubagentSpinner(task)
-    spinner.start()
+    # Register with global tracker
+    agent_id = _subagent_tracker.add(task, max_steps)
     t0 = time.time()
 
     try:
@@ -501,6 +641,7 @@ def dispatch_agent(
             future = executor.submit(
                 _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
+                agent_id, custom_system_prompt,
             )
             try:
                 outcome = future.result(timeout=_SUBAGENT_TIMEOUT)
@@ -512,10 +653,10 @@ def dispatch_agent(
                     is_error=True,
                 )
     except KeyboardInterrupt:
-        spinner.stop()
+        _subagent_tracker.remove(agent_id)
         raise
     except Exception as e:
-        spinner.stop()
+        _subagent_tracker.remove(agent_id)
         error_text = str(e)
         error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         return ToolResult(
@@ -524,7 +665,7 @@ def dispatch_agent(
         )
     finally:
         _nesting_depth.value = depth  # restore
-        spinner.stop()
+        _subagent_tracker.remove(agent_id)
 
     elapsed = time.time() - t0
 
@@ -548,7 +689,15 @@ def dispatch_agent(
     # Record token usage in parent stats
     try:
         parent_stats = get_stats()
-        parent_stats.record_subagent_usage(in_tok, out_tok, model_spec.provider, model_spec.model)
+        task_preview = task[:80] if len(task) > 80 else task
+        parent_stats.record_subagent_usage(
+            in_tok, out_tok, model_spec.provider, model_spec.model,
+            task_preview=task_preview,
+            elapsed=elapsed,
+            status=status,
+            steps=steps,
+            tool_calls=tool_calls,
+        )
     except Exception:
         pass  # stats recording is best-effort
 

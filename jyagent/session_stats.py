@@ -114,6 +114,7 @@ class SessionStats:
             self._known_turn_cost = 0.0
             self._has_unknown_total_cost = False
             self._has_unknown_turn_cost = False
+            self.subagent_runs: list[dict] = []
 
     def new_turn(self):
         """Reset per-turn counters."""
@@ -219,19 +220,47 @@ class SessionStats:
         with self._lock:
             self.tool_calls += 1
 
-    def record_subagent_usage(self, input_tokens: int, output_tokens: int, provider: str = "", model: str = ""):
-        """Record token usage from a sub-agent (counts toward session totals)."""
+    def record_subagent_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        provider: str = "",
+        model: str = "",
+        *,
+        task_preview: str = "",
+        elapsed: float = 0.0,
+        status: str = "",
+        steps: int = 0,
+        tool_calls: int = 0,
+    ):
+        """Record token usage from a sub-agent (counts toward session totals).
+
+        The provider/model are used ONLY for cost calculation — the parent's
+        active model label (self._provider / self._model) is never overwritten.
+        """
         with self._lock:
-            if provider:
-                self._provider = provider
-            if model:
-                self._model = model
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.turn_input_tokens += input_tokens
             self.turn_output_tokens += output_tokens
             self.api_calls += 1  # count sub-agent as at least 1 API call
-            self._record_cost(input_tokens, output_tokens, 0, 0, self._provider, self._model)
+
+            # Use the subagent's own provider/model for cost, not the parent's
+            cost_provider = provider or self._provider
+            cost_model = model or self._model
+            self._record_cost(input_tokens, output_tokens, 0, 0, cost_provider, cost_model)
+
+            self.subagent_runs.append({
+                "provider": provider,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "task_preview": task_preview,
+                "elapsed": elapsed,
+                "status": status,
+                "steps": steps,
+                "tool_calls": tool_calls,
+            })
 
     @property
     def total_cost(self) -> float | None:
@@ -248,6 +277,19 @@ class SessionStats:
             if self._has_unknown_turn_cost:
                 return None
             return self._known_turn_cost
+
+    @property
+    def subagent_summary(self) -> str:
+        """One-line summary of sub-agent dispatches for the session."""
+        with self._lock:
+            runs = list(self.subagent_runs)
+        if not runs:
+            return ""
+        total = len(runs)
+        completed = sum(1 for r in runs if r.get("status") == "completed")
+        total_in = sum(r.get("input_tokens", 0) for r in runs)
+        total_out = sum(r.get("output_tokens", 0) for r in runs)
+        return f"🤖 {completed}/{total} subagents, {self.format_tokens(total_in)}+{self.format_tokens(total_out)} tokens"
 
     @property
     def elapsed(self) -> float:
