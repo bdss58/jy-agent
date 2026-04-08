@@ -355,7 +355,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 # Take last 4 conversational messages ≈ 2 full prior exchanges.
                 force_rebuild = state.pop("_force_rebuild_context", False)
                 conv_messages = [
-                    m for m in messages
+                    m for m in messages[:-1]
                     if m.get("role") in ("user", "assistant")
                 ][-4:]  # last 4 = ~2 prior turns
                 full_system_prompt = _build_full_system_prompt(
