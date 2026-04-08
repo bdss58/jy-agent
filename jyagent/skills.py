@@ -400,46 +400,55 @@ class SkillManager:
                         resources.append(rel)
         return sorted(resources)
 
-    # ── 改进2: LLM-based skill routing ──────────────────────────────────────
+    # ── Diff-based skill routing (per-turn re-evaluation) ──────────────────
 
-    def auto_activate_for_query(self, query: str, runtime_owner=None) -> list[str]:
+    def auto_activate_for_query(self, query: str, runtime_owner=None,
+                                recent_messages: list | None = None) -> list[str]:
         """
-        Automatically activate relevant skills based on user query.
-        
+        Re-evaluate which skills should be active for this turn.
+
+        Unlike the old additive approach, this considers the FULL catalog
+        every turn and produces a diff: skills can be added AND removed.
+        Recent conversation messages give the router context for follow-up
+        queries like "test it" or "now fix the description".
+
         Strategy:
-          1. Try LLM routing (configured router model)
-          2. Fallback to keyword matching if LLM fails or is unavailable
-        
-        Returns list of newly activated skill names.
+          1. Try LLM diff-based routing (full catalog + recent history)
+          2. Fallback to keyword matching on full catalog if LLM fails
+          3. On fallback failure, keep current active set unchanged
+
+        Returns list of skill names in the new active set (not just newly added).
         """
         if not self._auto_activate:
+            return list(self._active)
+
+        if not self._skills:
             return []
 
-        # Filter to only inactive skills (no point routing already-active ones)
-        inactive = {n: s for n, s in self._skills.items() if n not in self._active}
-        if not inactive:
-            return []
+        prev_active = set(self._active)
 
-        # Try LLM routing first
-        newly_activated = self._auto_activate_llm(query, inactive, runtime_owner=runtime_owner)
-        if newly_activated is not None:
-            return newly_activated
+        # Try LLM routing first (evaluates full catalog)
+        result = self._route_llm(
+            query, recent_messages=recent_messages, runtime_owner=runtime_owner,
+        )
+        if result is not None:
+            return result
 
-        # Fallback: keyword matching
-        return self._auto_activate_keywords(query, inactive)
+        # Fallback: keyword matching on full catalog
+        result = self._route_keywords(query)
+        if result is not None:
+            return result
 
-    def _auto_activate_llm(self, query: str, candidates: dict, runtime_owner=None) -> Optional[list[str]]:
+        # Both failed — keep current set unchanged (graceful degrade)
+        return list(self._active)
+
+    def _route_llm(self, query: str, *, recent_messages: list | None = None,
+                   runtime_owner=None) -> Optional[list[str]]:
         """
-        Use a fast LLM to decide which skills to activate.
-        
-        Returns list of skill names to activate, or None if LLM call fails
-        (caller should fallback to keywords).
-        
-        Design:
-          - Minimal prompt: just skill catalog + user query
-          - max_tokens=100 — fast response
-          - JSON output: ["skill-name-1", "skill-name-2"] or []
-          - Timeout: ROUTER_TIMEOUT seconds, fail fast to fallback
+        LLM diff-based router: decide the complete active skill set for this turn.
+
+        Sends the full skill catalog, currently active set, recent conversation
+        context, and current query. Returns the new active set, or None on failure.
         """
         if runtime_owner is None:
             try:
@@ -448,20 +457,49 @@ class SkillManager:
             except Exception:
                 return None
 
-        # Build skill catalog for routing prompt
+        # Build skill catalog
         catalog_lines = []
-        for name, skill in sorted(candidates.items()):
+        for name, skill in sorted(self._skills.items()):
             catalog_lines.append(f"- {name}: {skill['description'][:200]}")
         catalog_text = "\n".join(catalog_lines)
 
+        # Build recent conversation context (prior turns for multi-turn continuity)
+        # Caller already filters to user/assistant and excludes current query.
+        history_text = ""
+        if recent_messages:
+            history_parts = []
+            for msg in recent_messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Extract text from content blocks
+                    content = " ".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                if content and role in ("user", "assistant"):
+                    content = content[:200]  # truncate for token budget
+                    history_parts.append(f"  {role}: {content}")
+            if history_parts:
+                history_text = "Recent conversation:\n" + "\n".join(history_parts) + "\n\n"
+
+        # Current active set (so router knows what's loaded)
+        active_text = ""
+        if self._active:
+            active_text = f"Currently active skills: {sorted(self._active)}\n\n"
+
         routing_prompt = (
-            "You are a skill router. Given a user query and available skills, "
-            "decide which skills (if any) should be activated to help answer the query.\n\n"
+            "You are a skill router. Given a user query, conversation context, "
+            "and available skills, decide which skills should be active for this turn.\n\n"
+            "Skills can be ADDED (newly relevant) or REMOVED (no longer needed). "
+            "Evaluate the FULL catalog — don't just keep everything active.\n\n"
             f"Available skills:\n{catalog_text}\n\n"
-            f"User query: {query}\n\n"
-            'Return a JSON array of skill names to activate. '
-            'Return [] if no skills are relevant. '
-            'ONLY output the JSON array, nothing else.'
+            f"{active_text}"
+            f"{history_text}"
+            f"Current user query: {query}\n\n"
+            "Return a JSON array of skill names that should be active for this turn. "
+            "Return [] if no skills are needed. "
+            "ONLY output the JSON array, nothing else."
         )
 
         try:
@@ -476,7 +514,6 @@ class SkillManager:
 
             # Parse response
             text = text.strip()
-            # Extract JSON array from response (handle markdown code fences)
             if text.startswith("```"):
                 text = re.sub(r'^```\w*\n?', '', text)
                 text = re.sub(r'\n?```$', '', text)
@@ -486,34 +523,46 @@ class SkillManager:
             if not isinstance(selected, list):
                 return None
 
-            # Validate and activate
-            newly_activated = []
+            # Validate: only accept known skill names
+            new_active = set()
             for name in selected:
-                if isinstance(name, str) and name in candidates:
-                    self._active.add(name)
-                    newly_activated.append(name)
+                if isinstance(name, str) and name in self._skills:
+                    new_active.add(name)
 
-            # Log for debugging (always, even when [] — that's a valid decision)
-            if newly_activated:
-                print(f"\033[2m  ⚡ Skill router ({elapsed:.1f}s): "
-                      f"activated {newly_activated}\033[0m", file=sys.stderr)
-            else:
-                print(f"\033[2m  ⚡ Skill router ({elapsed:.1f}s): "
-                      f"no skills needed\033[0m", file=sys.stderr)
+            # Compute diff for logging
+            prev_active = set(self._active)
+            added = new_active - prev_active
+            removed = prev_active - new_active
 
-            return newly_activated
+            # Apply the new active set
+            self._active = new_active
+
+            # Log the diff
+            parts = []
+            if added:
+                parts.append(f"+{sorted(added)}")
+            if removed:
+                parts.append(f"-{sorted(removed)}")
+            if not parts:
+                parts.append("no change")
+            diff_str = " ".join(parts)
+
+            print(f"\033[2m  ⚡ Skill router ({elapsed:.1f}s): "
+                  f"{sorted(new_active)} ({diff_str})\033[0m", file=sys.stderr)
+
+            return sorted(new_active)
 
         except Exception:
-            # Any failure (network, parse, API error) → return None to trigger fallback
             return None
 
-    def _auto_activate_keywords(self, query: str, candidates: dict) -> list[str]:
+    def _route_keywords(self, query: str) -> Optional[list[str]]:
         """
-        Fallback: keyword matching when LLM routing is unavailable.
-        Simple but reliable — 2+ meaningful word overlap or skill name match.
+        Fallback: keyword matching on the full catalog.
+
+        Unlike the old version, this evaluates ALL skills (not just inactive)
+        and replaces the active set entirely — same diff semantics as LLM router.
         """
         query_lower = query.lower()
-        newly_activated = []
 
         stopwords = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in',
                     'and', 'or', 'on', 'it', 'this', 'that', 'use', 'when',
@@ -521,7 +570,15 @@ class SkillManager:
                     'what', 'how', 'why', 'can', 'will', 'my', 'your', 'me'}
         query_words = set(re.findall(r'[a-z]{2,}', query_lower))
 
-        for name, skill in candidates.items():
+        # If query is very short (≤3 words), keyword matching is unreliable —
+        # keep current active set unchanged rather than guess wrong
+        if len(query_words) <= 3 and self._active:
+            print(f"\033[2m  ⚡ Skill keywords: query too short, keeping "
+                  f"{sorted(self._active)}\033[0m", file=sys.stderr)
+            return list(self._active)
+
+        new_active = set()
+        for name, skill in self._skills.items():
             desc_lower = skill["description"].lower()
             desc_words = set(re.findall(r'[a-z]{2,}', desc_lower))
             meaningful_overlap = (desc_words & query_words) - stopwords
@@ -530,17 +587,31 @@ class SkillManager:
             name_overlap = name_words & query_words
 
             if len(meaningful_overlap) >= 2 or len(name_overlap) >= 1:
-                self._active.add(name)
-                newly_activated.append(name)
+                new_active.add(name)
 
-        if newly_activated:
-            print(f"\033[2m  ⚡ Skill keywords: activated {newly_activated}\033[0m", file=sys.stderr)
+        prev_active = set(self._active)
+        added = new_active - prev_active
+        removed = prev_active - new_active
+        self._active = new_active
 
-        return newly_activated
+        parts = []
+        if added:
+            parts.append(f"+{sorted(added)}")
+        if removed:
+            parts.append(f"-{sorted(removed)}")
+        if not parts:
+            parts.append("no change")
+        diff_str = " ".join(parts)
+
+        print(f"\033[2m  ⚡ Skill keywords: "
+              f"{sorted(new_active)} ({diff_str})\033[0m", file=sys.stderr)
+
+        return sorted(new_active)
 
     # ── 改进1: XML prompt format (agentskills.io spec) ────────────────────
 
-    def build_prompt_context(self, query: str = "", runtime_owner=None) -> str:
+    def build_prompt_context(self, query: str = "", runtime_owner=None,
+                             recent_messages: list | None = None) -> str:
         """
         Build the skills context section for system prompt injection.
         
@@ -555,9 +626,12 @@ class SkillManager:
         if not self._skills:
             return ""
 
-        # Auto-activate relevant skills if query provided
+        # Route skills for this turn (diff-based: can add AND remove)
         if query:
-            self.auto_activate_for_query(query, runtime_owner=runtime_owner)
+            self.auto_activate_for_query(
+                query, runtime_owner=runtime_owner,
+                recent_messages=recent_messages,
+            )
 
         lines = []
 

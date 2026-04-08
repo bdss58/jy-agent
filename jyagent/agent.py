@@ -237,11 +237,12 @@ _cached_memory_context: str | None = None
 
 
 def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: RuntimeOwner,
-                              force_rebuild: bool = False) -> str:
+                              force_rebuild: bool = False,
+                              recent_messages: list | None = None) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
 
     Memory context is cached between turns (invalidated by force_rebuild).
-    Skills context is always rebuilt because auto-activation depends on user query.
+    Skills context is always rebuilt — diff-based routing re-evaluates every turn.
     """
     global _cached_memory_context
 
@@ -252,8 +253,11 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_
     if _cached_memory_context:
         full_system_prompt = SYSTEM_PROMPT + "\n\n" + _cached_memory_context
 
-    # Skills context depends on user query (auto-activation) — always rebuild
-    skills_context = skill_mgr.build_prompt_context(query=user_input, runtime_owner=runtime_owner)
+    # Skills: diff-based routing with conversation context for multi-turn continuity
+    skills_context = skill_mgr.build_prompt_context(
+        query=user_input, runtime_owner=runtime_owner,
+        recent_messages=recent_messages,
+    )
     if skills_context:
         full_system_prompt = full_system_prompt + "\n\n" + skills_context
 
@@ -345,10 +349,20 @@ def run(runtime_owner: RuntimeOwner) -> None:
                 messages = conversation.get_history()
                 history_len = len(messages)  # snapshot before loop mutates in-place
 
-                # Build system prompt (memory cached, skills always rebuilt)
+                # Build system prompt (memory cached, skills diff-routed per turn)
+                # Filter to user/assistant only (skip tool messages) and exclude
+                # the current query (already passed as `query` to the router).
+                # Take last 4 conversational messages ≈ 2 full prior exchanges.
                 force_rebuild = state.pop("_force_rebuild_context", False)
-                full_system_prompt = _build_full_system_prompt(user_input, skill_mgr, runtime_owner,
-                                                               force_rebuild=force_rebuild)
+                conv_messages = [
+                    m for m in messages
+                    if m.get("role") in ("user", "assistant")
+                ][-4:]  # last 4 = ~2 prior turns
+                full_system_prompt = _build_full_system_prompt(
+                    user_input, skill_mgr, runtime_owner,
+                    force_rebuild=force_rebuild,
+                    recent_messages=conv_messages or None,
+                )
 
                 cli.print_separator()
 
