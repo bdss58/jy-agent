@@ -2,6 +2,7 @@
 # These are the functions called by the manage_memory tool facade.
 
 import os
+from datetime import datetime, timezone
 
 from ..config import (
     MEMORY_MD_FILE, TOPICS_DIR,
@@ -80,6 +81,44 @@ def forget_from_memory_md(keyword: str) -> int:
 
 # ─── Topic file operations ────────────────────────────────────────────────────
 
+_FRONTMATTER_SEP = "---"
+
+
+def _now_iso() -> str:
+    """Return current time as ISO 8601 string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_frontmatter(raw: str) -> tuple[dict, str]:
+    """Parse YAML-style frontmatter from a topic file.
+
+    Returns (metadata_dict, body_text).  If no frontmatter, returns ({}, raw).
+    """
+    if not raw.startswith(_FRONTMATTER_SEP):
+        return {}, raw
+
+    parts = raw.split(_FRONTMATTER_SEP, 2)  # ['', yaml_block, body]
+    if len(parts) < 3:
+        return {}, raw
+
+    meta = {}
+    for line in parts[1].strip().splitlines():
+        if ":" in line:
+            key, _, val = line.partition(":")
+            meta[key.strip()] = val.strip()
+    body = parts[2].lstrip("\n")
+    return meta, body
+
+
+def _build_frontmatter(meta: dict) -> str:
+    """Serialize metadata dict into YAML frontmatter block."""
+    lines = [_FRONTMATTER_SEP]
+    for k, v in meta.items():
+        lines.append(f"{k}: {v}")
+    lines.append(_FRONTMATTER_SEP)
+    return "\n".join(lines) + "\n"
+
+
 def list_topics() -> list[str]:
     """List all topic files in the topics directory."""
     ensure_dirs()
@@ -101,12 +140,56 @@ def read_topic(name: str) -> str:
         return ""
 
 
+def read_topic_body(name: str) -> str:
+    """Read a topic file, stripping frontmatter. Returns just the body."""
+    raw = read_topic(name)
+    if not raw:
+        return ""
+    _, body = _parse_frontmatter(raw)
+    return body
+
+
+def read_topic_meta(name: str) -> dict:
+    """Read only the frontmatter metadata of a topic file."""
+    raw = read_topic(name)
+    if not raw:
+        return {}
+    meta, _ = _parse_frontmatter(raw)
+    return meta
+
+
 def write_topic(name: str, content: str) -> None:
-    """Write content to a topic file."""
+    """Write content to a topic file with created/updated frontmatter.
+
+    If the file already exists, preserves the original ``created`` timestamp
+    and updates ``updated``.  New files get both set to now.
+
+    If the caller passes content that already starts with ``---`` frontmatter,
+    we merge timestamps into it rather than double-wrapping.
+    """
     ensure_dirs()
     filepath = os.path.join(TOPICS_DIR, f"{name}.md")
+
+    now = _now_iso()
+
+    # Preserve original created timestamp if file already exists
+    existing_meta = read_topic_meta(name)
+    created = existing_meta.get("created", now)
+
+    # If caller included their own frontmatter, strip it and keep their keys
+    caller_meta, body = _parse_frontmatter(content)
+    if not caller_meta:
+        # No frontmatter from caller — treat entire content as body
+        body = content
+
+    # Build final metadata: caller keys + timestamps (timestamps win on conflict)
+    final_meta = {**caller_meta, "created": created, "updated": now}
+
     with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
+        f.write(_build_frontmatter(final_meta))
+        f.write(body)
+        if body and not body.endswith("\n"):
+            f.write("\n")
 
 
 def delete_topic(name: str) -> bool:
@@ -153,9 +236,12 @@ def show_memory() -> str:
         topic_lines = []
         for t in topics:
             tc = read_topic(t)
+            meta = read_topic_meta(t)
             size = len(tc)
             lines = len(tc.split("\n"))
-            topic_lines.append(f"  📄 {t}.md ({lines} lines, {size} chars)")
+            updated = meta.get("updated", "")
+            ts_suffix = f", updated {updated}" if updated else ""
+            topic_lines.append(f"  📄 {t}.md ({lines} lines, {size} chars{ts_suffix})")
         parts.append(f"📂 TOPIC FILES ({len(topics)} topics):\n" + "\n".join(topic_lines))
 
     if not parts:
