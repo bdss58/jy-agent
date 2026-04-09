@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 import threading
+import contextvars
 import concurrent.futures
 
 try:
@@ -43,8 +44,14 @@ _SUBAGENT_STATUS_COMPLETED = "completed"
 _SUBAGENT_STATUS_MAX_STEPS = "max_steps"
 _SUBAGENT_STATUS_API_ERROR = "api_error"
 
-# Track nesting to prevent runaway recursion
-_nesting_depth = threading.local()
+# Track nesting to prevent runaway recursion.
+# Uses contextvars.ContextVar because sub-agents run in ThreadPoolExecutor
+# worker threads.  Since Python 3.12, executor.submit() copies the caller's
+# context snapshot into the worker, so the child thread sees the incremented
+# depth.  (threading.local() would NOT propagate — each worker starts fresh.)
+_nesting_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_nesting_depth", default=0,
+)
 _MAX_NESTING = 2  # sub-agent can spawn sub-sub-agent, but no deeper
 
 
@@ -598,7 +605,7 @@ def dispatch_agent(
                     custom_system_prompt = agent_def.system_prompt
 
     # Guard: nesting depth
-    depth = getattr(_nesting_depth, "value", 0)
+    depth = _nesting_depth.get()
     if depth >= _MAX_NESTING:
         return ToolResult(
             f"Error: Maximum sub-agent nesting depth ({_MAX_NESTING}) reached. "
@@ -633,8 +640,10 @@ def dispatch_agent(
     t0 = time.time()
 
     try:
-        # Increment nesting depth for this thread
-        _nesting_depth.value = depth + 1
+        # Increment nesting depth — the ContextVar snapshot is copied into the
+        # ThreadPoolExecutor worker thread at submit() time (Python 3.12+), so
+        # the child sees the incremented value.
+        _depth_token = _nesting_depth.set(depth + 1)
 
         # Run with wall-clock timeout
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -664,7 +673,7 @@ def dispatch_agent(
             is_error=True,
         )
     finally:
-        _nesting_depth.value = depth  # restore
+        _nesting_depth.reset(_depth_token)  # restore
         _subagent_tracker.remove(agent_id)
 
     elapsed = time.time() - t0
