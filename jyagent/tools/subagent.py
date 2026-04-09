@@ -45,10 +45,10 @@ _SUBAGENT_STATUS_MAX_STEPS = "max_steps"
 _SUBAGENT_STATUS_API_ERROR = "api_error"
 
 # Track nesting to prevent runaway recursion.
-# Uses contextvars.ContextVar because sub-agents run in ThreadPoolExecutor
-# worker threads.  Since Python 3.12, executor.submit() copies the caller's
-# context snapshot into the worker, so the child thread sees the incremented
-# depth.  (threading.local() would NOT propagate — each worker starts fresh.)
+# Uses contextvars.ContextVar + explicit copy_context().run() because sub-agents
+# run in ThreadPoolExecutor worker threads.  ThreadPoolExecutor does NOT auto-
+# propagate ContextVars; we snapshot the context after incrementing depth and
+# pass ctx.run(fn, ...) to executor.submit() so the worker inherits it.
 _nesting_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
     "_nesting_depth", default=0,
 )
@@ -640,15 +640,16 @@ def dispatch_agent(
     t0 = time.time()
 
     try:
-        # Increment nesting depth — the ContextVar snapshot is copied into the
-        # ThreadPoolExecutor worker thread at submit() time (Python 3.12+), so
-        # the child sees the incremented value.
+        # Increment nesting depth, then snapshot the context so the worker
+        # thread inherits the updated value.  ThreadPoolExecutor does NOT
+        # auto-propagate ContextVars; we must use copy_context().run().
         _depth_token = _nesting_depth.set(depth + 1)
+        ctx = contextvars.copy_context()
 
         # Run with wall-clock timeout
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
-                _run_subagent, task, context, model_spec,
+                ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 agent_id, custom_system_prompt,
             )
