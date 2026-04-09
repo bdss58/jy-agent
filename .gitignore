@@ -120,6 +120,7 @@ mcp_stderr.log
 
 # Data directory (user data — excluded from git)
 data/memory/
+data/sessions/
 data/logs/
 
 # Package backups from evolution
