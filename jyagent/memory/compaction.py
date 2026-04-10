@@ -9,7 +9,7 @@ import sys
 from typing import Optional
 
 from ..config import (
-    COMPACT_TOKEN_THRESHOLD, SUMMARIZE_KEEP_RECENT, SUMMARIZE_THRESHOLD,
+    COMPACT_TOKEN_THRESHOLD, SUMMARIZE_KEEP_RECENT,
     DEFAULT_MAX_TOKENS,
 )
 from .conversation import ConversationMemory
@@ -185,16 +185,11 @@ def summarize_if_needed(
 
     estimated = conversation.estimated_tokens()
 
-    token_trigger = estimated >= threshold_tokens
-    count_trigger = len(conversation) >= SUMMARIZE_THRESHOLD * 2
-
-    if not token_trigger and not count_trigger:
+    if estimated < threshold_tokens:
         return None
-
-    trigger = "tokens" if token_trigger else "messages"
     sys.stdout.write(
         f"\033[2m  ⚡ Auto-compacting conversation "
-        f"({trigger}: ~{estimated} tokens, {len(conversation)} msgs)...\033[0m\n"
+        f"(~{estimated} tokens, {len(conversation)} msgs)...\033[0m\n"
     )
     sys.stdout.flush()
 
