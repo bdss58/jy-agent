@@ -217,6 +217,36 @@ class TestDedupTracker:
         feedback = dt.record([self._call("tool", {"a": 1, "b": 2})])
         assert feedback is not None
 
+    def test_exempt_tools_not_tracked(self):
+        """Exempt tools (e.g. check_background) are never flagged as loops."""
+        dt = _DedupTracker(threshold=2, exempt_tools={"check_background"})
+        call = self._call("check_background", {"pid": 12345, "tail": 10})
+        # Call many more times than threshold — should never trigger
+        for _ in range(10):
+            assert dt.record([call]) is None
+
+    def test_exempt_does_not_affect_other_tools(self):
+        """Non-exempt tools still get flagged even when exempt set is present."""
+        dt = _DedupTracker(threshold=2, exempt_tools={"check_background"})
+        call = self._call("read_file", {"path": "/tmp/x"})
+        dt.record([call])
+        feedback = dt.record([call])
+        assert feedback is not None
+        assert "LOOP DETECTED" in feedback
+
+    def test_mixed_batch_exempt_and_non_exempt(self):
+        """In a batch with exempt + non-exempt, only non-exempt is tracked."""
+        dt = _DedupTracker(threshold=2, exempt_tools={"check_background"})
+        batch = [
+            self._call("check_background", {"pid": 123}),
+            self._call("read_file", {"path": "/tmp/x"}),
+        ]
+        dt.record(batch)
+        feedback = dt.record(batch)
+        # read_file should trigger, check_background should not
+        assert feedback is not None
+        assert "read_file" in feedback
+
 
 # ─── Integration: LoopConfig new fields ──────────────────────────────────────
 
@@ -241,3 +271,29 @@ class TestLoopConfigHarness:
     def test_dedup_threshold_custom(self):
         cfg = LoopConfig(dedup_threshold=5)
         assert cfg.dedup_threshold == 5
+
+
+# ─── Registry: dedup_exempt metadata ─────────────────────────────────────────
+
+class TestDedupExemptRegistry:
+    """Verify dedup_exempt flag is correctly stored and queried."""
+
+    def test_check_background_is_exempt(self):
+        """check_background should be registered as dedup_exempt."""
+        import jyagent.tools  # ensure tool registration runs
+        from jyagent.registry import get_registry
+        reg = get_registry()
+        assert reg.is_dedup_exempt("check_background") is True
+
+    def test_read_file_is_not_exempt(self):
+        """Normal tools should NOT be dedup_exempt."""
+        import jyagent.tools
+        from jyagent.registry import get_registry
+        reg = get_registry()
+        assert reg.is_dedup_exempt("read_file") is False
+
+    def test_unknown_tool_is_not_exempt(self):
+        """Unknown tools default to not exempt."""
+        from jyagent.registry import get_registry
+        reg = get_registry()
+        assert reg.is_dedup_exempt("nonexistent_tool") is False

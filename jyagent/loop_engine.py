@@ -150,11 +150,16 @@ class _DedupTracker:
 
     Tracks (tool_name, args_key) → count.  Returns a feedback message when
     the threshold is hit so the engine can inject it and break the loop.
+
+    Tools marked as ``dedup_exempt`` (e.g. ``check_background``) are skipped —
+    polling the same background process repeatedly is the *intended* pattern,
+    not a loop.
     """
 
-    def __init__(self, threshold: int = 3):
+    def __init__(self, threshold: int = 3, exempt_tools: set[str] | None = None):
         self._counts: dict[str, int] = {}
         self._threshold = threshold
+        self._exempt: set[str] = exempt_tools or set()
 
     @staticmethod
     def _make_key(name: str, args: dict) -> str:
@@ -168,6 +173,8 @@ class _DedupTracker:
     def record(self, calls: list[ToolCallRequest]) -> str | None:
         """Record a batch of tool calls.  Return feedback if any hit threshold."""
         for call in calls:
+            if call.name in self._exempt:
+                continue
             key = self._make_key(call.name, call.input)
             self._counts[key] = self._counts.get(key, 0) + 1
             if self._counts[key] >= self._threshold:
@@ -633,7 +640,12 @@ class AgentLoop:
 
         # ── Harness trackers (QW-2, QW-3) ────────────────────────────────
         cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
-        dedup_tracker = _DedupTracker(cfg.dedup_threshold)
+        # Build exempt set from registry metadata (e.g. check_background is polling)
+        exempt_tools = {
+            name for name in registry.list_tools()
+            if registry.is_dedup_exempt(name)
+        }
+        dedup_tracker = _DedupTracker(cfg.dedup_threshold, exempt_tools=exempt_tools)
 
         # Resolve tools
         tool_schemas: list[dict] = []

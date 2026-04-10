@@ -53,7 +53,7 @@ _TOOL_METADATA = {
     "mcp":             {"parallel_safe": False, "timeout_hint": 180},
     "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}},
     "run_background":  {"parallel_safe": False},
-    "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral"},
+    "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral", "dedup_exempt": True},
 }
 
 _registry = get_registry()
@@ -72,4 +72,5 @@ for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA, SUBAGENT_SCHEMA]:
             timeout_hint=timeout_hint,
             large_input_keys=large_keys,
             compaction_priority=compaction_priority,
+            dedup_exempt=meta.get("dedup_exempt", False),
         )
