@@ -1,6 +1,8 @@
 # Core file/shell tools and shared path/file helpers.
 
 import os
+import json
+import time
 import difflib
 import fnmatch
 import subprocess
@@ -564,3 +566,121 @@ def _diagnose_multi_match(path: str, content: str, old_text: str, count: int) ->
         f"Hint: Add a few lines before/after the target to disambiguate.",
         is_error=True
     )
+
+
+# ─── Background process management ──────────────────────────────────────────
+
+# {pid: {"command", "output_file", "file_handle", "process", "started_at"}}
+_background_processes: dict[int, dict] = {}
+
+
+def run_background(command: str) -> ToolResult:
+    """Start a long-running command in the background.
+
+    Returns immediately with the PID and output file path.
+    Use check_background(pid) to poll status and read output.
+    """
+    try:
+        output_file = f"/tmp/jyagent_bg_{int(time.time() * 1000)}.out"
+        fh = open(output_file, "w")
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # detach from parent signal group
+        )
+        _background_processes[proc.pid] = {
+            "command": command,
+            "output_file": output_file,
+            "file_handle": fh,
+            "process": proc,
+            "started_at": time.time(),
+        }
+        return ToolResult(json.dumps({
+            "pid": proc.pid,
+            "output_file": output_file,
+            "status": "started",
+        }))
+    except Exception as e:
+        return ToolResult(f"Error starting background process: {e}", is_error=True)
+
+
+def check_background(pid: int, tail: int = 0, action: str = "status") -> ToolResult:
+    """Check on a background process started by run_background.
+
+    action="status" (default): return process status + output.
+    action="kill": send SIGTERM and return final status.
+    tail=0: return all output (truncated at 50K chars from the end).
+    tail=N: return only the last N lines (useful for progress polling).
+    """
+    import signal as _signal
+
+    info = _background_processes.get(pid)
+    if info is None:
+        # Check if PID exists in OS but wasn't started by us
+        try:
+            os.kill(pid, 0)
+            return ToolResult(json.dumps({
+                "pid": pid,
+                "status": "unknown",
+                "message": "PID exists but was not started by run_background",
+            }), is_error=True)
+        except ProcessLookupError:
+            return ToolResult(json.dumps({
+                "pid": pid,
+                "status": "not_found",
+                "message": "No such process. It may have already been checked after completion.",
+            }), is_error=True)
+
+    proc: subprocess.Popen = info["process"]
+
+    # Handle kill action
+    if action == "kill":
+        if proc.poll() is None:  # still running
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=3)
+
+    returncode = proc.poll()
+    is_running = returncode is None
+    elapsed = time.time() - info["started_at"]
+
+    # Read output
+    output_file = info["output_file"]
+    output = ""
+    try:
+        with open(output_file, "r") as rf:
+            if tail > 0:
+                lines = rf.readlines()
+                output = "".join(lines[-tail:])
+            else:
+                output = rf.read()
+        if len(output) > 50000:
+            output = "[... truncated to last 50000 chars ...]\n" + output[-50000:]
+    except FileNotFoundError:
+        output = "(output file not yet created)"
+    except Exception as e:
+        output = f"(error reading output: {e})"
+
+    result = {
+        "pid": pid,
+        "status": "running" if is_running else ("killed" if action == "kill" else "done"),
+        "exit_code": returncode,
+        "elapsed_seconds": round(elapsed, 1),
+        "command": info["command"],
+        "output_file": output_file,
+        "output": output,
+    }
+
+    # Close file handle when process is done
+    if not is_running:
+        try:
+            info["file_handle"].close()
+        except Exception:
+            pass
+
+    return ToolResult(json.dumps(result, ensure_ascii=False))

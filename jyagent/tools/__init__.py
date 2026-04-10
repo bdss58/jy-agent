@@ -9,7 +9,7 @@
 from ..registry import get_registry
 
 # Re-export all tool functions for backward compatibility
-from .core import run_shell, read_file, write_file, list_directory, edit_file
+from .core import run_shell, read_file, write_file, list_directory, edit_file, run_background, check_background
 from .search import glob_files, grep_files
 from .facades import manage_memory, manage_skills
 from .schemas import CORE_TOOLS
@@ -35,6 +35,8 @@ _TOOL_FN_MAP = {
     "web_fetch": web_fetch,
     "mcp": mcp,
     "dispatch_agent": dispatch_agent,
+    "run_background": run_background,
+    "check_background": check_background,
 }
 
 _TOOL_METADATA = {
@@ -50,6 +52,8 @@ _TOOL_METADATA = {
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180},
     "mcp":             {"parallel_safe": False, "timeout_hint": 180},
     "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}},
+    "run_background":  {"parallel_safe": False},
+    "check_background": {"parallel_safe": True},
 }
 
 _registry = get_registry()

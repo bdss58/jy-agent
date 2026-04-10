@@ -22,17 +22,50 @@ Delegate coding tasks to the local Codex CLI from inside `jy-agent`.
 Keep this skill narrow: it is for Codex-specific delegation, not for every
 coding request.
 
-## `run_shell` Timeout Policy
+## Timeout Policy: `run_shell` vs `run_background`
 
-When `jy-agent` launches Codex CLI through `run_shell`, explicitly pass
-`timeout=600` for `codex exec`, `codex review`, `codex exec resume --last`,
-and structured-output runs. Do not rely on the default `60s` shell timeout for
-delegated Codex work.
+Codex CLI can be slow. Choose the right execution mode:
 
-Use `timeout=60` only for lightweight preflight checks such as
-`run_shell("which codex && codex --version", timeout=60)`.
-If a `timeout=600` Codex run still times out, narrow the task, reduce the file
-set, or split verification instead of retrying the same broad command.
+```
+How long will this Codex call take?
+├─ Preflight (which codex, codex --version)
+│   → run_shell(cmd, timeout=60)
+│
+├─ Quick task — scoped review, small analysis, simple fix (<5 min likely)
+│   → run_shell(cmd, timeout=600)
+│
+├─ Medium task — multi-file analysis, complex implementation
+│   → Prefer run_background(cmd), then poll with check_background(pid)
+│   → Fallback: try run_shell(timeout=600), switch to background if it times out
+│
+└─ Heavy task — large repo scan, architecture review, broad refactor
+    → Always use run_background(cmd) + check_background(pid) polling loop
+```
+
+### Background execution pattern
+
+```python
+# Step 1: Start in background (returns instantly)
+run_background('codex exec --sandbox read-only "Analyze the full codebase"')
+# → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
+
+# Step 2: Poll progress (repeat until done)
+check_background(12345, tail=20)
+# → {"pid": 12345, "status": "running", "elapsed_seconds": 45.2, "output": "...last 20 lines..."}
+
+# Step 3: Read final output when done
+check_background(12345)
+# → {"pid": 12345, "status": "done", "exit_code": 0, "output": "...full output..."}
+
+# If stuck: kill it
+check_background(12345, action="kill")
+```
+
+### When run_shell times out at 600s
+
+Do NOT just retry the same command. Instead:
+1. Switch to `run_background` for the same command, OR
+2. Narrow the task scope and try `run_shell` again with a tighter prompt
 
 ## Decision Tree: Should Codex Handle This?
 
@@ -221,6 +254,30 @@ run_shell('codex exec resume --last "Now add regression tests for the fix"', tim
 run_shell('codex exec --sandbox read-only --output-schema /tmp/schema.json "Review the auth layer"', timeout=600)
 ```
 
+### Pattern F: Background execution (for slow tasks)
+
+Use `run_background` + `check_background` when the task may exceed 600 seconds.
+This is the **preferred pattern for complex Codex tasks**.
+
+```python
+# Start — returns instantly with PID
+run_background('codex exec --sandbox read-only -C /path/to/repo "Comprehensive architecture review"')
+# → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
+
+# Poll every 30-60s — use tail to avoid output flood
+check_background(12345, tail=30)
+# → {"status": "running", "elapsed_seconds": 120.5, "output": "...last 30 lines..."}
+
+# When status == "done", read full output
+check_background(12345)
+# → {"status": "done", "exit_code": 0, "output": "...complete result..."}
+```
+
+For implementation tasks in background:
+```python
+run_background('codex exec --full-auto -C /path/to/repo "Refactor the auth module to use JWT"')
+```
+
 ## Anti-Patterns
 
 ❌ **Don't** use `-p` to pass the prompt — `-p` is `--profile` (config profile selection)
@@ -246,6 +303,12 @@ run_shell('codex exec --sandbox read-only --output-schema /tmp/schema.json "Revi
 
 ❌ **Don't** claim delegation succeeded if `codex` is unavailable
 ✅ **Do** fail fast, report the environment problem, and stop
+
+❌ **Don't** retry `run_shell(timeout=600)` when it times out — the task is too slow for synchronous execution
+✅ **Do** switch to `run_background` + `check_background` polling for slow tasks
+
+❌ **Don't** poll `check_background` with `tail=0` every few seconds on a running process — it floods context with repeated full output
+✅ **Do** use `tail=20` or `tail=30` while polling; only use `tail=0` for the final read after status is "done"
 
 ## Reference Files
 

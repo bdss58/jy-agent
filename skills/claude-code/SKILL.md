@@ -21,17 +21,41 @@ metadata:
 Delegate coding tasks to Claude Code (`claude -p`) as a sub-agent.
 jy-agent plans and orchestrates; Claude Code implements.
 
-## `run_shell` Timeout Policy
+## Timeout Policy: `run_shell` vs `run_background`
 
-When `jy-agent` launches Claude Code through `run_shell`, explicitly pass
-`timeout=600` for every real Claude invocation in this skill. Do not rely on
-the default `60s` shell timeout for `claude -p`, `claude -p --continue`,
-structured-output runs, reviews, or implementation work.
+Claude Code can be slow on complex tasks. Choose the right execution mode:
 
-Use `timeout=60` only for lightweight preflight checks such as
-`run_shell("which claude && claude --version", timeout=60)`.
-If a `timeout=600` Claude run still times out, narrow the prompt, reduce the
-file set, or split verification instead of retrying the same broad command.
+```
+How long will this Claude Code call take?
+├─ Preflight (which claude, claude --version)
+│   → run_shell(cmd, timeout=60)
+│
+├─ Quick task — scoped review, simple fix, focused refactor (<5 min likely)
+│   → run_shell(cmd, timeout=600)
+│
+├─ Medium/heavy task — multi-file refactor, large codebase analysis, broad review
+│   → Use run_background(cmd) + check_background(pid) polling
+│   → Fallback: try run_shell(timeout=600) first, switch to background on timeout
+```
+
+### Background execution for Claude Code
+
+```python
+# Start — returns instantly
+run_background('claude -p --bare "Comprehensive refactor of the auth module"')
+# → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
+
+# Poll progress (tail=20 to avoid flooding context)
+check_background(12345, tail=20)
+# → {"status": "running", "elapsed_seconds": 180.5, "output": "..."}
+
+# Read full output when done
+check_background(12345)
+# → {"status": "done", "exit_code": 0, "output": "...full result..."}
+```
+
+When `run_shell(timeout=600)` times out, do NOT retry the same command.
+Switch to `run_background` or narrow the task scope.
 
 ## Decision Tree: Self-Do vs Delegate
 

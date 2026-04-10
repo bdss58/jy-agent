@@ -270,4 +270,44 @@ CORE_TOOLS = [
             "required": ["pattern"]
         }
     },
+    # --- run_background ---
+    {
+        "name": "run_background",
+        "description": "Start a long-running command in the background and return immediately. Use this instead of run_shell when a command may exceed 600 seconds (e.g., slow agent CLIs like `codex exec`, large builds, long test suites). Returns a PID — use check_background to poll for status and read output.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to run in the background"
+                }
+            },
+            "required": ["command"]
+        }
+    },
+    # --- check_background ---
+    {
+        "name": "check_background",
+        "description": "Check status and read output of a background process started by run_background. Returns status (running/done/killed), exit code, elapsed time, and output. Use tail=N to read only the last N lines (good for progress polling). Use action='kill' to terminate a runaway process.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "Process ID returned by run_background"
+                },
+                "tail": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Return only the last N lines of output. 0 = all output (default, truncated at 50K chars). Use a small number like 20-50 when polling a running process."
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "kill"],
+                    "description": "Action to take: 'status' (default) checks progress, 'kill' terminates the process."
+                }
+            },
+            "required": ["pid"]
+        }
+    },
 ]
