@@ -312,7 +312,11 @@ class OpenAIAdapter:
             and self._cached_api_key == api_key
         ):
             return self._cached_client
-        kwargs: dict[str, Any] = {"http_client": httpx.Client(verify=False)}
+        kwargs: dict[str, Any] = {
+            "http_client": httpx.Client(
+                verify=os.environ.get("SSL_VERIFY", "0").lower() not in ("0", "false", "no", ""),
+            ),
+        }
         if base_url:
             kwargs["base_url"] = base_url
         if api_key:

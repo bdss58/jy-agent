@@ -133,7 +133,11 @@ class AnthropicAdapter:
             and self._cached_auth_token == auth_token
         ):
             return self._cached_client
-        kwargs: dict[str, Any] = {"http_client": httpx.Client(verify=False)}
+        kwargs: dict[str, Any] = {
+            "http_client": httpx.Client(
+                verify=os.environ.get("SSL_VERIFY", "0").lower() not in ("0", "false", "no", ""),
+            ),
+        }
         if base_url:
             kwargs["base_url"] = base_url
         if auth_token:

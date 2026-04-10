@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import json
+import sys
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -91,8 +92,12 @@ ToolSource = Callable[[], tuple[list[dict], dict[str, Callable]]]
 
 
 # ─── Shared executor ─────────────────────────────────────────────────────────
+# Single process-wide executor shared by all AgentLoop instances (interactive
+# turns *and* sub-agents).  Workers are created on demand and idle threads are
+# cheap, so a slightly generous pool avoids contention during parallel tool
+# batches without meaningful resource cost.
 
-_tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 atexit.register(_tool_executor.shutdown, wait=False)
 
 
@@ -154,7 +159,13 @@ def _compact_messages(
     if estimated <= max_tokens:
         return messages
 
-    compacted = [dict(m) for m in messages]  # shallow copy each message
+    compacted = []  # deep-copy content to avoid mutating originals
+    for m in messages:
+        mc = dict(m)
+        c = mc.get("content")
+        if isinstance(c, list):
+            mc["content"] = [dict(b) if isinstance(b, dict) else b for b in c]
+        compacted.append(mc)
     did_compact = False
 
     for i in range(len(compacted) - 2):
@@ -323,7 +334,11 @@ def _execute_tools(
             results_arr[i] = (block, result)
             i += 1
 
-    return results_arr  # type: ignore[return-value]
+    # Guard: fill any slots that are still None (e.g. executor.submit() itself failed)
+    return [
+        r if r is not None else (blocks[i], ToolResult("Internal dispatch error", is_error=True))
+        for i, r in enumerate(results_arr)
+    ]
 
 
 def _execute_tool_with_timeout(
@@ -362,13 +377,53 @@ def _execute_tool_with_timeout(
 
 
 def _is_transient_error(error: BaseException) -> bool:
-    """Return True if the error is likely transient and worth retrying."""
+    """Return True if the error is likely transient and worth retrying.
+
+    Checks concrete exception types first to avoid false positives from
+    keyword-matching against arbitrary error messages.
+    """
+    # --- Network / transport layer (always transient) ---
+    import httpx  # local import to avoid hard dependency at module level
+    if isinstance(error, (
+        httpx.ConnectError,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.ConnectTimeout,
+        httpx.PoolTimeout,
+        httpx.RemoteProtocolError,
+        ConnectionResetError,
+        BrokenPipeError,
+        ConnectionAbortedError,
+    )):
+        return True
+
+    # --- Provider SDK errors (transient if server-side) ---
+    try:
+        import anthropic as _anth
+        if isinstance(error, _anth.APIStatusError) and error.status_code in (429, 500, 502, 503, 529):
+            return True
+        if isinstance(error, (_anth.APIConnectionError, _anth.APITimeoutError)):
+            return True
+    except ImportError:
+        pass
+    try:
+        import openai as _oai
+        if isinstance(error, _oai.APIStatusError) and error.status_code in (429, 500, 502, 503):
+            return True
+        if isinstance(error, (_oai.APIConnectionError, _oai.APITimeoutError)):
+            return True
+    except ImportError:
+        pass
+
+    # --- JSON decode failure (often a truncated stream response) ---
     if isinstance(error, json.JSONDecodeError):
         return True
+
+    # --- Fallback: keyword match, but only for generic / unknown types ---
     msg = str(error).lower()
     transient_keywords = [
-        "incomplete", "peer closed", "connection reset", "timeout",
-        "eof", "broken pipe", "overloaded", "529", "server_error",
+        "overloaded", "server_error", "peer closed",
+        "connection reset", "broken pipe",
     ]
     return any(kw in msg for kw in transient_keywords)
 
@@ -415,17 +470,21 @@ class AgentLoop:
         self._callbacks = callbacks or LoopCallbacks()
         self._tool_source = tool_source
         self._model_spec = model_spec  # override for sub-agent model tier
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=config.max_tool_workers,
-        )
-        atexit.register(self._executor.shutdown, wait=False)
+        # Reuse the module-level shared executor to avoid accumulating
+        # ThreadPoolExecutor objects and atexit handlers across turns and
+        # sub-agent dispatches.
+        self._executor = _tool_executor
 
     # ── callback helpers (no-op when callback is None) ────────────────────
 
     def _fire(self, name: str, *args: Any) -> None:
         cb = getattr(self._callbacks, name, None)
         if cb is not None:
-            cb(*args)
+            try:
+                cb(*args)
+            except Exception:
+                # Callbacks are for presentation — never abort the engine loop.
+                print(f"[warning] callback {name!r} raised:", traceback.format_exc(), file=sys.stderr)
 
     # ── public entry point ────────────────────────────────────────────────
 
@@ -440,6 +499,8 @@ class AgentLoop:
         tool_calls_count = 0
         registry = get_registry()
         step = 0
+        consecutive_truncations = 0  # cap truncation recovery retries
+        max_truncation_retries = 3
 
         # Resolve tools
         tool_schemas: list[dict] = []
@@ -532,6 +593,19 @@ class AgentLoop:
 
                 # Truncation detection → scale up and retry step
                 if cfg.auto_scale_on_truncation and _is_truncated(stop_reason, tool_call_blocks):
+                    consecutive_truncations += 1
+                    if consecutive_truncations > max_truncation_retries:
+                        return LoopResult(
+                            status="error",
+                            text=all_text or "",
+                            final_text="",
+                            messages=messages,
+                            steps=step + 1,
+                            total_input_tokens=total_input_tokens,
+                            total_output_tokens=total_output_tokens,
+                            tool_calls_count=tool_calls_count,
+                            error=f"Repeated truncation ({consecutive_truncations}x) — model output exceeds capacity",
+                        )
                     self._fire("on_truncation")
                     current_max_tokens = min(
                         current_max_tokens * cfg.token_scale_factor,
@@ -541,6 +615,9 @@ class AgentLoop:
                     all_text = all_text[: -len(step_text)] if step_text else all_text
                     continue
 
+                # Successful step — reset truncation counter
+                consecutive_truncations = 0
+
                 # Append assistant message (allow caller to transform)
                 if cfg.truncate_large_inputs:
                     content = final_message.get("content", [])
@@ -549,7 +626,9 @@ class AgentLoop:
 
                 cb_am = self._callbacks.on_assistant_message
                 if cb_am is not None:
-                    final_message = cb_am(final_message) or final_message
+                    transformed = cb_am(final_message)
+                    if transformed is not None:
+                        final_message = transformed
                 messages.append(final_message)
 
                 # Fire on_tool_batch for multi-tool batches
@@ -665,7 +744,7 @@ class AgentLoop:
                 text=all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]",
                 final_text="",
                 messages=messages,
-                steps=step + 1 if step else 1,
+                steps=step + 1,
                 total_input_tokens=total_input_tokens,
                 total_output_tokens=total_output_tokens,
                 tool_calls_count=tool_calls_count,
@@ -676,7 +755,7 @@ class AgentLoop:
                 text=all_text or "",
                 final_text="",
                 messages=messages,
-                steps=step + 1 if step else 1,
+                steps=step + 1,
                 total_input_tokens=total_input_tokens,
                 total_output_tokens=total_output_tokens,
                 tool_calls_count=tool_calls_count,
