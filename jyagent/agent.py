@@ -481,6 +481,20 @@ def run(runtime_owner: RuntimeOwner) -> None:
                             response = f"Error during planning: {result.error}"
                         final_text = ""
                         planner_messages = result.messages
+                    elif result.status == "cost_limit":
+                        cost_msg = f"\n\n⚠️ {result.error}"
+                        sys.stdout.flush()
+                        console.print(cost_msg, style="bold yellow", markup=False)
+                        response = result.text + cost_msg if result.text else cost_msg
+                        final_text = result.final_text
+                        planner_messages = result.messages
+                    elif result.status == "dedup_break":
+                        dedup_msg = f"\n\n⚠️ Loop detected — stopped to prevent infinite loop."
+                        sys.stdout.flush()
+                        console.print(dedup_msg, style="bold yellow", markup=False)
+                        response = result.text + dedup_msg if result.text else dedup_msg
+                        final_text = result.final_text
+                        planner_messages = result.messages
                     else:
                         # Fallback — should not happen
                         response = result.text or "Unknown error"

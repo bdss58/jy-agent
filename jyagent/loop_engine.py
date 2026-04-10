@@ -24,6 +24,7 @@ from .registry import get_registry
 from .toolresult import ToolResult
 from .validation import validate_tool_input
 from .memory.conversation import estimate_conversation_tokens
+from .remediation import enrich_error
 
 
 # ─── Core types ──────────────────────────────────────────────────────────────
@@ -47,6 +48,9 @@ class LoopConfig:
     streaming: bool = False
     truncate_large_inputs: bool = True
     fallback_on_max_steps: bool = False
+    # Harness controls (QW-2, QW-3)
+    max_cost_usd: float | None = None       # cost budget per turn — None = unlimited
+    dedup_threshold: int = 3                 # same tool+args N times → break loop
 
 
 @dataclass
@@ -69,7 +73,7 @@ class LoopCallbacks:
 
 @dataclass
 class LoopResult:
-    status: str  # "completed" | "max_steps" | "error" | "interrupted"
+    status: str  # "completed" | "max_steps" | "error" | "interrupted" | "cost_limit" | "dedup_break"
     text: str
     final_text: str
     messages: list
@@ -102,6 +106,81 @@ atexit.register(_tool_executor.shutdown, wait=False)
 
 
 # ─── Private helpers ─────────────────────────────────────────────────────────
+
+
+# ─── Harness helpers (QW-2, QW-3) ───────────────────────────────────────────
+
+class _CostTracker:
+    """Track estimated cost within a single run() for budget enforcement (QW-2).
+
+    Uses the session_stats pricing machinery but keeps a local running total
+    so the loop can check against LoopConfig.max_cost_usd each step.
+    """
+
+    def __init__(self):
+        self.total_cost: float = 0.0
+        self._has_unknown = False
+
+    def record(self, usage: dict, provider: str, model: str) -> None:
+        from .session_stats import _lookup_pricing
+        pricing = _lookup_pricing(provider, model) if provider and model else None
+        if pricing is None:
+            if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+                self._has_unknown = True
+            return
+        input_t = usage.get("input_tokens", 0) or 0
+        output_t = usage.get("output_tokens", 0) or 0
+        cache_create = usage.get("cache_creation_input_tokens", 0) or 0
+        cache_read = usage.get("cache_read_input_tokens", 0) or 0
+        self.total_cost += (
+            input_t * pricing.input_per_million / 1_000_000
+            + output_t * pricing.output_per_million / 1_000_000
+            + cache_create * (pricing.cache_creation_per_million or 0.0) / 1_000_000
+            + cache_read * (pricing.cache_read_per_million or 0.0) / 1_000_000
+        )
+
+    @property
+    def known_cost(self) -> float | None:
+        """Return cost or None if any usage was unpriced."""
+        return None if self._has_unknown else self.total_cost
+
+
+class _DedupTracker:
+    """Detect repeated identical tool calls within a single run() (QW-3).
+
+    Tracks (tool_name, args_key) → count.  Returns a feedback message when
+    the threshold is hit so the engine can inject it and break the loop.
+    """
+
+    def __init__(self, threshold: int = 3):
+        self._counts: dict[str, int] = {}
+        self._threshold = threshold
+
+    @staticmethod
+    def _make_key(name: str, args: dict) -> str:
+        """Stable string key for a tool call."""
+        try:
+            args_str = json.dumps(args, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            args_str = str(args)
+        return f"{name}::{args_str}"
+
+    def record(self, calls: list[ToolCallRequest]) -> str | None:
+        """Record a batch of tool calls.  Return feedback if any hit threshold."""
+        for call in calls:
+            key = self._make_key(call.name, call.input)
+            self._counts[key] = self._counts.get(key, 0) + 1
+            if self._counts[key] >= self._threshold:
+                return (
+                    f"LOOP DETECTED: Tool '{call.name}' was called with the same "
+                    f"arguments {self._counts[key]} times.  This is likely an "
+                    f"infinite loop.  Stop repeating this call and try a different "
+                    f"approach, or explain to the user why you're stuck."
+                )
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_text(message: dict) -> str:
     """Extract concatenated text blocks from an AssistantMessage."""
@@ -241,31 +320,31 @@ def _execute_tool(
     """Execute a single tool call with validation.  Always returns ToolResult."""
     fn = functions.get(name)
     if fn is None:
-        return ToolResult(
+        return enrich_error(ToolResult(
             f"Error: Unknown tool '{name}'. Available: {sorted(functions.keys())[:20]}",
             is_error=True,
-        )
+        ), name)
 
     tool_schema = registry.get_schema(name)
     validation_error = validate_tool_input(name, tool_input, fn, tool_schema)
     if validation_error:
-        return ToolResult(validation_error, is_error=True)
+        return enrich_error(ToolResult(validation_error, is_error=True), name)
 
     try:
         if tool_input is None:
             tool_input = {}
         raw = fn(**tool_input)
         if isinstance(raw, ToolResult):
-            return raw
+            return enrich_error(raw, name)
         return ToolResult(str(raw))
     except KeyboardInterrupt:
         raise
     except Exception as e:
         error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        return ToolResult(
+        return enrich_error(ToolResult(
             f"Error calling tool {name}: {e}\n{error_detail}",
             is_error=True,
-        )
+        ), name)
 
 
 def _execute_tools(
@@ -502,6 +581,10 @@ class AgentLoop:
         consecutive_truncations = 0  # cap truncation recovery retries
         max_truncation_retries = 3
 
+        # ── Harness trackers (QW-2, QW-3) ────────────────────────────────
+        cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
+        dedup_tracker = _DedupTracker(cfg.dedup_threshold)
+
         # Resolve tools
         tool_schemas: list[dict] = []
         tool_functions: dict[str, Callable] = {}
@@ -558,6 +641,31 @@ class AgentLoop:
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
                 self._fire("on_usage", usage)
+
+                # ── QW-2: Cost budget check ──────────────────────────────
+                if cost_tracker is not None:
+                    cost_tracker.record(
+                        usage,
+                        self._runtime_owner.model_spec.provider,
+                        self._runtime_owner.model_spec.model,
+                    )
+                    known = cost_tracker.known_cost
+                    if known is not None and known >= cfg.max_cost_usd:
+                        self._fire(
+                            "on_warning",
+                            f"Cost budget exceeded: ${known:.4f} >= ${cfg.max_cost_usd:.4f}",
+                        )
+                        return LoopResult(
+                            status="cost_limit",
+                            text=all_text or "",
+                            final_text=final_text,
+                            messages=messages,
+                            steps=step + 1,
+                            total_input_tokens=total_input_tokens,
+                            total_output_tokens=total_output_tokens,
+                            tool_calls_count=tool_calls_count,
+                            error=f"Cost budget exceeded: ${known:.4f} >= ${cfg.max_cost_usd:.4f}",
+                        )
 
                 all_text += step_text
                 final_text = step_text
@@ -634,6 +742,32 @@ class AgentLoop:
                 # Fire on_tool_batch for multi-tool batches
                 if len(tool_call_blocks) > 1:
                     self._fire("on_tool_batch", len(tool_call_blocks))
+
+                # ── QW-3: Duplicate tool-call detection ──────────────────
+                dedup_feedback = dedup_tracker.record(tool_call_blocks)
+                if dedup_feedback:
+                    self._fire("on_warning", dedup_feedback)
+                    # Inject feedback as a synthetic tool result for each call
+                    # so the model sees the warning, then terminate.
+                    for block in tool_call_blocks:
+                        messages.append({
+                            "role": "tool_result",
+                            "tool_call_id": block.id,
+                            "tool_name": block.name,
+                            "content": dedup_feedback,
+                            "is_error": True,
+                        })
+                    return LoopResult(
+                        status="dedup_break",
+                        text=all_text or "",
+                        final_text=final_text,
+                        messages=messages,
+                        steps=step + 1,
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        tool_calls_count=tool_calls_count,
+                        error=dedup_feedback,
+                    )
 
                 # Fire on_tool_start for all tool calls BEFORE execution
                 for block in tool_call_blocks:
