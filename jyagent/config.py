@@ -28,6 +28,7 @@ MAX_WORKING_TOKENS = int(os.environ.get("AGENT_MAX_WORKING_TOKENS", "180000"))  
 DEFAULT_TOOL_TIMEOUT = int(os.environ.get("AGENT_TOOL_TIMEOUT", "120"))
 STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
+OBSERVATION_MASK_DISTANCE = int(os.environ.get("AGENT_OBSERVATION_MASK_DISTANCE", "5"))  # fully clear tool results older than N messages from the end
 
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,8 @@ MEMORY_MD_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 COMPACT_TOKEN_THRESHOLD = int(os.environ.get("AGENT_COMPACT_TOKEN_THRESHOLD", "150000"))  # Layer 2 (LLM summary between turns); matches Anthropic API default & 75% of 200K window
 SUMMARIZE_KEEP_RECENT = int(os.environ.get("AGENT_SUMMARIZE_KEEP_RECENT", "6"))
 SUMMARIZE_THRESHOLD = int(os.environ.get("AGENT_SUMMARIZE_THRESHOLD", "20"))
+FILE_REINJECTION_COUNT = int(os.environ.get("AGENT_FILE_REINJECTION_COUNT", "5"))  # re-inject N most recent files after compaction
+FILE_REINJECTION_MAX_TOKENS = int(os.environ.get("AGENT_FILE_REINJECTION_MAX_TOKENS", "50000"))  # cap total re-injected content
 MAX_SESSIONS = 50
 MAX_MEMORY_INDEX_LINES = 200
 MAX_MEMORY_INDEX_BYTES = 25 * 1024

@@ -14,7 +14,8 @@ class ToolRegistry:
     def register(self, name: str, fn: Callable, schema: dict, *,
                  parallel_safe: bool = False,
                  timeout_hint: int | None = None,
-                 large_input_keys: set[str] | None = None) -> None:
+                 large_input_keys: set[str] | None = None,
+                 compaction_priority: str | None = None) -> None:
         with self._lock:
             self._functions[name] = fn
             self._schema_map[name] = schema
@@ -24,6 +25,8 @@ class ToolRegistry:
                 meta["timeout_hint"] = timeout_hint
             if large_input_keys:
                 meta["large_input_keys"] = large_input_keys
+            if compaction_priority:
+                meta["compaction_priority"] = compaction_priority
             self._metadata[name] = meta
             self._version += 1
 
@@ -57,6 +60,10 @@ class ToolRegistry:
     def get_large_input_keys(self, name: str) -> set[str] | None:
         """Return keys whose values should be truncated in working messages, or None."""
         return self._metadata.get(name, {}).get("large_input_keys")
+
+    def get_compaction_priority(self, name: str) -> str:
+        """Return tool's compaction priority: 'ephemeral', 'standard', or 'persistent'."""
+        return self._metadata.get(name, {}).get("compaction_priority", "standard")
 
     def get_function(self, name: str) -> Optional[Callable]:
         return self._functions.get(name)

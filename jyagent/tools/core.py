@@ -11,6 +11,15 @@ import tempfile
 from ..config import SKIP_DIRS, BINARY_EXTS
 from ..toolresult import ToolResult
 
+
+def _track_file(path: str) -> None:
+    """Record file access for post-compaction re-injection (best-effort)."""
+    try:
+        from ..memory.compaction import record_file_access
+        record_file_access(path)
+    except Exception:
+        pass  # never let tracking break tool execution
+
 _SKIP_EXACT: set[str] = set()
 _SKIP_PATTERNS: list[str] = []
 for _entry in SKIP_DIRS:
@@ -115,6 +124,7 @@ def read_file(path: str, offset: int = 0, limit: int = 0, line_numbers: bool = F
         if not os.path.exists(path):
             return ToolResult(f"Error: File not found: {path}", is_error=True)
 
+        _track_file(path)  # record for post-compaction re-injection
         _, ext = os.path.splitext(path)
         if ext.lower() in BINARY_EXTS:
             size = os.path.getsize(path)
@@ -181,6 +191,7 @@ def write_file(path: str, content: str) -> ToolResult:
     """
     try:
         path = resolve_path(path)
+        _track_file(path)  # record for post-compaction re-injection
         # Capture old file stats for overwrite summary
         old_exists = os.path.exists(path)
         old_chars = 0
@@ -345,6 +356,7 @@ def edit_file(
         dry_run: If True, show what would change without actually writing
     """
     path = resolve_path(path)
+    _track_file(path)  # record for post-compaction re-injection
 
     # --- Validate explicit operation ---
     if operation:

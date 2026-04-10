@@ -8,6 +8,7 @@ from .memory import (
     build_memory_context,
     save_session, load_session, has_saved_session,
     should_extract, extract_and_remember,
+    record_file_access,
 )
 from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
@@ -381,9 +382,13 @@ def run(runtime_owner: RuntimeOwner) -> None:
                     """Callback after auto-compaction: signal context rebuild."""
                     state["_force_rebuild_context"] = True
 
+                # Pass system_prompt so compaction can reuse it (cache-friendly).
+                # Use cached system prompt if available, otherwise the base prompt.
+                compact_sys_prompt = _cached_memory_context or SYSTEM_PROMPT
                 summarize_if_needed(
                     conversation, runtime_owner,
                     system_prompt_rebuilder=_on_compacted,
+                    system_prompt=compact_sys_prompt,
                 )
 
                 messages = conversation.get_history()

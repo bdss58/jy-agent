@@ -40,20 +40,20 @@ _TOOL_FN_MAP = {
 }
 
 _TOOL_METADATA = {
-    "read_file":       {"parallel_safe": True},
-    "list_directory":  {"parallel_safe": True},
-    "glob_files":      {"parallel_safe": True},
-    "grep_files":      {"parallel_safe": True},
-    "run_shell":       {"parallel_safe": False, "timeout_hint": "from_input"},
+    "read_file":       {"parallel_safe": True, "compaction_priority": "persistent"},
+    "list_directory":  {"parallel_safe": True, "compaction_priority": "ephemeral"},
+    "glob_files":      {"parallel_safe": True, "compaction_priority": "ephemeral"},
+    "grep_files":      {"parallel_safe": True, "compaction_priority": "ephemeral"},
+    "run_shell":       {"parallel_safe": False, "timeout_hint": "from_input", "compaction_priority": "ephemeral"},
     "write_file":      {"parallel_safe": False, "large_input_keys": {"content"}},
     "edit_file":       {"parallel_safe": False, "large_input_keys": {"new_text", "old_text"}},
     "manage_memory":   {"parallel_safe": False},
     "manage_skills":   {"parallel_safe": False},
-    "web_fetch":       {"parallel_safe": False, "timeout_hint": 180},
+    "web_fetch":       {"parallel_safe": False, "timeout_hint": 180, "compaction_priority": "persistent"},
     "mcp":             {"parallel_safe": False, "timeout_hint": 180},
     "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}},
     "run_background":  {"parallel_safe": False},
-    "check_background": {"parallel_safe": True},
+    "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral"},
 }
 
 _registry = get_registry()
@@ -65,9 +65,11 @@ for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA, SUBAGENT_SCHEMA]:
         # "from_input" is a sentinel — run_shell reads timeout from its own input
         timeout_hint = timeout if isinstance(timeout, int) else None
         large_keys = meta.get("large_input_keys")
+        compaction_priority = meta.get("compaction_priority")
         _registry.register(
             tool_def["name"], fn, tool_def,
             parallel_safe=meta.get("parallel_safe", False),
             timeout_hint=timeout_hint,
             large_input_keys=large_keys,
+            compaction_priority=compaction_priority,
         )

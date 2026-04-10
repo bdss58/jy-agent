@@ -228,17 +228,32 @@ def _compact_messages(
     max_tokens: int,
     compact_chars: int,
 ) -> list:
-    """Aggressively truncate older tool results when context is too large.
+    """Multi-tier context compaction for messages sent to the LLM.
 
-    Keeps the last 2 messages intact so the LLM can reason about the most
-    recent tool output.  Returns the original list unchanged if no truncation
-    was performed.
+    Applied in order of aggressiveness:
+      Tier 0 — Thinking block pruning: strip ``thinking`` blocks from old messages.
+      Tier 1 — Observation masking: beyond ``mask_distance`` messages from the end,
+               tool results are fully cleared (replaced with a short placeholder).
+               Within the mask distance but outside the keep-recent zone, results
+               are truncated to ``compact_chars``.
+      Tier 2 — Compaction-priority awareness: "ephemeral" tool results are cleared
+               more aggressively (zero chars) even within the mask distance.
+
+    Keeps the last 2 messages fully intact (the LLM needs them for reasoning).
+    Returns the original list unchanged if no modification was performed.
     """
+    from .config import OBSERVATION_MASK_DISTANCE
+
     estimated = estimate_conversation_tokens(messages)
     if estimated <= max_tokens:
         return messages
 
-    compacted = []  # deep-copy content to avoid mutating originals
+    registry = get_registry()
+    n = len(messages)
+    keep_intact = 2  # always preserve last 2 messages verbatim
+
+    # Deep-copy to avoid mutating originals
+    compacted = []
     for m in messages:
         mc = dict(m)
         c = mc.get("content")
@@ -247,11 +262,39 @@ def _compact_messages(
         compacted.append(mc)
     did_compact = False
 
-    for i in range(len(compacted) - 2):
+    for i in range(n - keep_intact):
         msg = compacted[i]
+        distance_from_end = n - 1 - i  # how far this message is from the newest
+        far_away = distance_from_end > OBSERVATION_MASK_DISTANCE
+
+        # ── Tier 0: Thinking block pruning ──────────────────────────
+        # Strip thinking blocks from all but the last few messages.
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            filtered_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "thinking":
+                    did_compact = True
+                    continue  # drop thinking block entirely
+                filtered_blocks.append(block)
+            if len(filtered_blocks) != len(content):
+                compacted[i]["content"] = filtered_blocks
+                content = filtered_blocks  # use filtered for subsequent tiers
+
+        # ── Tier 1 & 2: Observation masking + priority-aware compaction ──
+        # Process tool_result messages (top-level role)
         if msg.get("role") == "tool_result":
             result_text = str(msg.get("content", ""))
-            if len(result_text) > compact_chars:
+            tool_name = msg.get("tool_name", "")
+            priority = registry.get_compaction_priority(tool_name) if tool_name else "standard"
+
+            if far_away or priority == "ephemeral":
+                # Full clear — observation masking
+                if result_text:
+                    compacted[i]["content"] = "[Tool result cleared]"
+                    did_compact = True
+            elif len(result_text) > compact_chars and priority != "persistent":
+                # Truncate to compact_chars
                 compacted[i]["content"] = (
                     result_text[:compact_chars]
                     + f"\n[... compacted from {len(result_text)} chars ...]"
@@ -259,14 +302,21 @@ def _compact_messages(
                 did_compact = True
             continue
 
-        content = msg.get("content", "")
+        # Process tool_result blocks inside list content (e.g., after normalization)
         if isinstance(content, list):
             new_blocks = []
             block_changed = False
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     result_text = str(block.get("content", ""))
-                    if len(result_text) > compact_chars:
+                    tool_name = block.get("tool_name", "")
+                    priority = registry.get_compaction_priority(tool_name) if tool_name else "standard"
+
+                    if far_away or priority == "ephemeral":
+                        block = dict(block)
+                        block["content"] = "[Tool result cleared]"
+                        block_changed = True
+                    elif len(result_text) > compact_chars and priority != "persistent":
                         block = dict(block)
                         block["content"] = (
                             result_text[:compact_chars]

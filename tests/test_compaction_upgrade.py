@@ -1,0 +1,308 @@
+# tests/test_compaction_upgrade.py — Tests for the context compaction improvements.
+#
+# Covers:
+#   Phase 1: P0.1 observation masking, P0.2 thinking pruning, P0.3 cache-friendly sig
+#   Phase 2: P1.4 file reinjection, P1.5 compaction priority, P1.6 9-section prompt
+
+import os
+import tempfile
+import pytest
+
+# ─── Phase 1: P0.1 + P0.2 — Observation masking + thinking pruning ──────────
+
+def test_thinking_blocks_pruned_from_old_messages():
+    """Tier 0: thinking blocks are stripped from all but the last 2 messages."""
+    from jyagent.loop_engine import _compact_messages
+    import jyagent.tools  # noqa: triggers registration
+
+    messages = []
+    for i in range(6):
+        messages.append({
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": f"Thinking #{i} " + "x" * 200},
+                {"type": "text", "text": f"Response #{i}"},
+                {"type": "tool_call", "id": f"tc_{i}", "name": "run_shell",
+                 "arguments": {"command": "ls"}},
+            ],
+        })
+        messages.append({
+            "role": "tool_result", "tool_call_id": f"tc_{i}",
+            "tool_name": "run_shell", "content": "output " * 500,
+        })
+
+    result = _compact_messages(messages, max_tokens=1000, compact_chars=2000)
+    assert result is not messages
+
+    # Old messages (all but last 2) should have no thinking blocks
+    for i in range(len(result) - 2):
+        content = result[i].get("content", "")
+        if isinstance(content, list):
+            thinking = [b for b in content if isinstance(b, dict) and b.get("type") == "thinking"]
+            assert len(thinking) == 0, f"Message {i} still has {len(thinking)} thinking blocks"
+
+
+def test_observation_masking_clears_far_tool_results():
+    """Tier 1: tool results beyond OBSERVATION_MASK_DISTANCE are fully cleared."""
+    from jyagent.loop_engine import _compact_messages
+    import jyagent.tools  # noqa
+
+    messages = []
+    # 10 pairs = 20 messages. With mask_distance=5, messages 0-14 are "far"
+    for i in range(10):
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"Step {i}"}],
+        })
+        messages.append({
+            "role": "tool_result", "tool_call_id": f"tc_{i}",
+            "tool_name": "run_shell", "content": "long output " * 500,
+        })
+
+    result = _compact_messages(messages, max_tokens=500, compact_chars=2000)
+
+    # Far-away ephemeral results should be fully cleared
+    for i in [1, 3, 5, 7, 9, 11, 13]:  # tool_results at odd indices
+        distance = len(result) - 1 - i
+        content = result[i].get("content", "")
+        if distance > 5:
+            assert content == "[Tool result cleared]", \
+                f"Message {i} (distance={distance}) not cleared: {content[:60]}"
+
+
+def test_ephemeral_tools_cleared_even_when_close():
+    """Tier 2: ephemeral tools are cleared regardless of distance."""
+    from jyagent.loop_engine import _compact_messages
+    import jyagent.tools  # noqa
+
+    # 6 messages: assistant+tool_result x 3. Message indices 0-5.
+    # Last 2 kept intact (4,5). Messages 0-3 compacted.
+    messages = [
+        {"role": "assistant", "content": [{"type": "text", "text": "listing"}]},
+        {"role": "tool_result", "tool_call_id": "tc_0",
+         "tool_name": "list_directory", "content": "lots of dirs " * 500},
+        {"role": "assistant", "content": [{"type": "text", "text": "searching"}]},
+        {"role": "tool_result", "tool_call_id": "tc_1",
+         "tool_name": "grep_files", "content": "match results " * 500},
+        {"role": "user", "content": "ok"},
+        {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+    ]
+
+    result = _compact_messages(messages, max_tokens=100, compact_chars=2000)
+
+    # Both list_directory and grep_files are ephemeral → cleared
+    assert result[1]["content"] == "[Tool result cleared]"
+    assert result[3]["content"] == "[Tool result cleared]"
+
+
+def test_persistent_tool_results_retained():
+    """Persistent tool results (read_file, web_fetch) are NOT fully cleared."""
+    from jyagent.loop_engine import _compact_messages
+    import jyagent.tools  # noqa
+
+    content_4k = "line of code\n" * 300  # ~3900 chars
+
+    messages = [
+        {"role": "assistant", "content": [{"type": "text", "text": "reading"}]},
+        {"role": "tool_result", "tool_call_id": "tc_0",
+         "tool_name": "read_file", "content": content_4k},
+        {"role": "assistant", "content": [{"type": "text", "text": "got it"}]},
+        {"role": "tool_result", "tool_call_id": "tc_1",
+         "tool_name": "run_shell", "content": content_4k},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]
+
+    result = _compact_messages(messages, max_tokens=100, compact_chars=2000)
+
+    # read_file (persistent): should NOT be "[Tool result cleared]" but may be truncated
+    rf_content = result[1]["content"]
+    assert rf_content != "[Tool result cleared]", "Persistent read_file was fully cleared"
+    assert "line of code" in rf_content, "Persistent content should have some data"
+
+    # run_shell (ephemeral): should be fully cleared
+    rs_content = result[3]["content"]
+    assert rs_content == "[Tool result cleared]", f"Ephemeral run_shell not cleared: {rs_content[:60]}"
+
+
+def test_last_two_messages_always_intact():
+    """The last 2 messages are never modified regardless of content."""
+    from jyagent.loop_engine import _compact_messages
+    import jyagent.tools  # noqa
+
+    big_thinking = {"type": "thinking", "thinking": "x" * 10000}
+    messages = [
+        {"role": "user", "content": "start"},
+        {"role": "tool_result", "tool_call_id": "tc_0",
+         "tool_name": "run_shell", "content": "y" * 10000},
+        {"role": "user", "content": "end question"},
+        {"role": "assistant", "content": [big_thinking, {"type": "text", "text": "answer"}]},
+    ]
+
+    result = _compact_messages(messages, max_tokens=100, compact_chars=500)
+
+    # Last 2 messages unchanged
+    assert result[-1]["content"][0]["thinking"] == "x" * 10000
+    assert result[-2]["content"] == "end question"
+
+
+# ─── Phase 1: P0.3 — Cache-friendly compaction signature ─────────────────────
+
+def test_compact_conversation_accepts_system_prompt():
+    """compact_conversation accepts system_prompt parameter for cache reuse."""
+    import inspect
+    from jyagent.memory.compaction import compact_conversation
+    sig = inspect.signature(compact_conversation)
+    assert "system_prompt" in sig.parameters
+
+
+def test_summarize_if_needed_accepts_system_prompt():
+    """summarize_if_needed passes system_prompt through."""
+    import inspect
+    from jyagent.memory.compaction import summarize_if_needed
+    sig = inspect.signature(summarize_if_needed)
+    assert "system_prompt" in sig.parameters
+
+
+# ─── Phase 2: P1.4 — File re-injection ───────────────────────────────────────
+
+def test_file_access_tracker_basic():
+    """FileAccessTracker records and returns files in order."""
+    from jyagent.memory.compaction import FileAccessTracker
+
+    tracker = FileAccessTracker()
+    tracker.record("/a.py")
+    tracker.record("/b.py")
+    tracker.record("/c.py")
+
+    assert tracker.recent(2) == ["/c.py", "/b.py"]
+    assert tracker.recent(5) == ["/c.py", "/b.py", "/a.py"]
+    assert len(tracker) == 3
+
+
+def test_file_access_tracker_dedup_and_reorder():
+    """Re-accessing a file moves it to the most recent position."""
+    from jyagent.memory.compaction import FileAccessTracker
+
+    tracker = FileAccessTracker()
+    tracker.record("/a.py")
+    tracker.record("/b.py")
+    tracker.record("/a.py")  # re-access
+
+    assert tracker.recent(5) == ["/a.py", "/b.py"]
+    assert len(tracker) == 2
+
+
+def test_file_reinjection_reads_real_files():
+    """_build_file_reinjection_content reads actual file contents."""
+    from jyagent.memory.compaction import (
+        _build_file_reinjection_content, get_file_tracker,
+    )
+
+    tracker = get_file_tracker()
+    tracker.clear()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("def hello():\n    print('world')\n")
+        tmp_path = f.name
+
+    try:
+        tracker.record(tmp_path)
+        content = _build_file_reinjection_content()
+        assert "def hello()" in content
+        assert "Post-compaction context" in content
+    finally:
+        os.unlink(tmp_path)
+        tracker.clear()
+
+
+def test_file_reinjection_skips_missing_files():
+    """Non-existent files are silently skipped during re-injection."""
+    from jyagent.memory.compaction import (
+        _build_file_reinjection_content, get_file_tracker,
+    )
+
+    tracker = get_file_tracker()
+    tracker.clear()
+
+    tracker.record("/nonexistent/file.py")
+    content = _build_file_reinjection_content()
+    assert content == ""  # no files readable → empty
+    tracker.clear()
+
+
+# ─── Phase 2: P1.5 — Compaction priority ─────────────────────────────────────
+
+def test_compaction_priority_in_registry():
+    """Registry correctly stores and retrieves compaction_priority."""
+    from jyagent.registry import ToolRegistry
+
+    reg = ToolRegistry()
+    reg.register("test_tool", lambda: None, {"name": "test_tool"},
+                 compaction_priority="ephemeral")
+    assert reg.get_compaction_priority("test_tool") == "ephemeral"
+    assert reg.get_compaction_priority("unknown_tool") == "standard"  # default
+
+
+def test_builtin_tools_have_correct_priorities():
+    """Built-in tools registered with expected compaction priorities."""
+    import jyagent.tools  # noqa
+    from jyagent.registry import get_registry
+    r = get_registry()
+
+    assert r.get_compaction_priority("run_shell") == "ephemeral"
+    assert r.get_compaction_priority("list_directory") == "ephemeral"
+    assert r.get_compaction_priority("read_file") == "persistent"
+    assert r.get_compaction_priority("web_fetch") == "persistent"
+    assert r.get_compaction_priority("write_file") == "standard"
+
+
+# ─── Phase 2: P1.6 — Enhanced 9-section summary prompt ───────────────────────
+
+def test_compact_prompt_has_nine_sections():
+    """The compact prompt includes all 9 required sections."""
+    from jyagent.memory.compaction import COMPACT_PROMPT
+
+    sections = [l.strip() for l in COMPACT_PROMPT.splitlines() if l.strip().startswith("## ")]
+    expected = [
+        "## Task Context",
+        "## Files Modified",
+        "## Key Decisions",
+        "## Errors & Failures",
+        "## Technical Details",
+        "## Environment State",
+        "## Current State",
+        "## Working Hypotheses",
+        "## Pending Tasks",
+    ]
+    assert sections == expected, f"Sections mismatch:\n  got:      {sections}\n  expected: {expected}"
+
+
+def test_format_messages_excludes_thinking():
+    """_format_messages_for_compact strips thinking blocks."""
+    from jyagent.memory.compaction import _format_messages_for_compact
+
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "SECRET THINKING"},
+            {"type": "text", "text": "Visible response"},
+        ]},
+    ]
+    formatted = _format_messages_for_compact(messages)
+    assert "SECRET THINKING" not in formatted
+    assert "Visible response" in formatted
+
+
+# ─── Integration: file tracking from tools ────────────────────────────────────
+
+def test_track_file_from_tool_functions():
+    """_track_file in core.py records to the global tracker."""
+    from jyagent.tools.core import _track_file
+    from jyagent.memory.compaction import get_file_tracker
+
+    tracker = get_file_tracker()
+    tracker.clear()
+
+    _track_file("/test/integration.py")
+    assert "/test/integration.py" in tracker.recent(5)
+    tracker.clear()

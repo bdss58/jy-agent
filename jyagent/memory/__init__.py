@@ -9,7 +9,10 @@
 
 # Re-export the live memory API.
 from .conversation import ConversationMemory
-from .compaction import compact_conversation, summarize_if_needed
+from .compaction import (
+    compact_conversation, summarize_if_needed,
+    record_file_access, get_file_tracker, FileAccessTracker,
+)
 from .operations import (
     read_memory_md, read_memory_index, write_memory_md, append_memory_md,
     forget_from_memory_md,
