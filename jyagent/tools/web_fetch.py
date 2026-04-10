@@ -421,120 +421,26 @@ _CHROME_EXTRACT_SEARCH_JS = """() => {
 def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
     """Tier 4: Fetch via Chrome DevTools MCP — direct tool calls, no LLM.
 
-    Opens a new tab, navigates to the URL, extracts text via JS, closes tab.
-    Falls back to take_snapshot if JS extraction yields too little text.
+    Delegates to MCPManager.chrome_fetch_page() which handles:
+    - Reference-counted Chrome connection (no premature disconnect)
+    - Page-level locking (no interleaving between concurrent callers)
+    - Explicit select_page before evaluate_script / take_snapshot
+    - Automatic cleanup (close tab, restore original selection)
+
+    For search result pages, uses a specialised JS extractor that captures
+    real href URLs instead of truncated display text.
 
     Raises RuntimeError on failure (causes fallthrough to next strategy).
     """
-    import time
     from ..mcp_manager import get_manager
 
     manager = get_manager()
+    extract_js = _CHROME_EXTRACT_SEARCH_JS if _is_search_url(url) else _CHROME_EXTRACT_JS
 
-    # Ensure Chrome is connected (auto-connect if needed)
-    was_connected = manager.is_connected("chrome")
-    if not was_connected:
-        result = manager.connect("chrome")
-        if result.get("status") not in ("connected", "already_connected"):
-            raise RuntimeError(f"Failed to connect Chrome: {result}")
-
-    page_id = None
-    try:
-        # 1. Open a new tab with the URL
-        new_page_result = manager._call_mcp_tool("chrome", "new_page", {"url": url})
-        if new_page_result.is_error:
-            raise RuntimeError(f"new_page failed: {new_page_result.content}")
-
-        # Extract page ID from result for cleanup
-        page_id = _extract_page_id(new_page_result.content)
-
-        # 2. Wait a moment for dynamic content to render
-        time.sleep(1.5)
-
-        # 3. Extract text via evaluate_script
-        #    For search result pages, use the search-specific extractor that
-        #    captures real href URLs instead of truncated display URLs.
-        extract_js = _CHROME_EXTRACT_SEARCH_JS if _is_search_url(url) else _CHROME_EXTRACT_JS
-        extract_result = manager._call_mcp_tool("chrome", "evaluate_script", {
-            "function": extract_js,
-        })
-
-        content = ""
-        if not extract_result.is_error:
-            content = _extract_js_result(extract_result.content)
-
-        # 4. If JS extraction got too little, fall back to take_snapshot
-        if len(content) < 100:
-            snapshot_result = manager._call_mcp_tool("chrome", "take_snapshot", {})
-            if not snapshot_result.is_error:
-                content = snapshot_result.content.strip()
-
-        if not content or len(content) < 50:
-            raise RuntimeError(f"Chrome returned too little content: {len(content)} chars")
-
-        return 200, content
-
-    finally:
-        # Always close the tab we opened
-        if page_id:
-            try:
-                manager._call_mcp_tool("chrome", "close_page", {"pageId": page_id})
-            except Exception:
-                pass
-        # If WE connected Chrome, disconnect to clean up
-        if not was_connected and manager.is_connected("chrome"):
-            try:
-                manager.disconnect("chrome")
-            except Exception:
-                pass
-
-
-def _extract_page_id(new_page_output: str) -> int | None:
-    """Extract the page/tab ID from new_page tool output.
-
-    Output format: '## Pages\\n1: about:blank\\n2: https://example.com/ [selected]'
-    The [selected] page is the one we just opened.
-    """
-    import re
-    if not new_page_output:
-        return None
-    # Find the [selected] page line and extract its numeric ID
-    m = re.search(r'(\d+):\s+\S+.*\[selected\]', new_page_output)
-    if m:
-        return int(m.group(1))
-    # Fallback: last numeric page ID
-    ids = re.findall(r'^(\d+):', new_page_output, re.MULTILINE)
-    if ids:
-        return int(ids[-1])
-    return None
-
-
-def _extract_js_result(evaluate_output: str) -> str:
-    """Extract the actual JS result from evaluate_script output.
-
-    Output format: 'Script ran on page and returned:\\n```json\\n"actual text"\\n```'
-    """
-    import json as _json
-    if not evaluate_output:
-        return ""
-    # Try to extract from ```json ... ``` block
-    m = re.search(r'```(?:json)?\s*\n(.*?)\n```', evaluate_output, re.DOTALL)
-    if m:
-        raw = m.group(1).strip()
-        # Try to JSON-decode (strings come as "quoted")
-        try:
-            decoded = _json.loads(raw)
-            if isinstance(decoded, str):
-                return decoded
-        except (ValueError, _json.JSONDecodeError):
-            pass
-        return raw
-    # Fallback: strip prefix
-    text = evaluate_output
-    for prefix in ("Script ran on page and returned:", "Result:"):
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-    return text.strip()
+    content = manager.chrome_fetch_page(
+        url, timeout=timeout, js_function=extract_js,
+    )
+    return 200, content
 
 
 # ─── Strategy orchestration ──────────────────────────────────────────────────
