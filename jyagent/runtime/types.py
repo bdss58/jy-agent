@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal, Protocol, TypedDict
+from typing import Any, Iterator, Literal, Protocol, Required, TypedDict
 
 
 StopReason = Literal["stop", "length", "tool_use", "error", "aborted"]
@@ -25,7 +25,7 @@ class TextBlock(TypedDict):
 
 
 class ThinkingBlock(TypedDict, total=False):
-    type: Literal["thinking"]
+    type: Required[Literal["thinking"]]
     thinking: str
     signature: str
     redacted: bool
@@ -50,8 +50,8 @@ class UserMessage(TypedDict):
 
 
 class AssistantMessage(TypedDict, total=False):
-    role: Literal["assistant"]
-    content: list[AssistantContentBlock]
+    role: Required[Literal["assistant"]]
+    content: Required[list[AssistantContentBlock]]
     provider: str
     api: str
     model: str

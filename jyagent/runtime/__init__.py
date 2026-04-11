@@ -25,12 +25,18 @@ from .types import (
 # Each provider module calls register_adapter() at import time.
 def _auto_register_providers():
     """Import provider modules for registration side effects, skip missing deps."""
-    _provider_modules = ["anthropic", "openai"]  # Add "gemini" etc. here later
+    _provider_modules = ["anthropic", "openai"]
     for name in _provider_modules:
         try:
             __import__(f"{__name__}.providers.{name}", fromlist=[name])
-        except ImportError:
-            pass
+        except ImportError as exc:
+            # Only skip if the top-level SDK package is missing.
+            # Re-raise if it's an internal import error within our code.
+            module_name = f"{__name__}.providers.{name}"
+            if exc.name and not exc.name.startswith(module_name):
+                pass  # SDK not installed — skip this provider
+            else:
+                raise  # Bug inside provider module — don't swallow
 
 _auto_register_providers()
 

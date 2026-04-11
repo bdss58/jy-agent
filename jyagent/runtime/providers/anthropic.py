@@ -7,7 +7,7 @@ import anthropic
 import httpx
 
 from ..core import register_adapter
-from ..streams import ErrorStream, make_error_assistant_message
+from ..streams import BaseStream, ErrorStream, make_error_assistant_message
 from ..types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
 from ._anthropic_helpers import (
     assistant_from_response,
@@ -17,15 +17,15 @@ from ._anthropic_helpers import (
 
 # ─── _AnthropicStream ────────────────────────────────────────────────────────
 
-class _AnthropicStream(RuntimeStream):
+class _AnthropicStream(BaseStream):
     def __init__(self, stream_cm: Any, model_spec: ModelSpec):
-        self._stream_cm = stream_cm
-        self._stream: Any = None
-        self._model_spec = model_spec
-        self._final_message: AssistantMessage | None = None
-        self._closed = False
+        super().__init__(stream_cm, model_spec)
 
     def __iter__(self):
+        if self._consumed:
+            raise RuntimeError("Stream already consumed")
+        self._consumed = True
+
         # Enter the SDK context manager at iteration start so failures
         # are captured as error events rather than raised from __init__.
         if self._stream is None:
@@ -80,6 +80,7 @@ class _AnthropicStream(RuntimeStream):
         except Exception as err:
             self._final_message = make_error_assistant_message(self._model_spec, err)
             yield {"type": "error", "message": self._final_message}
+            self.close()
             return
 
         # Successful completion — resolve final message from the SDK.
@@ -89,30 +90,10 @@ class _AnthropicStream(RuntimeStream):
         except Exception as err:
             self._final_message = make_error_assistant_message(self._model_spec, err)
             yield {"type": "error", "message": self._final_message}
+            self.close()
             return
 
         yield {"type": "done", "message": self._final_message}
-
-    def get_final_message(self) -> AssistantMessage:
-        if self._final_message is not None:
-            return self._final_message
-        # Drive iteration to completion — terminal event always sets _final_message.
-        for _ in self:
-            pass
-        assert self._final_message is not None
-        return self._final_message
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        if self._stream is not None:
-            self._stream_cm.__exit__(None, None, None)
-        self._closed = True
-
-    def __enter__(self) -> _AnthropicStream:
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
 class AnthropicAdapter:
@@ -135,7 +116,7 @@ class AnthropicAdapter:
             return self._cached_client
         kwargs: dict[str, Any] = {
             "http_client": httpx.Client(
-                verify=os.environ.get("SSL_VERIFY", "0").lower() not in ("0", "false", "no", ""),
+                verify=os.environ.get("SSL_VERIFY", "1").lower() not in ("0", "false", "no"),
             ),
         }
         if base_url:
@@ -162,11 +143,8 @@ class AnthropicAdapter:
         options = options or RuntimeOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
-        try:
-            client = self._client()
-            response = client.messages.create(**kwargs, timeout=timeout)
-        except Exception:
-            raise
+        client = self._client()
+        response = client.messages.create(**kwargs, timeout=timeout)
         return assistant_from_response(model_spec, response)
 
 

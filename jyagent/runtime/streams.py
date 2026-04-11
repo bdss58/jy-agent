@@ -33,6 +33,42 @@ def make_error_assistant_message(
     return msg
 
 
+class BaseStream:
+    """Shared stream infrastructure for provider adapters."""
+
+    def __init__(self, stream_cm: Any, model_spec: ModelSpec) -> None:
+        self._stream_cm = stream_cm
+        self._stream: Any = None
+        self._model_spec = model_spec
+        self._final_message: AssistantMessage | None = None
+        self._closed = False
+        self._consumed = False
+
+    def get_final_message(self) -> AssistantMessage:
+        if self._final_message is not None:
+            return self._final_message
+        for _ in self:
+            pass
+        assert self._final_message is not None
+        return self._final_message
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._stream is not None:
+            try:
+                self._stream_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+
 class ErrorStream(RuntimeStream):
     """A ``RuntimeStream`` that immediately yields a terminal error event.
 
@@ -59,4 +95,4 @@ class ErrorStream(RuntimeStream):
         pass
 
 
-__all__ = ["ErrorStream", "make_error_assistant_message"]
+__all__ = ["BaseStream", "ErrorStream", "make_error_assistant_message"]

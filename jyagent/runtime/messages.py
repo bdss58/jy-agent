@@ -108,6 +108,10 @@ def transform_messages_for_target(messages: list[Message], target: ModelSpec) ->
                         tool_call_id_map[tool_call["id"]] = normalized_id
                         tool_call["id"] = normalized_id
                 new_blocks.append(tool_call)
+                continue
+            # Unknown block types — pass through for forward compatibility
+            else:
+                new_blocks.append(raw_block)
 
         assistant["content"] = new_blocks
         transformed.append(assistant)

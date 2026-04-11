@@ -30,6 +30,24 @@ from ..types import (
 _OPENAI_LEGACY_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
 _OPENAI_REASONING_EFFORT_MODEL_PREFIX = "gpt-5.4"
 
+_OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
+
+
+def validate_openai_reasoning(reasoning: Any, *, model: str | None = None) -> dict[str, Any]:
+    """Validate an OpenAI reasoning config dict."""
+    if not isinstance(reasoning, dict):
+        raise ValueError(f"OpenAI reasoning config must be a dict, got {type(reasoning).__name__}.")
+    effort = reasoning.get("effort")
+    if effort is not None and effort not in _OPENAI_REASONING_EFFORTS:
+        allowed = ", ".join(sorted(_OPENAI_REASONING_EFFORTS))
+        raise ValueError(f"OpenAI reasoning effort must be one of: {allowed}. Got '{effort}'.")
+    if model and effort and not supports_openai_reasoning_effort(model):
+        raise ValueError(
+            f"OpenAI reasoning effort is not supported by model '{model}'. "
+            "Use 'gpt-5.4' or newer."
+        )
+    return reasoning
+
 
 def supports_openai_reasoning_effort(model: str) -> bool:
     """Return True for GPT-5.4 models that accept reasoning_effort."""
@@ -122,8 +140,13 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
             arguments_str = getattr(item, "arguments", "") or "{}"
             try:
                 parsed_args = json.loads(arguments_str)
-            except (json.JSONDecodeError, TypeError):
-                parsed_args = {}
+            except (json.JSONDecodeError, TypeError) as exc:
+                import logging
+                logging.getLogger("jyagent.runtime").warning(
+                    "Malformed tool-call arguments from OpenAI (call_id=%s, name=%s): %s",
+                    getattr(item, "call_id", "?"), getattr(item, "name", "?"), exc,
+                )
+                parsed_args = {"_parse_error": str(exc)}
             content.append({
                 "type": "tool_call",
                 "id": getattr(item, "call_id", ""),
@@ -358,7 +381,8 @@ def build_request_kwargs(
 
     # Reasoning config → reasoning parameter
     if options.reasoning is not None and isinstance(options.reasoning, dict):
-        effort = options.reasoning.get("effort")
+        validated = validate_openai_reasoning(options.reasoning, model=model_spec.model)
+        effort = validated.get("effort")
         if effort and supports_reasoning:
             kwargs["reasoning"] = {"effort": effort}
 
@@ -375,4 +399,5 @@ __all__ = [
     "supports_openai_reasoning_effort",
     "usage_from_response",
     "uses_openai_legacy_reasoning_transport",
+    "validate_openai_reasoning",
 ]

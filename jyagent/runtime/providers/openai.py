@@ -18,7 +18,7 @@ except ImportError:
 import httpx
 
 from ..core import register_adapter
-from ..streams import ErrorStream, make_error_assistant_message
+from ..streams import BaseStream, ErrorStream, make_error_assistant_message
 from ..types import (
     AssistantMessage,
     Context,
@@ -41,7 +41,7 @@ from ...config import register_provider as _register_config_provider
 
 # ─── _OpenAIStream ──────────────────────────────────────────────────────────
 
-class _OpenAIStream(RuntimeStream):
+class _OpenAIStream(BaseStream):
     """Wraps an OpenAI Responses API streaming response.
 
     The stream context manager (``ResponseStreamManager``) yields
@@ -51,13 +51,13 @@ class _OpenAIStream(RuntimeStream):
     """
 
     def __init__(self, stream_cm: Any, model_spec: ModelSpec) -> None:
-        self._stream_cm = stream_cm
-        self._stream: Any = None
-        self._model_spec = model_spec
-        self._final_message: AssistantMessage | None = None
-        self._closed = False
+        super().__init__(stream_cm, model_spec)
 
     def __iter__(self):
+        if self._consumed:
+            raise RuntimeError("Stream already consumed")
+        self._consumed = True
+
         # Enter the SDK context manager at iteration start so failures
         # are captured as error events rather than raised from __init__.
         if self._stream is None:
@@ -206,13 +206,40 @@ class _OpenAIStream(RuntimeStream):
                         api="openai-responses",
                     )
                     yield {"type": "error", "message": self._final_message}
+                    self.close()
                     return
 
         except Exception as err:
+            # Build partial content from what we've accumulated so far
+            partial_content: list[dict[str, Any]] = []
+            if text_parts:
+                partial_content.append({"type": "text", "text": "".join(text_parts)})
+            for oi in sorted(thinking_parts):
+                summary_text = "".join(thinking_parts[oi])
+                if summary_text:
+                    partial_content.append({
+                        "type": "thinking",
+                        "thinking": summary_text,
+                        "summary": [summary_text],
+                    })
+            for oi in sorted(tool_calls_acc):
+                acc = tool_calls_acc[oi]
+                try:
+                    parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    parsed_args = {}
+                partial_content.append({
+                    "type": "tool_call",
+                    "id": acc["call_id"],
+                    "name": acc["name"],
+                    "arguments": parsed_args,
+                })
             self._final_message = make_error_assistant_message(
                 self._model_spec, err, api="openai-responses",
+                partial_content=partial_content if partial_content else None,
             )
             yield {"type": "error", "message": self._final_message}
+            self.close()
             return
 
         # ── Build final AssistantMessage ──
@@ -224,6 +251,7 @@ class _OpenAIStream(RuntimeStream):
                     self._model_spec, err, api="openai-responses",
                 )
                 yield {"type": "error", "message": self._final_message}
+                self.close()
                 return
         else:
             # Fallback: build from accumulated data
@@ -242,8 +270,13 @@ class _OpenAIStream(RuntimeStream):
                 acc = tool_calls_acc[oi]
                 try:
                     parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
-                except (json.JSONDecodeError, TypeError):
-                    parsed_args = {}
+                except (json.JSONDecodeError, TypeError) as exc:
+                    import logging
+                    logging.getLogger("jyagent.runtime").warning(
+                        "Malformed tool-call arguments from OpenAI (call_id=%s, name=%s): %s",
+                        acc.get("call_id", "?"), acc.get("name", "?"), exc,
+                    )
+                    parsed_args = {"_parse_error": str(exc)}
                 content.append({
                     "type": "tool_call",
                     "id": acc["call_id"],
@@ -265,30 +298,6 @@ class _OpenAIStream(RuntimeStream):
             }
 
         yield {"type": "done", "message": self._final_message}
-
-    def get_final_message(self) -> AssistantMessage:
-        if self._final_message is not None:
-            return self._final_message
-        # Drive iteration to completion — terminal event always sets _final_message.
-        for _ in self:
-            pass
-        assert self._final_message is not None
-        return self._final_message
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        if self._stream is not None:
-            try:
-                self._stream_cm.__exit__(None, None, None)
-            except Exception:
-                pass
-        self._closed = True
-
-    def __enter__(self) -> _OpenAIStream:
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
 
@@ -314,7 +323,7 @@ class OpenAIAdapter:
             return self._cached_client
         kwargs: dict[str, Any] = {
             "http_client": httpx.Client(
-                verify=os.environ.get("SSL_VERIFY", "0").lower() not in ("0", "false", "no", ""),
+                verify=os.environ.get("SSL_VERIFY", "1").lower() not in ("0", "false", "no"),
             ),
         }
         if base_url:
@@ -353,11 +362,8 @@ class OpenAIAdapter:
         options = options or RuntimeOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
-        try:
-            client = self._client()
-            response = client.responses.create(**kwargs, timeout=timeout)
-        except Exception:
-            raise
+        client = self._client()
+        response = client.responses.create(**kwargs, timeout=timeout)
         return assistant_from_response(model_spec, response)
 
 
