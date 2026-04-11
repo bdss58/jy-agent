@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import hashlib
 import json
+import re
 import sys
 import time
 import traceback
@@ -147,21 +149,30 @@ class _CostTracker:
         return None if self._has_unknown else self.total_cost
 
 
-class _DedupTracker:
-    """Detect repeated identical tool calls within a single run() (QW-3).
+class _StuckLoopDetector:
+    """Detect stuck loops by tracking whether repeated calls yield new responses (QW-3).
 
-    Tracks (tool_name, args_key) → count.  Returns a feedback message when
-    the threshold is hit so the engine can inject it and break the loop.
+    Key insight: a loop is "stuck" only when the same tool call returns the
+    same response repeatedly.  Polling tools (``check_background``,
+    ``take_snapshot``) naturally return changing responses (e.g. different
+    ``elapsed_seconds``) — they are never flagged without any exemption metadata.
 
-    Tools marked as ``dedup_exempt`` (e.g. ``check_background``) are skipped —
-    polling the same background process repeatedly is the *intended* pattern,
-    not a loop.
+    This replaces the old ``_DedupTracker`` which required a whitelist of
+    ``dedup_exempt`` tools and a regex hack for ``sleep`` commands.
+
+    Design:
+        Track ``(tool_name, args_key) → (consecutive_identical_count, last_response_hash)``
+
+        * If the response hash differs from the last recorded one for the same
+          ``(tool, args)`` key, the world is making progress — reset the counter.
+        * If the response hash is identical, increment the counter.
+        * At ``threshold``: return a feedback message so the engine can break.
     """
 
-    def __init__(self, threshold: int = 3, exempt_tools: set[str] | None = None):
-        self._counts: dict[str, int] = {}
+    def __init__(self, threshold: int = 3):
+        # key → (consecutive_identical_count, last_response_hash)
+        self._state: dict[str, tuple[int, str]] = {}
         self._threshold = threshold
-        self._exempt: set[str] = exempt_tools or set()
 
     @staticmethod
     def _make_key(name: str, args: dict) -> str:
@@ -172,20 +183,38 @@ class _DedupTracker:
             args_str = str(args)
         return f"{name}::{args_str}"
 
-    def record(self, calls: list[ToolCallRequest]) -> str | None:
-        """Record a batch of tool calls.  Return feedback if any hit threshold."""
-        for call in calls:
-            if call.name in self._exempt:
-                continue
-            key = self._make_key(call.name, call.input)
-            self._counts[key] = self._counts.get(key, 0) + 1
-            if self._counts[key] >= self._threshold:
-                return (
-                    f"LOOP DETECTED: Tool '{call.name}' was called with the same "
-                    f"arguments {self._counts[key]} times.  This is likely an "
-                    f"infinite loop.  Stop repeating this call and try a different "
-                    f"approach, or explain to the user why you're stuck."
-                )
+    @staticmethod
+    def _hash_response(content: str) -> str:
+        return hashlib.md5(content.encode(errors="replace")).hexdigest()
+
+    def record(self, name: str, args: dict, response: str) -> str | None:
+        """Record a single (tool, args, response) observation.
+
+        Returns a feedback message when a stuck loop is detected (same tool
+        called with identical arguments AND identical response ``threshold``
+        times consecutively), or ``None`` if everything is fine.
+        """
+        key = self._make_key(name, args if isinstance(args, dict) else {})
+        resp_hash = self._hash_response(response)
+
+        prev_count, prev_hash = self._state.get(key, (0, ""))
+
+        if prev_hash and resp_hash != prev_hash:
+            # Response changed — progress is being made, reset.
+            self._state[key] = (1, resp_hash)
+            return None
+
+        # Response identical (or first observation) — increment.
+        new_count = prev_count + 1
+        self._state[key] = (new_count, resp_hash)
+
+        if new_count >= self._threshold:
+            return (
+                f"STUCK LOOP: Tool '{name}' was called {new_count} times with "
+                f"identical arguments AND identical response.  The external "
+                f"state is not changing.  Stop repeating this call and try a "
+                f"different approach, or explain to the user why you're stuck."
+            )
         return None
 
 
@@ -647,12 +676,7 @@ class AgentLoop:
             spec = self._model_spec or self._runtime_owner.model_spec
             trace.start(spec.provider, spec.model)
         cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
-        # Build exempt set from registry metadata (e.g. check_background is polling)
-        exempt_tools = {
-            name for name in registry.list_tools()
-            if registry.is_dedup_exempt(name)
-        }
-        dedup_tracker = _DedupTracker(cfg.dedup_threshold, exempt_tools=exempt_tools)
+        stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
 
         # Resolve tools
         tool_schemas: list[dict] = []
@@ -851,37 +875,6 @@ class AgentLoop:
                 if len(tool_call_blocks) > 1:
                     self._fire("on_tool_batch", len(tool_call_blocks))
 
-                # ── QW-3: Duplicate tool-call detection ──────────────────
-                dedup_feedback = dedup_tracker.record(tool_call_blocks)
-                if dedup_feedback:
-                    self._fire("on_warning", dedup_feedback)
-                    # Inject feedback as a synthetic tool result for each call
-                    # so the model sees the warning, then terminate.
-                    for block in tool_call_blocks:
-                        messages.append({
-                            "role": "tool_result",
-                            "tool_call_id": block.id,
-                            "tool_name": block.name,
-                            "content": dedup_feedback,
-                            "is_error": True,
-                        })
-                    if trace:
-                        trace.add_span(step=step, event_type="dedup_break", success=False, error=dedup_feedback)
-                        cost = cost_tracker.known_cost if cost_tracker else 0.0
-                        trace.finish(status="dedup_break", total_steps=step + 1, total_cost_usd=cost or 0.0)
-                        trace.flush()
-                    return LoopResult(
-                        status="dedup_break",
-                        text=all_text or "",
-                        final_text=final_text,
-                        messages=messages,
-                        steps=step + 1,
-                        total_input_tokens=total_input_tokens,
-                        total_output_tokens=total_output_tokens,
-                        tool_calls_count=tool_calls_count,
-                        error=dedup_feedback,
-                    )
-
                 # Fire on_tool_start for all tool calls BEFORE execution
                 for block in tool_call_blocks:
                     self._fire("on_tool_start", block.name, block.input)
@@ -922,6 +915,41 @@ class AgentLoop:
                         "content": content_str,
                         "is_error": result.is_error,
                     })
+
+                # ── QW-3: Response-aware stuck-loop detection ─────────────
+                # Check AFTER execution so we can compare responses.  A tool
+                # is only "stuck" when the same (tool, args) returns the same
+                # response repeatedly — polling tools like check_background
+                # naturally return different responses (elapsed_seconds etc.)
+                # and are never flagged.
+                stuck_feedback = None
+                for block, result in tool_results_tuples:
+                    content_str = _truncate_result(result.content, cfg.max_tool_result_chars, result.is_error)
+                    feedback = stuck_detector.record(
+                        block.name,
+                        block.input,
+                        content_str,
+                    )
+                    if feedback and not stuck_feedback:
+                        stuck_feedback = feedback
+                if stuck_feedback:
+                    self._fire("on_warning", stuck_feedback)
+                    if trace:
+                        trace.add_span(step=step, event_type="dedup_break", success=False, error=stuck_feedback)
+                        cost = cost_tracker.known_cost if cost_tracker else 0.0
+                        trace.finish(status="dedup_break", total_steps=step + 1, total_cost_usd=cost or 0.0)
+                        trace.flush()
+                    return LoopResult(
+                        status="dedup_break",
+                        text=all_text or "",
+                        final_text=final_text,
+                        messages=messages,
+                        steps=step + 1,
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        tool_calls_count=tool_calls_count,
+                        error=stuck_feedback,
+                    )
 
             # Max steps reached
             if cfg.fallback_on_max_steps and not final_text:

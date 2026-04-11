@@ -15,8 +15,7 @@ class ToolRegistry:
                  parallel_safe: bool = False,
                  timeout_hint: int | None = None,
                  large_input_keys: set[str] | None = None,
-                 compaction_priority: str | None = None,
-                 dedup_exempt: bool = False) -> None:
+                 compaction_priority: str | None = None) -> None:
         with self._lock:
             self._functions[name] = fn
             self._schema_map[name] = schema
@@ -28,8 +27,6 @@ class ToolRegistry:
                 meta["large_input_keys"] = large_input_keys
             if compaction_priority:
                 meta["compaction_priority"] = compaction_priority
-            if dedup_exempt:
-                meta["dedup_exempt"] = True
             self._metadata[name] = meta
             self._version += 1
 
@@ -67,10 +64,6 @@ class ToolRegistry:
     def get_compaction_priority(self, name: str) -> str:
         """Return tool's compaction priority: 'ephemeral', 'standard', or 'persistent'."""
         return self._metadata.get(name, {}).get("compaction_priority", "standard")
-
-    def is_dedup_exempt(self, name: str) -> bool:
-        """Return True if the tool should be excluded from duplicate-call detection."""
-        return self._metadata.get(name, {}).get("dedup_exempt", False)
 
     def get_function(self, name: str) -> Optional[Callable]:
         return self._functions.get(name)

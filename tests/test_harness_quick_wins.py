@@ -148,113 +148,142 @@ class TestCostTracker:
         assert abs(ct.known_cost - 30.0) < 0.01
 
 
-# ─── QW-3: Duplicate-call detection ─────────────────────────────────────────
+# --- QW-3: Response-aware stuck-loop detection ---
 
-from jyagent.loop_engine import _DedupTracker, ToolCallRequest
+from jyagent.loop_engine import _StuckLoopDetector, ToolCallRequest
 
 
-class TestDedupTracker:
-    """QW-3: _DedupTracker detects repeated identical tool calls."""
+class TestStuckLoopDetector:
+    """QW-3: _StuckLoopDetector detects stuck loops via response comparison."""
 
-    def _call(self, name: str, args: dict) -> ToolCallRequest:
-        return ToolCallRequest(id=f"call_{name}", name=name, input=args)
+    def test_identical_response_triggers(self):
+        d = _StuckLoopDetector(threshold=3)
+        assert d.record("read_file", {"path": "/tmp/x"}, "hello") is None
+        assert d.record("read_file", {"path": "/tmp/x"}, "hello") is None
+        fb = d.record("read_file", {"path": "/tmp/x"}, "hello")
+        assert fb is not None
+        assert "STUCK LOOP" in fb
+        assert "read_file" in fb
 
-    def test_no_dup_below_threshold(self):
-        """Below threshold (3) → no feedback."""
-        dt = _DedupTracker(threshold=3)
-        assert dt.record([self._call("read_file", {"path": "/tmp/x"})]) is None
-        assert dt.record([self._call("read_file", {"path": "/tmp/x"})]) is None
+    def test_changing_response_resets(self):
+        d = _StuckLoopDetector(threshold=3)
+        d.record("cb", {"pid": 1}, '{"s":"run","e":30}')
+        d.record("cb", {"pid": 1}, '{"s":"run","e":60}')
+        d.record("cb", {"pid": 1}, '{"s":"run","e":90}')
+        assert d.record("cb", {"pid": 1}, '{"s":"done","e":95}') is None
 
-    def test_dup_at_threshold(self):
-        """At threshold → feedback returned."""
-        dt = _DedupTracker(threshold=3)
-        dt.record([self._call("read_file", {"path": "/tmp/x"})])
-        dt.record([self._call("read_file", {"path": "/tmp/x"})])
-        feedback = dt.record([self._call("read_file", {"path": "/tmp/x"})])
-        assert feedback is not None
-        assert "LOOP DETECTED" in feedback
-        assert "read_file" in feedback
+    def test_polling_never_stuck_with_changing_elapsed(self):
+        d = _StuckLoopDetector(threshold=2)
+        for i in range(20):
+            r = f'{{"elapsed":{30 + i * 15}}}'
+            assert d.record("check_background", {"pid": 42}, r) is None
 
-    def test_different_args_not_dup(self):
-        """Different args → separate tracking, no false positive."""
-        dt = _DedupTracker(threshold=3)
-        dt.record([self._call("read_file", {"path": "/tmp/a"})])
-        dt.record([self._call("read_file", {"path": "/tmp/b"})])
-        feedback = dt.record([self._call("read_file", {"path": "/tmp/c"})])
-        assert feedback is None
+    def test_different_args_separate(self):
+        d = _StuckLoopDetector(threshold=3)
+        d.record("rf", {"p": "/a"}, "a")
+        d.record("rf", {"p": "/b"}, "b")
+        assert d.record("rf", {"p": "/c"}, "c") is None
 
-    def test_different_tools_not_dup(self):
-        """Different tool names → separate tracking."""
-        dt = _DedupTracker(threshold=3)
-        dt.record([self._call("read_file", {"path": "/tmp/x"})])
-        dt.record([self._call("write_file", {"path": "/tmp/x"})])
-        feedback = dt.record([self._call("edit_file", {"path": "/tmp/x"})])
-        assert feedback is None
-
-    def test_batch_with_one_dup(self):
-        """Only the duplicated call triggers, not the whole batch."""
-        dt = _DedupTracker(threshold=2)
-        dt.record([self._call("read_file", {"path": "/tmp/x"})])
-        feedback = dt.record([
-            self._call("read_file", {"path": "/tmp/x"}),  # dup!
-            self._call("write_file", {"path": "/tmp/y"}),  # not dup
-        ])
-        assert feedback is not None
-        assert "read_file" in feedback
+    def test_different_tools_separate(self):
+        d = _StuckLoopDetector(threshold=3)
+        d.record("rf", {"p": "/x"}, "d")
+        d.record("wf", {"p": "/x"}, "d")
+        assert d.record("ef", {"p": "/x"}, "d") is None
 
     def test_custom_threshold(self):
-        """Custom threshold works."""
-        dt = _DedupTracker(threshold=5)
+        d = _StuckLoopDetector(threshold=5)
         for _ in range(4):
-            assert dt.record([self._call("foo", {"a": 1})]) is None
-        feedback = dt.record([self._call("foo", {"a": 1})])
-        assert feedback is not None
+            assert d.record("foo", {"a": 1}, "same") is None
+        assert d.record("foo", {"a": 1}, "same") is not None
 
     def test_key_stability(self):
-        """Args with different key order produce the same key (sorted)."""
-        dt = _DedupTracker(threshold=2)
-        dt.record([self._call("tool", {"b": 2, "a": 1})])
-        feedback = dt.record([self._call("tool", {"a": 1, "b": 2})])
-        assert feedback is not None
+        d = _StuckLoopDetector(threshold=2)
+        d.record("t", {"b": 2, "a": 1}, "r")
+        assert d.record("t", {"a": 1, "b": 2}, "r") is not None
 
-    def test_exempt_tools_not_tracked(self):
-        """Exempt tools (e.g. check_background) are never flagged as loops."""
-        dt = _DedupTracker(threshold=2, exempt_tools={"check_background"})
-        call = self._call("check_background", {"pid": 12345, "tail": 10})
-        # Call many more times than threshold — should never trigger
-        for _ in range(10):
-            assert dt.record([call]) is None
+    def test_response_change_then_revert(self):
+        d = _StuckLoopDetector(threshold=3)
+        d.record("rf", {"p": "/x"}, "v1")
+        d.record("rf", {"p": "/x"}, "v1")
+        d.record("rf", {"p": "/x"}, "v2")  # reset
+        d.record("rf", {"p": "/x"}, "v2")
+        fb = d.record("rf", {"p": "/x"}, "v2")  # 3rd v2
+        assert fb is not None
 
-    def test_exempt_does_not_affect_other_tools(self):
-        """Non-exempt tools still get flagged even when exempt set is present."""
-        dt = _DedupTracker(threshold=2, exempt_tools={"check_background"})
-        call = self._call("read_file", {"path": "/tmp/x"})
-        dt.record([call])
-        feedback = dt.record([call])
-        assert feedback is not None
-        assert "LOOP DETECTED" in feedback
+    def test_polling_completes_before_stuck(self):
+        d = _StuckLoopDetector(threshold=3)
+        d.record("cb", {"pid": 1}, '{"e":10}')
+        d.record("cb", {"pid": 1}, '{"e":20}')
+        d.record("cb", {"pid": 1}, '{"e":30}')
+        assert d.record("cb", {"pid": 1}, '{"s":"done"}') is None
 
-    def test_mixed_batch_exempt_and_non_exempt(self):
-        """In a batch with exempt + non-exempt, only non-exempt is tracked."""
-        dt = _DedupTracker(threshold=2, exempt_tools={"check_background"})
-        batch = [
-            self._call("check_background", {"pid": 123}),
-            self._call("read_file", {"path": "/tmp/x"}),
-        ]
-        dt.record(batch)
-        feedback = dt.record(batch)
-        # read_file should trigger, check_background should not
-        assert feedback is not None
-        assert "read_file" in feedback
+    def test_mcp_tool_naturally_handled(self):
+        d = _StuckLoopDetector(threshold=2)
+        d.record("mcp__chrome__take_snapshot", {}, "<div>state1</div>")
+        assert d.record("mcp__chrome__take_snapshot", {}, "<div>state2</div>") is None
+
+    def test_mcp_tool_stuck_when_same_response(self):
+        d = _StuckLoopDetector(threshold=2)
+        d.record("mcp__chrome__take_snapshot", {}, "<div>same</div>")
+        fb = d.record("mcp__chrome__take_snapshot", {}, "<div>same</div>")
+        assert fb is not None
+
+    def test_sleep_with_identical_empty_response(self):
+        """sleep returning empty string repeatedly IS stuck (correct behavior)."""
+        d = _StuckLoopDetector(threshold=3)
+        d.record("run_shell", {"command": "sleep 60"}, "")
+        d.record("run_shell", {"command": "sleep 60"}, "")
+        fb = d.record("run_shell", {"command": "sleep 60"}, "")
+        assert fb is not None
+
+    def test_non_dict_args_handled(self):
+        """None args don't crash."""
+        d = _StuckLoopDetector(threshold=2)
+        d.record("tool", None, "resp")
+        fb = d.record("tool", None, "resp")
+        assert fb is not None
+
+    def test_first_observation_no_trigger(self):
+        d = _StuckLoopDetector(threshold=2)
+        assert d.record("tool", {"a": 1}, "resp") is None
+
+    def test_counter_beyond_threshold(self):
+        """Counter keeps incrementing beyond threshold."""
+        d = _StuckLoopDetector(threshold=2)
+        d.record("t", {}, "x")
+        fb2 = d.record("t", {}, "x")
+        assert fb2 is not None
+        fb3 = d.record("t", {}, "x")
+        assert fb3 is not None
+        assert "3 times" in fb3
+
+    def test_hash_response_deterministic(self):
+        """Same content always produces the same hash."""
+        h1 = _StuckLoopDetector._hash_response("hello world")
+        h2 = _StuckLoopDetector._hash_response("hello world")
+        assert h1 == h2
+
+    def test_no_dedup_exempt_needed(self):
+        """check_background works without any exemption metadata."""
+        d = _StuckLoopDetector(threshold=3)
+        # Simulate realistic polling — elapsed changes each time
+        for i in range(10):
+            resp = f'{{"pid":99,"status":"running","elapsed_seconds":{10.0 + i * 15.5},"output":"line {i}"}}'
+            fb = d.record("check_background", {"pid": 99, "tail": 10}, resp)
+            assert fb is None
+        # Final done response
+        fb = d.record("check_background", {"pid": 99, "tail": 10},
+                       '{"pid":99,"status":"done","exit_code":0,"elapsed_seconds":200.0}')
+        assert fb is None
 
 
-# ─── Integration: LoopConfig new fields ──────────────────────────────────────
+# --- Integration: LoopConfig ---
 
 from jyagent.loop_engine import LoopConfig
 
 
 class TestLoopConfigHarness:
-    """Verify new LoopConfig fields have correct defaults."""
+    """Verify LoopConfig fields have correct defaults."""
 
     def test_max_cost_default_none(self):
         cfg = LoopConfig()
@@ -271,29 +300,3 @@ class TestLoopConfigHarness:
     def test_dedup_threshold_custom(self):
         cfg = LoopConfig(dedup_threshold=5)
         assert cfg.dedup_threshold == 5
-
-
-# ─── Registry: dedup_exempt metadata ─────────────────────────────────────────
-
-class TestDedupExemptRegistry:
-    """Verify dedup_exempt flag is correctly stored and queried."""
-
-    def test_check_background_is_exempt(self):
-        """check_background should be registered as dedup_exempt."""
-        import jyagent.tools  # ensure tool registration runs
-        from jyagent.registry import get_registry
-        reg = get_registry()
-        assert reg.is_dedup_exempt("check_background") is True
-
-    def test_read_file_is_not_exempt(self):
-        """Normal tools should NOT be dedup_exempt."""
-        import jyagent.tools
-        from jyagent.registry import get_registry
-        reg = get_registry()
-        assert reg.is_dedup_exempt("read_file") is False
-
-    def test_unknown_tool_is_not_exempt(self):
-        """Unknown tools default to not exempt."""
-        from jyagent.registry import get_registry
-        reg = get_registry()
-        assert reg.is_dedup_exempt("nonexistent_tool") is False
