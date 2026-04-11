@@ -25,6 +25,8 @@ from .toolresult import ToolResult
 from .validation import validate_tool_input
 from .memory.conversation import estimate_conversation_tokens
 from .remediation import enrich_error
+from .tracing import get_tracer
+from .verification import should_verify, build_verification_prompt
 
 
 # ─── Core types ──────────────────────────────────────────────────────────────
@@ -637,8 +639,13 @@ class AgentLoop:
         step = 0
         consecutive_truncations = 0  # cap truncation recovery retries
         max_truncation_retries = 3
+        verification_injected = False  # QW-5: only verify once per run
 
-        # ── Harness trackers (QW-2, QW-3) ────────────────────────────────
+        # ── Harness trackers (QW-2, QW-3, QW-4) ─────────────────────────
+        trace = get_tracer()
+        if trace:
+            spec = self._model_spec or self._runtime_owner.model_spec
+            trace.start(spec.provider, spec.model)
         cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
         # Build exempt set from registry metadata (e.g. check_background is polling)
         exempt_tools = {
@@ -690,9 +697,11 @@ class AgentLoop:
                     metadata={"component": "loop_engine", "step": step + 1},
                 )
 
+                llm_t0 = time.perf_counter()
                 step_text, tool_call_blocks, stop_reason, final_message = self._call_llm_with_retry(
                     context, opts, step,
                 )
+                llm_dur_ms = (time.perf_counter() - llm_t0) * 1000
 
                 # Fire runtime warnings
                 for warning in final_message.get("runtime_warnings", []):
@@ -703,6 +712,16 @@ class AgentLoop:
                 total_input_tokens += usage.get("input_tokens", 0)
                 total_output_tokens += usage.get("output_tokens", 0)
                 self._fire("on_usage", usage)
+
+                # ── QW-4: Trace LLM call ─────────────────────────────────
+                if trace:
+                    trace.add_span(
+                        step=step,
+                        event_type="llm_call",
+                        duration_ms=llm_dur_ms,
+                        tokens_in=usage.get("input_tokens"),
+                        tokens_out=usage.get("output_tokens"),
+                    )
 
                 # ── QW-2: Cost budget check ──────────────────────────────
                 if cost_tracker is not None:
@@ -717,6 +736,11 @@ class AgentLoop:
                             "on_warning",
                             f"Cost budget exceeded: ${known:.4f} >= ${cfg.max_cost_usd:.4f}",
                         )
+                        if trace:
+                            trace.add_span(step=step, event_type="cost_check", success=False,
+                                           error=f"budget ${cfg.max_cost_usd} exceeded")
+                            trace.finish(status="cost_limit", total_steps=step + 1, total_cost_usd=known)
+                            trace.flush()
                         return LoopResult(
                             status="cost_limit",
                             text=all_text or "",
@@ -732,8 +756,23 @@ class AgentLoop:
                 all_text += step_text
                 final_text = step_text
 
-                # No tool calls → done
+                # No tool calls → done (or verification gate)
                 if not tool_call_blocks:
+                    # ── QW-5: Pre-completion verification gate ────────────
+                    # If we mutated files and haven't verified yet, inject a
+                    # self-check prompt and loop once more instead of returning.
+                    if not verification_injected and should_verify(messages, tool_calls_count):
+                        verification_injected = True
+                        if trace:
+                            trace.add_span(step=step, event_type="verification")
+                        # Append the assistant's response, then inject verification
+                        messages.append(final_message)
+                        messages.append({
+                            "role": "user",
+                            "content": build_verification_prompt(messages),
+                        })
+                        continue
+
                     if not step_text:
                         final_text = _extract_text(final_message)
                         all_text = final_text or all_text
@@ -750,6 +789,13 @@ class AgentLoop:
                         final_message = cb_am(final_message) or final_message
                     messages.append(final_message)
                     result_text = all_text if all_text else "I processed your request but had no text response to return."
+
+                    # ── QW-4: Flush trace ─────────────────────────────────
+                    if trace:
+                        cost = cost_tracker.known_cost if cost_tracker else 0.0
+                        trace.finish(status="completed", total_steps=step + 1, total_cost_usd=cost or 0.0)
+                        trace.flush()
+
                     return LoopResult(
                         status="completed",
                         text=result_text,
@@ -819,6 +865,11 @@ class AgentLoop:
                             "content": dedup_feedback,
                             "is_error": True,
                         })
+                    if trace:
+                        trace.add_span(step=step, event_type="dedup_break", success=False, error=dedup_feedback)
+                        cost = cost_tracker.known_cost if cost_tracker else 0.0
+                        trace.finish(status="dedup_break", total_steps=step + 1, total_cost_usd=cost or 0.0)
+                        trace.flush()
                     return LoopResult(
                         status="dedup_break",
                         text=all_text or "",
@@ -836,6 +887,7 @@ class AgentLoop:
                     self._fire("on_tool_start", block.name, block.input)
 
                 # Execute tools
+                tools_t0 = time.perf_counter()
                 tool_results_tuples = _execute_tools(
                     tool_call_blocks,
                     tool_functions,
@@ -845,11 +897,23 @@ class AgentLoop:
                     cfg.tool_timeout,
                     executor=self._executor,
                 )
+                tools_dur_ms = (time.perf_counter() - tools_t0) * 1000
 
                 for block, result in tool_results_tuples:
                     tool_calls_count += 1
                     content_str = _truncate_result(result.content, cfg.max_tool_result_chars, result.is_error)
                     self._fire("on_tool_end", block.name, content_str, result.is_error)
+
+                    # ── QW-4: Trace tool call ─────────────────────────────
+                    if trace:
+                        trace.add_span(
+                            step=step,
+                            event_type="tool_call",
+                            tool_name=block.name,
+                            tool_args=block.input,
+                            success=not result.is_error,
+                            error=content_str[:200] if result.is_error else None,
+                        )
 
                     messages.append({
                         "role": "tool_result",
@@ -923,6 +987,12 @@ class AgentLoop:
                     # If fallback fails, fall through to normal max_steps handling
                     pass
 
+            # ── QW-4: Trace max_steps ─────────────────────────────────
+            if trace:
+                cost = cost_tracker.known_cost if cost_tracker else 0.0
+                trace.finish(status="max_steps", total_steps=cfg.max_steps, total_cost_usd=cost or 0.0)
+                trace.flush()
+
             return LoopResult(
                 status="max_steps",
                 text=all_text or "",
@@ -935,6 +1005,9 @@ class AgentLoop:
             )
 
         except KeyboardInterrupt:
+            if trace:
+                trace.finish(status="interrupted", total_steps=step + 1)
+                trace.flush()
             return LoopResult(
                 status="interrupted",
                 text=all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]",
@@ -946,6 +1019,9 @@ class AgentLoop:
                 tool_calls_count=tool_calls_count,
             )
         except Exception as e:
+            if trace:
+                trace.finish(status="error", total_steps=step + 1)
+                trace.flush()
             return LoopResult(
                 status="error",
                 text=all_text or "",
