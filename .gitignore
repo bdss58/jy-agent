@@ -118,9 +118,10 @@ dmypy.json
 .agent_history
 mcp_stderr.log
 
-# Data directory (user data — excluded from git)
-data/memory/
+# Data directory — runtime artifacts excluded, memory tracked
+# data/memory/ is tracked (small, curated, needed across devices)
 data/sessions/
+data/traces/
 data/logs/
 
 # Package backups from evolution
