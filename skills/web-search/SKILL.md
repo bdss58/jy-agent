@@ -11,15 +11,18 @@ description: >-
   or questions clearly answerable from training data alone.
 metadata:
   author: jy-agent
-  version: "3.0"
+  version: "4.0"
 ---
 
 # Web Search
 
-Use search engines effectively to find, verify, and synthesize information.
+Search the web using the `web_search` tool (primary) or `web_fetch` with
+search URLs (advanced). Combines DuckDuckGo for fast results and Codex for
+deep research with multi-source synthesis.
 
-> **Scope**: This skill is about *searching* — constructing queries, picking engines,
-> and synthesizing results. For *fetching* a known URL, just use `web_fetch()` directly.
+> **Scope**: This skill is about *searching* — constructing queries, picking
+> engines, and synthesizing results. For *fetching* a known URL, use
+> `web_fetch()` directly.
 
 ## Step 0: Always Verify Date
 
@@ -27,66 +30,101 @@ Use search engines effectively to find, verify, and synthesize information.
 run_shell("date")  # NEVER assume the year — agent defaults can be wrong
 ```
 
-## Decision Tree: Which Engine?
+## Decision Tree: Which Approach?
 
 ```
-What are you searching for?
-├─ General / English topic
-│   → Google (primary), DuckDuckGo (fallback)
+What does the user need?
+├─ Quick fact / single answer
+│   → web_search(query="...", engine="ddg")
+│   → Fast, free, always works
+│
+├─ General search / find resources
+│   → web_search(query="...", engine="auto")
+│   → DDG first; Codex fallback if results are poor
+│
+├─ Deep research / multi-source synthesis
+│   → web_search(query="...", engine="codex")
+│   → Best quality, includes synthesis, 40-80K tokens per call
+│   → Or dispatch_agent with a research task for parallel searches
+│
+├─ Current events / breaking news
+│   → web_search(query="...", engine="codex")
+│   → Codex web_search has real-time access, synthesizes across sources
 │
 ├─ Chinese topic (中文内容)
-│   → Google + 百度 (cross-reference both)
+│   → web_search(query="中文查询", engine="ddg") first
+│   → Then web_fetch("https://www.baidu.com/s?wd=查询") for cross-reference
 │
-├─ Technical / programming
-│   ├─ Official docs → Go to docs site directly (skip search)
-│   ├─ Error messages → Google exact error string in quotes
-│   └─ Code examples → Google with "site:github.com" or "site:stackoverflow.com"
+├─ Specific search engine features needed
+│   │  (time filters, site:, filetype:, etc.)
+│   → Use web_fetch with search URLs directly (see Advanced section)
 │
-├─ Current events / news
-│   ├─ English → Google News (tbm=nws) or Google with time filter (tbs=qdr:d)
-│   ├─ Chinese → 百度 + Google
-│   └─ Cross-reference 2-3 sources minimum
-│
-└─ Product / comparison
-    → Google, fetch 3+ review/comparison pages, build table
+└─ Need raw page content from results
+    → web_search to find URLs, then web_fetch each URL
 ```
 
-## Search Engine Cheat Sheet
+## Primary Tool: `web_search`
 
-### Google (preferred — most comprehensive)
+### Quick lookup
+```python
+web_search(query="python 3.14 new features")
+# → DDG results with titles, URLs, snippets
+```
+
+### Best quality (Codex-powered)
+```python
+web_search(query="comparison of vLLM vs TGI for LLM inference 2026", engine="codex")
+# → Structured results + synthesis paragraph from multiple sources
+```
+
+### Auto mode (recommended default)
+```python
+web_search(query="kubernetes pod security standards", engine="auto")
+# → Tries DDG first (fast). If < 3 results, falls back to Codex
+```
+
+### Engines at a glance
+
+| Engine | Speed | Cost | Quality | Synthesis | When to use |
+|--------|-------|------|---------|-----------|-------------|
+| `ddg` | ~2s | Free | Good | No | Quick lookups, known topics |
+| `codex` | ~15-30s | ~40-80K tokens | Excellent | Yes | Deep research, current events, comparisons |
+| `auto` | ~2-30s | Free→expensive | Good→Excellent | Maybe | Default — fast path with quality fallback |
+
+## Advanced: Search Engine URLs via `web_fetch`
+
+When you need specific search engine features (time filters, operators),
+use `web_fetch` with search URLs directly.
+
+### Google (needs Chrome MCP for best results)
 
 ```python
-# Basic search
+# Basic search — goes through web_fetch cascade, Chrome handles anti-bot
 web_fetch("https://www.google.com/search?q=your+query+here")
 
-# NOTE: Google blocks cffi/httpx, auto-cascade will use Chrome tier.
-# Chrome MCP must be connected. If not available, fall back to DuckDuckGo.
+# Time filter: past week
+web_fetch("https://www.google.com/search?q=query&tbs=qdr:w")
+
+# News search
+web_fetch("https://www.google.com/search?q=query&tbm=nws")
 ```
 
-**Key operators:** `"exact phrase"`, `site:domain`, `filetype:pdf`, `-exclude`, `after:YYYY-MM-DD`, `intitle:`, `OR`
-**Time filters:** `&tbs=qdr:d` (day), `qdr:w` (week), `qdr:m` (month), `qdr:y` (year)
-**News:** `&tbm=nws`
+**Key operators:** `"exact phrase"`, `site:domain`, `filetype:pdf`, `-exclude`,
+`after:YYYY-MM-DD`, `intitle:`, `OR`
 
 → Full operator reference: [references/search-operators.md](references/search-operators.md)
 
-### DuckDuckGo (fallback — no anti-bot)
+### DuckDuckGo (always works, no Chrome needed)
 
 ```python
-# HTML version — works with cffi tier, no Chrome needed
 web_fetch("https://duckduckgo.com/html/?q=your+query+here")
 ```
-- ✅ Always works (no anti-bot)
-- ❌ Less comprehensive than Google
-- Use when: Chrome MCP not connected, or Google is being difficult
 
 ### 百度 (Chinese content)
 
 ```python
 web_fetch("https://www.baidu.com/s?wd=你的搜索词")
 ```
-- ✅ Best for Chinese-language content, domestic sites
-- ❌ Heavy ads, lower signal-to-noise
-- Use when: Searching for Chinese-specific topics, domestic news, Chinese tech
 
 ## Query Construction Tips
 
@@ -104,40 +142,56 @@ web_fetch("https://www.baidu.com/s?wd=你的搜索词")
 
 ### Iterate: broad → narrow
 ```
-1st search: "vllm performance tuning"
-2nd search: "vllm tensor parallel vs pipeline parallel A100"  (narrowed by findings)
-3rd search: site:github.com/vllm-project/vllm "tensor_parallel"  (specific repo)
+1st: web_search(query="vllm performance tuning")
+2nd: web_search(query="vllm tensor parallel vs pipeline parallel A100")
+3rd: web_fetch a specific result URL for deep content
 ```
 
 ### Add context qualifiers
 ```
-# Add year for freshness
-"docker compose v2 migration 2025"
-
-# Add technology version
-"python 3.14 breaking changes"
-
-# Add platform
-"kubernetes ingress nginx vs traefik comparison"
+"docker compose v2 migration 2025"    # year for freshness
+"python 3.14 breaking changes"        # version
+"kubernetes ingress nginx vs traefik"  # comparison framing
 ```
 
-## Research Workflow
+## Research Workflows
 
 ### Quick lookup (single fact)
-1. One Google search → read top 1-2 results → answer with citation
+```python
+result = web_search(query="current Python latest stable version")
+# Read top result → answer with citation
+```
 
 ### Standard research (most cases)
-1. Google search → identify 3-5 relevant URLs from results
-2. `web_fetch()` each URL → extract key facts
-3. Cross-reference findings → note agreements and contradictions
-4. Synthesize with citations
+```python
+# 1. Search for results
+result = web_search(query="FastAPI vs Django REST framework comparison 2026")
+# 2. Fetch top 3-5 URLs from results
+web_fetch("https://result-url-1.com/...")
+web_fetch("https://result-url-2.com/...")
+# 3. Cross-reference → synthesize with citations
+```
 
 ### Deep research (comparisons, decisions)
-1. Search from multiple angles (2-3 different queries)
-2. Fetch 5-8 sources across queries
-3. Build comparison table or structured summary
-4. Note source dates and potential biases
-5. Present findings with confidence levels
+```python
+# Option A: Let Codex do the heavy lifting
+result = web_search(
+    query="AWS vs GCP GPU pricing comparison for LLM inference 2026",
+    engine="codex",
+)
+# Codex searches multiple sources and provides synthesis
+
+# Option B: Parallel sub-agent research
+dispatch_agent(task="Search for AWS GPU instance pricing for LLM inference...")
+dispatch_agent(task="Search for GCP GPU instance pricing for LLM inference...")
+# Combine results yourself
+```
+
+### Breaking news / current events
+```python
+# Codex excels here — real-time search with synthesis
+result = web_search(query="latest AI regulation news April 2026", engine="codex")
+```
 
 ## Anti-Patterns
 
@@ -147,17 +201,17 @@ web_fetch("https://www.baidu.com/s?wd=你的搜索词")
 ❌ **Don't** search once and trust a single source
 ✅ **Do** cross-reference 2-3 sources for important claims
 
-❌ **Don't** use vague queries like "tell me about X"
-✅ **Do** use specific, keyword-rich queries with operators
+❌ **Don't** use `engine="codex"` for simple factual lookups — it's overkill
+✅ **Do** use `engine="ddg"` or `"auto"` for quick lookups; reserve Codex for deep research
+
+❌ **Don't** construct Google search URLs when `web_search` would suffice
+✅ **Do** prefer `web_search(query="...")` — it handles engine selection and parsing
 
 ❌ **Don't** dump raw search results to the user
 ✅ **Do** fetch top results, synthesize, and cite URLs
 
 ❌ **Don't** forget to check the date of your sources
-✅ **Do** note publication dates — a 2021 article may be outdated for a 2025 question
-
-❌ **Don't** keep retrying Google if Chrome MCP isn't connected
-✅ **Do** fall back to DuckDuckGo immediately if Chrome is unavailable
+✅ **Do** note publication dates — a 2021 article may be outdated for a 2026 question
 
 ## Reference Files
 
