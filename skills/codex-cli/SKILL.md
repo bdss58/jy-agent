@@ -1,26 +1,28 @@
 ---
 name: codex-cli
 description: >-
-  Delegate coding work to Codex CLI, the local Codex command-line agent. Use this skill
-  whenever the user explicitly asks for Codex, Codex CLI, `codex exec`,
-  `codex review`, or a Codex-specific workflow such as "delegate to Codex",
-  "review with Codex", or "use Codex to analyze this repo". Also use it when
-  jy-agent has already chosen Codex for a follow-up and should continue that
-  same Codex thread. TRIGGER on: "use Codex", "Codex CLI", "run codex exec",
-  "run codex review", "delegate to Codex", "review with Codex", "continue the
-  Codex session". DO NOT TRIGGER on: generic coding tasks, trivial direct
-  edits, non-programming information lookups, or requests that explicitly ask for Claude or
-  another agent.
+  Delegate tasks to Codex CLI — coding, code review, image/vision analysis, and
+  structured output. Use this skill whenever the user explicitly asks for Codex,
+  Codex CLI, `codex exec`, `codex review`, or a Codex-specific workflow such as
+  "delegate to Codex", "review with Codex", or "use Codex to analyze this repo".
+  Also TRIGGER on image/vision tasks: "analyze this image", "describe this
+  screenshot", "what's in this picture", "read this diagram/chart", "compare
+  these screenshots" — because jy-agent has no native vision and Codex provides
+  it via the `-i` flag. TRIGGER on: "use Codex", "Codex CLI", "codex exec",
+  "codex review", "delegate to Codex", "analyze/describe image/screenshot",
+  "what's in this image", "read this chart/diagram". DO NOT TRIGGER on: generic
+  coding tasks without Codex mention, trivial direct edits, or requests that
+  explicitly ask for Claude or another agent.
 metadata:
   author: jy-agent
-  version: "1.1"
+  version: "2.0"
 ---
 
 # Codex CLI Delegation
 
-Delegate coding tasks to the local Codex CLI from inside `jy-agent`.
-Keep this skill narrow: it is for Codex-specific delegation, not for every
-coding request.
+Delegate tasks to the local Codex CLI from inside `jy-agent`.
+Codex handles coding, code review, **image/vision analysis**, and structured
+output with JSON schema enforcement.
 
 ## Timeout Policy: `run_shell` vs `run_background`
 
@@ -70,7 +72,7 @@ Do NOT just retry the same command. Instead:
 ## Decision Tree: Should Codex Handle This?
 
 ```
-User wants help with code →
+User wants help →
 ├─ They explicitly ask for Codex / Codex CLI / codex exec / codex review
 │  → Use this skill.
 │
@@ -79,6 +81,9 @@ User wants help with code →
 │
 ├─ They want analysis, planning, implementation, or a follow-up Codex turn
 │  → Use `codex exec`.
+│
+├─ They ask about an image, screenshot, diagram, or chart
+│  → Use `codex exec -i <file>` (jy-agent has NO native vision).
 │
 ├─ The task is trivial and already clear to jy-agent
 │  → Do it yourself. Spinning up Codex adds latency without much gain.
@@ -121,6 +126,46 @@ How much access should Codex get?
    → Push back unless the environment is already externally sandboxed.
       Least privilege is the default because it narrows blast radius and makes failures clearer.
 ```
+
+## Vision / Image Analysis
+
+jy-agent has **no native image understanding**. Codex fills this gap via the
+`-i <file>` flag, which attaches images to the prompt. Use this for any task
+involving visual content.
+
+### When to use
+
+- User says "analyze/describe this image/screenshot/diagram/chart"
+- Need to read text from an image (OCR-like)
+- Compare two UI screenshots for differences
+- Extract data from a chart or table image
+- Verify visual changes after CSS/UI edits
+
+### Patterns
+
+```bash
+# Describe an image
+echo "Describe this image in detail." | codex exec --sandbox read-only -i /path/to/image.png -
+
+# Analyze a screenshot for UI issues
+echo "Review this UI screenshot. Identify layout issues, accessibility problems, or visual bugs." | codex exec --sandbox read-only -i screenshot.png -
+
+# Read text / extract data from an image
+echo "Extract all visible text from this image." | codex exec --sandbox read-only -i photo.jpg -
+
+# Compare two screenshots
+echo "Compare these two screenshots and describe what changed." | codex exec --sandbox read-only -i before.png -i after.png -
+
+# Extract structured data from a chart image
+echo "Extract the data from this chart as a markdown table." | codex exec --sandbox read-only --output-schema /tmp/schema.json -i chart.png -
+```
+
+### Image flag gotchas
+
+- `-i` must come **before** the prompt argument or use stdin (`-`)
+- Multiple `-i` flags for multiple images: `-i img1.png -i img2.png`
+- Supports PNG, JPG, JPEG, GIF, WebP
+- Large images work but increase token cost; resize if possible
 
 ## Core Workflow
 
