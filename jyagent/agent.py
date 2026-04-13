@@ -1,5 +1,6 @@
 # Agent — Main run loop and command handlers.
 
+import os
 import sys
 from .registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
@@ -25,11 +26,15 @@ from .config import (
 
 # ─── System prompt (externalized from run()) ──────────────────────────────────
 
-SYSTEM_PROMPT = """You are jy-agent, a self-assembled AI agent built by Jianyong, bootstrapped from a single API call.
+def _base_system_prompt() -> str:
+    from .config import LAUNCH_DIR
+    launch_info = f"\nThe user launched you from: {LAUNCH_DIR}" if LAUNCH_DIR else ""
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return f"""You are jy-agent, a self-assembled AI agent built by Jianyong, bootstrapped from a single API call.
 You have access to tools for running shell commands, reading/writing files, and listing directories.
 Think step by step. Use tools when needed to accomplish tasks.
 Be helpful, precise, and concise.
-Your source code lives in the jyagent/ directory.
+Your source code project root is {project_root} (package: jyagent/).{launch_info}
 
 CRITICAL BEHAVIORAL PRINCIPLES:
 
@@ -286,9 +291,10 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_
     if force_rebuild or _cached_memory_context is None:
         _cached_memory_context = build_memory_context(query=user_input) or ""
 
-    full_system_prompt = SYSTEM_PROMPT
+    base_prompt = _base_system_prompt()
+    full_system_prompt = base_prompt
     if _cached_memory_context:
-        full_system_prompt = SYSTEM_PROMPT + "\n\n" + _cached_memory_context
+        full_system_prompt = base_prompt + "\n\n" + _cached_memory_context
 
     # Skills: diff-based routing with conversation context for multi-turn continuity
     skills_context = skill_mgr.build_prompt_context(
@@ -384,7 +390,7 @@ def run(runtime_owner: RuntimeOwner) -> None:
 
                 # Pass system_prompt so compaction can reuse it (cache-friendly).
                 # Use cached system prompt if available, otherwise the base prompt.
-                compact_sys_prompt = _cached_memory_context or SYSTEM_PROMPT
+                compact_sys_prompt = _cached_memory_context or _base_system_prompt()
                 summarize_if_needed(
                     conversation, runtime_owner,
                     system_prompt_rebuilder=_on_compacted,

@@ -5,6 +5,10 @@
 
 import os
 
+# ─── Launch context ───────────────────────────────────────────────────────────
+
+LAUNCH_DIR: str = ""  # Set once at startup by __main__.main(); do NOT read from env.
+
 # ─── API & Model ──────────────────────────────────────────────────────────────
 
 DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")

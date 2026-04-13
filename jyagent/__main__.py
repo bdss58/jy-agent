@@ -44,9 +44,11 @@ def main():
     """Main entry point."""
     _load_dotenv()
 
-    # Capture launch directory
-    if "LAUNCH_DIR" not in os.environ:
-        os.environ["LAUNCH_DIR"] = os.getcwd()
+    # LAUNCH_DIR is set by run.sh *before* it cd's to the project root.
+    # os.getcwd() here already points to the project dir, NOT the user's dir.
+    # Fall back to cwd only for direct `python -m jyagent` invocations (no run.sh).
+    import jyagent.config as _cfg
+    _cfg.LAUNCH_DIR = os.environ.get("LAUNCH_DIR") or os.getcwd()
 
     runtime_owner = create_runtime_owner()
 
