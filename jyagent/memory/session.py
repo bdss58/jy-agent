@@ -9,12 +9,12 @@ import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from ..config import SESSIONS_DIR, LATEST_SESSION_FILE
+from .. import config
 from .conversation import ConversationMemory
 
 
 def ensure_session_dir() -> None:
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
 
 
 def save_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
@@ -39,17 +39,17 @@ def save_session(conversation: ConversationMemory, metadata: Optional[dict] = No
     }
 
     # Write latest (always)
-    _atomic_write(LATEST_SESSION_FILE, payload)
+    _atomic_write(config.LATEST_SESSION_FILE, payload)
 
     # Write timestamped archive
     ts_name = now.strftime("%Y%m%d_%H%M%S")
-    archive_path = os.path.join(SESSIONS_DIR, f"{ts_name}.json")
+    archive_path = os.path.join(config.SESSIONS_DIR, f"{ts_name}.json")
     _atomic_write(archive_path, payload)
 
     # Prune old archives (keep most recent 20)
     _prune_archives(keep=20)
 
-    return LATEST_SESSION_FILE
+    return config.LATEST_SESSION_FILE
 
 
 def load_session(conversation: ConversationMemory, path: Optional[str] = None) -> dict:
@@ -62,7 +62,7 @@ def load_session(conversation: ConversationMemory, path: Optional[str] = None) -
     Returns:
         Metadata dict with saved_at, message_count, loaded (bool).
     """
-    path = path or LATEST_SESSION_FILE
+    path = path or config.LATEST_SESSION_FILE
     try:
         with open(path, 'r', encoding='utf-8') as f:
             payload = json.load(f)
@@ -92,13 +92,13 @@ def load_session(conversation: ConversationMemory, path: Optional[str] = None) -
 
 def has_saved_session(path: Optional[str] = None) -> bool:
     """Check if a saved session file exists."""
-    path = path or LATEST_SESSION_FILE
+    path = path or config.LATEST_SESSION_FILE
     return os.path.isfile(path)
 
 
 def delete_session(path: Optional[str] = None) -> bool:
     """Delete a saved session file."""
-    path = path or LATEST_SESSION_FILE
+    path = path or config.LATEST_SESSION_FILE
     try:
         os.remove(path)
         return True
@@ -127,9 +127,9 @@ def _prune_archives(keep: int = 20) -> None:
     """Remove old session archives, keeping the most recent ones."""
     try:
         files = []
-        for f in os.listdir(SESSIONS_DIR):
+        for f in os.listdir(config.SESSIONS_DIR):
             if f.endswith('.json') and f != "latest.json":
-                full = os.path.join(SESSIONS_DIR, f)
+                full = os.path.join(config.SESSIONS_DIR, f)
                 files.append((os.path.getmtime(full), full))
         files.sort(reverse=True)
         for _, path in files[keep:]:

@@ -50,6 +50,13 @@ def main():
     import jyagent.config as _cfg
     _cfg.LAUNCH_DIR = os.environ.get("LAUNCH_DIR") or os.getcwd()
 
+    # Change CWD to the user's launch directory so all tools (run_shell,
+    # read_file, etc.) operate in the user's project by default.
+    # Internal data paths (memory, sessions, skills, traces) are absolute
+    # (anchored to PROJECT_ROOT), so they are unaffected.
+    if _cfg.LAUNCH_DIR and os.path.isdir(_cfg.LAUNCH_DIR):
+        os.chdir(_cfg.LAUNCH_DIR)
+
     runtime_owner = create_runtime_owner()
 
     from .agent import run

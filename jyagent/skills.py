@@ -35,7 +35,7 @@ from .config import (
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_SKILLS_DIR = "skills"
+DEFAULT_SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills")
 SKILL_FILENAME = "SKILL.md"
 
 # Progressive disclosure budgets

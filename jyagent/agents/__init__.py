@@ -30,7 +30,7 @@ class AgentDef:
 
 # ─── Default directory ───────────────────────────────────────────────────────
 
-_DEFAULT_AGENTS_DIR = os.path.join("data", "agents")
+_DEFAULT_AGENTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "agents")
 _agents_cache: dict[str, AgentDef] | None = None
 
 

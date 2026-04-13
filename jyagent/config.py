@@ -5,6 +5,10 @@
 
 import os
 
+# ─── Project root (absolute, from __file__ — immune to CWD changes) ──────────
+
+PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # ─── Launch context ───────────────────────────────────────────────────────────
 
 LAUNCH_DIR: str = ""  # Set once at startup by __main__.main(); do NOT read from env.
@@ -36,7 +40,7 @@ OBSERVATION_MASK_DISTANCE = int(os.environ.get("AGENT_OBSERVATION_MASK_DISTANCE"
 
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
-MEMORY_DIR = os.path.join("data", "memory")
+MEMORY_DIR = os.path.join(PROJECT_ROOT, "data", "memory")
 TOPICS_DIR = os.path.join(MEMORY_DIR, "topics")
 MEMORY_MD_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 
@@ -52,7 +56,7 @@ MAX_MEMORY_PROMPT_CHARS = int(os.environ.get("AGENT_MAX_MEMORY_PROMPT_CHARS", "1
 CHARS_PER_TOKEN = 4
 
 # Session persistence
-SESSIONS_DIR = os.path.join("data", "sessions")
+SESSIONS_DIR = os.path.join(PROJECT_ROOT, "data", "sessions")
 LATEST_SESSION_FILE = os.path.join(SESSIONS_DIR, "latest.json")
 
 # ─── Skills ───────────────────────────────────────────────────────────────────
