@@ -1,8 +1,7 @@
 # Agent Memory
 
-This is the memory index. Detailed knowledge lives in topic files under
-`data/memory/topics/`. Keep this file concise and read topic files on demand
-with `read_file` when details are needed.
+This is the memory index. Keep it concise.
+Detailed knowledge lives in topic files under `data/memory/topics/`.
 
 ## User Profile
 - Name: Jianyong
@@ -12,7 +11,6 @@ with `read_file` when details are needed.
 - Timezone: Asia/Shanghai
 - Communication style: direct, holds agents accountable, often speaks Chinese
 - Tech stack: Python, Docker, Kubernetes, Bash, FastAPI, Chrome DevTools/MCP, MCP, Anthropic API, OpenAI API, AWS Bedrock, vllm, OpenClaw, GitLab
-- Projects: `jy-agent`, `openclaw-enterprise`, `snake-h5-game`
 
 ## Behavioral Rules (CRITICAL)
 - Never fabricate command results or claim actions were done without executing them
@@ -20,7 +18,7 @@ with `read_file` when details are needed.
 - Use live search/browser tools for current information; do not rely on stale model memory
 - Verify current date with `date` before time-sensitive research
 - Keep `MEMORY.md` concise and move detailed notes into topic files
-- For self-upgrades to jy-agent runtime/source code, use `git worktree` (see `git-worktree` topic)
+- For self-upgrades to jy-agent runtime/source code, use `git worktree` to avoid disrupting the running agent
 - **Codex as second opinion**: On significant tasks (code review, bug investigation, architecture planning, research, non-trivial analysis), proactively run Codex for a complementary perspective and synthesize both viewpoints before presenting results. Use `codex review` for code reviews, `codex exec --sandbox read-only` for analysis/planning, `web_search(engine="codex")` for deep research. Skip Codex for trivial tasks (typos, simple lookups, quick edits).
 
 ## User Preferences
@@ -44,8 +42,5 @@ with `read_file` when details are needed.
 - CLI history rendering avoids Rich markup parsing on dynamic text and formats normalized assistant/tool blocks safely
 - Silent completions now reuse the streaming runtime path, including subagents
 
-## Topic Index
-- **architecture**: current tool/runtime/memory/CLI architecture
-- **git-worktree**: required workflow for jy-agent self-upgrades
 [gotcha] `contextvars.ContextVar` is NOT auto-propagated by `ThreadPoolExecutor.submit()` (verified Python 3.14.3 — worker sees default, not caller's value). Must use `ctx = contextvars.copy_context(); executor.submit(ctx.run, fn, ...)` to explicitly propagate.
 [preference] Don't create memory topic files for obvious/training knowledge already covered by concise behavioral rules
