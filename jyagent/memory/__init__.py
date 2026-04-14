@@ -1,11 +1,4 @@
 # memory/ package — Self-use memory system (conversation, MEMORY.md, topics, compaction, sessions).
-#
-# Replaces the monolithic self_memory.py (912 lines) with focused modules:
-#   conversation.py — ConversationMemory + token estimation helpers
-#   compaction.py   — Conversation compaction (Claude Code /compact)
-#   operations.py   — MEMORY.md + topic file CRUD + remember/forget/show
-#   context.py      — build_memory_context (system prompt injection)
-#   session.py      — Session persistence (save/load conversation across sessions)
 
 # Re-export the live memory API.
 from .conversation import ConversationMemory

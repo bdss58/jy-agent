@@ -1,5 +1,4 @@
 # Terminal UX — Formatting, colors, spinner, and streaming callbacks for AgentLoop.
-# Extracted from planner.py to separate terminal presentation from loop engine.
 
 import sys
 import time

@@ -3,8 +3,6 @@
 # Shared algorithm for both planner (streaming, full-featured) and sub-agent
 # (non-streaming, silent).  Callers configure behaviour via LoopConfig and
 # LoopCallbacks; the engine never writes to stdout directly.
-#
-# Phase 1 — standalone module, no callers yet.
 
 from __future__ import annotations
 
@@ -52,9 +50,9 @@ class LoopConfig:
     streaming: bool = False
     truncate_large_inputs: bool = True
     fallback_on_max_steps: bool = False
-    # Harness controls (QW-2, QW-3)
+    # Harness controls
     max_cost_usd: float | None = None       # cost budget per turn — None = unlimited
-    dedup_threshold: int = 3                 # same tool+args N times → break loop
+    dedup_threshold: int = 3                 # same tool+args+response N times → break loop
 
 
 @dataclass
@@ -112,10 +110,10 @@ atexit.register(_tool_executor.shutdown, wait=False)
 # ─── Private helpers ─────────────────────────────────────────────────────────
 
 
-# ─── Harness helpers (QW-2, QW-3) ───────────────────────────────────────────
+# ─── Harness helpers ─────────────────────────────────────────────────────────
 
 class _CostTracker:
-    """Track estimated cost within a single run() for budget enforcement (QW-2).
+    """Track estimated cost within a single run() for budget enforcement.
 
     Uses the session_stats pricing machinery but keeps a local running total
     so the loop can check against LoopConfig.max_cost_usd each step.
@@ -150,7 +148,7 @@ class _CostTracker:
 
 
 class _StuckLoopDetector:
-    """Detect stuck loops by tracking whether repeated calls yield new responses (QW-3).
+    """Detect stuck loops by tracking whether repeated calls yield new responses.
 
     Key insight: a loop is "stuck" only when the same tool call returns the
     same response repeatedly.  Polling tools (``check_background``,
@@ -668,9 +666,9 @@ class AgentLoop:
         step = 0
         consecutive_truncations = 0  # cap truncation recovery retries
         max_truncation_retries = 3
-        verification_injected = False  # QW-5: only verify once per run
+        verification_injected = False  # only verify once per run
 
-        # ── Harness trackers (QW-2, QW-3, QW-4) ─────────────────────────
+        # ── Harness trackers ──────────────────────────────────────────
         trace = get_tracer()
         if trace:
             spec = self._model_spec or self._runtime_owner.model_spec
@@ -737,7 +735,7 @@ class AgentLoop:
                 total_output_tokens += usage.get("output_tokens", 0)
                 self._fire("on_usage", usage)
 
-                # ── QW-4: Trace LLM call ─────────────────────────────────
+                # ── Trace LLM call ────────────────────────────────────
                 if trace:
                     trace.add_span(
                         step=step,
@@ -747,7 +745,7 @@ class AgentLoop:
                         tokens_out=usage.get("output_tokens"),
                     )
 
-                # ── QW-2: Cost budget check ──────────────────────────────
+                # ── Cost budget check ─────────────────────────────────
                 if cost_tracker is not None:
                     cost_tracker.record(
                         usage,
@@ -782,7 +780,7 @@ class AgentLoop:
 
                 # No tool calls → done (or verification gate)
                 if not tool_call_blocks:
-                    # ── QW-5: Pre-completion verification gate ────────────
+                    # ── Pre-completion verification gate ───────────────
                     # If we mutated files and haven't verified yet, inject a
                     # self-check prompt and loop once more instead of returning.
                     if not verification_injected and should_verify(messages, tool_calls_count):
@@ -814,7 +812,7 @@ class AgentLoop:
                     messages.append(final_message)
                     result_text = all_text if all_text else "I processed your request but had no text response to return."
 
-                    # ── QW-4: Flush trace ─────────────────────────────────
+                    # ── Flush trace ────────────────────────────────────
                     if trace:
                         cost = cost_tracker.known_cost if cost_tracker else 0.0
                         trace.finish(status="completed", total_steps=step + 1, total_cost_usd=cost or 0.0)
@@ -897,7 +895,7 @@ class AgentLoop:
                     content_str = _truncate_result(result.content, cfg.max_tool_result_chars, result.is_error)
                     self._fire("on_tool_end", block.name, content_str, result.is_error)
 
-                    # ── QW-4: Trace tool call ─────────────────────────────
+                    # ── Trace tool call ────────────────────────────────
                     if trace:
                         trace.add_span(
                             step=step,
@@ -916,7 +914,7 @@ class AgentLoop:
                         "is_error": result.is_error,
                     })
 
-                # ── QW-3: Response-aware stuck-loop detection ─────────────
+                # ── Response-aware stuck-loop detection ────────────────
                 # Check AFTER execution so we can compare responses.  A tool
                 # is only "stuck" when the same (tool, args) returns the same
                 # response repeatedly — polling tools like check_background
@@ -1015,7 +1013,7 @@ class AgentLoop:
                     # If fallback fails, fall through to normal max_steps handling
                     pass
 
-            # ── QW-4: Trace max_steps ─────────────────────────────────
+            # ── Trace max_steps ────────────────────────────────────────
             if trace:
                 cost = cost_tracker.known_cost if cost_tracker else 0.0
                 trace.finish(status="max_steps", total_steps=cfg.max_steps, total_cost_usd=cost or 0.0)

@@ -1,7 +1,7 @@
-# tests/test_tracing_and_verification.py — Tests for QW-4 (tracing) and QW-5 (verification).
+# tests/test_tracing_and_verification.py — Tests for tracing and verification.
 #
-# QW-4: JSONL trace file logger
-# QW-5: Pre-completion verification gate
+# JSONL trace file logger
+# Pre-completion verification gate
 
 import json
 import os
@@ -13,7 +13,7 @@ import pytest
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# QW-4: Tracing
+# Tracing
 # ═══════════════════════════════════════════════════════════════════════════
 
 from jyagent.tracing import RunTrace, SpanEvent, get_tracer, TRACE_ENABLED
@@ -148,7 +148,7 @@ class TestGetTracer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# QW-5: Verification
+# Verification
 # ═══════════════════════════════════════════════════════════════════════════
 
 from jyagent.verification import (

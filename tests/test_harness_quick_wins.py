@@ -1,21 +1,21 @@
-# tests/test_harness_quick_wins.py — Tests for QW-1, QW-2, QW-3.
+# tests/test_harness_quick_wins.py — Tests for harness engineering features.
 #
 # These tests verify the harness engineering quick wins:
-#   QW-1: Remediation messages for tool errors
-#   QW-2: Cost budget enforcement
-#   QW-3: Duplicate tool-call detection (infinite loop breaker)
+#   Remediation messages for tool errors
+#   Cost budget enforcement
+#   Response-aware stuck-loop detection
 
 import json
 import pytest
 
-# ─── QW-1: Remediation messages ─────────────────────────────────────────────
+# ─── Remediation messages ──────────────────────────────────────────────────
 
 from jyagent.toolresult import ToolResult
 from jyagent.remediation import enrich_error
 
 
 class TestRemediation:
-    """QW-1: enrich_error appends remediation hints to known error patterns."""
+    """enrich_error appends remediation hints to known error patterns."""
 
     def test_non_error_unchanged(self):
         """Non-error results are never modified."""
@@ -100,13 +100,13 @@ class TestRemediation:
         assert "pip install" in enriched.content
 
 
-# ─── QW-2: Cost budget ──────────────────────────────────────────────────────
+# ─── Cost budget ───────────────────────────────────────────────────────────
 
 from jyagent.loop_engine import _CostTracker
 
 
 class TestCostTracker:
-    """QW-2: _CostTracker accumulates cost and detects budget exceeded."""
+    """_CostTracker accumulates cost and detects budget exceeded."""
 
     def test_unknown_pricing(self):
         """Unknown provider/model → known_cost returns None."""
@@ -148,13 +148,13 @@ class TestCostTracker:
         assert abs(ct.known_cost - 30.0) < 0.01
 
 
-# --- QW-3: Response-aware stuck-loop detection ---
+# --- Response-aware stuck-loop detection ---
 
 from jyagent.loop_engine import _StuckLoopDetector, ToolCallRequest
 
 
 class TestStuckLoopDetector:
-    """QW-3: _StuckLoopDetector detects stuck loops via response comparison."""
+    """_StuckLoopDetector detects stuck loops via response comparison."""
 
     def test_identical_response_triggers(self):
         d = _StuckLoopDetector(threshold=3)

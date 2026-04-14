@@ -1,10 +1,4 @@
 # tools/ package — Core tool implementations, schemas, and registration.
-#
-# This package replaces the monolithic tools.py (900 lines) with focused modules:
-#   core.py        — run_shell, read_file, write_file, list_directory, edit_file
-#   search.py      — glob_files, grep_files
-#   facades.py     — manage_memory, manage_skills (thin wrappers)
-#   schemas.py     — CORE_TOOLS JSON schema definitions
 
 from ..registry import get_registry
 

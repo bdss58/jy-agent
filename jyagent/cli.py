@@ -1,9 +1,6 @@
 # CLI module — Modern terminal interface using prompt_toolkit + rich
 # Provides: multi-line input, bracketed paste, syntax highlighting, rich output,
 # status bar with token/cost tracking
-#
-# v6: Added status bar with session stats (model, tokens, cost),
-#     turn summary after each response, updated banner
 
 import json
 import os

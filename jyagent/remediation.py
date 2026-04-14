@@ -1,4 +1,4 @@
-# remediation.py — Error remediation messages for tool results (QW-1).
+# remediation.py — Error remediation messages for tool results.
 #
 # When a tool call fails with a known error pattern, append a targeted
 # remediation hint so the LLM can self-correct without an extra round-trip.

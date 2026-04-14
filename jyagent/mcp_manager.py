@@ -1,4 +1,3 @@
-# evolved v2.1 — Chrome high-level helpers (chrome_fetch_page, chrome_ensure_connected)
 """
 MCP Manager — Manages MCP server lifecycle and dynamically registers tools.
 
