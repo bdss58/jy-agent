@@ -2,7 +2,8 @@
 # These are the functions called by the manage_memory tool facade.
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from ..config import (
     MEMORY_MD_FILE, TOPICS_DIR,
@@ -82,11 +83,12 @@ def forget_from_memory_md(keyword: str) -> int:
 # ─── Topic file operations ────────────────────────────────────────────────────
 
 _FRONTMATTER_SEP = "---"
+ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _now_iso() -> str:
     """Return current time as ISO 8601 string."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(ASIA_SHANGHAI_TZ).isoformat(timespec="seconds")
 
 
 def _parse_frontmatter(raw: str) -> tuple[dict, str]:

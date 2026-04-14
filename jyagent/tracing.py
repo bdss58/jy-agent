@@ -28,9 +28,10 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Config
@@ -43,6 +44,7 @@ TRACE_ENABLED: bool = os.environ.get("AGENT_TRACE_ENABLED", "").lower() in (
 )
 
 TRACES_DIR = Path(__file__).resolve().parent.parent / "data" / "traces"
+ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -211,7 +213,7 @@ class RunTrace:
         try:
             dt = datetime.fromisoformat(self.start_time)
         except (ValueError, TypeError):
-            dt = datetime.now(timezone.utc)
+            dt = datetime.now(ASIA_SHANGHAI_TZ)
         stamp = dt.strftime("%Y-%m-%d_%H%M%S")
         short_id = self.trace_id[:8]
         path = TRACES_DIR / f"{stamp}_{short_id}.jsonl"
@@ -272,4 +274,4 @@ def get_tracer() -> Optional[RunTrace]:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(ASIA_SHANGHAI_TZ).isoformat()

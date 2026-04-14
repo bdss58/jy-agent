@@ -6,11 +6,15 @@
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from .. import config
 from .conversation import ConversationMemory
+
+
+ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def ensure_session_dir() -> None:
@@ -19,10 +23,10 @@ def ensure_session_dir() -> None:
 
 def _build_payload(conversation: ConversationMemory, metadata: Optional[dict] = None) -> dict:
     """Build the JSON-serialisable session payload."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(ASIA_SHANGHAI_TZ)
     return {
         "version": 1,
-        "saved_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "saved_at": now.isoformat(timespec="seconds"),
         "message_count": len(conversation.messages),
         "metadata": metadata or {},
         "messages": conversation.messages,
