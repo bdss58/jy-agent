@@ -17,6 +17,18 @@ def ensure_session_dir() -> None:
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
 
 
+def _build_payload(conversation: ConversationMemory, metadata: Optional[dict] = None) -> dict:
+    """Build the JSON-serialisable session payload."""
+    now = datetime.now(timezone.utc)
+    return {
+        "version": 1,
+        "saved_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "message_count": len(conversation.messages),
+        "metadata": metadata or {},
+        "messages": conversation.messages,
+    }
+
+
 def save_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
     """Save conversation to disk. Returns the file path written.
 
@@ -29,20 +41,13 @@ def save_session(conversation: ConversationMemory, metadata: Optional[dict] = No
     if not conversation.messages:
         return ""
 
-    now = datetime.now(timezone.utc)
-    payload = {
-        "version": 1,
-        "saved_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "message_count": len(conversation.messages),
-        "metadata": metadata or {},
-        "messages": conversation.messages,
-    }
+    payload = _build_payload(conversation, metadata)
 
     # Write latest (always)
     _atomic_write(config.LATEST_SESSION_FILE, payload)
 
     # Write timestamped archive
-    ts_name = now.strftime("%Y%m%d_%H%M%S")
+    ts_name = payload["saved_at"].replace("-", "").replace(":", "").replace("T", "_").rstrip("Z")
     archive_path = os.path.join(config.SESSIONS_DIR, f"{ts_name}.json")
     _atomic_write(archive_path, payload)
 
@@ -50,6 +55,30 @@ def save_session(conversation: ConversationMemory, metadata: Optional[dict] = No
     _prune_archives(keep=20)
 
     return config.LATEST_SESSION_FILE
+
+
+def archive_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
+    """Archive conversation to a timestamped file WITHOUT updating latest.json.
+
+    Use this when the user explicitly starts a new conversation (/new) — the old
+    session should be recoverable but /continue should NOT resume it.
+
+    Returns the archive file path, or "" if there was nothing to save.
+    """
+    ensure_session_dir()
+
+    if not conversation.messages:
+        return ""
+
+    payload = _build_payload(conversation, metadata)
+
+    ts_name = payload["saved_at"].replace("-", "").replace(":", "").replace("T", "_").rstrip("Z")
+    archive_path = os.path.join(config.SESSIONS_DIR, f"{ts_name}.json")
+    _atomic_write(archive_path, payload)
+
+    _prune_archives(keep=20)
+
+    return archive_path
 
 
 def load_session(conversation: ConversationMemory, path: Optional[str] = None) -> dict:

@@ -7,7 +7,7 @@ import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, summarize_if_needed,
     build_memory_context,
-    save_session, load_session, has_saved_session,
+    save_session, load_session, has_saved_session, archive_session,
     should_extract, extract_and_remember,
     record_file_access,
 )
@@ -93,6 +93,20 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     """Clear current conversation state and start fresh."""
     global _cached_memory_context
 
+    # Archive current conversation before clearing (recoverable, but /continue
+    # still points to the last *exited* session, not this one).
+    if conversation.messages:
+        try:
+            from .session_stats import get_stats
+            stats = get_stats()
+            archive_session(conversation, metadata={
+                "provider": stats.provider or "",
+                "model": stats.model or "",
+                "reason": "new",
+            })
+        except Exception:
+            pass  # Don't let archive failure block /new
+
     # Clear conversation history
     conversation.clear()
 
@@ -107,7 +121,7 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     # Force memory context rebuild on next turn
     _cached_memory_context = None
 
-    cli.print_system("Conversation cleared. Starting fresh.")
+    cli.print_system("Conversation archived and cleared. Starting fresh.")
 
 def _cmd_tools(cli, **_):
     tools = get_registry().list_tools()

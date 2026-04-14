@@ -21,5 +21,5 @@ from .operations import (
 )
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
-from .session import save_session, load_session, has_saved_session, delete_session
+from .session import save_session, archive_session, load_session, has_saved_session, delete_session
 from .extraction import should_extract, extract_and_remember
