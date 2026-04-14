@@ -50,9 +50,9 @@ with `read_file` when details are needed.
 - **web-fetch**: 5-tier cascade, JS-heavy routing, Chrome tier details, fake-success detection
 - **git-worktree**: required workflow for jy-agent self-upgrades
 - **claude-code-best-practices**: delegation patterns, verification rules, local model-selection guidance
+- **harness-engineering**: agent maturity assessment and improvement plan
 [tip] Memory Phase 1 shipped: (1) topic file frontmatter timestamps, (2) session persistence with /continue, (3) MAX_MEMORY_PROMPT_CHARS 5K→10K, (4) proactive extraction hook (background thread, every 4 turns)
 [tip] Subagent improvements shipped (2025-07-08): (1) P0: model label overwrite fix, (2) P1: per-subagent cost tracking via subagent_runs list, (3) P1: consolidated _SubagentTracker spinner for parallel dispatch, (4) P2: memory injection into subagent system prompt, (5) P2: step progress in spinner via on_step_progress callback, (6) P2: declarative agent definitions in jyagent/agents/ + data/agents/*.md (explorer/researcher/reviewer built-in)
-[tip] `contextvars.
 [gotcha] `contextvars.ContextVar` is NOT auto-propagated by `ThreadPoolExecutor.submit()` (verified Python 3.14.3 — worker sees default, not caller's value). Must use `ctx = contextvars.copy_context(); executor.submit(ctx.run, fn, ...)` to explicitly propagate.
 
 [tip] Harness engineering research completed (2026-04-10). Current jy-agent maturity: 3.3/5. Plan in data/harness-improvement-plan.md. Key gaps: output verification (2/5), tracing (2/5). Quick wins: cost budget, duplicate-call detection, remediation messages.
