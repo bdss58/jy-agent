@@ -46,9 +46,6 @@ with `read_file` when details are needed.
 
 ## Topic Index
 - **architecture**: current tool/runtime/memory/CLI architecture
-- **chrome-mcp**: Chrome DevTools MCP behavior, dead-browser recovery, lifecycle gotchas
-- **web-fetch**: 5-tier cascade, JS-heavy routing, Chrome tier details, fake-success detection
 - **git-worktree**: required workflow for jy-agent self-upgrades
-- **harness-engineering**: agent maturity assessment and improvement plan
 [gotcha] `contextvars.ContextVar` is NOT auto-propagated by `ThreadPoolExecutor.submit()` (verified Python 3.14.3 — worker sees default, not caller's value). Must use `ctx = contextvars.copy_context(); executor.submit(ctx.run, fn, ...)` to explicitly propagate.
 [preference] Don't create memory topic files for obvious/training knowledge already covered by concise behavioral rules
