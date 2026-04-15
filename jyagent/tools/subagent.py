@@ -200,14 +200,6 @@ TOOL_SCHEMA = {
                     "Empty = all tools available. Example: ['web_fetch', 'read_file']"
                 ),
             },
-            "agent": {
-                "type": "string",
-                "description": (
-                    "Optional named agent definition (from data/agents/*.md). "
-                    "When set, overrides model, max_steps, tool_whitelist, and "
-                    "system_prompt with the agent's definition. Example: 'explorer'."
-                ),
-            },
         },
         "required": ["task"],
     },
@@ -581,28 +573,9 @@ def dispatch_agent(
     model: str = "default",
     max_steps: int = _DEFAULT_MAX_STEPS,
     tool_whitelist: list = None,
-    agent: str = "",
 ) -> ToolResult:
     """Spawn a sub-agent to handle a focused subtask."""
-    # ── Resolve agent definition if provided ─────────────────────────────
     custom_system_prompt = None
-    if agent:
-        try:
-            from ..agents import get_agent
-        except ImportError:
-            try:
-                from jyagent.agents import get_agent
-            except ImportError:
-                get_agent = None
-        if get_agent is not None:
-            agent_def = get_agent(agent)
-            if agent_def is not None:
-                model = agent_def.model or model
-                max_steps = agent_def.max_steps or max_steps
-                if agent_def.tools:
-                    tool_whitelist = agent_def.tools
-                if agent_def.system_prompt:
-                    custom_system_prompt = agent_def.system_prompt
 
     # Guard: nesting depth
     depth = _nesting_depth.get()
