@@ -160,6 +160,151 @@ def read_topic_meta(name: str) -> dict:
     return meta
 
 
+# ─── Topic index helpers (keep MEMORY.md in sync) ────────────────────────────
+
+_TOPIC_INDEX_HEADING = "## Topic Files Index"
+
+
+def _extract_topic_description(body: str) -> str:
+    """Extract a short description from topic body for the MEMORY.md index.
+
+    Uses the first ``#`` heading (stripped of ``#`` prefix).  Falls back to
+    the first non-empty line, truncated to 80 chars.
+    """
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            # Use heading text, remove leading #s
+            return stripped.lstrip("#").strip()
+        if stripped and not stripped.startswith("---"):
+            # First non-empty, non-frontmatter line
+            desc = stripped[:80]
+            if len(stripped) > 80:
+                desc += "…"
+            return desc
+    return "(no description)"
+
+
+def _add_topic_index_entry(name: str, description: str) -> None:
+    """Add a topic entry to the ``## Topic Files Index`` section of MEMORY.md.
+
+    Creates the section if it doesn't exist.  Skips if the topic is already
+    listed (idempotent).
+    """
+    content = read_memory_md()
+    entry_marker = f"**{name}.md**"
+
+    # Already indexed?
+    if entry_marker in content:
+        return
+
+    new_entry = f"- {entry_marker} — {description}"
+
+    if _TOPIC_INDEX_HEADING in content:
+        # Section exists — append entry after the heading line
+        lines = content.split("\n")
+        result: list[str] = []
+        inserted = False
+        for i, line in enumerate(lines):
+            result.append(line)
+            if not inserted and line.strip() == _TOPIC_INDEX_HEADING:
+                # Find insertion point: after last existing entry in this section
+                j = i + 1
+                while j < len(lines) and (
+                    lines[j].startswith("- **") or lines[j].strip() == ""
+                ):
+                    j += 1
+                # Insert before the first non-entry line after heading
+                # (but we need to continue appending lines up to j first)
+                pass
+        # Simpler approach: find the heading, collect section lines, append
+        lines = content.split("\n")
+        result = []
+        inserted = False
+        for i, line in enumerate(lines):
+            result.append(line)
+            if not inserted and line.strip() == _TOPIC_INDEX_HEADING:
+                # Scan forward past existing entries (lines starting with "- **")
+                # and blank lines
+                j = i + 1
+                while j < len(lines):
+                    next_line = lines[j]
+                    if next_line.startswith("- **") or next_line.strip() == "":
+                        result.append(next_line)
+                        j += 1
+                    else:
+                        break
+                # Insert the new entry
+                result.append(new_entry)
+                inserted = True
+                # Skip already-appended lines
+                for k in range(i + 1, j):
+                    pass  # already appended in the scan loop
+                # Append remaining lines
+                result.extend(lines[j:])
+                break
+        if not inserted:
+            # Heading found but loop didn't insert (shouldn't happen)
+            result.append(new_entry)
+        write_memory_md("\n".join(result))
+    else:
+        # Section doesn't exist — create it
+        # Insert before "## Repo Snapshot" or append at end
+        lines = content.split("\n")
+        result = []
+        inserted = False
+        for line in lines:
+            # Insert before common sections that should come after the index
+            if not inserted and line.strip().startswith("## ") and line.strip() not in (
+                "## User Profile", "## Behavioral Rules (CRITICAL)",
+                "## User Preferences", "## Environment",
+                _TOPIC_INDEX_HEADING,
+            ):
+                result.append(_TOPIC_INDEX_HEADING)
+                result.append(new_entry)
+                result.append("")
+                inserted = True
+            result.append(line)
+        if not inserted:
+            # No suitable section found — append at end
+            result.append("")
+            result.append(_TOPIC_INDEX_HEADING)
+            result.append(new_entry)
+        write_memory_md("\n".join(result))
+
+
+def _remove_topic_index_entry(name: str) -> None:
+    """Remove a topic entry from the ``## Topic Files Index`` in MEMORY.md."""
+    content = read_memory_md()
+    entry_marker = f"**{name}.md**"
+
+    if entry_marker not in content:
+        return
+
+    lines = content.split("\n")
+    new_lines = [l for l in lines if entry_marker not in l]
+
+    # If the section is now empty (only heading + blanks), remove it too
+    cleaned = []
+    skip_empty_section = False
+    for i, line in enumerate(new_lines):
+        if line.strip() == _TOPIC_INDEX_HEADING:
+            # Check if next non-blank line is another ## heading or EOF
+            j = i + 1
+            while j < len(new_lines) and new_lines[j].strip() == "":
+                j += 1
+            if j >= len(new_lines) or new_lines[j].startswith("## "):
+                # Section is empty — skip heading and trailing blanks
+                skip_empty_section = True
+                continue
+        if skip_empty_section and line.strip() == "":
+            continue
+        skip_empty_section = False
+        cleaned.append(line)
+
+    write_memory_md("\n".join(cleaned))
+
+
 def write_topic(name: str, content: str) -> None:
     """Write content to a topic file with created/updated frontmatter.
 
@@ -168,9 +313,13 @@ def write_topic(name: str, content: str) -> None:
 
     If the caller passes content that already starts with ``---`` frontmatter,
     we merge timestamps into it rather than double-wrapping.
+
+    For NEW topics (file doesn't exist yet), automatically adds an index entry
+    to the ``## Topic Files Index`` section of MEMORY.md.
     """
     ensure_dirs()
     filepath = os.path.join(TOPICS_DIR, f"{name}.md")
+    is_new = not os.path.exists(filepath)
 
     now = _now_iso()
 
@@ -193,12 +342,21 @@ def write_topic(name: str, content: str) -> None:
         if body and not body.endswith("\n"):
             f.write("\n")
 
+    # Auto-index new topics in MEMORY.md
+    if is_new:
+        description = _extract_topic_description(body)
+        _add_topic_index_entry(name, description)
+
 
 def delete_topic(name: str) -> bool:
-    """Delete a topic file. Returns True if deleted."""
+    """Delete a topic file and remove its index entry from MEMORY.md.
+
+    Returns True if the file was deleted.
+    """
     filepath = os.path.join(TOPICS_DIR, f"{name}.md")
     try:
         os.remove(filepath)
+        _remove_topic_index_entry(name)
         return True
     except FileNotFoundError:
         return False

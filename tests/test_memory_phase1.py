@@ -30,7 +30,9 @@ config.LATEST_SESSION_FILE = os.path.join(_tmpdir, "sessions", "latest.json")
 from jyagent.memory.operations import (
     write_topic, read_topic, read_topic_body, read_topic_meta,
     list_topics, delete_topic, remember, show_memory,
+    read_memory_md, write_memory_md,
     _parse_frontmatter, _build_frontmatter,
+    _extract_topic_description, _add_topic_index_entry, _remove_topic_index_entry,
 )
 from jyagent.memory.session import (
     save_session, load_session, has_saved_session, delete_session,
@@ -272,6 +274,97 @@ def test_should_extract_short_message():
     print("  ✅ should_extract skips short messages")
 
 
+# ─── Test 5: Topic Index Auto-Update ─────────────────────────────────────────
+
+def test_extract_topic_description_heading():
+    desc = _extract_topic_description("# My Cool Topic\nSome body text")
+    assert desc == "My Cool Topic", f"Expected heading text, got: {desc}"
+    print("  ✅ _extract_topic_description extracts heading")
+
+
+def test_extract_topic_description_no_heading():
+    desc = _extract_topic_description("Just some plain text here that is the body.")
+    assert desc == "Just some plain text here that is the body.", f"Got: {desc}"
+    print("  ✅ _extract_topic_description falls back to first line")
+
+
+def test_extract_topic_description_long_line():
+    long_line = "A" * 100
+    desc = _extract_topic_description(long_line)
+    assert len(desc) <= 81 + 1  # 80 chars + "…"
+    assert desc.endswith("…"), f"Should truncate with ellipsis: {desc}"
+    print("  ✅ _extract_topic_description truncates long lines")
+
+
+def test_extract_topic_description_empty():
+    desc = _extract_topic_description("")
+    assert desc == "(no description)"
+    print("  ✅ _extract_topic_description handles empty body")
+
+
+def test_write_topic_auto_indexes_new_topic():
+    setup()
+    # Seed MEMORY.md with basic content
+    write_memory_md("# Agent Memory\n\n## User Profile\n- Name: Test\n")
+    write_topic("test-auto-index", "# My Test Topic\nSome content.")
+    content = read_memory_md()
+    assert "## Topic Files Index" in content, f"Index section missing:\n{content}"
+    assert "**test-auto-index.md**" in content, f"Entry missing:\n{content}"
+    assert "My Test Topic" in content, f"Description missing:\n{content}"
+    print("  ✅ write_topic auto-indexes new topic in MEMORY.md")
+
+
+def test_write_topic_no_duplicate_index():
+    setup()
+    write_memory_md("# Agent Memory\n\n## User Profile\n- Name: Test\n")
+    write_topic("no-dup", "# First Version\nBody")
+    # Overwrite same topic
+    write_topic("no-dup", "# Second Version\nNew body")
+    content = read_memory_md()
+    count = content.count("**no-dup.md**")
+    assert count == 1, f"Expected 1 index entry, found {count}:\n{content}"
+    print("  ✅ write_topic doesn't duplicate index on overwrite")
+
+
+def test_delete_topic_removes_index_entry():
+    setup()
+    write_memory_md("# Agent Memory\n\n## User Profile\n- Name: Test\n")
+    write_topic("del-me", "# Delete Test\nContent")
+    content = read_memory_md()
+    assert "**del-me.md**" in content, "Precondition: entry should exist"
+    delete_topic("del-me")
+    content = read_memory_md()
+    assert "**del-me.md**" not in content, f"Entry not removed:\n{content}"
+    print("  ✅ delete_topic removes index entry from MEMORY.md")
+
+
+def test_delete_topic_removes_empty_section():
+    setup()
+    write_memory_md("# Agent Memory\n\n## User Profile\n- Name: Test\n")
+    write_topic("only-one", "# Only Topic\nContent")
+    delete_topic("only-one")
+    content = read_memory_md()
+    assert "## Topic Files Index" not in content, \
+        f"Empty section should be removed:\n{content}"
+    print("  ✅ delete_topic removes empty Topic Files Index section")
+
+
+def test_add_index_creates_section_before_later_sections():
+    setup()
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## User Profile\n- Name: Test\n\n"
+        "## Repo Snapshot\n- Some repo info\n"
+    )
+    write_topic("placement-test", "# Placement Test\nBody")
+    content = read_memory_md()
+    idx_pos = content.index("## Topic Files Index")
+    repo_pos = content.index("## Repo Snapshot")
+    assert idx_pos < repo_pos, \
+        f"Topic index ({idx_pos}) should come before Repo Snapshot ({repo_pos})"
+    print("  ✅ Topic Files Index section inserted before Repo Snapshot")
+
+
 # ─── Run all tests ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -299,6 +392,16 @@ if __name__ == "__main__":
         test_extract_text_blocks,
         test_should_extract_interval,
         test_should_extract_short_message,
+        # 5. Topic index auto-update
+        test_extract_topic_description_heading,
+        test_extract_topic_description_no_heading,
+        test_extract_topic_description_long_line,
+        test_extract_topic_description_empty,
+        test_write_topic_auto_indexes_new_topic,
+        test_write_topic_no_duplicate_index,
+        test_delete_topic_removes_index_entry,
+        test_delete_topic_removes_empty_section,
+        test_add_index_creates_section_before_later_sections,
     ]
 
     print(f"\n🧪 Running {len(tests)} Phase 1 memory tests...\n")
