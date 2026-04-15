@@ -34,6 +34,9 @@ Detailed knowledge lives in topic files under `data/memory/topics/`.
 - Python 3.14 `.venv` has broken CA certs; HTTP clients often need `verify=False` fallback
 - Dependency lockfile exists at `uv.lock`
 
+## Topic Files Index
+- **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read this file on any session mentioning nano-vLLM / learning / LLM study.
+
 ## Repo Snapshot
 - Runtime is provider-neutral: Anthropic Messages + OpenAI Responses adapters under `jyagent/runtime/`
 - `RuntimeOwner` owns the active `provider:model`; `/model <provider> <model>` switches future turns
@@ -44,3 +47,6 @@ Detailed knowledge lives in topic files under `data/memory/topics/`.
 
 [gotcha] `contextvars.ContextVar` is NOT auto-propagated by `ThreadPoolExecutor.submit()` (verified Python 3.14.3 — worker sees default, not caller's value). Must use `ctx = contextvars.copy_context(); executor.submit(ctx.run, fn, ...)` to explicitly propagate.
 [preference] Don't create memory topic files for obvious/training knowledge already covered by concise behavioral rules
+[gotcha] Codex CLI `--sandbox` flag (read-only / workspace-write / danger-full-access) only restricts **filesystem access** for model-generated shell commands. It does NOT restrict network access, web search, or any other capability. Never blame sandbox mode for web search issues.
+[goal] Long-term learning plan: Guide user through nano-vLLM to master LLM inference. Progress tracked in `data/memory/topics/nano-vllm-learning.md`. On any new session mentioning nano-vLLM, learning, or LLM study — read that file first to resume where we left off.
+[gotcha] User launches jy-agent from home dir (~), NOT from the project root. All file paths in memory are relative to project root `/Users/jyxc-dz-0100398/jy-agent/`. Always prefix with the project root when using read_file, glob_files, find, etc. Never use bare relative paths like `data/memory/...` — they resolve to the wrong directory.

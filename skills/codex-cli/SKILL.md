@@ -59,9 +59,32 @@ check_background(12345, tail=20)
 check_background(12345)
 # → {"pid": 12345, "status": "done", "exit_code": 0, "output": "...full output..."}
 
-# If stuck: kill it
+# If you SUSPECT it's stuck — read more output before killing:
+check_background(12345, tail=50)  # see what it's actually doing
+# Only kill after confirming it's truly looping or idle for several polls:
 check_background(12345, action="kill")
 ```
+
+### Diagnosing "stuck" Codex processes
+
+Codex research/analysis tasks routinely take 3-10 minutes. Don't assume
+a running process is stuck just because it's been going for a few minutes.
+
+```
+Codex still running after N seconds →
+├─ N < 300s (5 min) — Probably fine. Poll with tail=20, be patient.
+│
+├─ N = 300-600s — Read a larger window: check_background(pid, tail=50)
+│   ├─ Output shows progress (new content each poll) → Let it run
+│   ├─ Output is identical across 2-3 polls → Likely stuck, kill it
+│   └─ Output shows repeated identical tool calls → Stuck in a loop, kill it
+│
+└─ N > 600s — Read full output (tail=0), extract whatever it produced,
+    then kill and use the partial results.
+```
+
+**Key rule**: Always read substantial output (`tail=50`) before deciding
+to kill. Never judge from `tail=3` alone — that's not enough to see patterns.
 
 ### When run_shell times out at 600s
 
@@ -113,6 +136,11 @@ What does the user need?
 ```
 
 ## Decision Tree: Read-Only vs Workspace-Write
+
+**Sandbox scope**: The `--sandbox` flag controls **filesystem access** for
+model-generated shell commands only. It does NOT restrict network access,
+web search, or any other Codex capability. Don't blame sandbox mode when
+Codex has trouble with web searches — the issue is elsewhere.
 
 ```
 How much access should Codex get?
@@ -354,6 +382,12 @@ run_background('codex exec --full-auto -C /path/to/repo "Refactor the auth modul
 
 ❌ **Don't** poll `check_background` with `tail=0` every few seconds on a running process — it floods context with repeated full output
 ✅ **Do** use `tail=20` or `tail=30` while polling; only use `tail=0` for the final read after status is "done"
+
+❌ **Don't** kill a Codex process after checking only `tail=3` and assuming it's stuck — 3 lines is not enough to diagnose anything
+✅ **Do** read `tail=50` before deciding to kill; compare output across 2-3 polls to detect real loops vs. normal progress
+
+❌ **Don't** blame sandbox mode for web search or network issues — sandbox only restricts filesystem access for shell commands
+✅ **Do** investigate the actual cause (e.g., model looping, prompt issue, service outage) and don't fabricate explanations
 
 ## Reference Files
 
