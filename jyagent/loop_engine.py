@@ -151,9 +151,15 @@ class _StuckLoopDetector:
     """Detect stuck loops by tracking whether repeated calls yield new responses.
 
     Key insight: a loop is "stuck" only when the same tool call returns the
-    same response repeatedly.  Polling tools (``check_background``,
+    same response **consecutively**.  Polling tools (``check_background``,
     ``take_snapshot``) naturally return changing responses (e.g. different
     ``elapsed_seconds``) — they are never flagged without any exemption metadata.
+
+    Interleaved calls are also safe: if the agent alternates
+    ``run_shell(A) → check_background → run_shell(A) → check_background``
+    that's a polling pattern, not a stuck loop — even if ``run_shell(A)``
+    returns the same result each time.  Only **truly consecutive** identical
+    calls (``A → A → A``) trigger the detector.
 
     This replaces the old ``_DedupTracker`` which required a whitelist of
     ``dedup_exempt`` tools and a regex hack for ``sleep`` commands.
@@ -161,6 +167,8 @@ class _StuckLoopDetector:
     Design:
         Track ``(tool_name, args_key) → (consecutive_identical_count, last_response_hash)``
 
+        * If a **different** key was recorded since the last call to *this* key,
+          the pattern is interleaved — reset the counter (not a stuck loop).
         * If the response hash differs from the last recorded one for the same
           ``(tool, args)`` key, the world is making progress — reset the counter.
         * If the response hash is identical, increment the counter.
@@ -171,6 +179,7 @@ class _StuckLoopDetector:
         # key → (consecutive_identical_count, last_response_hash)
         self._state: dict[str, tuple[int, str]] = {}
         self._threshold = threshold
+        self._last_key: str | None = None
 
     @staticmethod
     def _make_key(name: str, args: dict) -> str:
@@ -190,12 +199,24 @@ class _StuckLoopDetector:
 
         Returns a feedback message when a stuck loop is detected (same tool
         called with identical arguments AND identical response ``threshold``
-        times consecutively), or ``None`` if everything is fine.
+        times **truly consecutively**), or ``None`` if everything is fine.
+
+        "Truly consecutive" means no other ``(tool, args)`` key was recorded
+        in between.  Interleaved patterns like ``A → B → A → B → A`` never
+        trigger — they represent polling, not a stuck loop.
         """
         key = self._make_key(name, args if isinstance(args, dict) else {})
         resp_hash = self._hash_response(response)
 
         prev_count, prev_hash = self._state.get(key, (0, ""))
+
+        # If a different tool/args was called since our last record() call,
+        # this is an interleaved pattern (e.g. polling).  Reset the counter
+        # for this key so it starts fresh.
+        if self._last_key is not None and self._last_key != key:
+            prev_count, prev_hash = 0, ""
+
+        self._last_key = key
 
         if prev_hash and resp_hash != prev_hash:
             # Response changed — progress is being made, reset.

@@ -276,6 +276,66 @@ class TestStuckLoopDetector:
                        '{"pid":99,"status":"done","exit_code":0,"elapsed_seconds":200.0}')
         assert fb is None
 
+    # --- Interleaved polling tests (the false-positive fix) ---
+
+    def test_interleaved_polling_never_triggers(self):
+        """A→B→A→B→A with identical A responses should NOT trigger.
+
+        This is the exact scenario that caused the false positive:
+        run_shell(git diff) → check_background → run_shell(git diff) → ...
+        """
+        d = _StuckLoopDetector(threshold=3)
+        git_args = {"command": "cd /tmp && git diff --stat"}
+        bg_args = {"pid": 33167, "tail": 5}
+        git_resp = "loop_engine.py | 63 +++"
+        for i in range(10):
+            fb = d.record("run_shell", git_args, git_resp)
+            assert fb is None, f"run_shell falsely triggered on iteration {i}"
+            fb = d.record("check_background", bg_args, f'{{"elapsed":{180 + i * 10}}}')
+            assert fb is None
+
+    def test_interleaved_three_tools_never_triggers(self):
+        """A→B→C→A→B→C with identical responses should NOT trigger."""
+        d = _StuckLoopDetector(threshold=2)
+        for _ in range(10):
+            assert d.record("t1", {}, "same") is None
+            assert d.record("t2", {}, "same") is None
+            assert d.record("t3", {}, "same") is None
+
+    def test_consecutive_still_triggers_after_interleave(self):
+        """After interleaved polling, truly consecutive calls still trigger."""
+        d = _StuckLoopDetector(threshold=3)
+        # First: interleaved (should not count)
+        d.record("run_shell", {"c": "git diff"}, "same")
+        d.record("check_background", {"pid": 1}, '{"e":10}')
+        d.record("run_shell", {"c": "git diff"}, "same")
+        d.record("check_background", {"pid": 1}, '{"e":20}')
+        # Now: truly consecutive (should count from 1)
+        assert d.record("run_shell", {"c": "git diff"}, "same") is None  # count=1
+        assert d.record("run_shell", {"c": "git diff"}, "same") is None  # count=2
+        fb = d.record("run_shell", {"c": "git diff"}, "same")            # count=3
+        assert fb is not None
+        assert "STUCK LOOP" in fb
+
+    def test_interleaved_then_response_changes(self):
+        """Interleaved calls with eventual response change — never triggers."""
+        d = _StuckLoopDetector(threshold=3)
+        for i in range(5):
+            d.record("run_shell", {"c": "stat"}, "old_output")
+            d.record("other_tool", {}, f"resp_{i}")
+        # Response changes
+        fb = d.record("run_shell", {"c": "stat"}, "new_output")
+        assert fb is None
+
+    def test_same_key_batch_within_step(self):
+        """Multiple calls to same key in one batch (no interleave) still count."""
+        d = _StuckLoopDetector(threshold=3)
+        # Simulate a step where model called the same tool 3 times
+        assert d.record("rf", {"p": "/x"}, "v") is None   # count=1
+        assert d.record("rf", {"p": "/x"}, "v") is None   # count=2
+        fb = d.record("rf", {"p": "/x"}, "v")              # count=3
+        assert fb is not None
+
 
 # --- Integration: LoopConfig ---
 
