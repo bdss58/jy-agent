@@ -941,6 +941,7 @@ def dispatch_agent(
         # Register with global tracker (spinner)
         agent_id = _subagent_tracker.add(task, max_steps)
         t0 = time.time()
+        _depth_reset = False  # guard against double-reset of ContextVar token
 
         try:
             # Run with wall-clock timeout using a per-call executor (existing pattern)
@@ -960,6 +961,7 @@ def dispatch_agent(
                         task_preview, future, cancel_event_handoff, max_steps, model_spec.model,
                     )
                     _nesting_depth.reset(_depth_token)
+                    _depth_reset = True
                     return ToolResult(json.dumps({
                         "status": "timeout_handoff",
                         "agent_id": bg_id,
@@ -981,7 +983,8 @@ def dispatch_agent(
                 is_error=True,
             )
         finally:
-            _nesting_depth.reset(_depth_token)
+            if not _depth_reset:
+                _nesting_depth.reset(_depth_token)
             _subagent_tracker.remove(agent_id)
 
         elapsed = time.time() - t0
