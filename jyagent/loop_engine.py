@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -650,16 +651,22 @@ class AgentLoop:
         callbacks: LoopCallbacks | None = None,
         tool_source: ToolSource | None = None,
         model_spec: ModelSpec | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         self._runtime_owner = runtime_owner
         self._config = config
         self._callbacks = callbacks or LoopCallbacks()
         self._tool_source = tool_source
         self._model_spec = model_spec  # override for sub-agent model tier
+        self._cancel_event = cancel_event
         # Reuse the module-level shared executor to avoid accumulating
         # ThreadPoolExecutor objects and atexit handlers across turns and
         # sub-agent dispatches.
         self._executor = _tool_executor
+
+    def _is_cancelled(self) -> bool:
+        """Check if external cancellation has been requested."""
+        return self._cancel_event is not None and self._cancel_event.is_set()
 
     # ── callback helpers (no-op when callback is None) ────────────────────
 
@@ -706,6 +713,10 @@ class AgentLoop:
         try:
             for step in range(cfg.max_steps):
                 self._fire("on_step_progress", step, cfg.max_steps)
+
+                # ── Cooperative cancellation check (top of loop) ─────
+                if self._is_cancelled():
+                    break
 
                 # Refresh tool source each step
                 if self._tool_source is not None:
@@ -899,6 +910,19 @@ class AgentLoop:
                     self._fire("on_tool_start", block.name, block.input)
 
                 # Execute tools
+                # ── Cooperative cancellation check (before tools) ────
+                if self._is_cancelled():
+                    # Return error results for all pending tool calls
+                    for block in tool_call_blocks:
+                        messages.append({
+                            "role": "tool_result",
+                            "tool_call_id": block.id,
+                            "tool_name": block.name,
+                            "content": "Cancelled",
+                            "is_error": True,
+                        })
+                    break
+
                 tools_t0 = time.perf_counter()
                 tool_results_tuples = _execute_tools(
                     tool_call_blocks,
@@ -969,6 +993,26 @@ class AgentLoop:
                         tool_calls_count=tool_calls_count,
                         error=stuck_feedback,
                     )
+
+                # ── Cooperative cancellation check (after tools) ─────
+                if self._is_cancelled():
+                    break
+
+            # ── Cooperative cancellation — early exit ────────────────
+            if self._is_cancelled():
+                if trace:
+                    trace.finish(status="interrupted", total_steps=step + 1)
+                    trace.flush()
+                return LoopResult(
+                    status="interrupted",
+                    text=all_text or "",
+                    final_text=final_text,
+                    messages=messages,
+                    steps=step + 1,
+                    total_input_tokens=total_input_tokens,
+                    total_output_tokens=total_output_tokens,
+                    tool_calls_count=tool_calls_count,
+                )
 
             # Max steps reached
             if cfg.fallback_on_max_steps and not final_text:
@@ -1107,6 +1151,8 @@ class AgentLoop:
             except Exception as err:
                 last_error = err
                 if _is_transient_error(err) and attempt < cfg.retry_attempts:
+                    if self._is_cancelled():
+                        raise
                     delay = cfg.retry_base_delay * (2 ** attempt)
                     self._fire("on_retry", attempt + 1, err)
                     time.sleep(delay)
