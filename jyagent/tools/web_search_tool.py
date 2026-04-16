@@ -183,6 +183,7 @@ def _search_codex(
 
         cmd = [
             "codex", "exec",
+            "--skip-git-repo-check",
             "--sandbox", "read-only",
             "-c", "tools_web_search=true",
             "--output-schema", schema_path,
