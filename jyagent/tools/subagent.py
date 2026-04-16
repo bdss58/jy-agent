@@ -6,12 +6,14 @@
 # Sub-agents run silently (no terminal streaming), have their own context
 # window and message history, and return only their final answer to the parent.
 
+import json
 import sys
 import time
 import traceback
 import threading
 import contextvars
 import concurrent.futures
+from dataclasses import dataclass, field
 
 try:
     from ..config import (
@@ -157,7 +159,9 @@ TOOL_SCHEMA = {
         "(3) context isolation — prevent a large subtask from polluting your main context. "
         "The sub-agent has access to the same tools as you (or a subset via tool_whitelist). "
         "Keep task descriptions specific and self-contained — the sub-agent has NO access to "
-        "your conversation history."
+        "your conversation history. "
+        "Set background=true for tasks that may take over 2 minutes; you'll get an agent_id "
+        "and can poll with check_agent()."
     ),
     "input_schema": {
         "type": "object",
@@ -198,6 +202,23 @@ TOOL_SCHEMA = {
                 "description": (
                     "Optional list of tool names the sub-agent can use. "
                     "Empty = all tools available. Example: ['web_fetch', 'read_file']"
+                ),
+            },
+            "background": {
+                "type": "boolean",
+                "description": (
+                    "If true, run in background and return immediately with agent_id. "
+                    "Poll with check_agent(). Use for tasks likely to exceed 2 minutes "
+                    "(research, multi-step analysis)."
+                ),
+            },
+            "timeout": {
+                "type": "integer",
+                "minimum": 60,
+                "maximum": 1800,
+                "description": (
+                    "Max runtime in seconds (default: 300 foreground, 900 background). "
+                    "Clamp: 60-1800."
                 ),
             },
         },
@@ -318,7 +339,7 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
 
 
 def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions,
-                  agent_id=None, custom_system_prompt=None):
+                  agent_id=None, custom_system_prompt=None, cancel_event=None):
     """Run a sub-agent's tool loop to completion via AgentLoop engine.
 
     Delegates the entire step loop, tool execution, retry, context compaction,
@@ -352,10 +373,11 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         streaming=False,
     )
 
-    # Step progress callback → update the global tracker
+    # Step progress callback → update the global tracker + background registry
     def _on_step_progress(step: int, max_s: int) -> None:
         if agent_id is not None:
             _subagent_tracker.update_progress(agent_id, step, max_s)
+            _bg_registry.update_progress(agent_id, step, max_s)
 
     callbacks = LoopCallbacks(on_step_progress=_on_step_progress)
 
@@ -365,6 +387,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         callbacks=callbacks,
         tool_source=tool_source,
         model_spec=model_spec,
+        cancel_event=cancel_event,
     )
     result = loop.run(system_prompt, messages)
 
@@ -565,7 +588,245 @@ class _SubagentTracker:
 _subagent_tracker = _SubagentTracker()
 
 
+# ─── Background Agent Registry ──────────────────────────────────────────────
+
+_bg_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=5, thread_name_prefix="bg-subagent",
+)
+
+
+@dataclass
+class _BackgroundAgent:
+    agent_id: int
+    task: str                           # task preview (first 80 chars)
+    future: concurrent.futures.Future
+    cancel_event: threading.Event
+    started_at: float
+    model: str = ""
+    current_step: int = 0
+    current_max_steps: int = 30
+    outcome: dict | None = None         # filled when future completes
+    stats_recorded: bool = False
+
+
+class _BackgroundAgentRegistry:
+    """Thread-safe registry for background sub-agent jobs."""
+
+    _MAX_CONCURRENT = 5
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._agents: dict[int, _BackgroundAgent] = {}
+        self._next_id = 0
+
+    def register(self, task, future, cancel_event, max_steps, model) -> int:
+        """Register a background agent.  Returns agent_id."""
+        with self._lock:
+            agent_id = self._next_id
+            self._next_id += 1
+            self._agents[agent_id] = _BackgroundAgent(
+                agent_id=agent_id,
+                task=task[:80] if len(task) > 80 else task,
+                future=future,
+                cancel_event=cancel_event,
+                started_at=time.time(),
+                model=model,
+                current_max_steps=max_steps,
+            )
+        return agent_id
+
+    def get(self, agent_id: int) -> _BackgroundAgent | None:
+        with self._lock:
+            return self._agents.get(agent_id)
+
+    def remove(self, agent_id: int) -> None:
+        with self._lock:
+            self._agents.pop(agent_id, None)
+
+    def list_active(self) -> list[dict]:
+        """Return summary of all active background agents."""
+        now = time.time()
+        with self._lock:
+            result = []
+            for a in self._agents.values():
+                done = a.future.done()
+                result.append({
+                    "agent_id": a.agent_id,
+                    "task": a.task,
+                    "status": "done" if done else "running",
+                    "elapsed_seconds": round(now - a.started_at, 1),
+                    "step": a.current_step,
+                    "max_steps": a.current_max_steps,
+                })
+            return result
+
+    def update_progress(self, agent_id: int, step: int, max_steps: int = 0):
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if agent is not None:
+                agent.current_step = step
+                if max_steps:
+                    agent.current_max_steps = max_steps
+
+    def cancel_all(self):
+        """Cancel all background agents (for cleanup on exit)."""
+        with self._lock:
+            agents = list(self._agents.values())
+        for a in agents:
+            a.cancel_event.set()
+            try:
+                a.future.result(timeout=10)
+            except Exception:
+                pass
+        with self._lock:
+            self._agents.clear()
+
+
+# Module-level singleton
+_bg_registry = _BackgroundAgentRegistry()
+
+
+def _record_bg_stats(agent: _BackgroundAgent) -> None:
+    """Record token usage for a background agent in parent stats (best-effort)."""
+    if agent.stats_recorded:
+        return
+    agent.stats_recorded = True
+    try:
+        outcome = agent.outcome
+        if outcome is None and agent.future.done():
+            try:
+                outcome = agent.future.result(timeout=0)
+            except Exception:
+                return
+        if outcome is None:
+            return
+        parent_stats = get_stats()
+        elapsed = time.time() - agent.started_at
+        parent_stats.record_subagent_usage(
+            outcome.get("input_tokens", 0),
+            outcome.get("output_tokens", 0),
+            "",  # provider — not tracked in bg agent currently
+            agent.model,
+            task_preview=agent.task,
+            elapsed=elapsed,
+            status=outcome.get("status", "unknown"),
+            steps=outcome.get("steps", 0),
+            tool_calls=outcome.get("tool_calls", 0),
+        )
+    except Exception:
+        pass  # stats recording is best-effort
+
+
+# ─── check_agent tool ───────────────────────────────────────────────────────
+
+CHECK_AGENT_SCHEMA = {
+    "name": "check_agent",
+    "description": (
+        "Check status of a background sub-agent or manage background agents. "
+        "Use after dispatch_agent(background=True) to poll for results. "
+        "action='status' returns progress/result. action='kill' cancels the agent. "
+        "action='list' shows all active background agents."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "agent_id": {
+                "type": "integer",
+                "description": "ID of the background agent (from dispatch_agent response). Required for status/kill.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["status", "kill", "list"],
+                "description": "Action: 'status' (default) check progress, 'kill' cancel agent, 'list' show all active.",
+            },
+        },
+        "required": [],
+    },
+}
+
+
+def check_agent(agent_id: int = -1, action: str = "status") -> ToolResult:
+    """Check on or manage background sub-agents."""
+    if action == "list":
+        return ToolResult(json.dumps(_bg_registry.list_active()))
+
+    if agent_id < 0:
+        return ToolResult(
+            "Error: agent_id is required for status/kill actions.",
+            is_error=True,
+        )
+
+    agent = _bg_registry.get(agent_id)
+    if agent is None:
+        return ToolResult(
+            f"Error: No background agent with id={agent_id}. "
+            "Use check_agent(action='list') to see active agents.",
+            is_error=True,
+        )
+
+    if action == "kill":
+        agent.cancel_event.set()  # cooperative cancel
+        try:
+            agent.future.result(timeout=10)  # wait for clean shutdown
+        except Exception:
+            pass
+        _record_bg_stats(agent)
+        _bg_registry.remove(agent_id)
+        return ToolResult(f"Agent {agent_id} cancelled.")
+
+    # action == "status"
+    if agent.future.done():
+        try:
+            outcome = agent.future.result(timeout=0)
+        except Exception as e:
+            _bg_registry.remove(agent_id)
+            return ToolResult(
+                f"Error: Background agent failed: {e}", is_error=True,
+            )
+
+        # Record stats, print terminal summary, return result
+        agent.outcome = outcome
+        _record_bg_stats(agent)
+        _bg_registry.remove(agent_id)
+
+        elapsed = time.time() - agent.started_at
+        status = outcome.get("status", "completed")
+        answer = outcome.get("content", "")
+        steps = outcome.get("steps", 0)
+        in_tok = outcome.get("input_tokens", 0)
+        out_tok = outcome.get("output_tokens", 0)
+        tool_calls = outcome.get("tool_calls", 0)
+
+        # Terminal summary
+        status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
+        status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
+        sys.stdout.write(
+            f"{status_color}  {status_icon} 🤖 Background agent done{COLOR_RESET}"
+            f"{COLOR_DIM} ({status}, {elapsed:.1f}s, {steps} steps, {tool_calls} tool calls, "
+            f"{in_tok}+{out_tok} tokens){COLOR_RESET}\n"
+        )
+        sys.stdout.flush()
+
+        return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
+    else:
+        # Still running
+        elapsed = time.time() - agent.started_at
+        return ToolResult(json.dumps({
+            "status": "running",
+            "agent_id": agent_id,
+            "elapsed_seconds": round(elapsed, 1),
+            "step": agent.current_step,
+            "max_steps": agent.current_max_steps,
+            "task": agent.task,
+        }))
+
+
 # ─── Main tool function ──────────────────────────────────────────────────────
+
+_BG_GRACE_PERIOD = 30  # seconds to wait before backgrounding
+_FG_DEFAULT_TIMEOUT = 300  # default foreground timeout
+_BG_DEFAULT_TIMEOUT = 900  # default background timeout
+
 
 def dispatch_agent(
     task: str,
@@ -573,6 +834,8 @@ def dispatch_agent(
     model: str = "default",
     max_steps: int = _DEFAULT_MAX_STEPS,
     tool_whitelist: list = None,
+    background: bool = False,
+    timeout: int = 0,
 ) -> ToolResult:
     """Spawn a sub-agent to handle a focused subtask."""
     custom_system_prompt = None
@@ -585,6 +848,14 @@ def dispatch_agent(
             f"Cannot spawn deeper sub-agents.",
             is_error=True,
         )
+
+    # Resolve effective timeout
+    if timeout > 0:
+        effective_timeout = max(60, min(1800, timeout))
+    elif background:
+        effective_timeout = _BG_DEFAULT_TIMEOUT
+    else:
+        effective_timeout = _FG_DEFAULT_TIMEOUT
 
     # Resolve model
     runtime_owner = _get_runtime_owner()
@@ -608,51 +879,120 @@ def dispatch_agent(
         tool_schemas = [s for s in tool_schemas if s["name"] != "dispatch_agent"]
         tool_functions = {k: v for k, v in tool_functions.items() if k != "dispatch_agent"}
 
-    # Register with global tracker
-    agent_id = _subagent_tracker.add(task, max_steps)
-    t0 = time.time()
+    task_preview = task[:80] if len(task) > 80 else task
+    cancel_event = threading.Event()
 
-    try:
-        # Increment nesting depth, then snapshot the context so the worker
-        # thread inherits the updated value.  ThreadPoolExecutor does NOT
-        # auto-propagate ContextVars; we must use copy_context().run().
-        _depth_token = _nesting_depth.set(depth + 1)
-        ctx = contextvars.copy_context()
+    # Increment nesting depth, then snapshot the context so the worker
+    # thread inherits the updated value.  ThreadPoolExecutor does NOT
+    # auto-propagate ContextVars; we must use copy_context().run().
+    _depth_token = _nesting_depth.set(depth + 1)
+    ctx = contextvars.copy_context()
 
-        # Run with wall-clock timeout
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
+    if background:
+        # ── Background path ─────────────────────────────────────────────
+        # Register spinner for the grace period
+        spinner_id = _subagent_tracker.add(task, max_steps)
+        t0 = time.time()
+
+        try:
+            future = _bg_executor.submit(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
-                agent_id, custom_system_prompt,
+                spinner_id, custom_system_prompt, cancel_event,
             )
+
+            # Grace period: wait up to 30s for fast finish
             try:
-                outcome = future.result(timeout=_SUBAGENT_TIMEOUT)
+                outcome = future.result(timeout=_BG_GRACE_PERIOD)
             except concurrent.futures.TimeoutError:
-                future.cancel()
-                return ToolResult(
-                    f"Error: Sub-agent timed out after {_SUBAGENT_TIMEOUT}s. "
-                    f"Task may be too complex — try breaking it down further.",
-                    is_error=True,
+                # Still running — register in background registry, remove spinner
+                _subagent_tracker.remove(spinner_id)
+                bg_id = _bg_registry.register(
+                    task_preview, future, cancel_event, max_steps, model_spec.model,
                 )
-    except KeyboardInterrupt:
-        _subagent_tracker.remove(agent_id)
-        raise
-    except Exception as e:
-        _subagent_tracker.remove(agent_id)
-        error_text = str(e)
-        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        return ToolResult(
-            f"Error: Sub-agent failed: {error_text}\n{error_detail}",
-            is_error=True,
-        )
-    finally:
-        _nesting_depth.reset(_depth_token)  # restore
-        _subagent_tracker.remove(agent_id)
+                return ToolResult(json.dumps({
+                    "status": "dispatched",
+                    "agent_id": bg_id,
+                    "message": f"Background agent running. Call check_agent(agent_id={bg_id}) to get results.",
+                    "task": task_preview,
+                }))
+        except KeyboardInterrupt:
+            cancel_event.set()
+            _subagent_tracker.remove(spinner_id)
+            raise
+        except Exception as e:
+            _subagent_tracker.remove(spinner_id)
+            error_text = str(e)
+            error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            return ToolResult(
+                f"Error: Sub-agent failed: {error_text}\n{error_detail}",
+                is_error=True,
+            )
+        finally:
+            _nesting_depth.reset(_depth_token)
+            _subagent_tracker.remove(spinner_id)
 
-    elapsed = time.time() - t0
+        # Fast finish — return inline (same as sync path)
+        elapsed = time.time() - t0
+        return _finalize_outcome(outcome, elapsed, model_spec, task_preview)
 
-    # Print summary to terminal
+    else:
+        # ── Foreground (sync) path ──────────────────────────────────────
+        # Register with global tracker (spinner)
+        agent_id = _subagent_tracker.add(task, max_steps)
+        t0 = time.time()
+        _depth_reset = False  # guard against double-reset of ContextVar token
+
+        try:
+            # Run with wall-clock timeout using a per-call executor (existing pattern)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    ctx.run, _run_subagent, task, context, model_spec,
+                    max_steps, tool_schemas, tool_functions,
+                    agent_id, custom_system_prompt, cancel_event,
+                )
+                try:
+                    outcome = future.result(timeout=effective_timeout)
+                except concurrent.futures.TimeoutError:
+                    # Soft handoff: register as background agent instead of erroring
+                    cancel_event_handoff = cancel_event  # reuse the existing event
+                    _subagent_tracker.remove(agent_id)
+                    bg_id = _bg_registry.register(
+                        task_preview, future, cancel_event_handoff, max_steps, model_spec.model,
+                    )
+                    _nesting_depth.reset(_depth_token)
+                    _depth_reset = True
+                    return ToolResult(json.dumps({
+                        "status": "timeout_handoff",
+                        "agent_id": bg_id,
+                        "message": (
+                            f"Agent exceeded {effective_timeout}s. Handed off to background. "
+                            f"Call check_agent(agent_id={bg_id}) to get results."
+                        ),
+                    }))
+        except KeyboardInterrupt:
+            cancel_event.set()
+            _subagent_tracker.remove(agent_id)
+            raise
+        except Exception as e:
+            _subagent_tracker.remove(agent_id)
+            error_text = str(e)
+            error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            return ToolResult(
+                f"Error: Sub-agent failed: {error_text}\n{error_detail}",
+                is_error=True,
+            )
+        finally:
+            if not _depth_reset:
+                _nesting_depth.reset(_depth_token)
+            _subagent_tracker.remove(agent_id)
+
+        elapsed = time.time() - t0
+        return _finalize_outcome(outcome, elapsed, model_spec, task_preview)
+
+
+def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
+    """Print terminal summary, record stats, return ToolResult for a completed sub-agent."""
     status = outcome.get("status", _SUBAGENT_STATUS_COMPLETED)
     answer = outcome.get("content", "")
     steps = outcome.get("steps", 0)
@@ -672,7 +1012,6 @@ def dispatch_agent(
     # Record token usage in parent stats
     try:
         parent_stats = get_stats()
-        task_preview = task[:80] if len(task) > 80 else task
         parent_stats.record_subagent_usage(
             in_tok, out_tok, model_spec.provider, model_spec.model,
             task_preview=task_preview,
