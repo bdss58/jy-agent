@@ -50,6 +50,7 @@ def _pricing(
 _MODEL_PRICING = {
     "anthropic": {
         "claude-opus-4-6": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
+        "claude-opus-4-7": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
     },
     "openai": {
         "gpt-5.4": _pricing(2.50, 15.0, cache_read_per_million=0.25),

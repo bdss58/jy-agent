@@ -7,6 +7,7 @@ the Anthropic-specific types from runtime/types.py.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, cast
 
 from typing import TypedDict
@@ -33,9 +34,7 @@ _ANTHROPIC_REASONING_KEYS = {"type", "budget_tokens", "display", "effort"}
 _ANTHROPIC_THINKING_TYPES = {"disabled", "adaptive"}
 _ANTHROPIC_THINKING_DISPLAYS = {"summarized", "omitted"}
 _ANTHROPIC_REASONING_EFFORTS = {"low", "medium", "high", "max"}
-_ANTHROPIC_ADAPTIVE_MODEL_PREFIXES = ("claude-sonnet-4-6", "claude-opus-4-6")
-_ANTHROPIC_EFFORT_MODEL_PREFIXES = ("claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-5")
-_ANTHROPIC_MAX_EFFORT_MODEL_PREFIXES = ("claude-opus-4-6",)
+_ANTHROPIC_MODEL_RE = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d+)(?:[-.].*)?$")
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -64,21 +63,42 @@ def _normalize_model_name(model: str | None) -> str:
     return (model or "").strip().lower()
 
 
-def _matches_model_prefix(model: str | None, prefixes: tuple[str, ...]) -> bool:
-    normalized = _normalize_model_name(model)
-    return any(normalized.startswith(prefix) for prefix in prefixes)
+def _parse_anthropic_model(model: str | None) -> tuple[str, int, int] | None:
+    match = _ANTHROPIC_MODEL_RE.match(_normalize_model_name(model))
+    if not match:
+        return None
+    try:
+        return match.group(1), int(match.group(2)), int(match.group(3))
+    except ValueError:
+        return None
 
 
 def _supports_anthropic_adaptive_thinking(model: str | None) -> bool:
-    return _matches_model_prefix(model, _ANTHROPIC_ADAPTIVE_MODEL_PREFIXES)
+    parsed = _parse_anthropic_model(model)
+    if parsed is None:
+        return False
+    family, major, minor = parsed
+    return family in ("opus", "sonnet") and (major, minor) >= (4, 6)
 
 
 def _supports_anthropic_effort(model: str | None) -> bool:
-    return _matches_model_prefix(model, _ANTHROPIC_EFFORT_MODEL_PREFIXES)
+    parsed = _parse_anthropic_model(model)
+    if parsed is None:
+        return False
+    family, major, minor = parsed
+    if family == "opus":
+        return (major, minor) >= (4, 5)
+    if family == "sonnet":
+        return (major, minor) >= (4, 6)
+    return False
 
 
 def _supports_anthropic_max_effort(model: str | None) -> bool:
-    return _matches_model_prefix(model, _ANTHROPIC_MAX_EFFORT_MODEL_PREFIXES)
+    parsed = _parse_anthropic_model(model)
+    if parsed is None:
+        return False
+    family, major, minor = parsed
+    return family == "opus" and (major, minor) >= (4, 6)
 
 
 def _anthropic_budget_migration_error() -> ValueError:
@@ -100,14 +120,16 @@ def _anthropic_disabled_fields_error(fields: set[str]) -> ValueError:
 def _anthropic_adaptive_requires_claude_46_error(model: str | None) -> ValueError:
     return ValueError(
         f"Anthropic adaptive thinking is not supported by model '{model or '<unset>'}'. "
-        "Switch to 'claude-sonnet-4-6' or 'claude-opus-4-6'."
+        "Switch to a Claude 4.6+ Sonnet or Opus model "
+        "(e.g., 'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-7')."
     )
 
 
 def _anthropic_effort_unsupported_error(model: str | None) -> ValueError:
     return ValueError(
         f"Anthropic reasoning effort is not supported by model '{model or '<unset>'}'. "
-        "Use 'claude-sonnet-4-6', 'claude-opus-4-6', or 'claude-opus-4-5'."
+        "Use a Claude 4.6+ Sonnet, or a Claude 4.5+ Opus model "
+        "(e.g., 'claude-opus-4-5', 'claude-opus-4-6', 'claude-opus-4-7')."
     )
 
 
@@ -170,7 +192,7 @@ def validate_anthropic_reasoning(reasoning: Any, *, model: str | None = None) ->
             raise _anthropic_effort_unsupported_error(model)
         if validated_effort == "max" and not _supports_anthropic_max_effort(model):
             raise ValueError(
-                f"Anthropic reasoning effort 'max' is only supported by model 'claude-opus-4-6', not '{model or '<unset>'}'."
+                f"Anthropic reasoning effort 'max' requires a Claude 4.6+ Opus model, not '{model or '<unset>'}'."
             )
 
     if resolved_type == "adaptive" and validated_effort is None:

@@ -1062,6 +1062,50 @@ class TestValidateAnthropicReasoning:
         )
         assert result["display"] == "summarized"
 
+    def test_adaptive_claude_opus_4_7_accepted(self):
+        result = validate_anthropic_reasoning(
+            {"type": "adaptive"},
+            model="claude-opus-4-7",
+        )
+        assert result["type"] == "adaptive"
+        assert result["effort"] == "medium"
+
+    def test_effort_max_claude_opus_4_7_accepted(self):
+        result = validate_anthropic_reasoning(
+            {"effort": "max"},
+            model="claude-opus-4-7",
+        )
+        assert result["effort"] == "max"
+        assert result.get("type") == "adaptive"
+
+    def test_adaptive_future_sonnet_4_7_accepted(self):
+        result = validate_anthropic_reasoning(
+            {"type": "adaptive"},
+            model="claude-sonnet-4-7",
+        )
+        assert result["type"] == "adaptive"
+
+    def test_adaptive_future_minor_4_20_accepted(self):
+        result = validate_anthropic_reasoning(
+            {"type": "adaptive"},
+            model="claude-opus-4-20",
+        )
+        assert result["type"] == "adaptive"
+
+    def test_model_with_date_suffix_accepted(self):
+        result = validate_anthropic_reasoning(
+            {"type": "adaptive"},
+            model="claude-opus-4-7-20260101",
+        )
+        assert result["type"] == "adaptive"
+
+    def test_opus_4_5_still_rejects_adaptive(self):
+        with pytest.raises(ValueError, match="adaptive"):
+            validate_anthropic_reasoning(
+                {"type": "adaptive"},
+                model="claude-opus-4-5",
+            )
+
 
 class TestBuildAnthropicRequestReasoning:
     def test_disabled(self):
