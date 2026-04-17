@@ -123,14 +123,6 @@ def get_skill_router_model_spec(active_spec=None):
     return build_model_spec(provider, model, source="SKILL_ROUTER_PROVIDER")
 
 
-def get_subagent_model_spec(tier: str, active_spec=None):
-    active_spec = active_spec or get_active_model_spec()
-    tier_key = tier.upper()
-    provider = (os.environ.get(f"SUBAGENT_{tier_key}_PROVIDER") or active_spec.provider).strip() or active_spec.provider
-    model = (os.environ.get(f"SUBAGENT_{tier_key}_MODEL") or active_spec.model).strip() or active_spec.model
-    return build_model_spec(provider, model, source=f"SUBAGENT_{tier_key}_PROVIDER")
-
-
 def get_reasoning_config_for_provider(
     provider: str,
     *,

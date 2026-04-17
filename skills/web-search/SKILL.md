@@ -205,12 +205,12 @@ When sub-queries are independent, search in parallel using dispatch_agent:
 dispatch_agent(
     task='Search for "AWS GPU instance pricing p5 p4d LLM inference 2026". '
          'Return: instance types, GPU models, hourly prices, spot prices.',
-    model="fast", background=True
+    background=True
 )
 dispatch_agent(
     task='Search for "GCP GPU instance pricing A100 H100 LLM inference 2026". '
          'Return: instance types, GPU models, hourly prices, spot prices.',
-    model="fast", background=True
+    background=True
 )
 # Poll both, then synthesize into comparison table
 ```

@@ -176,7 +176,6 @@ RULES:
 - If sources conflict, note both with citations
 - Do NOT make up numbers — if data is unavailable, say so
 - Spend your full budget searching — thoroughness matters""",
-    model="default",
     background=True,
     timeout=600,
     max_steps=25
@@ -192,7 +191,6 @@ for thread in research_plan["threads"]:
     result = dispatch_agent(
         task=f"""RESEARCH THREAD: {thread['query']}
         ... (prompt template above, customized per thread) ...""",
-        model="default",
         background=True,
         timeout=600,
         max_steps=25

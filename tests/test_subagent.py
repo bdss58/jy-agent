@@ -61,15 +61,13 @@ def _patch_subagent_deps():
     with (
         patch("jyagent.tools.subagent.get_registry", return_value=mock_registry),
         patch("jyagent.tools.subagent._get_memory_context", return_value=""),
-        patch("jyagent.tools.subagent.get_subagent_model_spec") as mock_spec,
         patch("jyagent.tools.subagent._get_runtime_owner") as mock_owner,
         patch("jyagent.tools.subagent.get_stats") as mock_stats,
     ):
-        # Provide a minimal model_spec
+        # Provide a minimal model_spec via the runtime owner
         spec = MagicMock()
         spec.model = "test-model"
         spec.provider = "anthropic"
-        mock_spec.return_value = spec
         mock_owner.return_value = MagicMock(model_spec=spec)
         mock_stats.return_value = MagicMock()
         yield

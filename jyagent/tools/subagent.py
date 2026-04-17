@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 try:
     from ..config import (
         STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
-        get_subagent_model_spec,
     )
     from ..loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from ..registry import get_registry
@@ -28,7 +27,6 @@ try:
 except ImportError:
     from jyagent.config import (
         STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
-        get_subagent_model_spec,
     )
     from jyagent.loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from jyagent.registry import get_registry
@@ -37,7 +35,7 @@ except ImportError:
     from jyagent.session_stats import get_stats
 
 
-# ─── Model tiers ──────────────────────────────────────────────────────────────
+# ─── Defaults ────────────────────────────────────────────────────────────────
 
 _DEFAULT_MAX_STEPS = 30
 _DEFAULT_MAX_TOKENS_PER_RESPONSE = 8192
@@ -178,15 +176,6 @@ TOOL_SCHEMA = {
                 "description": (
                     "Optional additional context or data for the sub-agent. "
                     "Use this to pass relevant information from your conversation."
-                ),
-            },
-            "model": {
-                "type": "string",
-                "enum": ["fast", "default", "strong"],
-                "description": (
-                    "Model tier. 'fast' = Haiku (cheap, simple tasks), "
-                    "'default' = same model as parent (balanced), "
-                    "'strong' = best available (complex reasoning). Default: 'default'."
                 ),
             },
             "max_steps": {
@@ -870,7 +859,6 @@ _BG_DEFAULT_TIMEOUT = 900  # default background timeout
 def dispatch_agent(
     task: str,
     context: str = "",
-    model: str = "default",
     max_steps: int = _DEFAULT_MAX_STEPS,
     tool_whitelist: list = None,
     background: bool = False,
@@ -896,9 +884,8 @@ def dispatch_agent(
     else:
         effective_timeout = _FG_DEFAULT_TIMEOUT
 
-    # Resolve model
     runtime_owner = _get_runtime_owner()
-    model_spec = get_subagent_model_spec(model, runtime_owner.model_spec)
+    model_spec = runtime_owner.model_spec
 
     # Build tool schemas & functions for the sub-agent
     registry = get_registry()
