@@ -5,15 +5,17 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from ..config import (
-    MEMORY_MD_FILE, TOPICS_DIR,
-    MAX_MEMORY_INDEX_LINES, MAX_MEMORY_INDEX_BYTES,
-)
+from .. import config as _cfg
+
+# Access paths via _cfg.MEMORY_MD_FILE / _cfg.TOPICS_DIR (late-bound) so that
+# tests can patch config attributes *after* this module is imported.
+MAX_MEMORY_INDEX_LINES = _cfg.MAX_MEMORY_INDEX_LINES
+MAX_MEMORY_INDEX_BYTES = _cfg.MAX_MEMORY_INDEX_BYTES
 
 
 def ensure_dirs() -> None:
-    os.makedirs(os.path.dirname(MEMORY_MD_FILE), exist_ok=True)
-    os.makedirs(TOPICS_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(_cfg.MEMORY_MD_FILE), exist_ok=True)
+    os.makedirs(_cfg.TOPICS_DIR, exist_ok=True)
 
 
 # ─── MEMORY.md operations ─────────────────────────────────────────────────────
@@ -21,7 +23,7 @@ def ensure_dirs() -> None:
 def read_memory_md() -> str:
     """Read the MEMORY.md index file. Returns empty string if not found."""
     try:
-        with open(MEMORY_MD_FILE, 'r', encoding='utf-8') as f:
+        with open(_cfg.MEMORY_MD_FILE, 'r', encoding='utf-8') as f:
             return f.read()
     except FileNotFoundError:
         return ""
@@ -49,7 +51,7 @@ def read_memory_index() -> str:
 def write_memory_md(content: str) -> None:
     """Write content to MEMORY.md."""
     ensure_dirs()
-    with open(MEMORY_MD_FILE, 'w', encoding='utf-8') as f:
+    with open(_cfg.MEMORY_MD_FILE, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -59,7 +61,7 @@ def append_memory_md(text: str) -> None:
     existing = read_memory_md()
     if existing and not existing.endswith("\n"):
         existing += "\n"
-    with open(MEMORY_MD_FILE, 'a', encoding='utf-8') as f:
+    with open(_cfg.MEMORY_MD_FILE, 'a', encoding='utf-8') as f:
         if not existing:
             f.write(f"# Agent Memory\n\n{text}\n")
         else:
@@ -125,8 +127,8 @@ def list_topics() -> list[str]:
     """List all topic files in the topics directory."""
     ensure_dirs()
     topics = []
-    if os.path.exists(TOPICS_DIR):
-        for f in sorted(os.listdir(TOPICS_DIR)):
+    if os.path.exists(_cfg.TOPICS_DIR):
+        for f in sorted(os.listdir(_cfg.TOPICS_DIR)):
             if f.endswith('.md'):
                 topics.append(f[:-3])
     return topics
@@ -134,7 +136,7 @@ def list_topics() -> list[str]:
 
 def read_topic(name: str) -> str:
     """Read a topic file. Returns empty string if not found."""
-    filepath = os.path.join(TOPICS_DIR, f"{name}.md")
+    filepath = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             return f.read()
@@ -318,7 +320,7 @@ def write_topic(name: str, content: str) -> None:
     to the ``## Topic Files Index`` section of MEMORY.md.
     """
     ensure_dirs()
-    filepath = os.path.join(TOPICS_DIR, f"{name}.md")
+    filepath = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
     is_new = not os.path.exists(filepath)
 
     now = _now_iso()
@@ -353,7 +355,7 @@ def delete_topic(name: str) -> bool:
 
     Returns True if the file was deleted.
     """
-    filepath = os.path.join(TOPICS_DIR, f"{name}.md")
+    filepath = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
     try:
         os.remove(filepath)
         _remove_topic_index_entry(name)
