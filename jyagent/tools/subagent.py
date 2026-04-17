@@ -41,7 +41,6 @@ except ImportError:
 
 _DEFAULT_MAX_STEPS = 30
 _DEFAULT_MAX_TOKENS_PER_RESPONSE = 8192
-_SUBAGENT_TIMEOUT = 300  # 5 min wall-clock per sub-agent
 _SUBAGENT_STATUS_COMPLETED = "completed"
 _SUBAGENT_STATUS_MAX_STEPS = "max_steps"
 _SUBAGENT_STATUS_API_ERROR = "api_error"
