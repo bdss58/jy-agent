@@ -1,219 +1,344 @@
 ---
 name: web-search
 description: >-
-  Search the web efficiently using search engines. Use this skill whenever the
-  user asks to look up information, find answers, check current events/news,
-  compare options, fact-check claims, or research any topic that requires
-  current/external knowledge. TRIGGER on: "search for", "look up", "find out",
-  "what is the latest", "current news", "research X", any factual question about
-  real-world state, prices, events, people, comparisons. DO NOT TRIGGER on:
-  fetching a known URL (web_fetch handles that), browser automation tasks,
-  or questions clearly answerable from training data alone.
+  Use this skill when users need current web information or real-world
+  lookups. TRIGGER immediately for: information seeking ("find out about X",
+  "look up Y"), current events and updates ("what's the latest on Z", "what
+  changed with A"), research requests ("research B topic"), verification
+  queries ("is X still Y", "check if C is true"), comparisons needing live
+  data, factual questions about people/companies/products/prices, and anything
+  requiring fresh external knowledge beyond training data. DO NOT TRIGGER for:
+  known URL fetching (use web_fetch), weather/time queries (use appropriate
+  APIs), questions answerable from existing knowledge alone, or comprehensive
+  multi-source reports (use deep-research). This skill provides efficient web
+  search with smart query breakdown and cited answers.
 metadata:
   author: jy-agent
-  version: "4.0"
+  version: "5.0"
 ---
 
 # Web Search
 
-Search the web using the `web_search` tool (primary) or `web_fetch` with
-search URLs (advanced). Combines DuckDuckGo for fast results and Codex for
-deep research with multi-source synthesis.
+Search the web using `web_search` (primary), `web_fetch` (page-level),
+and `dispatch_agent` (parallel). Inspired by how Google, OpenAI, and Anthropic
+implement search in their AI agents — with query decomposition, iterative
+multi-hop search, dynamic filtering, and citation-first output.
 
-> **Scope**: This skill is about *searching* — constructing queries, picking
-> engines, and synthesizing results. For *fetching* a known URL, use
-> `web_fetch()` directly.
+> **Scope**: This skill handles searching and synthesizing. For *fetching*
+> a known URL, use `web_fetch()` directly. For comprehensive multi-source
+> research reports (5+ min), escalate to the **deep-research** skill.
 
 ## Step 0: Always Verify Date
 
-```
-run_shell("date")  # NEVER assume the year — agent defaults can be wrong
+```python
+run_shell("date")  # NEVER assume the year — model defaults can be wrong
 ```
 
 ## Decision Tree: Which Approach?
 
 ```
 What does the user need?
-├─ Quick fact / single answer
-│   → web_search(query="...", engine="ddg")
-│   → Fast, free, always works
+│
+├─ Quick fact / single answer (who, what, when)
+│   → Single-Shot Search (DDG)
 │
 ├─ General search / find resources
-│   → web_search(query="...", engine="auto")
-│   → DDG first; Codex fallback if results are poor
+│   → Single-Shot Search (auto)
 │
-├─ Deep research / multi-source synthesis
-│   → web_search(query="...", engine="codex")
-│   → Best quality, includes synthesis, 40-80K tokens per call
-│   → Or dispatch_agent with a research task for parallel searches
+├─ Multi-faceted question or comparison
+│   → Decompose & Multi-Hop Search
 │
 ├─ Current events / breaking news
-│   → web_search(query="...", engine="codex")
-│   → Codex web_search has real-time access, synthesizes across sources
+│   → Single-Shot (codex) or Multi-Hop with recency filter
 │
 ├─ Chinese topic (中文内容)
-│   → web_search(query="中文查询", engine="ddg") first
-│   → Then web_fetch("https://www.baidu.com/s?wd=查询") for cross-reference
+│   → DDG first + 百度 cross-reference
 │
-├─ Specific search engine features needed
-│   │  (time filters, site:, filetype:, etc.)
-│   → Use web_fetch with search URLs directly (see Advanced section)
+├─ Deep research report (10+ sources, comprehensive analysis)
+│   → ESCALATE to deep-research skill
+│   → Tell user: "This needs deep research — launching multi-agent investigation"
 │
-└─ Need raw page content from results
-    → web_search to find URLs, then web_fetch each URL
+├─ Specific search features needed (time filters, site:, filetype:)
+│   → Advanced: web_fetch with search engine URLs
+│
+└─ Need raw page content from search results
+    → Search → web_fetch each URL
 ```
 
-## Primary Tool: `web_search`
+## Core Pattern: Search → Filter → Cite
 
-### Quick lookup
-```python
-web_search(query="python 3.14 new features")
-# → DDG results with titles, URLs, snippets
+All search follows this 3-step loop (inspired by Google's grounding pipeline
+and Anthropic's dynamic filtering):
+
+```
+1. SEARCH — Generate optimized query, execute search
+2. FILTER — Evaluate results: relevance, authority, freshness; fetch top sources
+3. CITE   — Synthesize answer with inline citations [title](url)
 ```
 
-### Best quality (Codex-powered)
-```python
-web_search(query="comparison of vLLM vs TGI for LLM inference 2026", engine="codex")
-# → Structured results + synthesis paragraph from multiple sources
-```
+## Single-Shot Search
 
-### Auto mode (recommended default)
+For straightforward questions with a single clear answer:
+
 ```python
+# Quick fact — DDG (fast, free)
+web_search(query="python 3.14 release date", engine="ddg")
+
+# General search — auto (DDG with Codex fallback)
 web_search(query="kubernetes pod security standards", engine="auto")
-# → Tries DDG first (fast). If < 3 results, falls back to Codex
+
+# Current events — Codex (real-time, multi-source synthesis)
+web_search(query="latest AI regulation news 2026", engine="codex")
 ```
 
-### Engines at a glance
+### Engine Selection
 
-| Engine | Speed | Cost | Quality | Synthesis | When to use |
-|--------|-------|------|---------|-----------|-------------|
-| `ddg` | ~2s | Free | Good | No | Quick lookups, known topics |
-| `codex` | ~15-30s | ~40-80K tokens | Excellent | Yes | Deep research, current events, comparisons |
-| `auto` | ~2-30s | Free→expensive | Good→Excellent | Maybe | Default — fast path with quality fallback |
+| Engine | Speed | Cost | Quality | Synthesis | Best for |
+|--------|-------|------|---------|-----------|----------|
+| `ddg` | ~2s | Free | Good | No | Quick facts, known topics |
+| `codex` | ~15-30s | ~40-80K tokens | Excellent | Yes | Current events, comparisons |
+| `auto` | ~2-30s | Free→expensive | Good→Excellent | Maybe | Default for most queries |
 
-## Advanced: Search Engine URLs via `web_fetch`
+## Query Decomposition & Reformulation
 
-When you need specific search engine features (time filters, operators),
-use `web_fetch` with search URLs directly.
+Before searching, transform the user's question into optimized queries.
+All three major AI providers do this — it is the single biggest quality lever.
 
-### Google (needs Chrome MCP for best results)
+### Reformulation Rules
+
+```
+User's natural language → Search-optimized query
+
+├─ Drop conversational filler
+│   "Can you help me find out what the best..." → "best ..."
+│
+├─ Add specificity qualifiers
+│   Version numbers, year, platform, context
+│   "python ssl error" → '"ssl: CERTIFICATE_VERIFY_FAILED" python 3.14'
+│
+├─ Use exact error messages verbatim (in quotes)
+│   "I got some timeout error" → ask user for exact message, then quote it
+│
+├─ Split compound questions into multiple queries
+│   "Compare vLLM vs TGI performance and pricing"
+│   → Query 1: "vLLM vs TGI inference performance benchmark 2026"
+│   → Query 2: "vLLM TGI pricing comparison cloud deployment"
+│
+└─ Add domain qualifiers for authoritative sources
+    "kubernetes networking" → "site:kubernetes.io networking CNI"
+```
+
+### Decomposition Pattern
+
+For multi-faceted questions, decompose BEFORE searching:
 
 ```python
-# Basic search — goes through web_fetch cascade, Chrome handles anti-bot
-web_fetch("https://www.google.com/search?q=your+query+here")
+# User asks: "Should I use vLLM or TGI for my LLM inference setup?"
+# Decompose into sub-queries:
+queries = [
+    "vLLM vs TGI inference throughput latency benchmark 2026",
+    "vLLM features model support GPU compatibility",
+    "TGI text-generation-inference features limitations",
+    "vLLM production deployment best practices",
+]
+# Execute top 2-3 most important queries, then fetch key pages
+```
 
-# Time filter: past week
+## Iterative Multi-Hop Search
+
+For questions where the first search informs what to search next — like
+how OpenAI's o3 chains dozens of searches and Anthropic's Claude pivots
+based on intermediate findings.
+
+### The Loop
+
+```
+Start with broad query
+  ↓
+Review results → Extract leads (names, terms, URLs)
+  ↓
+Formulate narrower follow-up queries using new terms
+  ↓
+Fetch specific pages for detailed content
+  ↓
+Repeat until: answer is clear OR 3-4 hops done OR diminishing returns
+```
+
+### Example: Multi-Hop in Practice
+
+```python
+# Hop 1: Broad search
+results = web_search(query="fastest open-source LLM inference engine 2026")
+# → Learn about vLLM, TGI, SGLang, TensorRT-LLM
+
+# Hop 2: Narrow based on findings
+results = web_search(query="SGLang vs vLLM benchmark throughput A100 2026")
+# → Find specific benchmark page
+
+# Hop 3: Fetch the actual benchmark data
+content = web_fetch("https://benchmark-page-url.com/results")
+# → Extract specific numbers
+
+# Hop 4 (if needed): Verify with second source
+content2 = web_fetch("https://another-benchmark.com/llm-inference")
+```
+
+### When to Multi-Hop
+
+- First search results are generic or insufficient
+- Found a specific term/name that needs drilling into
+- Results contradict each other — need more sources
+- Paywalled or empty results — pivot to alternative query
+
+### When to STOP
+
+- 2+ reliable sources agree on the answer
+- 3-4 hops done with diminishing returns
+- User asked a simple question — don't over-research
+
+## Parallel Search (for comparisons & multi-aspect queries)
+
+When sub-queries are independent, search in parallel using dispatch_agent:
+
+```python
+# User: "Compare AWS vs GCP GPU pricing for LLM inference"
+dispatch_agent(
+    task='Search for "AWS GPU instance pricing p5 p4d LLM inference 2026". '
+         'Return: instance types, GPU models, hourly prices, spot prices.',
+    model="fast", background=True
+)
+dispatch_agent(
+    task='Search for "GCP GPU instance pricing A100 H100 LLM inference 2026". '
+         'Return: instance types, GPU models, hourly prices, spot prices.',
+    model="fast", background=True
+)
+# Poll both, then synthesize into comparison table
+```
+
+## Citation-First Output
+
+Every search-based answer MUST include citations. This is how Google,
+OpenAI, and Anthropic all handle it — inline source attribution.
+
+### Citation Format
+
+```markdown
+## Answer
+
+According to the official benchmarks, vLLM achieves 2.3x higher throughput
+than TGI on A100 GPUs for Llama 3 70B [vLLM Benchmarks](https://url1.com).
+However, TGI offers better integration with Hugging Face's ecosystem
+[TGI Docs](https://url2.com).
+
+### Sources
+1. [vLLM Official Benchmarks](https://url1.com) — Retrieved 2026-04-17
+2. [TGI Documentation](https://url2.com) — Retrieved 2026-04-17
+```
+
+### Rules
+
+- Every factual claim gets a citation — no uncited assertions
+- Use `[Title](URL)` inline, plus a Sources section at the end
+- Note when information comes from training data vs live search
+- If sources conflict, present both sides with citations
+- Include retrieval date for time-sensitive information
+
+## Source Quality Evaluation
+
+Evaluate every source before citing. Anthropic found their early agents
+chose SEO-optimized content farms over authoritative sources — adding
+quality heuristics to prompts fixed this.
+
+### Quick Credibility Check
+
+```
+Source found → Evaluate in order:
+├─ 1. Domain authority
+│   ├─ Official docs (*.readthedocs.io, docs.*.com) → High trust
+│   ├─ Known tech (SO, GitHub, MDN, HN) → High trust
+│   ├─ Major publications (Reuters, NYT, BBC) → High trust
+│   ├─ Personal engineering blogs → Medium (check author)
+│   ├─ Content farms (w3schools, geeksforgeeks) → Low trust
+│   └─ Unknown domain → Low trust (must cross-reference)
+│
+├─ 2. Freshness — is it current enough?
+│   ├─ Software/API → within 1-2 years
+│   ├─ News/events → days/weeks
+│   └─ Concepts/theory → older OK
+│
+├─ 3. Does it directly answer the question?
+│
+└─ 4. Do other sources confirm it?
+    ├─ 2+ agree → high confidence
+    ├─ Sources conflict → present both, note disagreement
+    └─ Single source → qualify with "according to [source]"
+```
+
+→ Detailed guide: [references/source-evaluation.md](references/source-evaluation.md)
+
+## Advanced: Search Engine URLs via web_fetch
+
+When you need specific search engine features, use web_fetch with URLs:
+
+```python
+# Google with time filter (past week)
 web_fetch("https://www.google.com/search?q=query&tbs=qdr:w")
 
-# News search
+# Google News
 web_fetch("https://www.google.com/search?q=query&tbm=nws")
-```
 
-**Key operators:** `"exact phrase"`, `site:domain`, `filetype:pdf`, `-exclude`,
-`after:YYYY-MM-DD`, `intitle:`, `OR`
-
-→ Full operator reference: [references/search-operators.md](references/search-operators.md)
-
-### DuckDuckGo (always works, no Chrome needed)
-
-```python
+# DuckDuckGo (always works, no Chrome needed)
 web_fetch("https://duckduckgo.com/html/?q=your+query+here")
-```
 
-### 百度 (Chinese content)
-
-```python
+# 百度 (Chinese content)
 web_fetch("https://www.baidu.com/s?wd=你的搜索词")
 ```
 
-## Query Construction Tips
+→ Full operator reference: [references/search-operators.md](references/search-operators.md)
 
-### Be specific, not conversational
-```
-❌ "what's the best way to deploy a python app to kubernetes"
-✅ "python kubernetes deployment best practices 2025"
-```
+## Escalation to Deep Research
 
-### Use error messages verbatim
-```
-❌ python ssl certificate error
-✅ "ssl: CERTIFICATE_VERIFY_FAILED" python 3.14
-```
+Recognize when a question exceeds web-search scope and escalate:
 
-### Iterate: broad → narrow
 ```
-1st: web_search(query="vllm performance tuning")
-2nd: web_search(query="vllm tensor parallel vs pipeline parallel A100")
-3rd: web_fetch a specific result URL for deep content
+Escalation signals:
+├─ User asks for "comprehensive", "thorough", "detailed report"
+├─ Question has 3+ independent aspects needing separate investigation
+├─ Answer requires synthesizing 10+ sources
+├─ Comparison across many dimensions (pricing, features, benchmarks, etc.)
+├─ User explicitly asks for "deep research" or "research report"
+└─ First search attempt reveals the topic is much bigger than expected
 ```
 
-### Add context qualifiers
-```
-"docker compose v2 migration 2025"    # year for freshness
-"python 3.14 breaking changes"        # version
-"kubernetes ingress nginx vs traefik"  # comparison framing
-```
-
-## Research Workflows
-
-### Quick lookup (single fact)
-```python
-result = web_search(query="current Python latest stable version")
-# Read top result → answer with citation
-```
-
-### Standard research (most cases)
-```python
-# 1. Search for results
-result = web_search(query="FastAPI vs Django REST framework comparison 2026")
-# 2. Fetch top 3-5 URLs from results
-web_fetch("https://result-url-1.com/...")
-web_fetch("https://result-url-2.com/...")
-# 3. Cross-reference → synthesize with citations
-```
-
-### Deep research (comparisons, decisions)
-```python
-# Option A: Let Codex do the heavy lifting
-result = web_search(
-    query="AWS vs GCP GPU pricing comparison for LLM inference 2026",
-    engine="codex",
-)
-# Codex searches multiple sources and provides synthesis
-
-# Option B: Parallel sub-agent research
-dispatch_agent(task="Search for AWS GPU instance pricing for LLM inference...")
-dispatch_agent(task="Search for GCP GPU instance pricing for LLM inference...")
-# Combine results yourself
-```
-
-### Breaking news / current events
-```python
-# Codex excels here — real-time search with synthesis
-result = web_search(query="latest AI regulation news April 2026", engine="codex")
-```
+When escalating, tell the user and switch to the deep-research skill pattern.
 
 ## Anti-Patterns
 
-❌ **Don't** answer "from training data" when user asks for current info
-✅ **Do** always search, even if you think you know — things change
+❌ **Don't** answer from training data when user asks about current state
+✅ **Do** always search — things change; verify even "known" facts
 
-❌ **Don't** search once and trust a single source
-✅ **Do** cross-reference 2-3 sources for important claims
+❌ **Don't** use a single query for multi-faceted questions
+✅ **Do** decompose into sub-queries, search the most important ones
 
-❌ **Don't** use `engine="codex"` for simple factual lookups — it's overkill
-✅ **Do** use `engine="ddg"` or `"auto"` for quick lookups; reserve Codex for deep research
+❌ **Don't** cite sources without checking credibility
+✅ **Do** prefer official docs and Tier 1 sources; cross-reference claims
 
-❌ **Don't** construct Google search URLs when `web_search` would suffice
-✅ **Do** prefer `web_search(query="...")` — it handles engine selection and parsing
+❌ **Don't** search once and give up if results are poor
+✅ **Do** iterate: reformulate query, try different terms, pivot strategy
+
+❌ **Don't** use `engine="codex"` for simple factual lookups
+✅ **Do** use `engine="ddg"` or `"auto"` for quick lookups; Codex for depth
 
 ❌ **Don't** dump raw search results to the user
-✅ **Do** fetch top results, synthesize, and cite URLs
+✅ **Do** synthesize, cite inline, and add a Sources section
 
-❌ **Don't** forget to check the date of your sources
-✅ **Do** note publication dates — a 2021 article may be outdated for a 2026 question
+❌ **Don't** forget to check publication dates
+✅ **Do** note when sources are old — a 2022 article may be wrong for 2026
+
+❌ **Don't** over-research simple questions (5+ searches for "what year was X")
+✅ **Do** match search depth to question complexity — 1 search for simple facts
 
 ## Reference Files
 
-- [📋 Search Operators](references/search-operators.md) — Google, DuckDuckGo, 百度 advanced syntax & power combos
-- [🔍 Source Evaluation](references/source-evaluation.md) — How to assess credibility, domain tier list, red flags
+- [📋 Search Operators](references/search-operators.md) — Google, DuckDuckGo, 百度 advanced syntax
+- [🔍 Source Evaluation](references/source-evaluation.md) — Credibility tiers, red flags, presentation formats
