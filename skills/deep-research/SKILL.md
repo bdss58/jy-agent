@@ -177,8 +177,7 @@ RULES:
 - Do NOT make up numbers — if data is unavailable, say so
 - Spend your full budget searching — thoroughness matters""",
     background=True,
-    timeout=600,
-    max_steps=25
+    timeout=600
 )
 ```
 
@@ -192,8 +191,7 @@ for thread in research_plan["threads"]:
         task=f"""RESEARCH THREAD: {thread['query']}
         ... (prompt template above, customized per thread) ...""",
         background=True,
-        timeout=600,
-        max_steps=25
+        timeout=600
     )
     agent_ids.append(result["agent_id"])
 

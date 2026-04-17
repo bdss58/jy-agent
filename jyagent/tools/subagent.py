@@ -178,12 +178,6 @@ TOOL_SCHEMA = {
                     "Use this to pass relevant information from your conversation."
                 ),
             },
-            "max_steps": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 50,
-                "description": "Max tool-use steps (default 30). Lower = cheaper/faster.",
-            },
             "tool_whitelist": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -859,12 +853,12 @@ _BG_DEFAULT_TIMEOUT = 900  # default background timeout
 def dispatch_agent(
     task: str,
     context: str = "",
-    max_steps: int = _DEFAULT_MAX_STEPS,
     tool_whitelist: list = None,
     background: bool = False,
     timeout: int = 0,
 ) -> ToolResult:
     """Spawn a sub-agent to handle a focused subtask."""
+    max_steps = _DEFAULT_MAX_STEPS
     custom_system_prompt = None
 
     # Guard: nesting depth
