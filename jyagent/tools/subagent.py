@@ -338,7 +338,8 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
 
 
 def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions,
-                  agent_id=None, custom_system_prompt=None, cancel_event=None):
+                  agent_id=None, custom_system_prompt=None, cancel_event=None,
+                  progress_ids=None):
     """Run a sub-agent's tool loop to completion via AgentLoop engine.
 
     Delegates the entire step loop, tool execution, retry, context compaction,
@@ -372,11 +373,18 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         streaming=False,
     )
 
-    # Step progress callback → update the global tracker + background registry
+    # Step progress callback → update the global tracker + background registry.
+    # Uses a mutable container shared with the caller so bg_id can be updated
+    # after handoff/dispatch without the worker needing to know about ID changes.
+    _progress_ids = progress_ids if progress_ids is not None else {"spinner_id": agent_id, "bg_id": None}
+
     def _on_step_progress(step: int, max_s: int) -> None:
-        if agent_id is not None:
-            _subagent_tracker.update_progress(agent_id, step, max_s)
-            _bg_registry.update_progress(agent_id, step, max_s)
+        sid = _progress_ids.get("spinner_id")
+        if sid is not None:
+            _subagent_tracker.update_progress(sid, step, max_s)
+        bid = _progress_ids.get("bg_id")
+        if bid is not None:
+            _bg_registry.update_progress(bid, step, max_s)
 
     callbacks = LoopCallbacks(on_step_progress=_on_step_progress)
 
@@ -593,6 +601,9 @@ _bg_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=5, thread_name_prefix="bg-subagent",
 )
 
+import atexit as _subagent_atexit
+_subagent_atexit.register(_bg_executor.shutdown, wait=False)
+
 
 @dataclass
 class _BackgroundAgent:
@@ -618,20 +629,34 @@ class _BackgroundAgentRegistry:
         self._agents: dict[int, _BackgroundAgent] = {}
         self._next_id = 0
 
-    def register(self, task, future, cancel_event, max_steps, model) -> int:
-        """Register a background agent.  Returns agent_id."""
+    def register(self, task, future, cancel_event, max_steps, model, started_at=None) -> int:
+        """Register a background agent.  Returns agent_id.
+
+        Also attaches a done callback to the future for automatic stats
+        recording when the agent completes (even if nobody polls for it).
+        """
         with self._lock:
             agent_id = self._next_id
             self._next_id += 1
-            self._agents[agent_id] = _BackgroundAgent(
+            agent = _BackgroundAgent(
                 agent_id=agent_id,
                 task=task[:80] if len(task) > 80 else task,
                 future=future,
                 cancel_event=cancel_event,
-                started_at=time.time(),
+                started_at=started_at or time.time(),
                 model=model,
                 current_max_steps=max_steps,
             )
+            self._agents[agent_id] = agent
+
+        # Auto-record stats when future completes (fire-and-forget)
+        def _on_done(fut):
+            try:
+                _record_bg_stats(agent)
+            except Exception:
+                pass
+        future.add_done_callback(_on_done)
+
         return agent_id
 
     def get(self, agent_id: int) -> _BackgroundAgent | None:
@@ -686,7 +711,10 @@ _bg_registry = _BackgroundAgentRegistry()
 
 
 def _record_bg_stats(agent: _BackgroundAgent) -> None:
-    """Record token usage for a background agent in parent stats (best-effort)."""
+    """Record token usage for a background agent in parent stats (best-effort).
+
+    Thread-safe: uses the stats_recorded flag as a one-shot guard.
+    """
     if agent.stats_recorded:
         return
     agent.stats_recorded = True
@@ -695,6 +723,7 @@ def _record_bg_stats(agent: _BackgroundAgent) -> None:
         if outcome is None and agent.future.done():
             try:
                 outcome = agent.future.result(timeout=0)
+                agent.outcome = outcome
             except Exception:
                 return
         if outcome is None:
@@ -767,6 +796,17 @@ def check_agent(agent_id: int = -1, action: str = "status") -> ToolResult:
         agent.cancel_event.set()  # cooperative cancel
         try:
             agent.future.result(timeout=10)  # wait for clean shutdown
+        except concurrent.futures.TimeoutError:
+            # Agent is still running — report honest status
+            return ToolResult(json.dumps({
+                "status": "cancelling",
+                "agent_id": agent_id,
+                "message": (
+                    f"Cancel signal sent but agent is still running after 10s. "
+                    f"It will stop at the next loop boundary. "
+                    f"Use check_agent(agent_id={agent_id}) to poll."
+                ),
+            }))
         except Exception:
             pass
         _record_bg_stats(agent)
@@ -893,11 +933,16 @@ def dispatch_agent(
         spinner_id = _subagent_tracker.add(task, max_steps)
         t0 = time.time()
 
+        # Shared mutable dict so the worker's progress callback can target
+        # the correct bg_id once we register it after the grace period.
+        progress_ids = {"spinner_id": spinner_id, "bg_id": None}
+
         try:
             future = _bg_executor.submit(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 spinner_id, custom_system_prompt, cancel_event,
+                progress_ids,
             )
 
             # Grace period: wait up to 30s for fast finish
@@ -907,8 +952,13 @@ def dispatch_agent(
                 # Still running — register in background registry, remove spinner
                 _subagent_tracker.remove(spinner_id)
                 bg_id = _bg_registry.register(
-                    task_preview, future, cancel_event, max_steps, model_spec.model,
+                    task_preview, future, cancel_event, max_steps,
+                    model_spec.model, started_at=t0,
                 )
+                # Update the shared progress_ids so the running worker
+                # reports progress to the correct bg_id going forward.
+                progress_ids["bg_id"] = bg_id
+                progress_ids["spinner_id"] = None  # stop updating dead spinner
                 return ToolResult(json.dumps({
                     "status": "dispatched",
                     "agent_id": bg_id,
@@ -942,33 +992,43 @@ def dispatch_agent(
         t0 = time.time()
         _depth_reset = False  # guard against double-reset of ContextVar token
 
+        # Shared mutable dict for progress routing after potential handoff.
+        progress_ids = {"spinner_id": agent_id, "bg_id": None}
+
         try:
-            # Run with wall-clock timeout using a per-call executor (existing pattern)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    ctx.run, _run_subagent, task, context, model_spec,
-                    max_steps, tool_schemas, tool_functions,
-                    agent_id, custom_system_prompt, cancel_event,
+            # Submit to the shared executor (NOT a per-call `with ThreadPoolExecutor`
+            # which blocks on __exit__ with shutdown(wait=True), making timeout
+            # handoff impossible).
+            future = _bg_executor.submit(
+                ctx.run, _run_subagent, task, context, model_spec,
+                max_steps, tool_schemas, tool_functions,
+                agent_id, custom_system_prompt, cancel_event,
+                progress_ids,
+            )
+            try:
+                outcome = future.result(timeout=effective_timeout)
+            except concurrent.futures.TimeoutError:
+                # Soft handoff: register as background agent instead of erroring.
+                # Because we use the shared _bg_executor (no `with` block),
+                # this return is non-blocking — the worker keeps running.
+                _subagent_tracker.remove(agent_id)
+                bg_id = _bg_registry.register(
+                    task_preview, future, cancel_event, max_steps,
+                    model_spec.model, started_at=t0,
                 )
-                try:
-                    outcome = future.result(timeout=effective_timeout)
-                except concurrent.futures.TimeoutError:
-                    # Soft handoff: register as background agent instead of erroring
-                    cancel_event_handoff = cancel_event  # reuse the existing event
-                    _subagent_tracker.remove(agent_id)
-                    bg_id = _bg_registry.register(
-                        task_preview, future, cancel_event_handoff, max_steps, model_spec.model,
-                    )
-                    _nesting_depth.reset(_depth_token)
-                    _depth_reset = True
-                    return ToolResult(json.dumps({
-                        "status": "timeout_handoff",
-                        "agent_id": bg_id,
-                        "message": (
-                            f"Agent exceeded {effective_timeout}s. Handed off to background. "
-                            f"Call check_agent(agent_id={bg_id}) to get results."
-                        ),
-                    }))
+                # Update progress routing
+                progress_ids["bg_id"] = bg_id
+                progress_ids["spinner_id"] = None
+                _nesting_depth.reset(_depth_token)
+                _depth_reset = True
+                return ToolResult(json.dumps({
+                    "status": "timeout_handoff",
+                    "agent_id": bg_id,
+                    "message": (
+                        f"Agent exceeded {effective_timeout}s. Handed off to background. "
+                        f"Call check_agent(agent_id={bg_id}) to get results."
+                    ),
+                }))
         except KeyboardInterrupt:
             cancel_event.set()
             _subagent_tracker.remove(agent_id)

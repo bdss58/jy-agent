@@ -582,8 +582,61 @@ def _diagnose_multi_match(path: str, content: str, old_text: str, count: int) ->
 
 # ─── Background process management ──────────────────────────────────────────
 
+import atexit
+import threading as _bg_threading
+
 # {pid: {"command", "output_file", "file_handle", "process", "started_at"}}
 _background_processes: dict[int, dict] = {}
+_bg_lock = _bg_threading.Lock()
+
+# Completed-entry TTL: keep for 10 minutes so callers can re-read, then evict.
+_BG_COMPLETED_TTL = 600  # seconds
+
+
+def _bg_cleanup_completed() -> None:
+    """Evict completed entries older than TTL and clean up their temp files."""
+    now = time.time()
+    to_remove: list[int] = []
+    with _bg_lock:
+        for pid, info in _background_processes.items():
+            if info.get("completed_at") and now - info["completed_at"] > _BG_COMPLETED_TTL:
+                to_remove.append(pid)
+        for pid in to_remove:
+            info = _background_processes.pop(pid, None)
+            if info:
+                _bg_close_and_cleanup(info)
+
+
+def _bg_close_and_cleanup(info: dict) -> None:
+    """Close file handle and remove temp file (best-effort)."""
+    try:
+        info["file_handle"].close()
+    except Exception:
+        pass
+    try:
+        os.unlink(info["output_file"])
+    except Exception:
+        pass
+
+
+def _bg_atexit_cleanup() -> None:
+    """Terminate all tracked background processes on interpreter exit."""
+    with _bg_lock:
+        for pid, info in list(_background_processes.items()):
+            proc = info.get("process")
+            if proc and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, 15)  # SIGTERM to process group
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            _bg_close_and_cleanup(info)
+        _background_processes.clear()
+
+
+atexit.register(_bg_atexit_cleanup)
 
 
 def run_background(command: str) -> ToolResult:
@@ -592,9 +645,14 @@ def run_background(command: str) -> ToolResult:
     Returns immediately with the PID and output file path.
     Use check_background(pid) to poll status and read output.
     """
+    fh = None
+    output_file = None
     try:
-        output_file = f"/tmp/jyagent_bg_{int(time.time() * 1000)}.out"
-        fh = open(output_file, "w")
+        # Use mkstemp for safe temp file creation
+        fd_int, output_file = tempfile.mkstemp(
+            prefix="jyagent_bg_", suffix=".out", dir="/tmp",
+        )
+        fh = os.fdopen(fd_int, "w")
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -602,33 +660,75 @@ def run_background(command: str) -> ToolResult:
             stderr=subprocess.STDOUT,
             start_new_session=True,  # detach from parent signal group
         )
-        _background_processes[proc.pid] = {
-            "command": command,
-            "output_file": output_file,
-            "file_handle": fh,
-            "process": proc,
-            "started_at": time.time(),
-        }
+        with _bg_lock:
+            _background_processes[proc.pid] = {
+                "command": command,
+                "output_file": output_file,
+                "file_handle": fh,
+                "process": proc,
+                "started_at": time.time(),
+                "completed_at": None,
+            }
+        # Opportunistically evict old completed entries
+        _bg_cleanup_completed()
         return ToolResult(json.dumps({
             "pid": proc.pid,
             "output_file": output_file,
             "status": "started",
         }))
     except Exception as e:
+        # Clean up on failure — avoid leaking the temp file and fd
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        if output_file is not None:
+            try:
+                os.unlink(output_file)
+            except Exception:
+                pass
         return ToolResult(f"Error starting background process: {e}", is_error=True)
+
+
+def _read_tail_efficient(filepath: str, n: int) -> str:
+    """Read the last N lines from a file efficiently using seek-from-end."""
+    try:
+        with open(filepath, "rb") as f:
+            # Seek backwards in 8KB chunks to find N newlines
+            f.seek(0, 2)  # end of file
+            size = f.tell()
+            if size == 0:
+                return ""
+            chunk_size = 8192
+            lines_found = 0
+            pos = size
+            while pos > 0 and lines_found <= n:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                lines_found += chunk.count(b"\n")
+            f.seek(pos)
+            data = f.read().decode("utf-8", errors="replace")
+            return "\n".join(data.splitlines()[-n:])
+    except Exception:
+        # Fall back to full read
+        with open(filepath, "r") as f:
+            lines = f.readlines()
+            return "".join(lines[-n:])
 
 
 def check_background(pid: int, tail: int = 0, action: str = "status") -> ToolResult:
     """Check on a background process started by run_background.
 
     action="status" (default): return process status + output.
-    action="kill": send SIGTERM and return final status.
+    action="kill": send SIGTERM to process group and return final status.
     tail=0: return all output (truncated at 50K chars from the end).
-    tail=N: return only the last N lines (useful for progress polling).
+    tail=N: return only the last N lines (efficient seek-from-end).
     """
-    import signal as _signal
-
-    info = _background_processes.get(pid)
+    with _bg_lock:
+        info = _background_processes.get(pid)
     if info is None:
         # Check if PID exists in OS but wasn't started by us
         try:
@@ -647,14 +747,20 @@ def check_background(pid: int, tail: int = 0, action: str = "status") -> ToolRes
 
     proc: subprocess.Popen = info["process"]
 
-    # Handle kill action
+    # Handle kill action — kill the entire process group, not just the shell
     if action == "kill":
         if proc.poll() is None:  # still running
-            proc.terminate()
+            try:
+                os.killpg(proc.pid, 15)  # SIGTERM to process group
+            except (ProcessLookupError, PermissionError, OSError):
+                proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, 9)  # SIGKILL to process group
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.kill()
                 proc.wait(timeout=3)
 
     returncode = proc.poll()
@@ -665,11 +771,10 @@ def check_background(pid: int, tail: int = 0, action: str = "status") -> ToolRes
     output_file = info["output_file"]
     output = ""
     try:
-        with open(output_file, "r") as rf:
-            if tail > 0:
-                lines = rf.readlines()
-                output = "".join(lines[-tail:])
-            else:
+        if tail > 0:
+            output = _read_tail_efficient(output_file, tail)
+        else:
+            with open(output_file, "r") as rf:
                 output = rf.read()
         if len(output) > 50000:
             output = "[... truncated to last 50000 chars ...]\n" + output[-50000:]
@@ -688,8 +793,10 @@ def check_background(pid: int, tail: int = 0, action: str = "status") -> ToolRes
         "output": output,
     }
 
-    # Close file handle when process is done
-    if not is_running:
+    # Mark completed (but don't remove yet — TTL cleanup handles eviction)
+    if not is_running and not info.get("completed_at"):
+        with _bg_lock:
+            info["completed_at"] = time.time()
         try:
             info["file_handle"].close()
         except Exception:
