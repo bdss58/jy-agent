@@ -273,13 +273,26 @@ CORE_TOOLS = [
     # --- run_background ---
     {
         "name": "run_background",
-        "description": "Start a long-running command in the background and return immediately. Use this instead of run_shell when a command may exceed 600 seconds (e.g., slow agent CLIs like `codex exec`, large builds, long test suites). Returns a PID — use check_background to poll for status and read output.",
+        "description": "Start a long-running shell command in the background and return immediately. Use this instead of run_shell when a command may exceed 600 seconds (e.g., slow agent CLIs like `codex exec`, large builds, long test suites). Returns {pid, output_file, status:'started'}. Output (stdout+stderr merged) is streamed to output_file — use check_background(pid, tail=N) to poll progress; do NOT `cat` the file via run_shell. Commands run with stdin redirected from /dev/null by default (noninteractive). A global cap of 8 concurrent background jobs is enforced.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
                     "description": "The shell command to run in the background"
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Hard deadline in seconds. If >0, the job is auto-killed when it elapses and status becomes 'timed_out'. 0 (default) = no deadline. Use this for any untrusted long-running command — do not rely on remembering to kill."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the command. Empty (default) = inherit. Prefer this over `cd X && cmd` shell tricks."
+                },
+                "stdin_null": {
+                    "type": "boolean",
+                    "description": "Redirect stdin from /dev/null so the command cannot hang on an interactive prompt. Default: true. Set false only if the child must inherit the parent's stdin."
                 }
             },
             "required": ["command"]
@@ -288,7 +301,7 @@ CORE_TOOLS = [
     # --- check_background ---
     {
         "name": "check_background",
-        "description": "Check status and read output of a background process started by run_background. Returns status (running/done/killed), exit code, elapsed time, and output. Use tail=N to read only the last N lines (good for progress polling). Use action='kill' to terminate a runaway process.",
+        "description": "Check status and read output of a background process started by run_background. Returns {pid, status, exit_code, elapsed_seconds, command, output_file, output}. Status values: 'running' | 'succeeded' (exit 0) | 'failed' (exit != 0) | 'killed' (caller signaled it) | 'timed_out' (auto-killed at deadline). Always inspect exit_code — 'succeeded' ≠ 'the task did what you wanted'. Use tail=N (20–50) while polling to avoid flooding context; use tail=0 only for final collection. action='wait' blocks up to wait_timeout_seconds for the job to finish — prefer this over tight polling loops (each poll costs a model turn). action='kill' SIGTERMs the process group (no-op if already exited; status reflects the real outcome, not the request).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -299,12 +312,18 @@ CORE_TOOLS = [
                 "tail": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Return only the last N lines of output. 0 = all output (default, truncated at 50K chars). Use a small number like 20-50 when polling a running process."
+                    "description": "Return only the last N lines of output (bounded backward scan). 0 = last ~50 KB of the file (default). Use 20–50 while polling a running process."
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["status", "kill"],
-                    "description": "Action to take: 'status' (default) checks progress, 'kill' terminates the process."
+                    "enum": ["status", "wait", "kill"],
+                    "description": "Action to take: 'status' (default) returns current progress; 'wait' blocks up to wait_timeout_seconds for completion then returns; 'kill' terminates the process group (SIGTERM, then SIGKILL after 5s)."
+                },
+                "wait_timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 300,
+                    "description": "Only used with action='wait'. Max seconds to block waiting for the job to finish. Default 60, hard cap 300."
                 }
             },
             "required": ["pid"]

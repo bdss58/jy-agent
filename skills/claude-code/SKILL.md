@@ -41,18 +41,34 @@ How long will this Claude Code call take?
 ### Background execution for Claude Code
 
 ```python
-# Start — returns instantly
-run_background('claude -p --bare "Comprehensive refactor of the auth module"')
+# Start with a deadline so a runaway job gets auto-killed
+run_background(
+    'claude -p --bare "Comprehensive refactor of the auth module"',
+    timeout_seconds=1800,   # 30 min hard cap
+)
 # → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
 
-# Poll progress (tail=20 to avoid flooding context)
-check_background(12345, tail=20)
-# → {"status": "running", "elapsed_seconds": 180.5, "output": "..."}
+# Poll progress — ALWAYS use tail=20..50 while the job is running
+# (tail=0 floods your context with the whole log every poll)
+check_background(12345, tail=30)
+# → {"status": "running", "elapsed_seconds": 180.5, "output": "...",
+#    "deadline_seconds_remaining": 1619.5}
 
-# Read full output when done
+# Prefer `wait` over tight polling loops — each poll costs a model turn
+check_background(12345, action="wait", wait_timeout_seconds=120)
+# Blocks up to 120 s waiting for exit, then returns status.
+
+# Read full output once the job is finished
 check_background(12345)
-# → {"status": "done", "exit_code": 0, "output": "...full result..."}
+# → {"status": "succeeded", "exit_code": 0, "output": "..."}
+#   Status values: running | succeeded | failed | killed | timed_out
+#   ALWAYS check exit_code — "succeeded" just means exit-0, not that the
+#   task actually did what you wanted.
 ```
+
+**Concurrency cap**: at most 8 live background jobs. If you hit the cap,
+`run_background` returns `{"status":"rejected","reason":"concurrency_cap"}` —
+kill or wait for existing jobs before launching more.
 
 When `run_shell(timeout=600)` times out, do NOT retry the same command.
 Switch to `run_background` or narrow the task scope.

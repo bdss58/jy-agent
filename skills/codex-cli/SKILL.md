@@ -47,23 +47,37 @@ How long will this Codex call take?
 ### Background execution pattern
 
 ```python
-# Step 1: Start in background (returns instantly)
-run_background('codex exec --sandbox read-only "Analyze the full codebase"')
+# Step 1: Start with a deadline so a runaway task gets auto-killed
+run_background(
+    'codex exec --sandbox read-only "Analyze the full codebase"',
+    timeout_seconds=1200,   # 20 min hard cap
+)
 # → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
 
-# Step 2: Poll progress (repeat until done)
-check_background(12345, tail=20)
-# → {"pid": 12345, "status": "running", "elapsed_seconds": 45.2, "output": "...last 20 lines..."}
+# Step 2: Poll progress — ALWAYS use tail>0 while the job is running.
+# tail=0 returns the last ~50 KB every poll and floods your context.
+check_background(12345, tail=30)
+# → {"pid": 12345, "status": "running", "elapsed_seconds": 45.2,
+#    "output": "...", "deadline_seconds_remaining": 1154.8}
 
-# Step 3: Read final output when done
+# Step 3: Prefer `wait` over tight polling — it saves a model turn per poll.
+check_background(12345, action="wait", wait_timeout_seconds=120)
+# Blocks up to 120 s (hard cap 300); returns early when the job finishes.
+
+# Step 4: Final collection — tail=0 only AFTER the job has finished
 check_background(12345)
-# → {"pid": 12345, "status": "done", "exit_code": 0, "output": "...full output..."}
+# → status values: running | succeeded | failed | killed | timed_out
+#   ALWAYS inspect exit_code — "succeeded" is exit-0, not task success.
 
-# If you SUSPECT it's stuck — read more output before killing:
-check_background(12345, tail=50)  # see what it's actually doing
-# Only kill after confirming it's truly looping or idle for several polls:
+# If you SUSPECT it's stuck, read more output before killing:
+check_background(12345, tail=50)
+# Only kill after confirming it's truly looping or idle across polls:
 check_background(12345, action="kill")
+# (kill is a no-op if the process already exited; status reflects reality.)
 ```
+
+**Concurrency cap**: at most 8 live background jobs. `run_background` will
+return `{"status":"rejected","reason":"concurrency_cap"}` if you exceed it.
 
 ### Diagnosing "stuck" Codex processes
 
