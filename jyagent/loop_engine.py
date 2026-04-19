@@ -10,6 +10,7 @@ import atexit
 import concurrent.futures
 import hashlib
 import json
+import random
 import re
 import sys
 import threading
@@ -51,6 +52,34 @@ class LoopConfig:
     streaming: bool = False
     truncate_large_inputs: bool = True
     fallback_on_max_steps: bool = False
+    # When True, streaming text deltas are buffered per-attempt and only
+    # flushed via on_text_delta after a clean `done` event.  Eliminates
+    # visual duplication on transient-error retry and truncation recovery
+    # at the cost of losing live-token UX.  Off by default.
+    buffered_streaming: bool = False
+    # Persistent task-plan scratchpad (see jyagent/todos.py).  When True:
+    #   * a per-loop `write_todos` tool is overlaid onto the tool source
+    #     so the model can create / update the plan;
+    #   * the current plan is rendered as a <system-reminder> block
+    #     appended to the tail user message before each LLM call — NOT
+    #     persisted into the messages list, so it survives compaction
+    #     automatically.
+    todos_enabled: bool = False
+    # Mid-loop reflection / critic step (see jyagent/reflection.py).  Injects
+    # a short progress-check prompt after every N tool calls and/or after
+    # any batch that dispatched a sub-agent.  Both triggers OFF by default.
+    reflect_every_n_tool_calls: int = 0   # 0 disables the cadence trigger
+    reflect_after_subagent: bool = False
+    # Phase-aware tool_choice shaping (see jyagent/phases.py).  When set,
+    # the policy is consulted each step and may override tool_choice for
+    # that LLM call (plan / act / verify / finalize).  Does NOT mutate the
+    # message history — keeps Anthropic prefix caching fully intact.
+    phase_policy: Any = None  # PhasePolicy | None — typed as Any to avoid cycles
+    # Checkpointed replay (see jyagent/checkpoint.py).  When both are set,
+    # LoopCheckpoint is written every N steps (and on terminal exits) to
+    # ``<checkpoint_dir>/<run_id>/step_NNNN.json``.  Off by default.
+    checkpoint_dir: str | None = None
+    checkpoint_every_n_steps: int = 0
     # Harness controls
     max_cost_usd: float | None = None       # cost budget per turn — None = unlimited
     dedup_threshold: int = 3                 # same tool+args+response N times → break loop
@@ -72,6 +101,23 @@ class LoopCallbacks:
     on_warning: Callable[[str], None] | None = None  # runtime warnings
     on_truncation: Callable[[], None] | None = None  # response truncated, retrying
     on_tool_batch: Callable[[int], None] | None = None  # number of tools in batch
+    # Fires once before a stream retry (transient error OR truncation recovery).
+    # `reason` is "transient_error" or "truncation".  `partial_text` is whatever
+    # the current attempt had emitted before the restart — UIs can use this to
+    # mark, clear, or strikethrough the duplicated output that will follow.
+    on_stream_retry: Callable[[str, str], None] | None = None  # (reason, partial_text)
+    # Fires when the engine injects a mid-loop reflection prompt.  `reason`
+    # is "every_n" or "after_subagent".  Callback is purely observational —
+    # does not affect the loop.
+    on_reflection: Callable[[str], None] | None = None
+    # Fires when a PhasePolicy assigns a phase to the current step.  `phase`
+    # is a short string ("plan" | "act" | "verify" | "finalize" | custom).
+    # Observational only.
+    on_phase_enter: Callable[[str], None] | None = None
+    # Fires after a checkpoint is persisted.  Args: (path, step).  Use
+    # for logging / progress display.  Step < 0 indicates a terminal
+    # checkpoint (e.g. final.json).
+    on_checkpoint: Callable[[str, int], None] | None = None
 
 
 @dataclass
@@ -85,6 +131,10 @@ class LoopResult:
     total_output_tokens: int = 0
     tool_calls_count: int = 0
     error: str | None = None
+    # Final state of the task-plan scratchpad.  Empty list when todos are
+    # disabled or the model never wrote any.  Outer layers (agent.py) are
+    # expected to persist this across turns.
+    todos: list = field(default_factory=list)
 
 
 @dataclass
@@ -98,14 +148,46 @@ class ToolCallRequest:
 ToolSource = Callable[[], tuple[list[dict], dict[str, Callable]]]
 
 
-# ─── Shared executor ─────────────────────────────────────────────────────────
-# Single process-wide executor shared by all AgentLoop instances (interactive
-# turns *and* sub-agents).  Workers are created on demand and idle threads are
-# cheap, so a slightly generous pool avoids contention during parallel tool
-# batches without meaningful resource cost.
+def _t_as_dict(t: Any) -> dict:
+    """Best-effort TodoItem → dict.  Tolerates raw dicts already."""
+    if isinstance(t, dict):
+        return t
+    try:
+        from dataclasses import asdict
+        return asdict(t)
+    except Exception:
+        return {"content": str(getattr(t, "content", t))}
 
-_tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-atexit.register(_tool_executor.shutdown, wait=False)
+
+# ─── Shared executors ────────────────────────────────────────────────────────
+# Tool execution uses two distinct mechanisms:
+#
+#   1. `_tool_dispatch_executor` — fixed-size ThreadPoolExecutor used by
+#      `_execute_tools()` to fan out a parallel-safe batch.  Order is
+#      preserved via index-keyed slots.
+#
+#   2. Daemon thread per invocation — used inside `_execute_tool_with_timeout`
+#      to run the tool body with a hard wall-clock deadline.  Previously this
+#      was a second ThreadPoolExecutor (`_tool_body_executor`), but Python
+#      thread futures are not cancellable — a timed-out body permanently
+#      leaked a worker slot.  Daemon threads hold no pool slot and die with
+#      the process, eliminating the leak.
+#
+# `_tool_body_executor` is retained as a module attribute pointing at a
+# small pool for any external caller that grabs it directly (e.g. legacy
+# tests) but the engine itself no longer uses it.
+
+_tool_dispatch_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8, thread_name_prefix="jyagent-tool-dispatch",
+)
+_tool_body_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="jyagent-tool-body-legacy",
+)
+atexit.register(_tool_dispatch_executor.shutdown, wait=False)
+atexit.register(_tool_body_executor.shutdown, wait=False)
+
+# Backwards-compat alias (callers that pass a pool explicitly).
+_tool_executor = _tool_dispatch_executor
 
 
 # ─── Private helpers ─────────────────────────────────────────────────────────
@@ -327,13 +409,31 @@ def _compact_messages(
 
         # ── Tier 0: Thinking block pruning ──────────────────────────
         # Strip thinking blocks from all but the last few messages.
+        #
+        # Provider-aware rule (P0 fix, 2026-04): Anthropic extended-thinking
+        # emits cryptographically-signed `thinking` blocks that are bound to
+        # the following `tool_use` block in the same assistant message.  If
+        # we strip the thinking block but keep the tool_use, the signature
+        # becomes invalid and the provider rejects the next turn.  So:
+        # preserve all `thinking` blocks in any message that also contains
+        # at least one `tool_use` block.  Safe across providers — non-
+        # Anthropic responses simply won't have the adjacency in the first
+        # place.
         content = msg.get("content", "")
         if isinstance(content, list):
+            has_tool_use = any(
+                isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in content
+            )
             filtered_blocks = []
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "thinking":
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "thinking"
+                    and not has_tool_use
+                ):
                     did_compact = True
-                    continue  # drop thinking block entirely
+                    continue  # safe to drop
                 filtered_blocks.append(block)
             if len(filtered_blocks) != len(content):
                 compacted[i]["content"] = filtered_blocks
@@ -498,7 +598,7 @@ def _execute_tools(
                 parallel_batch.append((i, blocks[i]))
                 i += 1
 
-            pool = executor or _tool_executor
+            pool = executor or _tool_dispatch_executor
             futures = {
                 pool.submit(
                     _execute_tool_with_timeout, block.name, block.input, functions, registry, timeout
@@ -536,7 +636,25 @@ def _execute_tool_with_timeout(
     default_timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
 ) -> ToolResult:
-    """Execute a tool via an executor with a timeout."""
+    """Execute a tool body with a timeout.
+
+    Uses a daemon thread per invocation rather than a shared pool.  Rationale
+    (P0 fix, 2026-04): Python threads are not cancellable — `future.cancel()`
+    on a running thread is a no-op, so a timed-out tool running in a shared
+    pool permanently consumes a worker slot.  Under enough timeouts the pool
+    starves and every subsequent tool call blocks waiting for a slot that
+    never frees.
+
+    Daemon threads sidestep this:
+      * A timed-out thread keeps running but holds no pool slot.
+      * Daemon status guarantees it cannot block process exit.
+      * Thread creation overhead is ~0.1 ms — negligible next to any LLM call.
+
+    The ``executor`` parameter is kept for backwards compatibility (callers
+    that passed an explicit pool) but is now ignored.  Dispatch-level
+    parallelism still uses ``_tool_dispatch_executor``; only the inner
+    timeout wrapper changed.
+    """
     timeout = default_timeout
     hint = registry.get_timeout_hint(name)
     if hint is not None:
@@ -547,20 +665,58 @@ def _execute_tool_with_timeout(
         user_timeout = (tool_input or {}).get("timeout", 60)
         timeout = max(timeout, int(user_timeout) + 10)
 
-    pool = executor or _tool_executor
-    future = pool.submit(_execute_tool, name, tool_input, functions, registry)
-    try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        future.cancel()
+    result_holder: list[ToolResult | None] = [None]
+    exc_holder: list[BaseException | None] = [None]
+    done = threading.Event()
+
+    def _run_body() -> None:
+        try:
+            result_holder[0] = _execute_tool(name, tool_input, functions, registry)
+        except BaseException as e:  # noqa: BLE001 — we need to propagate everything
+            exc_holder[0] = e
+        finally:
+            done.set()
+
+    t = threading.Thread(
+        target=_run_body,
+        name=f"jyagent-tool-body:{name}",
+        daemon=True,
+    )
+    t.start()
+
+    if not done.wait(timeout):
+        # Timeout — the daemon thread continues running but holds no pool
+        # slot, so there's nothing to leak.  We just report the timeout.
         return ToolResult(
             f"Error: Tool '{name}' timed out after {timeout}s. "
             f"Consider breaking the operation into smaller steps.",
             is_error=True,
         )
-    except KeyboardInterrupt:
-        future.cancel()
-        raise
+
+    if exc_holder[0] is not None:
+        # KeyboardInterrupt in the worker is rare (main thread gets SIGINT)
+        # but propagate anyway.  _execute_tool normally catches exceptions
+        # and returns an error ToolResult, so reaching this branch implies
+        # something pathological.
+        if isinstance(exc_holder[0], KeyboardInterrupt):
+            raise exc_holder[0]
+        return enrich_error(
+            ToolResult(
+                f"Error: Tool '{name}' raised an uncaught exception: "
+                f"{type(exc_holder[0]).__name__}: {exc_holder[0]}",
+                is_error=True,
+            ),
+            name,
+        )
+
+    result = result_holder[0]
+    if result is None:
+        return ToolResult(
+            f"Error: Tool '{name}' returned no result (worker finished "
+            f"without producing output)",
+            is_error=True,
+        )
+    return result
 
 
 def _is_transient_error(error: BaseException) -> bool:
@@ -663,10 +819,85 @@ class AgentLoop:
         # ThreadPoolExecutor objects and atexit handlers across turns and
         # sub-agent dispatches.
         self._executor = _tool_executor
+        # Task-plan scratchpad (see jyagent/todos.py).  Populated via the
+        # `write_todos` tool and seeded optionally via run(initial_todos=...)
+        # so outer layers can carry the plan across turns.
+        self._todos: list = []
+        # Run id for checkpointing.  Fresh per AgentLoop; outer layers can
+        # override via `set_run_id()` before calling run() to correlate
+        # checkpoints with an external request/session.
+        self._run_id: str = ""
+
+    def set_run_id(self, run_id: str) -> None:
+        """Override the run id used by checkpoint paths.  Must be called
+        before ``run()``.  Empty string / None restores default."""
+        self._run_id = run_id or ""
 
     def _is_cancelled(self) -> bool:
         """Check if external cancellation has been requested."""
         return self._cancel_event is not None and self._cancel_event.is_set()
+
+    def _cancellable_sleep(self, seconds: float) -> bool:
+        """Sleep that returns early if cancellation is signalled.
+
+        Returns True if cancelled during the wait, False otherwise.  When no
+        cancel_event is attached, falls back to a plain blocking sleep.
+        """
+        if self._cancel_event is None:
+            time.sleep(seconds)
+            return False
+        # Event.wait returns True when set, False on timeout.
+        return self._cancel_event.wait(seconds)
+
+    def _write_checkpoint(
+        self,
+        *,
+        step: int | str,
+        messages: list,
+        total_input_tokens: int,
+        total_output_tokens: int,
+        tool_calls_count: int,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        """Persist a LoopCheckpoint if checkpointing is enabled.
+
+        ``step`` may be an int (regular step boundary) or ``"final"``
+        (terminal exit).  Errors are logged via ``on_warning`` — never
+        propagated, checkpointing must never break a run.
+        """
+        cfg = self._config
+        if not cfg.checkpoint_dir:
+            return
+        from .checkpoint import (
+            LoopCheckpoint,
+            checkpoint_path,
+            iso_utc_now,
+        )
+        effective_spec = self._model_spec or self._runtime_owner.model_spec
+        try:
+            cp = LoopCheckpoint(
+                run_id=self._run_id,
+                step=step if isinstance(step, int) else -1,
+                saved_at=iso_utc_now(),
+                messages=list(messages),
+                total_input_tokens=total_input_tokens,
+                total_output_tokens=total_output_tokens,
+                tool_calls_count=tool_calls_count,
+                todos=[_t_as_dict(t) for t in self._todos] if cfg.todos_enabled else [],
+                provider=effective_spec.provider,
+                model=effective_spec.model,
+                status=status,
+                error=error,
+            )
+            path = checkpoint_path(cfg.checkpoint_dir, self._run_id, step)
+            cp.save(path)
+            self._fire(
+                "on_checkpoint", path,
+                step if isinstance(step, int) else -1,
+            )
+        except Exception as e:
+            self._fire("on_warning", f"checkpoint write failed: {e}")
 
     # ── callback helpers (no-op when callback is None) ────────────────────
 
@@ -681,8 +912,44 @@ class AgentLoop:
 
     # ── public entry point ────────────────────────────────────────────────
 
-    def run(self, system_prompt: str, messages: list) -> LoopResult:
-        """Run the agentic tool-use loop.  *messages* is mutated in-place."""
+    def run(
+        self,
+        system_prompt: str,
+        messages: list,
+        initial_todos: list | None = None,
+    ) -> LoopResult:
+        """Run the agentic tool-use loop.  *messages* is mutated in-place.
+
+        Thin wrapper around ``_run_impl`` that attaches the final todos
+        scratchpad and writes a terminal checkpoint (if enabled),
+        regardless of which exit path fired.
+        """
+        result = self._run_impl(system_prompt, messages, initial_todos)
+        if self._config.todos_enabled:
+            # Serialize to dict-form for easy JSON persistence by outer layers.
+            from .todos import todo_to_dict
+            result.todos = [todo_to_dict(t) for t in self._todos]
+        if self._config.checkpoint_dir:
+            # Terminal ("final") checkpoint — includes status + error.
+            self._write_checkpoint(
+                step="final",
+                messages=result.messages,
+                total_input_tokens=result.total_input_tokens,
+                total_output_tokens=result.total_output_tokens,
+                tool_calls_count=result.tool_calls_count,
+                status=result.status,
+                error=result.error,
+            )
+        return result
+
+    def _run_impl(
+        self,
+        system_prompt: str,
+        messages: list,
+        initial_todos: list | None = None,
+    ) -> LoopResult:
+        """Core run loop.  Public entry point is ``run()`` which also
+        snapshots the final todos onto the result."""
         cfg = self._config
         all_text = ""
         final_text = ""
@@ -690,17 +957,62 @@ class AgentLoop:
         total_input_tokens = 0
         total_output_tokens = 0
         tool_calls_count = 0
+        last_reflection_count = 0  # tool_calls_count at last reflection injection
         registry = get_registry()
         step = 0
         consecutive_truncations = 0  # cap truncation recovery retries
         max_truncation_retries = 3
         verification_injected = False  # only verify once per run
 
+        # Lazy import of the reflection module so test imports of
+        # loop_engine stay cheap and reflection is opt-in by config.
+        if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
+            from . import reflection  # noqa: F401 — referenced below
+        else:
+            reflection = None  # type: ignore[assignment]
+
+        # Ensure a run id is set when checkpointing is enabled (outer
+        # layers may have preset one via set_run_id).
+        if cfg.checkpoint_dir and not self._run_id:
+            from .checkpoint import new_run_id
+            self._run_id = new_run_id()
+
+        # ── Seed todos scratchpad ─────────────────────────────────────
+        # Lazy import to keep the dependency optional.
+        if cfg.todos_enabled:
+            from .todos import (
+                WRITE_TODOS_SCHEMA,
+                build_write_todos_tool,
+                inject_todos_into_messages,
+                normalize_todo,
+            )
+            if initial_todos:
+                try:
+                    self._todos = [normalize_todo(t) for t in initial_todos]
+                except TypeError as e:
+                    self._fire("on_warning", f"ignoring invalid initial_todos: {e}")
+                    self._todos = []
+            else:
+                self._todos = []
+
+            # Per-loop write_todos tool closing over self._todos.
+            def _get_store() -> list:
+                return self._todos
+
+            def _set_store(new_list: list) -> None:
+                self._todos = new_list
+
+            _write_todos_fn = build_write_todos_tool(_get_store, _set_store)
+
         # ── Harness trackers ──────────────────────────────────────────
+        # Effective model spec — sub-agent override wins over owner default.
+        # Used for tracing and cost accounting so sub-agents on a different
+        # tier are billed against the correct pricing.
+        effective_spec = self._model_spec or self._runtime_owner.model_spec
+
         trace = get_tracer()
         if trace:
-            spec = self._model_spec or self._runtime_owner.model_spec
-            trace.start(spec.provider, spec.model)
+            trace.start(effective_spec.provider, effective_spec.model)
         cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
         stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
 
@@ -724,6 +1036,16 @@ class AgentLoop:
                 elif step == 0 or (reg_version is not None and registry.version != reg_version):
                     reg_version, tool_schemas, tool_functions = registry.snapshot()
 
+                # Overlay the per-loop write_todos tool on top of the
+                # registry snapshot when todos are enabled.  This is the
+                # closure-scoped injection point recommended by the design
+                # review (avoids ContextVar propagation issues with our
+                # daemon-thread tool executor).
+                if cfg.todos_enabled:
+                    tool_schemas = list(tool_schemas) + [WRITE_TODOS_SCHEMA]
+                    tool_functions = dict(tool_functions)
+                    tool_functions["write_todos"] = _write_todos_fn
+
                 # Context compaction
                 if cfg.compact_messages:
                     before_len = len(messages)
@@ -735,10 +1057,19 @@ class AgentLoop:
                         messages[:] = messages_maybe
                         self._fire("on_compaction", before_len, after_len)
 
-                # Build context dict
+                # Build context dict.  Todos are injected as a
+                # <system-reminder> text block appended to the tail user
+                # message — NOT persisted into `messages`, so compaction
+                # never touches them.  The base system_prompt stays
+                # untouched to preserve Anthropic prefix caching.
+                if cfg.todos_enabled and self._todos:
+                    context_messages = inject_todos_into_messages(messages, self._todos)
+                else:
+                    context_messages = messages
+
                 context: dict[str, Any] = {
                     "system_prompt": system_prompt,
-                    "messages": messages,
+                    "messages": context_messages,
                 }
                 if tool_schemas:
                     context["tools"] = tool_schemas
@@ -750,6 +1081,34 @@ class AgentLoop:
                     model_spec=self._model_spec,
                     metadata={"component": "loop_engine", "step": step + 1},
                 )
+
+                # Phase-aware tool_choice shaping (see jyagent/phases.py).
+                # The policy is consulted once per step.  Returning a
+                # PhaseDirective with `tool_choice=None` is informational
+                # only (engine fires on_phase_enter for observability but
+                # leaves tool_choice unchanged).  A non-None tool_choice
+                # rebuilds `opts` so the runtime adapter sees the override.
+                if cfg.phase_policy is not None:
+                    try:
+                        directive = cfg.phase_policy(step, cfg.max_steps, tool_calls_count)
+                    except Exception as e:
+                        directive = None
+                        self._fire("on_warning", f"phase_policy raised: {e}")
+                    if directive is not None:
+                        self._fire("on_phase_enter", directive.phase)
+                        if trace:
+                            trace.add_span(
+                                step=step, event_type="phase",
+                                tool_name=directive.phase,
+                            )
+                        if directive.tool_choice is not None:
+                            opts = RuntimeOptions(
+                                max_output_tokens=opts.max_output_tokens,
+                                timeout=opts.timeout,
+                                reasoning=opts.reasoning,
+                                metadata={**(opts.metadata or {}), "phase": directive.phase},
+                                tool_choice=directive.tool_choice,
+                            )
 
                 llm_t0 = time.perf_counter()
                 step_text, tool_call_blocks, stop_reason, final_message = self._call_llm_with_retry(
@@ -779,10 +1138,12 @@ class AgentLoop:
 
                 # ── Cost budget check ─────────────────────────────────
                 if cost_tracker is not None:
+                    # Use the effective spec so sub-agent model overrides are
+                    # billed at the right rate (P0 fix).
                     cost_tracker.record(
                         usage,
-                        self._runtime_owner.model_spec.provider,
-                        self._runtime_owner.model_spec.model,
+                        effective_spec.provider,
+                        effective_spec.model,
                     )
                     known = cost_tracker.known_cost
                     if known is not None and known >= cfg.max_cost_usd:
@@ -815,7 +1176,17 @@ class AgentLoop:
                     # ── Pre-completion verification gate ───────────────
                     # If we mutated files and haven't verified yet, inject a
                     # self-check prompt and loop once more instead of returning.
-                    if not verification_injected and should_verify(messages, tool_calls_count):
+                    #
+                    # Boundary guard (P0 fix): never inject on the final allowed
+                    # step — the follow-up model reply has no iteration left to
+                    # run, and the dangling `[VERIFICATION]` user message would
+                    # otherwise leak into the persisted session and poison the
+                    # next turn.
+                    if (
+                        not verification_injected
+                        and should_verify(messages, tool_calls_count)
+                        and step + 1 < cfg.max_steps
+                    ):
                         verification_injected = True
                         if trace:
                             trace.add_span(step=step, event_type="verification")
@@ -877,6 +1248,10 @@ class AgentLoop:
                             error=f"Repeated truncation ({consecutive_truncations}x) — model output exceeds capacity",
                         )
                     self._fire("on_truncation")
+                    # Also fire the unified stream-retry hook so UIs that
+                    # already handle transient-error duplication can use the
+                    # same visual treatment for truncation-recovery replays.
+                    self._fire("on_stream_retry", "truncation", step_text or "")
                     current_max_tokens = min(
                         current_max_tokens * cfg.token_scale_factor,
                         cfg.max_tokens_cap,
@@ -965,13 +1340,30 @@ class AgentLoop:
                 # response repeatedly — polling tools like check_background
                 # naturally return different responses (elapsed_seconds etc.)
                 # and are never flagged.
+                #
+                # Two correctness rules (P0 fixes, 2026-04):
+                #   1. Hash the RAW tool output, not the UI-truncated string.
+                #      Two different long outputs that happen to share a
+                #      common prefix up to max_tool_result_chars would
+                #      collide on the truncated string and look "stuck".
+                #   2. Deduplicate (name, args) keys *within a single batch*.
+                #      A legitimate parallel fanout of e.g. 3 identical
+                #      read_file calls in one step is not a stuck loop — it's
+                #      the model doing simultaneous reads.  Without this, such
+                #      a batch alone can hit threshold=3 in a single step.
                 stuck_feedback = None
+                seen_batch_keys: set[str] = set()
                 for block, result in tool_results_tuples:
-                    content_str = _truncate_result(result.content, cfg.max_tool_result_chars, result.is_error)
+                    batch_key = _StuckLoopDetector._make_key(
+                        block.name, block.input if isinstance(block.input, dict) else {},
+                    )
+                    if batch_key in seen_batch_keys:
+                        continue
+                    seen_batch_keys.add(batch_key)
                     feedback = stuck_detector.record(
                         block.name,
                         block.input,
-                        content_str,
+                        result.content,  # raw content — not the truncated display string
                     )
                     if feedback and not stuck_feedback:
                         stuck_feedback = feedback
@@ -998,6 +1390,49 @@ class AgentLoop:
                 if self._is_cancelled():
                     break
 
+                # ── Mid-loop reflection / critic step ─────────────────
+                # After meaningful work boundaries (every-N cadence or
+                # sub-agent return), append a short progress-check user
+                # message so the next LLM call re-grounds on the task.
+                # Avoids drift on long-horizon rollouts.
+                if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
+                    batch_names = [b.name for b, _ in tool_results_tuples]
+                    inject, reason = reflection.should_reflect(
+                        reflect_every_n=cfg.reflect_every_n_tool_calls,
+                        reflect_after_subagent=cfg.reflect_after_subagent,
+                        tool_calls_total=tool_calls_count,
+                        tool_calls_at_last_reflection=last_reflection_count,
+                        batch_tool_names=batch_names,
+                        messages=messages,
+                    )
+                    if inject:
+                        prompt = reflection.build_reflection_prompt(
+                            reason, tool_calls_count,
+                        )
+                        messages.append({"role": "user", "content": prompt})
+                        last_reflection_count = tool_calls_count
+                        self._fire("on_reflection", reason)
+                        if trace:
+                            trace.add_span(step=step, event_type="reflection")
+
+                # ── Periodic checkpoint ──────────────────────────────
+                # At the end of each step, if a cadence is configured and
+                # we're on the boundary, persist state so crashes can
+                # resume from here.  No-op when checkpoint_dir is None.
+                if (
+                    cfg.checkpoint_every_n_steps > 0
+                    and cfg.checkpoint_dir
+                    and (step + 1) % cfg.checkpoint_every_n_steps == 0
+                ):
+                    self._write_checkpoint(
+                        step=step,
+                        messages=messages,
+                        total_input_tokens=total_input_tokens,
+                        total_output_tokens=total_output_tokens,
+                        tool_calls_count=tool_calls_count,
+                        status="in_progress",
+                    )
+
             # ── Cooperative cancellation — early exit ────────────────
             if self._is_cancelled():
                 if trace:
@@ -1015,7 +1450,26 @@ class AgentLoop:
                 )
 
             # Max steps reached
-            if cfg.fallback_on_max_steps and not final_text:
+            # Fallback always fires when enabled: reaching max_steps means the
+            # loop never hit a no-tool terminal step, so the incidental text
+            # accumulated from prior tool-use steps is NOT a real answer.
+            # (Old condition `not final_text` was wrong — `final_text` is
+            # written on every step including ones that also had tool calls.)
+            #
+            # Defense-in-depth (P0 fix): if a verification prompt was injected
+            # and the model never produced a follow-up reply before we ran out
+            # of steps, strip the trailing `[VERIFICATION]` user message so
+            # it doesn't leak into the persisted session and poison the next
+            # turn.  The boundary guard above should already prevent this,
+            # but we clean up anyway in case of a race.
+            if verification_injected and messages:
+                tail = messages[-1]
+                tail_content = tail.get("content", "") if isinstance(tail, dict) else ""
+                if tail.get("role") == "user" and isinstance(tail_content, str) \
+                        and tail_content.startswith("[VERIFICATION]"):
+                    messages.pop()
+
+            if cfg.fallback_on_max_steps:
                 # Try one more streaming call with system instruction to avoid tools
                 try:
                     fallback_context = dict(context)
@@ -1153,9 +1607,25 @@ class AgentLoop:
                 if _is_transient_error(err) and attempt < cfg.retry_attempts:
                     if self._is_cancelled():
                         raise
-                    delay = cfg.retry_base_delay * (2 ** attempt)
+                    # Exponential backoff with "equal jitter" (AWS architecture
+                    # recommendation) to avoid thundering-herd when multiple
+                    # parallel sub-agents all retry a 529 at the same moment.
+                    #   half the delay is deterministic exponential,
+                    #   half is uniform random in [0, base * 2^attempt / 2].
+                    base = cfg.retry_base_delay * (2 ** attempt)
+                    delay = base / 2 + random.uniform(0, base / 2)
                     self._fire("on_retry", attempt + 1, err)
-                    time.sleep(delay)
+                    # Signal UI that any partial output from the failed
+                    # attempt will be replayed on retry (visual de-duplication
+                    # hook).  `partial_stream_text` is stashed by
+                    # `_call_streaming` on the exception; missing for
+                    # non-streaming path.
+                    partial_text = getattr(err, "partial_stream_text", "")
+                    self._fire("on_stream_retry", "transient_error", partial_text)
+                    # Cancel-aware backoff: wake immediately on Ctrl-C so we
+                    # don't burn through a long retry window after cancel.
+                    if self._cancellable_sleep(delay):
+                        raise KeyboardInterrupt("cancelled during retry backoff")
                     continue
                 raise
 
@@ -1193,17 +1663,53 @@ class AgentLoop:
         context: dict,
         options: RuntimeOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Streaming: consume RuntimeStream events and fire callbacks."""
+        """Streaming: consume RuntimeStream events and fire callbacks.
+
+        Delta-emission policy is controlled by ``cfg.buffered_streaming``:
+
+        * ``False`` (default) — fire ``on_text_delta`` live as tokens arrive.
+          On transient error mid-stream, the user sees partial output and the
+          retry replays it, producing visible duplication.  The engine fires
+          ``on_stream_retry`` before the retry so UIs can mark/clear the
+          duplicated region.
+        * ``True`` — buffer deltas locally and only flush them to
+          ``on_text_delta`` after a clean ``done`` event.  A failed attempt
+          discards its buffer silently.  Eliminates duplication at the cost
+          of losing live-token UX.
+
+        The buffered partial text is stashed on the raised exception as
+        ``err.partial_stream_text`` so ``_call_llm_with_retry`` can pass it
+        to ``on_stream_retry``.
+        """
+        cfg = self._config
         text_parts: list[str] = []
+        # Tracks how many characters have already been flushed to
+        # on_text_delta — used for buffered mode and for partial-text
+        # reporting on error.
+        emitted_len = 0
         final_message: dict | None = None
         thinking_active = False
         stream = None
+
+        def _flush_pending() -> None:
+            """Emit un-flushed buffered deltas (buffered mode only)."""
+            nonlocal emitted_len
+            if emitted_len >= sum(len(p) for p in text_parts):
+                return
+            pending = "".join(text_parts)[emitted_len:]
+            if pending:
+                self._fire("on_text_delta", pending)
+                emitted_len += len(pending)
 
         try:
             stream = self._runtime_owner.stream(
                 context, options=options, model_spec=self._model_spec,
             )
             for event in stream:
+                # Cancellation check inside the stream loop so Ctrl-C
+                # doesn't wait for the provider to close — latency-sensitive.
+                if self._is_cancelled():
+                    raise KeyboardInterrupt("cancelled during stream")
                 etype = event.get("type")
 
                 if etype == "text_delta":
@@ -1211,8 +1717,12 @@ class AgentLoop:
                     if thinking_active:
                         thinking_active = False
                         self._fire("on_thinking_stop")
-                    self._fire("on_text_delta", text)
                     text_parts.append(text)
+                    if not cfg.buffered_streaming:
+                        # Live mode: emit now.
+                        self._fire("on_text_delta", text)
+                        emitted_len += len(text)
+                    # Buffered mode: accumulate, flush on `done`.
 
                 elif etype == "thinking_start":
                     if not thinking_active:
@@ -1236,6 +1746,10 @@ class AgentLoop:
 
                 elif etype == "done":
                     final_message = event["message"]
+                    # Buffered mode: flush the accumulated text now that we
+                    # know the stream completed cleanly.
+                    if cfg.buffered_streaming:
+                        _flush_pending()
 
                 elif etype == "error":
                     final_message = event["message"]
@@ -1246,10 +1760,28 @@ class AgentLoop:
             stop_reason = final_message.get("stop_reason", "stop")
             if stop_reason == "error":
                 error_msg = final_message.get("error_message", "Unknown streaming error")
-                raise RuntimeError(error_msg)
+                # Attach partial text so the retry layer can report it to
+                # on_stream_retry.  Accumulated even in buffered mode — the
+                # caller decides what (if anything) to do with it.
+                err = RuntimeError(error_msg)
+                err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
+                raise err
 
+            # Successful completion: in live mode emitted_len already equals
+            # the full text length; in buffered mode the done-handler above
+            # flushed it.  Nothing more to do.
             tool_calls = _extract_tool_calls(final_message)
             return "".join(text_parts), tool_calls, stop_reason, final_message
+
+        except BaseException as err:
+            # Stash partial text on every exception path (transient network
+            # errors, cancellations, etc.) so the retry layer can pass it to
+            # on_stream_retry.  Intentionally set on the raised exception
+            # rather than returned — the call site re-raises and catches it
+            # at a different layer.
+            if not hasattr(err, "partial_stream_text"):
+                err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
+            raise
 
         finally:
             if thinking_active:

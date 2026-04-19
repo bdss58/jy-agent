@@ -1031,14 +1031,62 @@ def dispatch_agent(
         return _finalize_outcome(outcome, elapsed, model_spec, task_preview)
 
 
+def _format_subagent_envelope(
+    *,
+    status: str,
+    answer: str,
+    elapsed: float,
+    steps: int,
+    tool_calls: int,
+    input_tokens: int,
+    output_tokens: int,
+    error: str = "",
+) -> str:
+    """Wrap a sub-agent's free-form answer in a structured Markdown envelope.
+
+    The envelope is stable and machine-parseable-ish — the parent LLM sees
+    status and cost metadata upfront, which substantially improves its
+    ability to reason about sub-agent outputs without ambiguity (this was
+    a flagged P1 from the 2026-04-18 joint Codex + Claude Code review).
+
+    Headings are plain Markdown so the parent model parses them trivially.
+    """
+    lines = [
+        "## Sub-agent Result",
+        f"**Status:** {status}",
+        (
+            f"**Stats:** {steps} step(s) · {tool_calls} tool call(s) · "
+            f"{input_tokens}+{output_tokens} tokens · {elapsed:.1f}s"
+        ),
+    ]
+    if error:
+        lines.append(f"**Error:** {error}")
+    body = (answer or "").rstrip()
+    if body:
+        lines.extend(["", "### Response", body])
+    else:
+        lines.extend(["", "### Response", "_(sub-agent produced no text output)_"])
+    return "\n".join(lines)
+
+
 def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
-    """Print terminal summary, record stats, return ToolResult for a completed sub-agent."""
+    """Print terminal summary, record stats, return ToolResult for a completed sub-agent.
+
+    Output format: structured Markdown envelope (see ``_format_subagent_envelope``)
+    so the parent model sees status + cost + response as distinct sections,
+    rather than having to infer them from free-form text.  Set
+    ``JY_SUBAGENT_FLAT_RESULT=1`` in the environment to opt out and get
+    the legacy raw-answer string (mainly for backwards compatibility).
+    """
+    import os as _os
+
     status = outcome.get("status", _SUBAGENT_STATUS_COMPLETED)
     answer = outcome.get("content", "")
     steps = outcome.get("steps", 0)
     in_tok = outcome.get("input_tokens", 0)
     out_tok = outcome.get("output_tokens", 0)
     tool_calls = outcome.get("tool_calls", 0)
+    err = outcome.get("error", "")
 
     status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
     status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
@@ -1063,4 +1111,19 @@ def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
     except Exception:
         pass  # stats recording is best-effort
 
-    return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
+    # Structured envelope is the new default; `JY_SUBAGENT_FLAT_RESULT=1`
+    # opts out for callers that rely on the legacy raw-answer string.
+    if _os.environ.get("JY_SUBAGENT_FLAT_RESULT", "").lower() in ("1", "true", "yes"):
+        return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
+
+    envelope = _format_subagent_envelope(
+        status=status,
+        answer=answer,
+        elapsed=elapsed,
+        steps=steps,
+        tool_calls=tool_calls,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        error=err,
+    )
+    return ToolResult(envelope, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
