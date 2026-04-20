@@ -509,6 +509,11 @@ class SkillManager:
                 max_output_tokens=100,
                 model_spec=get_skill_router_model_spec(runtime_owner.model_spec),
                 timeout=SKILL_ROUTER_TIMEOUT,
+                # Router is a cheap utility call — no extended thinking.
+                # This also avoids validate_anthropic_reasoning rejecting
+                # models < Claude 4.6 when adaptive thinking is configured
+                # via env for the main agent.
+                reasoning=None,
             )
             elapsed = time.time() - t0
 
@@ -552,7 +557,13 @@ class SkillManager:
 
             return sorted(new_active)
 
-        except Exception:
+        except Exception as e:
+            # Surface router failures so silent keyword fallback isn't
+            # mistaken for "router is working". First-line-only, dim, to
+            # stderr so the UX stays calm but debuggable.
+            msg = str(e).split("\n", 1)[0][:240]
+            print(f"\033[2m  ⚡ Skill router failed ({type(e).__name__}): "
+                  f"{msg}\033[0m", file=sys.stderr)
             return None
 
     def _route_keywords(self, query: str) -> Optional[list[str]]:

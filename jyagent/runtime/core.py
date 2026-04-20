@@ -19,6 +19,11 @@ class RuntimeAdapter(Protocol):
 
 _ADAPTERS: dict[str, RuntimeAdapter] = {}
 
+# Sentinel for "caller did not pass a value" — lets callers explicitly pass
+# `reasoning=None` to disable reasoning while still keeping the default behavior
+# (auto-derive from env via get_reasoning_config_for_provider) for others.
+_UNSET: Any = object()
+
 
 def register_adapter(adapter: RuntimeAdapter) -> None:
     _ADAPTERS[adapter.provider] = adapter
@@ -71,7 +76,19 @@ class RuntimeOwner:
         model_spec: ModelSpec | None = None,
         timeout: float | None = None,
         metadata: dict[str, Any] | None = None,
+        reasoning: Any = _UNSET,
     ) -> str:
+        # Default: auto-derive reasoning config from env (may fail for models
+        # that don't support adaptive thinking). Callers can pass reasoning=None
+        # to explicitly disable reasoning — useful for cheap utility calls
+        # (e.g. skill router) where extended thinking is wasteful and may be
+        # rejected by validation for non-4.6+ Anthropic models.
+        if reasoning is _UNSET:
+            reasoning = get_reasoning_config_for_provider(
+                (model_spec or self._model_spec).provider,
+                max_output_tokens=max_output_tokens,
+                model=(model_spec or self._model_spec).model,
+            )
         message = self.complete(
             {
                 "system_prompt": system_prompt,
@@ -80,11 +97,7 @@ class RuntimeOwner:
             options=RuntimeOptions(
                 max_output_tokens=max_output_tokens,
                 timeout=timeout,
-                reasoning=get_reasoning_config_for_provider(
-                    (model_spec or self._model_spec).provider,
-                    max_output_tokens=max_output_tokens,
-                    model=(model_spec or self._model_spec).model,
-                ),
+                reasoning=reasoning,
                 metadata={
                     "component": "runtime_owner",
                     "mode": "complete_text",
