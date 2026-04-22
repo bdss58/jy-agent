@@ -1,7 +1,11 @@
 """Tests for web_search tool — DDG parsing, Codex backend, and integration."""
 
+import glob
 import json
+import logging
 import os
+import subprocess
+import tempfile
 import pytest
 
 from jyagent.tools.web_search_tool import (
@@ -169,7 +173,7 @@ class TestWebSearch:
         ]
         monkeypatch.setattr(
             web_search_tool, "_search_codex",
-            lambda q, n=10, timeout=120: (fake_results, "Synthesis: found it"),
+            lambda q, n=10, timeout=180: (fake_results, "Synthesis: found it"),
         )
 
         result = web_search(query="test", engine="codex")
@@ -190,7 +194,7 @@ class TestWebSearch:
         monkeypatch.setattr(web_search_tool, "_search_ddg", lambda q, n=10: ddg_results)
         monkeypatch.setattr(
             web_search_tool, "_search_codex",
-            lambda q, n=10, timeout=120: (codex_called.append(1) or ([], "")),
+            lambda q, n=10, timeout=180: (codex_called.append(1) or ([], "")),
         )
 
         result = web_search(query="test", engine="auto")
@@ -212,7 +216,7 @@ class TestWebSearch:
         monkeypatch.setattr(web_search_tool, "_search_ddg", lambda q, n=10: ddg_results)
         monkeypatch.setattr(
             web_search_tool, "_search_codex",
-            lambda q, n=10, timeout=120: (codex_results, "Better synthesis"),
+            lambda q, n=10, timeout=180: (codex_results, "Better synthesis"),
         )
 
         result = web_search(query="test", engine="auto")
@@ -234,6 +238,420 @@ class TestWebSearch:
         result = web_search(query="test", engine="ddg", max_results=3)
         text = str(result)
         assert "Found: 3 results" in text
+
+
+# ─── Popen-based _search_codex tests ─────────────────────────────────────────
+#
+# IMPORTANT: FakePopen classes must NOT close stdout/stderr FDs passed as ints.
+# Real subprocess.Popen doesn't close the parent's FD copies — the caller code
+# in _search_codex (os.close(fd3); os.close(fd4)) handles that.
+
+
+class TestSearchCodexPopen:
+    """Tests for the Popen-based Codex backend: timeout, graceful kill,
+    partial-output salvage, stderr diagnostics, stdin /dev/null."""
+
+    def test_codex_not_available_returns_early(self, monkeypatch):
+        """If codex CLI is not installed, return immediately."""
+        from jyagent.tools import web_search_tool
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: False)
+
+        results, synthesis = web_search_tool._search_codex("test query")
+        assert results == []
+        assert "not found" in synthesis
+
+    def test_normal_completion(self, monkeypatch):
+        """Codex finishes within timeout → results parsed normally."""
+        from jyagent.tools import web_search_tool
+
+        fake_output = json.dumps({
+            "results": [
+                {"title": "Result A", "url": "https://a.com", "snippet": "aaa"},
+            ],
+            "synthesis": "Found A.",
+        })
+
+        class FakePopen:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 99999
+                self.returncode = 0
+                for i, arg in enumerate(cmd):
+                    if arg == "-o" and i + 1 < len(cmd):
+                        with open(cmd[i + 1], "w") as f:
+                            f.write(fake_output)
+                        break
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+
+        results, synthesis = web_search_tool._search_codex("test", max_results=5, timeout=10)
+        assert len(results) == 1
+        assert results[0]["title"] == "Result A"
+        assert "Found A" in synthesis
+
+    def test_timeout_triggers_termination(self, monkeypatch):
+        """When deadline expires, process is terminated and timeout message returned."""
+        from jyagent.tools import web_search_tool
+
+        terminated = []
+
+        class HangingPopen:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 88888
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired("codex", timeout)
+                return self.returncode
+
+            def terminate(self):
+                terminated.append("SIGTERM")
+                self.returncode = -15
+
+            def kill(self):
+                terminated.append("SIGKILL")
+                self.returncode = -9
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", HangingPopen)
+
+        results, synthesis = web_search_tool._search_codex("stuck query", timeout=1)
+        assert results == []
+        assert "timed out" in synthesis
+        assert "SIGTERM" in terminated  # graceful termination attempted
+
+    def test_timeout_salvages_partial_output(self, monkeypatch):
+        """If Codex wrote partial results before timing out, salvage them."""
+        from jyagent.tools import web_search_tool
+
+        partial = json.dumps({
+            "results": [
+                {"title": "Partial", "url": "https://p.com", "snippet": "saved"},
+            ],
+            "synthesis": "Partial data.",
+        })
+
+        class SlowButWrotePopen:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 77777
+                self.returncode = None
+                for i, arg in enumerate(cmd):
+                    if arg == "-o" and i + 1 < len(cmd):
+                        with open(cmd[i + 1], "w") as f:
+                            f.write(partial)
+                        break
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired("codex", timeout)
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", SlowButWrotePopen)
+
+        results, synthesis = web_search_tool._search_codex("partial query", timeout=1)
+        assert len(results) == 1
+        assert results[0]["title"] == "Partial"
+        assert "Partial data" in synthesis
+
+    def test_nonzero_exit_logs_stderr(self, monkeypatch, caplog):
+        """Non-zero exit code → stderr is read and logged as warning."""
+        from jyagent.tools import web_search_tool
+
+        stderr_content = "Error: API key invalid"
+
+        class FailingPopen:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 66666
+                self.returncode = 1
+                # Write stderr content to the FD (but don't close it)
+                stderr_val = kwargs.get("stderr")
+                if isinstance(stderr_val, int):
+                    os.write(stderr_val, stderr_content.encode())
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", FailingPopen)
+
+        with caplog.at_level(logging.WARNING, logger="jyagent.tools.web_search_tool"):
+            results, synthesis = web_search_tool._search_codex("fail query", timeout=10)
+
+        assert results == []
+        # Should have logged the non-zero exit with stderr content
+        assert any("exited" in r.message and "API key invalid" in r.message
+                    for r in caplog.records)
+
+    def test_stdin_is_devnull(self, monkeypatch):
+        """Verify stdin=DEVNULL is passed to Popen."""
+        from jyagent.tools import web_search_tool
+
+        captured_kwargs = {}
+
+        class CapturePopen:
+            def __init__(self, cmd, **kwargs):
+                captured_kwargs.update(kwargs)
+                self.pid = 55555
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", CapturePopen)
+
+        web_search_tool._search_codex("test", timeout=5)
+        assert captured_kwargs.get("stdin") == subprocess.DEVNULL
+
+    def test_temp_files_cleaned_up(self, monkeypatch):
+        """All temp files (schema, output, stdout, stderr) are removed after run."""
+        from jyagent.tools import web_search_tool
+
+        class QuickPopen:
+            def __init__(self, cmd, **kwargs):
+                self.pid = 44444
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", QuickPopen)
+
+        # Snapshot temp files before
+        tmp_dir = tempfile.gettempdir()
+        before = set(glob.glob(os.path.join(tmp_dir, "ws_*")))
+
+        web_search_tool._search_codex("cleanup test", timeout=5)
+
+        # After: no new ws_* files should remain
+        after = set(glob.glob(os.path.join(tmp_dir, "ws_*")))
+        new_files = after - before
+        assert len(new_files) == 0, f"Leaked temp files: {new_files}"
+
+    def test_exception_in_popen_is_caught(self, monkeypatch):
+        """If Popen raises, the exception is caught and returned as error."""
+        from jyagent.tools import web_search_tool
+
+        def exploding_popen(*args, **kwargs):
+            raise OSError("spawn failed")
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", exploding_popen)
+
+        results, synthesis = web_search_tool._search_codex("boom", timeout=5)
+        assert results == []
+        assert "error" in synthesis.lower() or "spawn failed" in synthesis
+
+    def test_process_group_used_on_posix(self, monkeypatch):
+        """On POSIX systems, preexec_fn=os.setpgrp should be set."""
+        from jyagent.tools import web_search_tool
+
+        captured_kwargs = {}
+
+        class CapturePopen:
+            def __init__(self, cmd, **kwargs):
+                captured_kwargs.update(kwargs)
+                self.pid = 33333
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(web_search_tool, "_codex_available", lambda: True)
+        monkeypatch.setattr(subprocess, "Popen", CapturePopen)
+
+        web_search_tool._search_codex("test", timeout=5)
+        if hasattr(os, "setpgrp"):
+            assert captured_kwargs.get("preexec_fn") is os.setpgrp
+        else:
+            assert captured_kwargs.get("preexec_fn") is None
+
+    def test_default_timeout_is_180(self, monkeypatch):
+        """Default timeout should be 180s (increased from old 120s)."""
+        from jyagent.tools import web_search_tool
+        import inspect
+
+        sig = inspect.signature(web_search_tool._search_codex)
+        assert sig.parameters["timeout"].default == 180
+
+
+# ─── Helper function tests ───────────────────────────────────────────────────
+
+
+class TestHelperFunctions:
+    """Tests for _terminate_proc and _read_output."""
+
+    def test_terminate_proc_already_dead(self):
+        """_terminate_proc is a no-op if process already exited."""
+        from jyagent.tools.web_search_tool import _terminate_proc
+
+        class DeadProc:
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                raise AssertionError("Should not be called")
+
+        _terminate_proc(DeadProc())  # should not raise
+
+    def test_terminate_proc_sigterm_works(self):
+        """_terminate_proc sends SIGTERM and it works."""
+        from jyagent.tools.web_search_tool import _terminate_proc
+
+        actions = []
+
+        class NiceProc:
+            def __init__(self):
+                self._alive = True
+
+            def poll(self):
+                return None if self._alive else -15
+
+            def terminate(self):
+                actions.append("term")
+                self._alive = False
+
+            def wait(self, timeout=None):
+                if self._alive:
+                    raise subprocess.TimeoutExpired("x", timeout)
+                return -15
+
+            def kill(self):
+                actions.append("kill")
+
+        _terminate_proc(NiceProc())
+        assert actions == ["term"]  # no kill needed
+
+    def test_terminate_proc_escalates_to_sigkill(self):
+        """_terminate_proc escalates to SIGKILL when SIGTERM doesn't work."""
+        from jyagent.tools.web_search_tool import _terminate_proc
+
+        actions = []
+
+        class StubbornProc:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                actions.append("term")
+
+            def wait(self, timeout=None):
+                if "kill" not in actions:
+                    raise subprocess.TimeoutExpired("x", timeout)
+                return -9
+
+            def kill(self):
+                actions.append("kill")
+
+        _terminate_proc(StubbornProc())
+        assert "term" in actions
+        assert "kill" in actions
+
+    def test_read_output_prefers_output_file(self, tmp_path):
+        """_read_output prefers the -o file over stdout capture."""
+        from jyagent.tools.web_search_tool import _read_output
+
+        out = tmp_path / "output.txt"
+        stdout = tmp_path / "stdout.txt"
+        out.write_text('{"results": [], "synthesis": "from output"}')
+        stdout.write_text('{"results": [], "synthesis": "from stdout"}')
+
+        result = _read_output(str(out), str(stdout))
+        assert "from output" in result
+
+    def test_read_output_falls_back_to_stdout(self, tmp_path):
+        """_read_output falls back to stdout if -o file is empty."""
+        from jyagent.tools.web_search_tool import _read_output
+
+        out = tmp_path / "output.txt"
+        stdout = tmp_path / "stdout.txt"
+        out.write_text("")
+        stdout.write_text("fallback content")
+
+        result = _read_output(str(out), str(stdout))
+        assert result == "fallback content"
+
+    def test_read_output_both_empty(self, tmp_path):
+        """_read_output returns empty string when both files are empty."""
+        from jyagent.tools.web_search_tool import _read_output
+
+        out = tmp_path / "output.txt"
+        stdout = tmp_path / "stdout.txt"
+        out.write_text("")
+        stdout.write_text("")
+
+        result = _read_output(str(out), str(stdout))
+        assert result == ""
+
+    def test_read_output_missing_files(self):
+        """_read_output handles missing files gracefully."""
+        from jyagent.tools.web_search_tool import _read_output
+
+        result = _read_output("/nonexistent/file.txt", None)
+        assert result == ""
 
 
 # ─── Live integration test (requires network) ────────────────────────────────

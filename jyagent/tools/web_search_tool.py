@@ -14,8 +14,10 @@ Engines:
 import json
 import logging
 import os
+import signal
 import subprocess
 import tempfile
+import time
 from urllib.parse import parse_qs, quote_plus, urlparse
 
 from ..toolresult import ToolResult
@@ -152,10 +154,46 @@ def _parse_codex_json(text: str) -> dict | None:
     return None
 
 
+_POLL_INTERVAL = 2.0   # seconds between liveness checks
+_KILL_GRACE = 5        # seconds to wait after SIGTERM before SIGKILL
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """Gracefully terminate a Popen process (SIGTERM → SIGKILL)."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=3)
+
+
+def _read_output(output_path: str | None, stdout_path: str | None) -> str:
+    """Read Codex output, preferring the -o file, falling back to stdout capture."""
+    for path in (output_path, stdout_path):
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    text = f.read().strip()
+                if text:
+                    return text
+            except OSError:
+                continue
+    return ""
+
+
 def _search_codex(
-    query: str, max_results: int = 10, timeout: int = 120,
+    query: str, max_results: int = 10, timeout: int = 180,
 ) -> tuple[list[dict], str]:
     """Search via Codex CLI with native web_search tool.
+
+    Uses ``Popen`` + poll loop instead of blocking ``subprocess.run()`` so that:
+    - The process can be gracefully terminated (SIGTERM → SIGKILL) on timeout.
+    - Partial output can be salvaged if Codex wrote results before the deadline.
+    - stdin is redirected from ``/dev/null`` to prevent interactive hangs.
+    - stderr is captured for diagnostics.
 
     Returns ``(results_list, synthesis_text)``.
     Both may be empty on failure.
@@ -165,14 +203,22 @@ def _search_codex(
 
     schema_path: str | None = None
     output_path: str | None = None
+    stdout_path: str | None = None
+    stderr_path: str | None = None
+    proc: subprocess.Popen | None = None
+
     try:
-        # Write JSON-Schema for --output-schema
+        # ── Temp files ───────────────────────────────────────────────────
         fd, schema_path = tempfile.mkstemp(suffix=".json", prefix="ws_schema_")
         with os.fdopen(fd, "w") as f:
             json.dump(_CODEX_SCHEMA, f)
 
         fd2, output_path = tempfile.mkstemp(suffix=".txt", prefix="ws_out_")
         os.close(fd2)
+
+        # Capture stdout/stderr to files (avoids PIPE-buffer deadlocks)
+        fd3, stdout_path = tempfile.mkstemp(suffix=".txt", prefix="ws_stdout_")
+        fd4, stderr_path = tempfile.mkstemp(suffix=".txt", prefix="ws_stderr_")
 
         prompt = (
             f"Search the web for: {query}\n"
@@ -193,19 +239,71 @@ def _search_codex(
 
         log.debug("web_search codex cmd: %s", " ".join(cmd))
 
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+        # ── Launch ───────────────────────────────────────────────────────
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=fd3,
+            stderr=fd4,
+            # Start a new process group so we can signal the whole tree
+            preexec_fn=os.setpgrp if hasattr(os, "setpgrp") else None,
         )
+        # Close our copies of the FDs — the child owns them now
+        os.close(fd3)
+        os.close(fd4)
 
-        # Prefer the -o output file (contains just the last model message)
-        raw = ""
-        if output_path and os.path.exists(output_path):
-            with open(output_path) as fout:
-                raw = fout.read().strip()
+        # ── Poll loop ────────────────────────────────────────────────────
+        deadline = time.monotonic() + timeout
+        timed_out = False
 
-        # Fallback to stdout
-        if not raw and proc.stdout:
-            raw = proc.stdout.strip()
+        while proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                proc.wait(timeout=min(_POLL_INTERVAL, max(0.1, remaining)))
+            except subprocess.TimeoutExpired:
+                pass
+
+        # ── Handle timeout ───────────────────────────────────────────────
+        if timed_out:
+            elapsed = int(time.monotonic() - (deadline - timeout))
+            log.warning(
+                "Codex web_search timed out after %ds — terminating (pid %d)",
+                elapsed, proc.pid,
+            )
+            _terminate_proc(proc)
+
+            # Try to salvage partial output
+            raw = _read_output(output_path, stdout_path)
+            if raw:
+                data = _parse_codex_json(raw)
+                if data and data.get("results"):
+                    results = data["results"][:max_results]
+                    synthesis = data.get("synthesis", "")
+                    log.info(
+                        "Salvaged %d results from timed-out Codex search",
+                        len(results),
+                    )
+                    return results, synthesis
+
+            return [], f"[Codex search timed out after {elapsed}s]"
+
+        # ── Process finished — read output ───────────────────────────────
+        if proc.returncode != 0:
+            stderr_text = ""
+            if stderr_path and os.path.exists(stderr_path):
+                try:
+                    with open(stderr_path) as f:
+                        stderr_text = f.read().strip()[:500]
+                except OSError:
+                    pass
+            log.warning(
+                "Codex web_search exited %d: %s", proc.returncode, stderr_text,
+            )
+
+        raw = _read_output(output_path, stdout_path)
 
         if not raw:
             log.warning("Codex web_search returned empty output")
@@ -213,7 +311,6 @@ def _search_codex(
 
         data = _parse_codex_json(raw)
         if data is None:
-            # Could not parse JSON; return raw text as synthesis
             log.warning("Codex web_search: JSON parse failed, returning raw text")
             return [], raw
 
@@ -221,14 +318,15 @@ def _search_codex(
         synthesis = data.get("synthesis", "")
         return results[:max_results], synthesis
 
-    except subprocess.TimeoutExpired:
-        log.warning("Codex web_search timed out after %ds", timeout)
-        return [], f"[Codex search timed out after {timeout}s]"
     except Exception as e:
         log.warning("Codex web_search error: %s", e)
         return [], f"[Codex search error: {e}]"
     finally:
-        for p in (schema_path, output_path):
+        # Kill process if still alive (safety net)
+        if proc is not None and proc.poll() is None:
+            _terminate_proc(proc)
+        # Clean up temp files
+        for p in (schema_path, output_path, stdout_path, stderr_path):
             if p:
                 try:
                     os.unlink(p)
