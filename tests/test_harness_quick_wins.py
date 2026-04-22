@@ -109,10 +109,14 @@ class TestCostTracker:
     """_CostTracker accumulates cost and detects budget exceeded."""
 
     def test_unknown_pricing(self):
-        """Unknown provider/model → known_cost returns None."""
+        """Unknown provider/model → call is counted as unpriced; ``cost``
+        still returns the running priced total (0 so far)."""
         ct = _CostTracker()
         ct.record({"input_tokens": 1000, "output_tokens": 500}, "unknown_provider", "unknown_model")
-        assert ct.known_cost is None
+        # Unpriced calls do NOT enter the running total (they'd distort the
+        # budget) but are tracked via a separate flag so the engine can warn.
+        assert ct.has_unpriced_usage is True
+        assert ct.cost == 0.0
 
     def test_known_pricing_accumulates(self):
         """Known provider/model → cost accumulates."""
@@ -123,14 +127,14 @@ class TestCostTracker:
             "anthropic", "claude-opus-4-6",
         )
         # 1M input tokens at $5/M = $5.00
-        assert ct.known_cost is not None
-        assert abs(ct.known_cost - 5.0) < 0.01
+        assert ct.has_unpriced_usage is False
+        assert abs(ct.cost - 5.0) < 0.01
 
     def test_zero_usage(self):
         """Empty usage → cost stays at 0."""
         ct = _CostTracker()
         ct.record({"input_tokens": 0, "output_tokens": 0}, "anthropic", "claude-opus-4-6")
-        assert ct.known_cost == 0.0
+        assert ct.cost == 0.0
 
     def test_multiple_records(self):
         """Multiple calls accumulate."""
@@ -144,8 +148,8 @@ class TestCostTracker:
             "anthropic", "claude-opus-4-6",
         )
         # $5 input + $25 output = $30
-        assert ct.known_cost is not None
-        assert abs(ct.known_cost - 30.0) < 0.01
+        assert ct.has_unpriced_usage is False
+        assert abs(ct.cost - 30.0) < 0.01
 
 
 # --- Response-aware stuck-loop detection ---

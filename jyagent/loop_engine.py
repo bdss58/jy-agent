@@ -11,7 +11,6 @@ import concurrent.futures
 import hashlib
 import json
 import random
-import re
 import sys
 import threading
 import time
@@ -159,32 +158,22 @@ def _t_as_dict(t: Any) -> dict:
         return {"content": str(getattr(t, "content", t))}
 
 
-# ─── Shared executors ────────────────────────────────────────────────────────
-# Tool execution uses two distinct mechanisms:
+# ─── Shared dispatch executor ────────────────────────────────────────────────
+# `_execute_tools()` fans out a parallel-safe batch onto this shared pool.
+# Order is preserved via index-keyed result slots, so out-of-order completion
+# (`as_completed`) doesn't scramble results.  Per-call concurrency is capped
+# by a BoundedSemaphore sized from LoopConfig.max_tool_workers — the shared
+# pool stays hot while each batch still honours its configured width.
 #
-#   1. `_tool_dispatch_executor` — fixed-size ThreadPoolExecutor used by
-#      `_execute_tools()` to fan out a parallel-safe batch.  Order is
-#      preserved via index-keyed slots.
-#
-#   2. Daemon thread per invocation — used inside `_execute_tool_with_timeout`
-#      to run the tool body with a hard wall-clock deadline.  Previously this
-#      was a second ThreadPoolExecutor (`_tool_body_executor`), but Python
-#      thread futures are not cancellable — a timed-out body permanently
-#      leaked a worker slot.  Daemon threads hold no pool slot and die with
-#      the process, eliminating the leak.
-#
-# `_tool_body_executor` is retained as a module attribute pointing at a
-# small pool for any external caller that grabs it directly (e.g. legacy
-# tests) but the engine itself no longer uses it.
+# Tool *bodies* (inside `_execute_tool_with_timeout`) do NOT use a pool —
+# they run in daemon threads so a timed-out body holds no pool slot and dies
+# with the process.  Python futures aren't cancellable, so pooling bodies
+# would permanently leak workers every time a tool timed out.
 
 _tool_dispatch_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=8, thread_name_prefix="jyagent-tool-dispatch",
 )
-_tool_body_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=16, thread_name_prefix="jyagent-tool-body-legacy",
-)
 atexit.register(_tool_dispatch_executor.shutdown, wait=False)
-atexit.register(_tool_body_executor.shutdown, wait=False)
 
 # Backwards-compat alias (callers that pass a pool explicitly).
 _tool_executor = _tool_dispatch_executor
@@ -200,18 +189,26 @@ class _CostTracker:
 
     Uses the session_stats pricing machinery but keeps a local running total
     so the loop can check against LoopConfig.max_cost_usd each step.
+
+    When a call's (provider, model) has no pricing entry, the call's tokens
+    are NOT included in the running total and ``unpriced_calls`` is bumped.
+    The budget check still runs on the partial total — i.e. the accounted
+    cost is a lower bound.  An earlier design returned ``None`` from
+    ``known_cost`` in that case, which silently disabled the budget entirely;
+    the current design reports a lower-bound cost and exposes
+    ``has_unpriced_usage`` so the caller can warn once.
     """
 
     def __init__(self):
         self.total_cost: float = 0.0
-        self._has_unknown = False
+        self.unpriced_calls: int = 0
 
     def record(self, usage: dict, provider: str, model: str) -> None:
         from .session_stats import _lookup_pricing
         pricing = _lookup_pricing(provider, model) if provider and model else None
         if pricing is None:
             if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
-                self._has_unknown = True
+                self.unpriced_calls += 1
             return
         input_t = usage.get("input_tokens", 0) or 0
         output_t = usage.get("output_tokens", 0) or 0
@@ -225,9 +222,14 @@ class _CostTracker:
         )
 
     @property
-    def known_cost(self) -> float | None:
-        """Return cost or None if any usage was unpriced."""
-        return None if self._has_unknown else self.total_cost
+    def has_unpriced_usage(self) -> bool:
+        return self.unpriced_calls > 0
+
+    @property
+    def cost(self) -> float:
+        """Best-effort running total in USD.  When ``has_unpriced_usage`` is
+        True, this is a lower bound — unpriced calls are not included."""
+        return self.total_cost
 
 
 class _StuckLoopDetector:
@@ -275,7 +277,11 @@ class _StuckLoopDetector:
 
     @staticmethod
     def _hash_response(content: str) -> str:
-        return hashlib.md5(content.encode(errors="replace")).hexdigest()
+        # Non-cryptographic: MD5 is fine for collision-detection here, and
+        # `usedforsecurity=False` silences security-linter false positives.
+        return hashlib.md5(
+            content.encode(errors="replace"), usedforsecurity=False,
+        ).hexdigest()
 
     def record(self, name: str, args: dict, response: str) -> str | None:
         """Record a single (tool, args, response) observation.
@@ -349,6 +355,27 @@ def _is_truncated(stop_reason: str, tool_calls: list[ToolCallRequest]) -> bool:
     return stop_reason == "length" and bool(tool_calls)
 
 
+def _strip_dangling_verification(messages: list) -> None:
+    """Remove a trailing unanswered ``[VERIFICATION]`` user message in-place.
+
+    The verification gate appends a user prompt asking the model to self-
+    check before returning.  If the loop exits before the model replies
+    (max_steps, KeyboardInterrupt, uncaught exception), that unanswered user
+    message would leak into the persisted session and poison the next turn.
+    Called from every terminal path that could fire *after* the gate.
+    """
+    if not messages:
+        return
+    tail = messages[-1]
+    if not isinstance(tail, dict):
+        return
+    if tail.get("role") != "user":
+        return
+    tail_content = tail.get("content", "")
+    if isinstance(tail_content, str) and tail_content.startswith("[VERIFICATION]"):
+        messages.pop()
+
+
 def _truncate_result(content: str, max_chars: int, is_error: bool = False) -> str:
     """Truncate a tool result string.  Error results are never truncated."""
     if len(content) <= max_chars or is_error:
@@ -410,19 +437,24 @@ def _compact_messages(
         # ── Tier 0: Thinking block pruning ──────────────────────────
         # Strip thinking blocks from all but the last few messages.
         #
-        # Provider-aware rule (P0 fix, 2026-04): Anthropic extended-thinking
-        # emits cryptographically-signed `thinking` blocks that are bound to
-        # the following `tool_use` block in the same assistant message.  If
-        # we strip the thinking block but keep the tool_use, the signature
-        # becomes invalid and the provider rejects the next turn.  So:
-        # preserve all `thinking` blocks in any message that also contains
-        # at least one `tool_use` block.  Safe across providers — non-
-        # Anthropic responses simply won't have the adjacency in the first
-        # place.
+        # Provider-aware rule (P0 fix): Anthropic extended-thinking emits
+        # cryptographically-signed `thinking` blocks that are bound to a
+        # following tool-invocation block in the same assistant message.
+        # If we strip the thinking block but keep the tool block, the
+        # signature becomes invalid and the provider rejects the next turn.
+        # So: preserve all `thinking` blocks in any message that also
+        # contains at least one tool-invocation block.  We check BOTH type
+        # names because the engine sees assistant messages in their
+        # normalized form (`tool_call`, per runtime.types.ToolCallBlock),
+        # while raw Anthropic-SDK payloads sometimes reach compaction with
+        # the provider-native `tool_use` name.  Safe across providers —
+        # non-Anthropic responses simply won't have the adjacency in the
+        # first place.
+        _TOOL_BLOCK_TYPES = ("tool_call", "tool_use")
         content = msg.get("content", "")
         if isinstance(content, list):
-            has_tool_use = any(
-                isinstance(b, dict) and b.get("type") == "tool_use"
+            has_tool_block = any(
+                isinstance(b, dict) and b.get("type") in _TOOL_BLOCK_TYPES
                 for b in content
             )
             filtered_blocks = []
@@ -430,7 +462,7 @@ def _compact_messages(
                 if (
                     isinstance(block, dict)
                     and block.get("type") == "thinking"
-                    and not has_tool_use
+                    and not has_tool_block
                 ):
                     did_compact = True
                     continue  # safe to drop
@@ -568,6 +600,12 @@ def _execute_tools(
 
     Parallel-safe tools run concurrently; state-mutating tools run sequentially
     as barriers between parallel batches.  Results are always in original order.
+
+    ``max_workers`` caps how many tool bodies may execute concurrently across
+    a parallel sub-batch.  A per-call ``BoundedSemaphore`` enforces this cap
+    on top of the shared dispatch pool so the shared pool can stay hot (with
+    a larger worker count) without violating per-loop concurrency preferences.
+    Sequential paths don't acquire permits — they're serial by construction.
     """
     if not blocks:
         return []
@@ -588,6 +626,10 @@ def _execute_tools(
             results.append((block, result))
         return results
 
+    # Per-batch concurrency cap (honours cfg.max_tool_workers).  Only applied
+    # on the parallel path — sequential calls are already serialised.
+    body_permits = threading.BoundedSemaphore(max(1, max_workers))
+
     # Partition into contiguous groups
     results_arr: list[tuple[ToolCallRequest, ToolResult] | None] = [None] * len(blocks)
     i = 0
@@ -601,7 +643,9 @@ def _execute_tools(
             pool = executor or _tool_dispatch_executor
             futures = {
                 pool.submit(
-                    _execute_tool_with_timeout, block.name, block.input, functions, registry, timeout
+                    _execute_tool_with_timeout,
+                    block.name, block.input, functions, registry, timeout,
+                    body_permits=body_permits,
                 ): (idx, block)
                 for idx, block in parallel_batch
             }
@@ -635,6 +679,7 @@ def _execute_tool_with_timeout(
     registry,
     default_timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
+    body_permits: threading.BoundedSemaphore | None = None,
 ) -> ToolResult:
     """Execute a tool body with a timeout.
 
@@ -654,6 +699,12 @@ def _execute_tool_with_timeout(
     that passed an explicit pool) but is now ignored.  Dispatch-level
     parallelism still uses ``_tool_dispatch_executor``; only the inner
     timeout wrapper changed.
+
+    ``body_permits`` (optional) caps concurrent live tool bodies to honour
+    ``LoopConfig.max_tool_workers`` independent of the dispatch-pool width.
+    Released as soon as ``done.wait(timeout)`` returns, so a tool that
+    times out does not hold a permit while its daemon thread continues in
+    the background.
     """
     timeout = default_timeout
     hint = registry.get_timeout_hint(name)
@@ -677,14 +728,21 @@ def _execute_tool_with_timeout(
         finally:
             done.set()
 
-    t = threading.Thread(
-        target=_run_body,
-        name=f"jyagent-tool-body:{name}",
-        daemon=True,
-    )
-    t.start()
+    if body_permits is not None:
+        body_permits.acquire()
+    try:
+        t = threading.Thread(
+            target=_run_body,
+            name=f"jyagent-tool-body:{name}",
+            daemon=True,
+        )
+        t.start()
+        timed_out = not done.wait(timeout)
+    finally:
+        if body_permits is not None:
+            body_permits.release()
 
-    if not done.wait(timeout):
+    if timed_out:
         # Timeout — the daemon thread continues running but holds no pool
         # slot, so there's nothing to leak.  We just report the timeout.
         return ToolResult(
@@ -1014,6 +1072,7 @@ class AgentLoop:
         if trace:
             trace.start(effective_spec.provider, effective_spec.model)
         cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
+        unpriced_warned = False  # one-shot flag for cost_tracker.has_unpriced_usage
         stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
 
         # Resolve tools
@@ -1145,16 +1204,27 @@ class AgentLoop:
                         effective_spec.provider,
                         effective_spec.model,
                     )
-                    known = cost_tracker.known_cost
-                    if known is not None and known >= cfg.max_cost_usd:
+                    # One-shot warning if any call lacked pricing data.  The
+                    # budget still enforces on the priced subtotal (lower
+                    # bound) — silent "None ⇒ skip" would disable the gate.
+                    if cost_tracker.has_unpriced_usage and not unpriced_warned:
+                        unpriced_warned = True
                         self._fire(
                             "on_warning",
-                            f"Cost budget exceeded: ${known:.4f} >= ${cfg.max_cost_usd:.4f}",
+                            f"Cost budget using lower bound: "
+                            f"{cost_tracker.unpriced_calls} call(s) had no pricing data "
+                            f"({effective_spec.provider}/{effective_spec.model}).",
+                        )
+                    current_cost = cost_tracker.cost
+                    if current_cost >= cfg.max_cost_usd:
+                        self._fire(
+                            "on_warning",
+                            f"Cost budget exceeded: ${current_cost:.4f} >= ${cfg.max_cost_usd:.4f}",
                         )
                         if trace:
                             trace.add_span(step=step, event_type="cost_check", success=False,
                                            error=f"budget ${cfg.max_cost_usd} exceeded")
-                            trace.finish(status="cost_limit", total_steps=step + 1, total_cost_usd=known)
+                            trace.finish(status="cost_limit", total_steps=step + 1, total_cost_usd=current_cost)
                             trace.flush()
                         return LoopResult(
                             status="cost_limit",
@@ -1165,7 +1235,7 @@ class AgentLoop:
                             total_input_tokens=total_input_tokens,
                             total_output_tokens=total_output_tokens,
                             tool_calls_count=tool_calls_count,
-                            error=f"Cost budget exceeded: ${known:.4f} >= ${cfg.max_cost_usd:.4f}",
+                            error=f"Cost budget exceeded: ${current_cost:.4f} >= ${cfg.max_cost_usd:.4f}",
                         )
 
                 all_text += step_text
@@ -1217,7 +1287,7 @@ class AgentLoop:
 
                     # ── Flush trace ────────────────────────────────────
                     if trace:
-                        cost = cost_tracker.known_cost if cost_tracker else 0.0
+                        cost = cost_tracker.cost if cost_tracker else 0.0
                         trace.finish(status="completed", total_steps=step + 1, total_cost_usd=cost or 0.0)
                         trace.flush()
 
@@ -1371,7 +1441,7 @@ class AgentLoop:
                     self._fire("on_warning", stuck_feedback)
                     if trace:
                         trace.add_span(step=step, event_type="dedup_break", success=False, error=stuck_feedback)
-                        cost = cost_tracker.known_cost if cost_tracker else 0.0
+                        cost = cost_tracker.cost if cost_tracker else 0.0
                         trace.finish(status="dedup_break", total_steps=step + 1, total_cost_usd=cost or 0.0)
                         trace.flush()
                     return LoopResult(
@@ -1462,12 +1532,8 @@ class AgentLoop:
             # it doesn't leak into the persisted session and poison the next
             # turn.  The boundary guard above should already prevent this,
             # but we clean up anyway in case of a race.
-            if verification_injected and messages:
-                tail = messages[-1]
-                tail_content = tail.get("content", "") if isinstance(tail, dict) else ""
-                if tail.get("role") == "user" and isinstance(tail_content, str) \
-                        and tail_content.startswith("[VERIFICATION]"):
-                    messages.pop()
+            if verification_injected:
+                _strip_dangling_verification(messages)
 
             if cfg.fallback_on_max_steps:
                 # Try one more streaming call with system instruction to avoid tools
@@ -1534,7 +1600,7 @@ class AgentLoop:
 
             # ── Trace max_steps ────────────────────────────────────────
             if trace:
-                cost = cost_tracker.known_cost if cost_tracker else 0.0
+                cost = cost_tracker.cost if cost_tracker else 0.0
                 trace.finish(status="max_steps", total_steps=cfg.max_steps, total_cost_usd=cost or 0.0)
                 trace.flush()
 
@@ -1550,6 +1616,8 @@ class AgentLoop:
             )
 
         except KeyboardInterrupt:
+            if verification_injected:
+                _strip_dangling_verification(messages)
             if trace:
                 trace.finish(status="interrupted", total_steps=step + 1)
                 trace.flush()
@@ -1564,6 +1632,8 @@ class AgentLoop:
                 tool_calls_count=tool_calls_count,
             )
         except Exception as e:
+            if verification_injected:
+                _strip_dangling_verification(messages)
             if trace:
                 trace.finish(status="error", total_steps=step + 1)
                 trace.flush()

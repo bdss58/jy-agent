@@ -11,21 +11,34 @@ import pytest
 # ─── Phase 1: P0.1 + P0.2 — Observation masking + thinking pruning ──────────
 
 def test_thinking_blocks_pruned_from_old_messages():
-    """Tier 0: thinking blocks are stripped from all but the last 2 messages."""
+    """Tier 0: thinking blocks are stripped from old messages, EXCEPT when
+    they sit alongside a tool-invocation block in the same assistant message
+    (Anthropic extended-thinking signatures are bound to the adjacent
+    tool_use/tool_call and must not be separated — stripping them would
+    invalidate the cryptographic signature and the provider would reject
+    the next turn).
+    """
     from jyagent.loop_engine import _compact_messages
     import jyagent.tools  # noqa: triggers registration
 
     messages = []
     for i in range(6):
-        messages.append({
-            "role": "assistant",
-            "content": [
+        # Alternate: even-indexed assistants have a tool_call + thinking
+        # (must be preserved together); odd-indexed have thinking but no
+        # tool_call (free to strip).
+        if i % 2 == 0:
+            assistant_content = [
                 {"type": "thinking", "thinking": f"Thinking #{i} " + "x" * 200},
                 {"type": "text", "text": f"Response #{i}"},
                 {"type": "tool_call", "id": f"tc_{i}", "name": "run_shell",
                  "arguments": {"command": "ls"}},
-            ],
-        })
+            ]
+        else:
+            assistant_content = [
+                {"type": "thinking", "thinking": f"Thinking #{i} " + "x" * 200},
+                {"type": "text", "text": f"Response #{i}"},
+            ]
+        messages.append({"role": "assistant", "content": assistant_content})
         messages.append({
             "role": "tool_result", "tool_call_id": f"tc_{i}",
             "tool_name": "run_shell", "content": "output " * 500,
@@ -34,12 +47,30 @@ def test_thinking_blocks_pruned_from_old_messages():
     result = _compact_messages(messages, max_tokens=1000, compact_chars=2000)
     assert result is not messages
 
-    # Old messages (all but last 2) should have no thinking blocks
-    for i in range(len(result) - 2):
-        content = result[i].get("content", "")
-        if isinstance(content, list):
-            thinking = [b for b in content if isinstance(b, dict) and b.get("type") == "thinking"]
-            assert len(thinking) == 0, f"Message {i} still has {len(thinking)} thinking blocks"
+    # Walk old messages (all but last 2) and check thinking-block state.
+    for i, msg in enumerate(result[:-2]):
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            continue
+        has_tool_block = any(
+            isinstance(b, dict) and b.get("type") in ("tool_call", "tool_use")
+            for b in content
+        )
+        thinking_blocks = [
+            b for b in content if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        if has_tool_block:
+            # Must keep the thinking block — signature integrity.
+            assert len(thinking_blocks) > 0, (
+                f"Message {i} has a tool_call but its thinking block was "
+                f"stripped — Anthropic signature would break"
+            )
+        else:
+            # Safe to strip.
+            assert len(thinking_blocks) == 0, (
+                f"Message {i} still has {len(thinking_blocks)} thinking "
+                f"blocks and has no tool_call to protect them"
+            )
 
 
 def test_observation_masking_clears_far_tool_results():

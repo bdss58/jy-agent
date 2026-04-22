@@ -21,7 +21,6 @@ from jyagent import loop_engine as le
 from jyagent.loop_engine import (
     _execute_tool_with_timeout,
     _execute_tools,
-    _tool_body_executor,
     _tool_dispatch_executor,
     ToolCallRequest,
 )
@@ -62,15 +61,13 @@ def _sleep_tool(ms: int):
 
 
 class TestNoNestedPoolDeadlock:
-    """Module-level pools must be distinct so nested submits don't deadlock.
+    """Parallel batches must not deadlock on the shared dispatch pool.
 
     Bug: with a single shared pool of N workers, a parallel batch of N tools
-    would each submit an inner body future that could never acquire a worker.
-    The scheduler would block forever.
+    each submitting an inner body future would exhaust the pool and block
+    forever.  The current design puts tool bodies on daemon threads, not a
+    second pool — so there's no inner-future contention to deadlock on.
     """
-
-    def test_dispatch_and_body_pools_are_distinct(self):
-        assert _tool_dispatch_executor is not _tool_body_executor
 
     def test_backcompat_alias_points_to_dispatch(self):
         assert le._tool_executor is _tool_dispatch_executor
@@ -429,7 +426,13 @@ class TestVerificationGateBoundary:
 
     def test_max_steps_handler_pops_dangling_verification(self):
         """Defense-in-depth: if somehow a verification prompt ends up at the
-        tail of messages when max_steps is hit, the loop must pop it.
+        tail of messages when max_steps is hit, the loop must clear it.
+
+        After the P2 refactor, cleanup is delegated to the
+        ``_strip_dangling_verification`` helper — the behavioural contract
+        (pop a trailing [VERIFICATION] user message) is unchanged.  See
+        ``TestVerificationCleanupParity`` for helper-level coverage across
+        all three exit paths.
         """
         import inspect
         source = inspect.getsource(le.AgentLoop._run_impl)
@@ -437,15 +440,8 @@ class TestVerificationGateBoundary:
         anchor = source.find("# Max steps reached")
         assert anchor != -1
         tail_block = source[anchor : anchor + 2500]
-        assert "verification_injected and messages" in tail_block, (
+        assert "_strip_dangling_verification(messages)" in tail_block, (
             "Missing dangling-[VERIFICATION] cleanup in the max_steps handler."
-        )
-        assert 'startswith("[VERIFICATION]")' in tail_block, (
-            "Cleanup must identify the dangling prompt via the "
-            "[VERIFICATION] marker."
-        )
-        assert "messages.pop()" in tail_block, (
-            "Cleanup must pop the dangling user message."
         )
 
 
@@ -976,4 +972,287 @@ class TestDaemonThreadTimeout:
         assert "future.cancel(" not in code_nodes, (
             "future.cancel() is a no-op on thread futures and must not be "
             "used as the timeout strategy"
+        )
+
+
+# ─── Compaction preserves thinking paired with normalized `tool_call` ────────
+
+
+class TestCompactionThinkingPairedWithToolCall:
+    """The engine sees normalized assistant messages where the tool-invocation
+    block type is `tool_call` (see runtime.types.ToolCallBlock).  Compaction's
+    thinking-block pruner must therefore protect adjacency with BOTH the
+    provider-native `tool_use` name AND the normalized `tool_call` name —
+    otherwise signed-thinking/tool_use pairs get stripped in production even
+    though the `tool_use`-only test passes on synthetic input.
+    """
+
+    def _make_conv(self, tool_block_type: str, n_padding: int = 30):
+        signed_assistant = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Reasoning...", "signature": "SIG-AB"},
+                {
+                    "type": tool_block_type,
+                    "id": "tcall",
+                    "name": "read_file",
+                    # `tool_call` uses `arguments`, `tool_use` uses `input`
+                    ("arguments" if tool_block_type == "tool_call" else "input"): {"path": "/x"},
+                },
+            ],
+        }
+        padding = []
+        for i in range(n_padding):
+            padding.append({"role": "user", "content": "x" * 5_000})
+            padding.append({
+                "role": "tool_result",
+                "tool_call_id": f"p{i}",
+                "tool_name": "read_file",
+                "content": "y" * 5_000,
+            })
+        return [signed_assistant] + padding + [
+            {"role": "user", "content": "final prompt"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        ], signed_assistant
+
+    def test_thinking_preserved_when_paired_with_tool_call(self):
+        msgs, _ = self._make_conv(tool_block_type="tool_call")
+        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200)
+        assert compacted is not msgs, "compaction did not run — test setup issue"
+        # Locate the signed assistant message.
+        signed_after = None
+        for m in compacted:
+            if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("id") == "tcall":
+                        signed_after = m
+                        break
+        assert signed_after is not None, "signed assistant message lost"
+        block_types = [b.get("type") for b in signed_after["content"] if isinstance(b, dict)]
+        assert "thinking" in block_types, (
+            "`thinking` block was stripped from a normalized assistant message "
+            "that contains a `tool_call` block — this breaks Anthropic extended "
+            "thinking signatures when the message is re-serialized for the next "
+            "turn."
+        )
+        # Order preserved: thinking before tool_call.
+        assert block_types.index("thinking") < block_types.index("tool_call")
+
+
+# ─── Verification cleanup parity across exit paths ───────────────────────────
+
+
+class TestVerificationCleanupParity:
+    """The dangling-[VERIFICATION] cleanup must run on every terminal path that
+    fires AFTER the gate could have injected the prompt — not just max_steps.
+
+    Otherwise a KeyboardInterrupt or uncaught exception between the gate's
+    inject-and-continue step and the model's follow-up reply leaves the
+    unanswered user message at the tail of `messages`, poisoning the next
+    persisted turn.
+    """
+
+    def test_helper_strips_only_trailing_verification(self):
+        """Direct test of the helper: idempotent, guards non-dict tail."""
+        # Positive: trailing VERIFICATION user message is popped.
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": "[VERIFICATION] please self-check"},
+        ]
+        le._strip_dangling_verification(msgs)
+        assert len(msgs) == 2
+        assert msgs[-1]["role"] == "assistant"
+
+        # Negative: non-VERIFICATION tail is left alone.
+        msgs2 = [{"role": "user", "content": "normal"}]
+        le._strip_dangling_verification(msgs2)
+        assert len(msgs2) == 1
+
+        # Empty list is a no-op.
+        empty: list = []
+        le._strip_dangling_verification(empty)
+        assert empty == []
+
+        # Non-dict tail is a no-op (guard against malformed input).
+        mixed = [{"role": "user", "content": "hi"}, "not-a-dict"]
+        le._strip_dangling_verification(mixed)
+        assert mixed == [{"role": "user", "content": "hi"}, "not-a-dict"]
+
+    def test_source_calls_helper_in_max_steps_path(self):
+        import inspect
+        source = inspect.getsource(le.AgentLoop._run_impl)
+        anchor = source.find("# Max steps reached")
+        assert anchor != -1
+        tail_block = source[anchor : anchor + 3000]
+        assert "_strip_dangling_verification(messages)" in tail_block, (
+            "max_steps path must call _strip_dangling_verification(messages)"
+        )
+
+    def test_source_calls_helper_in_keyboardinterrupt_path(self):
+        """The outer KeyboardInterrupt handler (the one that finalises the
+        trace with status='interrupted') must strip the dangling prompt.
+
+        There is an inner ``except KeyboardInterrupt: raise`` nested inside
+        the max_steps fallback try/except — that one is intentionally a
+        bare re-raise, so we skip past it and assert on the outer handler.
+        """
+        import inspect
+        source = inspect.getsource(le.AgentLoop._run_impl)
+        # Find every ``except KeyboardInterrupt:`` and keep the one whose
+        # body contains the interrupted-trace finalisation.
+        import re as _re
+        outer_handler = None
+        for m in _re.finditer(r"except KeyboardInterrupt:", source):
+            window = source[m.start() : m.start() + 800]
+            if 'status="interrupted"' in window:
+                outer_handler = window
+                break
+        assert outer_handler is not None, (
+            "Could not locate the outer KeyboardInterrupt handler in _run_impl"
+        )
+        assert "_strip_dangling_verification(messages)" in outer_handler, (
+            "KeyboardInterrupt handler must strip dangling [VERIFICATION] so "
+            "Ctrl-C mid-turn doesn't leak the unanswered prompt into the next "
+            "persisted session"
+        )
+
+    def test_source_calls_helper_in_exception_path(self):
+        """The outer generic Exception handler (the one that finalises the
+        trace with status='error') must strip the dangling prompt."""
+        import inspect
+        import re as _re
+        source = inspect.getsource(le.AgentLoop._run_impl)
+        outer_handler = None
+        for m in _re.finditer(r"except Exception as e:", source):
+            window = source[m.start() : m.start() + 1500]
+            if 'status="error"' in window:
+                outer_handler = window
+                break
+        assert outer_handler is not None, (
+            "Could not locate the outer Exception handler in _run_impl"
+        )
+        assert "_strip_dangling_verification(messages)" in outer_handler, (
+            "generic Exception handler must also clean up the dangling prompt"
+        )
+
+
+# ─── max_tool_workers honours LoopConfig ─────────────────────────────────────
+
+
+class TestMaxToolWorkersApplied:
+    """`LoopConfig.max_tool_workers` must actually cap concurrent tool-body
+    execution.  Historically the value was threaded through `_execute_tools`
+    but never applied — the shared dispatch pool (8 workers) always dictated
+    parallelism.  A per-call BoundedSemaphore now honours the config.
+    """
+
+    def test_semaphore_caps_concurrent_bodies(self):
+        """With max_workers=2, only 2 of 5 parallel-safe tools run at once."""
+        import concurrent.futures as cf
+
+        registry = _FakeRegistry(parallel_safe=True)
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        event = threading.Event()
+
+        def _tracked(label: str = "x"):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            # Hold until enough observations are in — but short overall so
+            # even if the cap is broken the test finishes.
+            event.wait(0.3)
+            with lock:
+                active -= 1
+            return f"{label}-done"
+
+        n = 5
+        blocks = [
+            ToolCallRequest(id=f"id{i}", name="t", input={"label": f"t{i}"})
+            for i in range(n)
+        ]
+        functions = {"t": _tracked}
+
+        t0 = time.perf_counter()
+        caller = cf.ThreadPoolExecutor(max_workers=1)
+        fut = caller.submit(
+            _execute_tools,
+            blocks=blocks,
+            functions=functions,
+            registry=registry,
+            concurrent_mode=True,
+            max_workers=2,
+            timeout=5,
+        )
+        # Give the batch a moment to saturate the cap, then release.
+        time.sleep(0.1)
+        event.set()
+        results = fut.result(timeout=5.0)
+        caller.shutdown(wait=True)
+        elapsed = time.perf_counter() - t0
+
+        assert len(results) == n
+        assert all(not r.is_error for _, r in results)
+        assert peak <= 2, (
+            f"max_tool_workers=2 was ignored — saw peak={peak} concurrent bodies"
+        )
+        # Sanity: with cap=2 and 5 tools of ~0.3s hold-then-release, the
+        # floor is two hold waves (~0.3s + ~0.3s). Generous upper bound so
+        # CI jitter doesn't flake.
+        assert elapsed < 3.0, f"unexpected slowdown: {elapsed:.2f}s"
+
+
+# ─── _CostTracker reports lower bound when pricing is unknown ────────────────
+
+
+class TestCostTrackerLowerBound:
+    """Unknown pricing must report a lower-bound ``cost`` with
+    ``has_unpriced_usage`` set — the old ``known_cost → None`` sentinel
+    silently disabled the budget check on any unpriced call.
+    """
+
+    def test_cost_excludes_unpriced_and_flags_it(self):
+        tracker = le._CostTracker()
+        # One priced call at a known-to-exist model; one call at a bogus
+        # provider that lookup will miss.
+        tracker.record(
+            {"input_tokens": 1000, "output_tokens": 500},
+            "anthropic", "claude-opus-4-6",
+        )
+        priced_only = tracker.cost
+        assert priced_only > 0, "priced call should have produced non-zero cost"
+        assert not tracker.has_unpriced_usage
+        assert tracker.unpriced_calls == 0
+
+        tracker.record(
+            {"input_tokens": 1000, "output_tokens": 500},
+            "bogus-provider", "does-not-exist",
+        )
+        # Unpriced call must NOT alter the running total, only the flag.
+        assert tracker.cost == priced_only, (
+            "unpriced call tokens must not enter the running total — they'd "
+            "fabricate a number that isn't backed by pricing data"
+        )
+        assert tracker.has_unpriced_usage
+        assert tracker.unpriced_calls == 1
+
+    def test_budget_gate_does_not_silently_disable_on_unpriced(self):
+        """Source-level assertion: the budget check uses tracker.cost, not a
+        None-returning sentinel — so the gate still fires even when some
+        calls were unpriced."""
+        import inspect
+        source = inspect.getsource(le.AgentLoop._run_impl)
+        assert "cost_tracker.cost" in source, (
+            "budget check must consume cost_tracker.cost (partial total)"
+        )
+        assert "cost_tracker.known_cost" not in source, (
+            "regression: known_cost returned None on unpriced usage, which "
+            "silently disabled the budget"
+        )
+        assert "has_unpriced_usage" in source, (
+            "loop must surface has_unpriced_usage via on_warning so the "
+            "lower-bound nature of the budget is visible"
         )
