@@ -32,12 +32,15 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - User launches jy-agent from home dir (`~`), NOT project root — always prefix paths with the project root in tool calls
 - Python 3.14 `.venv` has broken CA certs; HTTP clients often need `verify=False` fallback
 - Dependency lockfile: `uv.lock`
+- Working on offline image update process for OpenClaw shipped to customer hosts (see `topics/openclaw-offline-update.md`)
+- K8s test host: `wan2` (`wan2.think-force.com`), `kubectl port-forward` on port 31555
 
 ## Topic Files Index
 - **memory-design.md** — Three-tier memory architecture (this file's design rationale + routing rules). Read this if asked to refactor or extend the memory system.
 - **agent-loop-changelog.md** — Loop engine internals (TODO scratchpad, reflection, phases, checkpoints, sub-agent envelope) + `run_background` hardening detail. Read on questions about loop_engine, todos, reflection, phases, checkpoint, or background tooling.
 - **skill-router-fix.md** — Why the skill LLM router was silently broken and the `complete_text(reasoning=...)` fix. Read on questions about skill routing, `_route_llm`, or the `validate_anthropic_reasoning` ValueError.
 - **gfw-proxy-fallback.md** — SSH SOCKS5 tunnel workflow for GFW-blocked hosts (ghcr.io, raw.githubusercontent.com, huggingface.co, etc.). Read when a network call fails against a likely-blocked host.
+- **openclaw-offline-update.md** — OpenClaw offline bundle update process (preflight, docker-compose schema migration, build-artifact staleness). Read on any OpenClaw customer-deployment question.
 - **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read on any session mentioning nano-vLLM / learning / LLM study.
 
 ## Repo Snapshot
@@ -52,6 +55,8 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - `contextvars.ContextVar` is NOT auto-propagated by `ThreadPoolExecutor.submit()` (Python 3.14.3). Use `ctx = contextvars.copy_context(); executor.submit(ctx.run, fn, ...)` to propagate.
 - Daemon threads don't propagate `ContextVar` after spawn — use per-loop closures for tool state, not `ContextVar`.
 - Codex CLI `--sandbox` flag (read-only / workspace-write / danger-full-access) only restricts **filesystem access** for model-generated shell commands. It does NOT restrict network / web search. Never blame sandbox mode for web-search issues.
+- `kubectl port-forward` defaults to binding 127.0.0.1 only. Use `--address 0.0.0.0` to expose externally.
+- After modifying a build artifact (tarball/bundle), **re-run the build and verify** (`tar tzf | grep <file>`). Patching the build script alone does not refresh the artifact, and `scp`'ing a file into an already-extracted remote dir hides the bug.
 
 ## Durable Tips
 - **Mutating Anthropic `system_prompt` breaks prompt caching** — inject dynamic context as a non-persisted tail message block instead. (This is also why MEMORY.md must stay stable across a session.)
