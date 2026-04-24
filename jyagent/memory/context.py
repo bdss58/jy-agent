@@ -38,10 +38,17 @@ def build_memory_context(query: str = "") -> str:
 {full_text}{topic_listing}
 ═══ END MEMORY ═══
 
-Memory instructions:
-- MEMORY.md is the index. Keep it concise (under 200 lines). 
-- Move detailed knowledge to topic files in data/memory/topics/<name>.md
-- Read topic files on-demand with read_file when you need details.
-- To remember something: use manage_memory tool, or directly write files.
-- To reorganize: rewrite MEMORY.md and topic files with write_file.
+Memory tier model (do not violate):
+  Tier 1 — MEMORY.md: ALWAYS LOADED, hard cap 200 lines / 25 KB. Durable rules
+           and facts only. Bloat causes attention degradation + cache invalidation.
+  Tier 2 — data/memory/topics/<name>.md: curated detail, read on demand.
+  Tier 3 — data/memory/journal/YYYY-MM.md: append-only session notes; NEVER
+           auto-loaded. The home for "what I did today" / commit-style entries.
+
+Routing:
+  - Durable rule (passes "would removing cause a future mistake?") → manage_memory(action='remember')
+  - Extended detail / curated knowledge → manage_memory(action='topic', text='write:<name>|<body>')
+  - Chronological session note → manage_memory(action='journal', text=..., category=...)
+  - Audit MEMORY.md for bloat / dedup → manage_memory(action='consolidate')
+  - Read topic / journal on demand with read_file.
 """

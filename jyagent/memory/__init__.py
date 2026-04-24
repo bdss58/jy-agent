@@ -10,6 +10,8 @@ from .operations import (
     read_memory_md, read_memory_index, write_memory_md, append_memory_md,
     forget_from_memory_md,
     list_topics, read_topic, read_topic_body, read_topic_meta, write_topic, delete_topic,
+    list_journals, read_journal, append_journal,
+    memory_index_size_warning, consolidate_memory,
     remember, forget, show_memory,
 )
 from .context import build_memory_context

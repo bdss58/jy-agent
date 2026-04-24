@@ -2,6 +2,7 @@
 # These are the functions called by the manage_memory tool facade.
 
 import os
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,7 @@ MAX_MEMORY_INDEX_BYTES = _cfg.MAX_MEMORY_INDEX_BYTES
 def ensure_dirs() -> None:
     os.makedirs(os.path.dirname(_cfg.MEMORY_MD_FILE), exist_ok=True)
     os.makedirs(_cfg.TOPICS_DIR, exist_ok=True)
+    os.makedirs(_cfg.JOURNAL_DIR, exist_ok=True)
 
 
 # ─── MEMORY.md operations ─────────────────────────────────────────────────────
@@ -364,13 +366,320 @@ def delete_topic(name: str) -> bool:
         return False
 
 
+# ─── Journal tier (Tier 3: never auto-loaded) ────────────────────────────────
+#
+# Why a separate tier? Anthropic Claude Code docs and the consensus across
+# Letta/Mem0/LangMem/Zep/A-MEM are unanimous: chronological "what I did today"
+# notes do NOT belong in the always-loaded memory file. They cause:
+#   - prompt-cache invalidation (mutating the cached prefix → ~12× cost penalty)
+#   - context rot (NoLiMa: Claude 3.5 Sonnet effective length only ~4K tokens)
+#   - "lost in the middle" attention degradation (Liu et al., TACL 2023)
+#
+# Journal entries live under data/memory/journal/YYYY-MM.md and are read on
+# demand only (e.g. "what did we work on last Tuesday?"). They are NOT injected
+# into the system prompt.
+
+_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+def _journal_path(month: str | None = None) -> str:
+    """Return the journal file path for the given month (YYYY-MM).
+
+    Validates ``month`` to prevent path traversal (``../../etc/passwd``) —
+    low-severity in a single-user agent, but cheap to close the door on a
+    future caller passing user-controlled strings.
+    """
+    if month is None:
+        month = datetime.now(ASIA_SHANGHAI_TZ).strftime("%Y-%m")
+    if not _MONTH_RE.match(month):
+        raise ValueError(f"journal month must match YYYY-MM, got {month!r}")
+    return os.path.join(_cfg.JOURNAL_DIR, f"{month}.md")
+
+
+def list_journals() -> list[str]:
+    """List all journal months (YYYY-MM strings), newest first."""
+    ensure_dirs()
+    months = []
+    if os.path.exists(_cfg.JOURNAL_DIR):
+        for f in os.listdir(_cfg.JOURNAL_DIR):
+            if f.endswith(".md") and _MONTH_RE.match(f[:-3]):
+                months.append(f[:-3])
+    return sorted(months, reverse=True)
+
+
+def read_journal(month: str | None = None) -> str:
+    """Read a single journal month. Empty string if no entries."""
+    ensure_dirs()
+    path = _journal_path(month)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def append_journal(text: str, category: str = "note") -> str:
+    """Append a dated entry to the current month's journal file.
+
+    Returns the journal-relative path that was written, so callers (and the
+    agent) know where the note lives without having to guess.
+
+    Concurrency: the header is written via O_CREAT|O_EXCL so two parallel
+    sub-agents racing on the first entry of a fresh month cannot produce a
+    duplicate ``# Journal —`` heading. The body write uses plain append mode;
+    on POSIX a single ``write()`` under ``O_APPEND`` is atomic up to
+    ``PIPE_BUF`` (4 KB on macOS) — entries longer than that can interleave at
+    the file level. That's an acceptable trade-off for a human-readable
+    journal and matches how most structured-log files behave.
+    """
+    ensure_dirs()
+    now = datetime.now(ASIA_SHANGHAI_TZ)
+    month = now.strftime("%Y-%m")
+    timestamp = now.strftime("%Y-%m-%d %H:%M")
+    path = _journal_path(month)
+
+    # Race-free header install: whoever wins the O_EXCL create writes the
+    # header; everyone else raises FileExistsError and skips straight to the
+    # append step.
+    header = (
+        f"# Journal — {month}\n\n"
+        "Tier 3 / append-only / NEVER auto-loaded. Chronological session "
+        "notes live here so they don't pollute MEMORY.md (the always-loaded "
+        "index) or topic files (curated knowledge).\n\n"
+    )
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, header.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        pass  # another writer already installed the header — safe to append
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"## {timestamp} [{category}]\n{text.rstrip()}\n\n")
+
+    return f"data/memory/journal/{month}.md"
+
+
+# ─── Size-warning helper (soft cap) ──────────────────────────────────────────
+
+def memory_index_size_warning() -> str | None:
+    """Return a one-line warning if MEMORY.md is approaching the load cap.
+
+    Soft thresholds (configurable):
+      - lines >= MEMORY_INDEX_WARN_LINES (default 150 / hard cap 200)
+      - bytes >= MEMORY_INDEX_WARN_BYTES (default 18 KB / hard cap 25 KB)
+
+    Anthropic guidance: "target under 200 lines per CLAUDE.md file. Longer
+    files consume more context and reduce adherence." Bloated memory files
+    cause the model to ignore actual instructions.
+
+    Returns None if memory is healthy. Returns a printable warning otherwise.
+    """
+    content = read_memory_md()
+    if not content:
+        return None
+    line_count = len(content.splitlines())
+    byte_count = len(content.encode("utf-8"))
+
+    warn_lines = _cfg.MEMORY_INDEX_WARN_LINES
+    warn_bytes = _cfg.MEMORY_INDEX_WARN_BYTES
+    cap_lines = _cfg.MAX_MEMORY_INDEX_LINES
+    cap_bytes = _cfg.MAX_MEMORY_INDEX_BYTES
+
+    over_lines = line_count >= warn_lines
+    over_bytes = byte_count >= warn_bytes
+    if not (over_lines or over_bytes):
+        return None
+
+    bits = []
+    if over_lines:
+        bits.append(f"{line_count} lines (warn at {warn_lines}, hard cap {cap_lines})")
+    if over_bytes:
+        bits.append(f"{byte_count} bytes (warn at {warn_bytes}, hard cap {cap_bytes})")
+    return (
+        "⚠️ MEMORY.md approaching load cap: "
+        + "; ".join(bits)
+        + ". Move detail into topics/<name>.md (curated) or journal/YYYY-MM.md (chronological)."
+    )
+
+
+# ─── Consolidate (dedup analysis, no LLM call) ───────────────────────────────
+
+def consolidate_memory() -> str:
+    """Analyze MEMORY.md for likely-duplicate entries and report groupings.
+
+    Pure heuristic / read-only — does NOT delete anything. The agent can use
+    the report to decide which entries to merge or move out manually.
+
+    Heuristics:
+      1. Group lines by category tag (`[gotcha]`, `[tip]`, `[note]`, etc.)
+      2. Flag categories with >5 entries (consolidation candidates)
+      3. Within each large category, flag pairs whose significant-token sets
+         overlap by >=4 (likely related topics). Token extraction covers
+         ASCII identifiers, version numbers, and CJK words so the heuristic
+         works on bilingual memory.
+      4. Always flag any line longer than 400 chars (belongs in a topic file)
+      5. Always flag any categorized line with a YYYY-MM-DD date in its body
+         (likely belongs in the journal tier, not the index)
+    """
+    content = read_memory_md()
+    if not content:
+        return "MEMORY.md is empty — nothing to consolidate."
+
+    lines = content.splitlines()
+    cat_re = re.compile(r"^\[(?P<cat>[a-z_]+)\]\s*(?P<body>.*)$", re.IGNORECASE)
+
+    by_cat: dict[str, list[tuple[int, str]]] = {}
+    long_lines: list[tuple[int, str]] = []
+    journal_candidates: list[tuple[int, str, str]] = []  # (line_no, category, preview)
+    date_re = re.compile(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b")
+
+    for idx, line in enumerate(lines, start=1):
+        m = cat_re.match(line.strip())
+        if not m:
+            continue
+        cat = m.group("cat").lower()
+        body = m.group("body")
+        by_cat.setdefault(cat, []).append((idx, body))
+        if len(line) > 400:
+            long_lines.append((idx, body[:80]))
+        # Dated entries in ANY category are journal candidates — not only [note].
+        # A dated [gotcha] or [tip] is equally an activity-log smell.
+        if date_re.search(body):
+            journal_candidates.append((idx, cat, body[:80]))
+
+    report = ["📊 MEMORY.md consolidation analysis", ""]
+    issues_found = False
+
+    # 1. Per-category counts
+    report.append("## Categories")
+    for cat in sorted(by_cat, key=lambda c: -len(by_cat[c])):
+        if len(by_cat[cat]) > 5:
+            report.append(f"  [{cat}]: {len(by_cat[cat])} entries  ⚠️ consider consolidating")
+            issues_found = True
+        else:
+            report.append(f"  [{cat}]: {len(by_cat[cat])} entries")
+
+    # 2. Lines that are too long for the always-loaded tier
+    if long_lines:
+        issues_found = True
+        report.append("")
+        report.append("## Lines > 400 chars (move to topics/<name>.md)")
+        for ln, preview in long_lines:
+            report.append(f"  L{ln}: {preview}…")
+
+    # 3. Dated entries in any category → belong in journal
+    if journal_candidates:
+        issues_found = True
+        report.append("")
+        report.append("## Dated entries (move to journal/YYYY-MM.md)")
+        for ln, cat, preview in journal_candidates:
+            report.append(f"  L{ln} [{cat}]: {preview}")
+
+    # 4. Cheap overlap dedup hints inside large categories.
+    # Token extraction covers three shapes:
+    #   • ASCII identifiers of 3+ letters with ._- internal punctuation so
+    #     version numbers and dotted paths stay intact ("Python3.14",
+    #     "jyagent.tools.facades").
+    #   • CJK character bigrams (Chinese/Japanese/Korean). CJK has no
+    #     inter-word whitespace, so "用户偏好中文" as one "run" is useless for
+    #     dedup — instead we emit "用户", "户偏", "偏好", "好中", "中文" and
+    #     let the set-overlap heuristic do its job. Stop-words are ASCII-only
+    #     (no curated CJK stop list; bigram noise is low in practice).
+    ascii_tok = re.compile(r"[A-Za-z][\w.\-]{2,}")
+    cjk_run = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff]{2,}")
+
+    def _sig_words(s: str) -> set[str]:
+        out = {
+            tok.lower()
+            for tok in ascii_tok.findall(s)
+            if tok.lower() not in _STOP_WORDS
+        }
+        for run in cjk_run.findall(s):
+            for i in range(len(run) - 1):
+                out.add(run[i : i + 2])
+        return out
+
+    overlap_hints: list[str] = []
+    for cat, entries in by_cat.items():
+        if len(entries) < 4:
+            continue
+        word_sets = [(ln, body, _sig_words(body)) for ln, body in entries]
+        for i in range(len(word_sets)):
+            for j in range(i + 1, len(word_sets)):
+                ln_a, body_a, ws_a = word_sets[i]
+                ln_b, body_b, ws_b = word_sets[j]
+                shared = ws_a & ws_b
+                if len(shared) >= 4:
+                    overlap_hints.append(
+                        f"  [{cat}] L{ln_a} ↔ L{ln_b} share: "
+                        f"{', '.join(sorted(shared)[:6])}"
+                    )
+
+    if overlap_hints:
+        issues_found = True
+        report.append("")
+        report.append("## Possible duplicate pairs (>=4 shared content words)")
+        report.extend(overlap_hints[:20])
+        if len(overlap_hints) > 20:
+            report.append(f"  … and {len(overlap_hints) - 20} more pairs")
+
+    warning = memory_index_size_warning()
+    if warning:
+        issues_found = True
+        report.append("")
+        report.append(warning)
+
+    if not issues_found:
+        report.append("")
+        report.append("✅ No obvious consolidation candidates found.")
+
+    return "\n".join(report)
+
+
+_STOP_WORDS = {
+    "with", "from", "that", "this", "have", "when", "then", "than",
+    "they", "them", "their", "there", "where", "which", "what",
+    "your", "yours", "been", "being", "would", "could", "should", "must",
+    "will", "shall", "does", "doesn", "didn", "isn", "wasn", "aren", "weren",
+    "about", "above", "below", "between", "after", "before", "during",
+    "while", "until", "because", "since", "though", "although",
+    "also", "only", "even", "just", "still", "very", "more", "most", "less",
+    "least", "other", "another", "some", "many", "each", "every", "both",
+    "either", "neither", "such", "same", "different",
+    "into", "onto", "over", "under", "through", "across", "around",
+    "always", "never", "often", "sometimes", "usually",
+    "make", "made", "makes", "making", "take", "taken", "takes", "taking",
+    "give", "gave", "given", "gives", "giving", "want", "wants", "need",
+    "needs", "see", "saw", "seen", "look", "looks", "looking",
+    "good", "better", "best", "bad", "worse", "worst",
+    "true", "false", "none", "null",
+}
+
+
 # ─── High-level operations (used by manage_memory tool) ──────────────────────
 
-def remember(text: str, category: str = "") -> str:
-    """Remember a fact or learning by appending to MEMORY.md."""
+def remember(text: str, category: str = "", *, suppress_warning: bool = False) -> str:
+    """Remember a durable fact or learning by appending to MEMORY.md.
+
+    NOTE: This appends to the always-loaded index. Use only for data-independent
+    rules / facts that prevent future mistakes. Ephemeral task notes ("today I
+    finished X") belong in the journal tier — call ``append_journal`` instead.
+
+    The return string concatenates a soft-cap warning when MEMORY.md is near
+    its load limit. Set ``suppress_warning=True`` for programmatic callers /
+    tests that parse the return value.
+    """
     prefix = f"[{category}] " if category else "- "
     append_memory_md(f"{prefix}{text}")
-    return f"Remembered: {text[:100]}"
+    msg = f"Remembered: {text[:100]}"
+    if not suppress_warning:
+        warning = memory_index_size_warning()
+        if warning:
+            msg += "\n" + warning
+    return msg
 
 
 def forget(keyword: str) -> str:
@@ -387,7 +696,7 @@ def show_memory() -> str:
 
     content = read_memory_md()
     if content:
-        line_count = len(content.split("\n"))
+        line_count = len(content.splitlines())
         display = content[:2000]
         if len(content) > 2000:
             display += f"\n... ({line_count} total lines)"
@@ -406,7 +715,18 @@ def show_memory() -> str:
             topic_lines.append(f"  📄 {t}.md ({lines} lines, {size} chars{ts_suffix})")
         parts.append(f"📂 TOPIC FILES ({len(topics)} topics):\n" + "\n".join(topic_lines))
 
+    journals = list_journals()
+    if journals:
+        j_lines = []
+        for m in journals[:6]:  # show at most 6 most-recent months
+            jc = read_journal(m)
+            j_lines.append(f"  📓 {m}.md ({len(jc.split(chr(10)))} lines, {len(jc)} chars)")
+        more = "" if len(journals) <= 6 else f"\n  … and {len(journals) - 6} older months"
+        parts.append(f"📓 JOURNAL ({len(journals)} months, on-demand only):\n" + "\n".join(j_lines) + more)
+
     if not parts:
         return "🧠 Memory is empty. I'll start learning about you as we interact!"
 
-    return "🧠 SELF-USE MEMORY\n" + "\n\n".join(parts)
+    warning = memory_index_size_warning()
+    suffix = ("\n\n" + warning) if warning else ""
+    return "🧠 SELF-USE MEMORY\n" + "\n\n".join(parts) + suffix

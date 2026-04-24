@@ -104,22 +104,22 @@ CORE_TOOLS = [
     # --- manage_memory ---
     {
         "name": "manage_memory",
-        "description": "Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions.",
+        "description": "Manage the agent's three-tier self-use memory system. TIERS: (1) MEMORY.md — always-loaded index, hard cap 200 lines / 25 KB; only durable, data-independent rules / facts that prevent future mistakes. (2) topics/<name>.md — curated on-demand knowledge files for extended detail (architecture, library quirks, ongoing projects). (3) journal/YYYY-MM.md — append-only chronological session notes; NEVER auto-loaded; the right home for 'what I did today' style entries. Actions: 'remember' (append durable rule to MEMORY.md — use sparingly), 'forget' (remove memories by keyword), 'show' (display all memories + size warnings), 'topic' (manage curated topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (DEPRECATED alias → routes to journal), 'journal' (append a dated session note), 'consolidate' (read-only analysis: dedup candidates, oversized lines, dated notes that belong in journal).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action: remember, forget, show, topic, goal, note",
-                    "enum": ["remember", "forget", "show", "topic", "goal", "note"]
+                    "description": "Action: remember | forget | show | topic | goal | note | journal | consolidate",
+                    "enum": ["remember", "forget", "show", "topic", "goal", "note", "journal", "consolidate"]
                 },
                 "text": {
                     "type": "string",
-                    "description": "Main text content. REQUIRED for all actions except 'show'. For 'remember'/'note': what to save. For 'forget': keyword to match. For 'topic': command like 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'. For 'goal': goal text or 'done:<text>' to complete."
+                    "description": "Main text content. REQUIRED for: remember, forget, topic, goal, note, journal. NOT needed for: show, consolidate. For 'remember': the durable rule/fact (1 line, imperative). For 'journal'/'note': the chronological note (multi-line OK). For 'forget': keyword to match. For 'topic': command 'list' | 'read:<name>' | 'write:<name>|<content>' | 'delete:<name>'. For 'goal': goal text or 'done:<text>'."
                 },
                 "category": {
                     "type": "string",
-                    "description": "Category for 'remember' action: correction, preference, gotcha, tip, workflow, user_stated, goal, note"
+                    "description": "Category tag. For 'remember': correction | preference | gotcha | tip | workflow | user_stated | goal. For 'journal'/'note': any short tag (default 'note'), e.g. session | debug | ship | research."
                 }
             },
             "required": ["action"]

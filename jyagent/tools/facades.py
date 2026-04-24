@@ -5,10 +5,11 @@ from ..toolresult import ToolResult
 
 
 def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult:
-    """Manage the agent's self-use memory system. Actions: 'remember' (save a learning/fact), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (add a working note). This tool lets you proactively remember things about the user for future sessions."""
+    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage curated topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (DEPRECATED alias for journal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/)."""
     from ..memory.operations import (
         remember, forget, show_memory,
         list_topics, read_topic, write_topic, delete_topic,
+        append_journal, list_journals, read_journal, consolidate_memory,
     )
 
     try:
@@ -24,6 +25,16 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
 
         elif action == "show":
             return ToolResult(show_memory())
+
+        elif action == "journal":
+            if not text:
+                return ToolResult("Error: 'text' parameter required for 'journal' action", is_error=True)
+            cat = category or "note"
+            path = append_journal(text, cat)
+            return ToolResult(f"📓 Journal entry appended to {path} [{cat}]")
+
+        elif action == "consolidate":
+            return ToolResult(consolidate_memory())
 
         elif action == "topic":
             if not text:
@@ -73,12 +84,22 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
             return ToolResult(f"🧠 {remember(text, 'goal')}")
 
         elif action == "note":
+            # 'note' used to mean "append [note] to MEMORY.md" — that was an
+            # anti-pattern (chronological cruft in the always-loaded index, with
+            # prompt-cache invalidation cost). Redirect to the journal tier and
+            # tell the caller. Old call sites still work.
             if not text:
                 return ToolResult("Error: 'text' parameter required", is_error=True)
-            return ToolResult(f"🧠 {remember(text, 'note')}")
+            cat = category or "note"
+            path = append_journal(text, cat)
+            return ToolResult(
+                f"📓 Note routed to journal: {path} [{cat}] "
+                "(action='note' is now an alias for action='journal'; "
+                "use action='remember' only for durable rules in MEMORY.md)"
+            )
 
         else:
-            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, show, topic, goal, note", is_error=True)
+            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, show, topic, goal, note, journal, consolidate", is_error=True)
 
     except Exception as e:
         return ToolResult(f"Error managing memory: {e}", is_error=True)

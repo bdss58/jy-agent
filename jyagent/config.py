@@ -42,6 +42,7 @@ OBSERVATION_MASK_DISTANCE = int(os.environ.get("AGENT_OBSERVATION_MASK_DISTANCE"
 
 MEMORY_DIR = os.path.join(PROJECT_ROOT, "data", "memory")
 TOPICS_DIR = os.path.join(MEMORY_DIR, "topics")
+JOURNAL_DIR = os.path.join(MEMORY_DIR, "journal")  # Tier 3: never auto-loaded
 MEMORY_MD_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 
 COMPACT_TOKEN_THRESHOLD = int(os.environ.get("AGENT_COMPACT_TOKEN_THRESHOLD", "150000"))  # Layer 2 (LLM summary between turns); matches Anthropic API default & 75% of 200K window
@@ -52,6 +53,10 @@ FILE_REINJECTION_MAX_TOKENS = int(os.environ.get("AGENT_FILE_REINJECTION_MAX_TOK
 MAX_SESSIONS = 50
 MAX_MEMORY_INDEX_LINES = 200
 MAX_MEMORY_INDEX_BYTES = 25 * 1024
+# Soft warning thresholds (matches Letta-style "approaching cap" guidance,
+# Anthropic CLAUDE.md best practice: target <200 lines, warn at 75%).
+MEMORY_INDEX_WARN_LINES = int(os.environ.get("AGENT_MEMORY_WARN_LINES", "150"))
+MEMORY_INDEX_WARN_BYTES = int(os.environ.get("AGENT_MEMORY_WARN_BYTES", str(18 * 1024)))
 MAX_MEMORY_PROMPT_CHARS = int(os.environ.get("AGENT_MAX_MEMORY_PROMPT_CHARS", "10000"))
 CHARS_PER_TOKEN = 4
 
