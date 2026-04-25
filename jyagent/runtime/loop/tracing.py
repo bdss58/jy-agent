@@ -43,7 +43,7 @@ TRACE_ENABLED: bool = os.environ.get("AGENT_TRACE_ENABLED", "").lower() in (
     "yes",
 )
 
-TRACES_DIR = Path(__file__).resolve().parent.parent / "data" / "traces"
+TRACES_DIR = Path(__file__).resolve().parents[3] / "data" / "traces"
 ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 # ---------------------------------------------------------------------------
