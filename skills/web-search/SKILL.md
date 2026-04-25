@@ -14,12 +14,12 @@ description: >-
   search with smart query breakdown and cited answers.
 metadata:
   author: jy-agent
-  version: "5.0"
+  version: "6.0"
 ---
 
 # Web Search
 
-Search the web using `web_search` (primary), `web_fetch` (page-level),
+Search the web using `web_search` (DuckDuckGo, primary), `web_fetch` (page-level),
 and `dispatch_agent` (parallel). Inspired by how Google, OpenAI, and Anthropic
 implement search in their AI agents — with query decomposition, iterative
 multi-hop search, dynamic filtering, and citation-first output.
@@ -40,19 +40,19 @@ run_shell("date")  # NEVER assume the year — model defaults can be wrong
 What does the user need?
 │
 ├─ Quick fact / single answer (who, what, when)
-│   → Single-Shot Search (DDG)
+│   → Single-Shot Search
 │
 ├─ General search / find resources
-│   → Single-Shot Search (auto)
+│   → Single-Shot Search
 │
 ├─ Multi-faceted question or comparison
 │   → Decompose & Multi-Hop Search
 │
 ├─ Current events / breaking news
-│   → Single-Shot (codex) or Multi-Hop with recency filter
+│   → Multi-Hop Search with recency in the query (e.g. "2026")
 │
 ├─ Chinese topic (中文内容)
-│   → DDG first + 百度 cross-reference
+│   → DDG first + 百度 cross-reference (web_fetch the 百度 search URL)
 │
 ├─ Deep research report (10+ sources, comprehensive analysis)
 │   → ESCALATE to deep-research skill
@@ -81,23 +81,26 @@ and Anthropic's dynamic filtering):
 For straightforward questions with a single clear answer:
 
 ```python
-# Quick fact — DDG (fast, free)
-web_search(query="python 3.14 release date", engine="ddg")
+# Quick fact
+web_search(query="python 3.14 release date")
 
-# General search — auto (DDG with Codex fallback)
-web_search(query="kubernetes pod security standards", engine="auto")
+# General search
+web_search(query="kubernetes pod security standards")
 
-# Current events — Codex (real-time, multi-source synthesis)
-web_search(query="latest AI regulation news 2026", engine="codex")
+# Current events — add the year to bias toward fresh results
+web_search(query="latest AI regulation news 2026")
 ```
 
-### Engine Selection
+### Backend
 
-| Engine | Speed | Cost | Quality | Synthesis | Best for |
-|--------|-------|------|---------|-----------|----------|
-| `ddg` | ~2s | Free | Good | No | Quick facts, known topics |
-| `codex` | ~15-30s | ~40-80K tokens | Excellent | Yes | Current events, comparisons |
-| `auto` | ~2-30s | Free→expensive | Good→Excellent | Maybe | Default for most queries |
+`web_search` is backed by **DuckDuckGo HTML search** (fast, free, no auth).
+Returns up to `max_results` (default 10) hits with title, URL, snippet.
+
+For deeper coverage, the agent does the orchestration itself:
+**search → pick promising URLs → `web_fetch` each → synthesize.**
+This is cheaper and more controllable than delegating to a subagent
+search engine. For genuinely large investigations, escalate to the
+**deep-research** skill which dispatches parallel `dispatch_agent` workers.
 
 ## Query Decomposition & Reformulation
 
@@ -325,9 +328,6 @@ When escalating, tell the user and switch to the deep-research skill pattern.
 
 ❌ **Don't** search once and give up if results are poor
 ✅ **Do** iterate: reformulate query, try different terms, pivot strategy
-
-❌ **Don't** use `engine="codex"` for simple factual lookups
-✅ **Do** use `engine="ddg"` or `"auto"` for quick lookups; Codex for depth
 
 ❌ **Don't** dump raw search results to the user
 ✅ **Do** synthesize, cite inline, and add a Sources section

@@ -29,7 +29,7 @@ orchestration, MCP integration, durable cross-session memory, and a skills syste
   `timeout_seconds` auto-kill, `cwd`, `stdin_null`, `action="wait"`,
   and a global 8-job concurrency cap.
 - **Web**: `web_fetch` (5-tier anti-blocking cascade: curl_cffi → httpx →
-  Jina Reader → Chrome → diagnostics) and `web_search` (DDG → Codex fallback).
+  Jina Reader → Chrome → diagnostics) and `web_search` (DuckDuckGo HTML).
 - **Sub-agents**: `dispatch_agent` / `check_agent` — spawn focused workers in
   foreground or background with soft handoff, grace-period cancellation, and
   isolated context windows.
@@ -105,7 +105,7 @@ jyagent/
     core.py             # Filesystem + run_shell + run_background
     subagent.py         # dispatch_agent / check_agent
     web_fetch.py        # 5-tier anti-blocking fetch
-    web_search_tool.py  # DDG + Codex search
+    web_search_tool.py  # DuckDuckGo HTML search
     mcp_tool.py         # MCP bridge
   registry.py           # Tool registry with parallel-safe / timeout metadata
 data/
