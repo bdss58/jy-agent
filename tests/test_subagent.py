@@ -353,7 +353,7 @@ class TestCancelEventInterruptsLoop:
         tool_functions = {"dummy_tool": dummy_tool}
 
         # Patch get_reasoning_config_for_provider to avoid model validation errors
-        with patch("jyagent.loop_engine.get_reasoning_config_for_provider", return_value=None):
+        with patch("jyagent.runtime.loop.engine.get_reasoning_config_for_provider", return_value=None):
             loop = AgentLoop(
                 runtime_owner=mock_owner,
                 config=LoopConfig(max_steps=10, streaming=False),

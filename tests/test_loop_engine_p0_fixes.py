@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from jyagent import loop_engine as le
+from jyagent.runtime.loop import engine as le
 from jyagent.loop_engine import (
     _execute_tool_with_timeout,
     _execute_tools,

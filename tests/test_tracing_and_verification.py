@@ -107,7 +107,7 @@ class TestRunTrace:
         with tempfile.TemporaryDirectory() as tmpdir:
             traces_dir = Path(tmpdir) / "traces"
             # Patch the TRACES_DIR
-            with mock.patch("jyagent.tracing.TRACES_DIR", traces_dir):
+            with mock.patch("jyagent.runtime.loop.tracing.TRACES_DIR", traces_dir):
                 t.flush()
 
             files = list(traces_dir.glob("*.jsonl"))
@@ -137,12 +137,12 @@ class TestGetTracer:
 
     def test_disabled_returns_none(self):
         """When TRACE_ENABLED is False, get_tracer() returns None."""
-        with mock.patch("jyagent.tracing.TRACE_ENABLED", False):
+        with mock.patch("jyagent.runtime.loop.tracing.TRACE_ENABLED", False):
             assert get_tracer() is None
 
     def test_enabled_returns_run_trace(self):
         """When TRACE_ENABLED is True, get_tracer() returns a RunTrace."""
-        with mock.patch("jyagent.tracing.TRACE_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.tracing.TRACE_ENABLED", True):
             t = get_tracer()
             assert isinstance(t, RunTrace)
 
@@ -166,30 +166,30 @@ class TestShouldVerify:
 
     def test_disabled_returns_false(self):
         """When VERIFICATION_ENABLED is False, always returns False."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", False):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", False):
             msgs = [{"role": "tool_result", "tool_name": "edit_file", "content": "ok"}]
             assert should_verify(msgs, tool_calls_count=1) is False
 
     def test_no_tool_calls_returns_false(self):
         """Zero tool calls → no verification."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             assert should_verify([], tool_calls_count=0) is False
 
     def test_no_mutation_returns_false(self):
         """Tool calls but no file mutations → no verification."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "read_file", "content": "data"}]
             assert should_verify(msgs, tool_calls_count=1) is False
 
     def test_mutation_triggers_verification(self):
         """edit_file tool result + enabled → should verify."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "edit_file", "content": "ok"}]
             assert should_verify(msgs, tool_calls_count=1) is True
 
     def test_already_injected_returns_false(self):
         """If verification prompt already in messages, don't inject again."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [
                 {"role": "tool_result", "tool_name": "edit_file", "content": "ok"},
                 {"role": "user", "content": f"{_VERIFICATION_MARKER} Before you finish..."},
@@ -198,13 +198,13 @@ class TestShouldVerify:
 
     def test_run_shell_counts_as_mutation(self):
         """run_shell is in VERIFY_TOOL_NAMES."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "run_shell", "content": "ok"}]
             assert should_verify(msgs, tool_calls_count=1) is True
 
     def test_write_file_counts_as_mutation(self):
         """write_file is in VERIFY_TOOL_NAMES."""
-        with mock.patch("jyagent.verification.VERIFICATION_ENABLED", True):
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "write_file", "content": "ok"}]
             assert should_verify(msgs, tool_calls_count=1) is True
 
