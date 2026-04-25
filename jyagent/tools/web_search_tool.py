@@ -30,7 +30,7 @@ import os
 from typing import Callable
 from urllib.parse import parse_qs, quote_plus, urlparse
 
-from ..toolresult import ToolResult
+from ..runtime.tools.result import ToolResult
 
 log = logging.getLogger(__name__)
 

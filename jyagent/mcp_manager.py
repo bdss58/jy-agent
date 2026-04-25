@@ -13,8 +13,8 @@ import re
 import threading
 from typing import Optional
 from .mcp_client import MCPClient
-from .registry import get_registry
-from .toolresult import ToolResult
+from .runtime.tools.registry import get_registry
+from .runtime.tools.result import ToolResult
 
 # Module version marker — bump this to confirm reloads are taking effect
 _MODULE_VERSION = "2.1.0"

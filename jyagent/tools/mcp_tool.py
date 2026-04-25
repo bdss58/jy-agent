@@ -19,9 +19,9 @@ try:
 except ImportError:
     from jyagent.mcp_manager import get_manager, reset_manager
 try:
-    from ..toolresult import ToolResult
+    from ..runtime.tools.result import ToolResult
 except ImportError:
-    from jyagent.toolresult import ToolResult
+    from jyagent.runtime.tools.result import ToolResult
 
 
 def mcp(action: str, server: str = "") -> ToolResult:

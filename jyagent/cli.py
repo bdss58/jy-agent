@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from .session_stats import get_stats
+from .runtime.stats import get_stats
 
 
 # ─── Rich console with custom theme ──────────────────────────────────────────

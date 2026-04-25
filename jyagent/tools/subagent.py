@@ -20,19 +20,19 @@ try:
         STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
     )
     from ..loop_engine import AgentLoop, LoopConfig, LoopCallbacks
-    from ..registry import get_registry
+    from ..runtime.tools.registry import get_registry
     from ..llm import LLMOptions, LLMOwner
-    from ..toolresult import ToolResult
-    from ..session_stats import get_stats
+    from ..runtime.tools.result import ToolResult
+    from ..runtime.stats import get_stats
 except ImportError:
     from jyagent.config import (
         STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
     )
     from jyagent.loop_engine import AgentLoop, LoopConfig, LoopCallbacks
-    from jyagent.registry import get_registry
+    from jyagent.runtime.tools.registry import get_registry
     from jyagent.llm import LLMOptions, LLMOwner
-    from jyagent.toolresult import ToolResult
-    from jyagent.session_stats import get_stats
+    from jyagent.runtime.tools.result import ToolResult
+    from jyagent.runtime.stats import get_stats
 
 
 # ─── Defaults ────────────────────────────────────────────────────────────────

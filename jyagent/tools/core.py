@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 
 from ..config import SKIP_DIRS, BINARY_EXTS
-from ..toolresult import ToolResult
+from ..runtime.tools.result import ToolResult
 
 
 def _track_file(path: str) -> None:

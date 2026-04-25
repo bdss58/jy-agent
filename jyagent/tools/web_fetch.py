@@ -19,7 +19,7 @@ Usage (as native tool):
 
 import re
 from urllib.parse import urlparse
-from ..toolresult import ToolResult
+from ..runtime.tools.result import ToolResult
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 

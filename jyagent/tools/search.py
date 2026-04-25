@@ -13,7 +13,7 @@ import glob as _glob
 import fnmatch
 import time
 
-from ..toolresult import ToolResult
+from ..runtime.tools.result import ToolResult
 from .core import _format_size, is_binary_ext, should_skip_dir
 
 

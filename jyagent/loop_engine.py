@@ -21,13 +21,13 @@ from typing import Any, Callable
 from .llm import LLMOwner, LLMOptions
 from .llm.types import ModelSpec
 from .config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
-from .registry import get_registry
-from .toolresult import ToolResult
-from .validation import validate_tool_input
+from .runtime.tools.registry import get_registry
+from .runtime.tools.result import ToolResult
+from .runtime.tools.validation import validate_tool_input
 from .memory.conversation import estimate_conversation_tokens
-from .remediation import enrich_error
-from .tracing import get_tracer
-from .verification import should_verify, build_verification_prompt
+from .runtime.loop.remediation import enrich_error
+from .runtime.loop.tracing import get_tracer
+from .runtime.loop.verification import should_verify, build_verification_prompt
 
 
 # ─── Core types ──────────────────────────────────────────────────────────────
@@ -204,7 +204,7 @@ class _CostTracker:
         self.unpriced_calls: int = 0
 
     def record(self, usage: dict, provider: str, model: str) -> None:
-        from .session_stats import _lookup_pricing
+        from .runtime.stats import _lookup_pricing
         pricing = _lookup_pricing(provider, model) if provider and model else None
         if pricing is None:
             if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
@@ -927,7 +927,7 @@ class AgentLoop:
         cfg = self._config
         if not cfg.checkpoint_dir:
             return
-        from .checkpoint import (
+        from .runtime.loop.checkpoint import (
             LoopCheckpoint,
             checkpoint_path,
             iso_utc_now,
@@ -985,7 +985,7 @@ class AgentLoop:
         result = self._run_impl(system_prompt, messages, initial_todos)
         if self._config.todos_enabled:
             # Serialize to dict-form for easy JSON persistence by outer layers.
-            from .todos import todo_to_dict
+            from .runtime.loop.todos import todo_to_dict
             result.todos = [todo_to_dict(t) for t in self._todos]
         if self._config.checkpoint_dir:
             # Terminal ("final") checkpoint — includes status + error.
@@ -1025,20 +1025,20 @@ class AgentLoop:
         # Lazy import of the reflection module so test imports of
         # loop_engine stay cheap and reflection is opt-in by config.
         if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
-            from . import reflection  # noqa: F401 — referenced below
+            from .runtime.loop import reflection  # noqa: F401 — referenced below
         else:
             reflection = None  # type: ignore[assignment]
 
         # Ensure a run id is set when checkpointing is enabled (outer
         # layers may have preset one via set_run_id).
         if cfg.checkpoint_dir and not self._run_id:
-            from .checkpoint import new_run_id
+            from .runtime.loop.checkpoint import new_run_id
             self._run_id = new_run_id()
 
         # ── Seed todos scratchpad ─────────────────────────────────────
         # Lazy import to keep the dependency optional.
         if cfg.todos_enabled:
-            from .todos import (
+            from .runtime.loop.todos import (
                 WRITE_TODOS_SCHEMA,
                 build_write_todos_tool,
                 inject_todos_into_messages,

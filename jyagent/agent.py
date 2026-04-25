@@ -2,7 +2,7 @@
 
 import os
 import sys
-from .registry import get_registry
+from .runtime.tools.registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, summarize_if_needed,
@@ -14,9 +14,9 @@ from .memory import (
 from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
-from .skills import SkillManager, get_skill_manager, init_skills
+from .runtime.skills import SkillManager, get_skill_manager, init_skills
 from .llm import LLMOwner
-from .session_stats import get_stats
+from .runtime.stats import get_stats
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
     MAX_TOOL_RESULT_CHARS, MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT,
@@ -100,7 +100,7 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     # still points to the last *exited* session, not this one).
     if conversation.messages:
         try:
-            from .session_stats import get_stats
+            from .runtime.stats import get_stats
             stats = get_stats()
             archive_session(conversation, metadata={
                 "provider": stats.provider or "",
@@ -268,7 +268,7 @@ def _graceful_exit(cli, conversation=None):
     # Save session before saying goodbye (fast, silent)
     if conversation and conversation.messages:
         try:
-            from .session_stats import get_stats
+            from .runtime.stats import get_stats
             stats = get_stats()
             save_session(conversation, metadata={
                 "provider": stats.provider or "",

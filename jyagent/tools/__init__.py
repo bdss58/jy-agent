@@ -1,6 +1,6 @@
 # tools/ package — Core tool implementations, schemas, and registration.
 
-from ..registry import get_registry
+from ..runtime.tools.registry import get_registry
 
 # Re-export all tool functions for backward compatibility
 from .core import run_shell, read_file, write_file, list_directory, edit_file, run_background, check_background
