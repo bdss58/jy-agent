@@ -10,11 +10,13 @@ from .operations import (
     read_memory_md, read_memory_index, write_memory_md, append_memory_md,
     forget_from_memory_md,
     list_topics, read_topic, read_topic_body, read_topic_meta, write_topic, delete_topic,
+    read_topic_section, list_topic_sections,
     list_journals, read_journal, append_journal,
     memory_index_size_warning, consolidate_memory,
-    remember, forget, show_memory,
+    remember, forget, supersede, show_memory,
 )
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
 from .session import save_session, archive_session, load_session, has_saved_session, delete_session
 from .extraction import should_extract, extract_and_remember
+from .search import search_memory, render_hits, SearchHit, SearchChunk

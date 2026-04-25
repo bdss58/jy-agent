@@ -76,6 +76,36 @@ CONVERSATION TO COMPACT:
 """
 
 
+# ─── Reflection prompt (Phase 4 P3 — emit memory-write candidates) ───────────
+# After the structured summary is produced, we ask the model a second, much
+# smaller question: "do any durable lessons fall out of this session?".
+# Candidates are written to the journal rather than directly into MEMORY.md —
+# auto-promotion is a slippery slope (would erode the 200-line cap we defend
+# against context rot). The agent reviews the reflection entry and explicitly
+# promotes anything worth keeping with `manage_memory remember`.
+
+REFLECTION_PROMPT = """\
+You are a reflection agent. Below is a structured summary of a long \
+conversation that was just compacted. Identify at most 3 durable learnings \
+that would prevent future mistakes — things a fresh agent starting a new \
+session would benefit from knowing.
+
+HARD CONSTRAINTS:
+- Return at most 3 items.
+- Each item must pass the test: "would removing this cause future mistakes?"
+- Skip anything that is just a record of what happened today (that is already
+  in the summary). We want rules, gotchas, environment facts — not a diary.
+- If nothing qualifies, return exactly: NONE
+
+Output format — one directive per line, no prose:
+  [category] <one-line durable fact>
+Categories: correction | preference | gotcha | tip | workflow | user_stated
+
+COMPACTION SUMMARY:
+{summary}
+"""
+
+
 # ─── File access tracker ──────────────────────────────────────────────────────
 
 class FileAccessTracker:
@@ -270,18 +300,102 @@ def compact_conversation(
 
         after_tokens = conversation.estimated_tokens()
 
+        # ── Reflection pass (P3) ──────────────────────────────────────
+        # Runs after compaction succeeds, never raises. Returns the count
+        # of memory-write candidates written to the journal for the caller
+        # to include in its status line.
+        reflections = _run_reflection_pass(
+            runtime_owner, summary, system_prompt=system_prompt,
+        )
+
         return {
             "compacted": True,
             "before_tokens": before_tokens,
             "after_tokens": after_tokens,
             "summary": summary,
             "files_reinjected": len(get_file_tracker().recent(FILE_REINJECTION_COUNT)) if file_context else 0,
+            "reflections": reflections,
         }
 
     except Exception as e:
         return {"compacted": False, "before_tokens": before_tokens,
                 "after_tokens": before_tokens, "summary": "",
                 "error": str(e)}
+
+
+def _run_reflection_pass(
+    runtime_owner,
+    summary: str,
+    *,
+    system_prompt: str = "",
+) -> int:
+    """Ask the LLM to extract durable lessons from a compaction summary.
+
+    Successful candidates land in the journal as ``[reflection]`` entries —
+    NOT in MEMORY.md. Auto-promotion to the always-loaded index would erode
+    the 200-line cap and reintroduce the context-rot symptoms we documented
+    in topics/memory-design.md. The agent reviews and explicitly promotes.
+
+    Returns the number of reflection candidates written. Always returns 0 on
+    failure rather than raising — reflection is a best-effort enrichment of
+    the compaction step, not part of its critical path.
+    """
+    if not summary or not summary.strip():
+        return 0
+
+    # Lazy import: append_journal lives in operations, which is heavy; keep
+    # the module-level imports of compaction.py minimal so test suites can
+    # patch operations.* late.
+    try:
+        from .operations import append_journal
+    except Exception:
+        return 0
+
+    prompt = REFLECTION_PROMPT.format(summary=summary[:8000])
+    try:
+        if system_prompt:
+            raw = _complete_with_system_prompt(
+                runtime_owner, system_prompt, prompt,
+            )
+        else:
+            raw = runtime_owner.complete_text(prompt, max_output_tokens=512)
+    except Exception:
+        return 0
+
+    if not raw or raw.strip().upper() == "NONE":
+        return 0
+
+    candidates: list[str] = []
+    cat_re = __import__("re").compile(
+        r"^\s*\[(?P<cat>[a-z_]+)\]\s*(?P<body>.+?)\s*$", __import__("re").IGNORECASE,
+    )
+    for line in raw.strip().splitlines():
+        m = cat_re.match(line)
+        if not m:
+            continue
+        cat = m.group("cat").lower()
+        body = m.group("body").strip()
+        if len(body) < 10 or len(body) > 200:
+            continue
+        candidates.append(f"[{cat}] {body}")
+        if len(candidates) >= 3:
+            break
+
+    if not candidates:
+        return 0
+
+    # Single journal entry, multiple candidates inside — the agent can scan
+    # one entry to decide what (if anything) to promote with `remember`.
+    body = (
+        "Compaction reflection — candidates for `manage_memory remember` "
+        "(do NOT promote blindly; apply the 'would removing this cause "
+        "future mistakes?' filter):\n\n" + "\n".join(f"- {c}" for c in candidates)
+    )
+    try:
+        append_journal(body, "reflection")
+    except Exception:
+        return 0
+    return len(candidates)
 
 
 def _complete_with_system_prompt(
@@ -410,11 +524,17 @@ def summarize_if_needed(
         files_note = ""
         if result.get("files_reinjected", 0):
             files_note = f", {result['files_reinjected']} files re-injected"
+        reflect_note = ""
+        if result.get("reflections", 0):
+            reflect_note = (
+                f", {result['reflections']} reflection candidate(s) "
+                f"in latest journal entry"
+            )
         sys.stdout.write(
             f"\033[2m  ✅ Compacted: ~{result['before_tokens']} → "
             f"~{result['after_tokens']} tokens "
             f"(saved ~{result['before_tokens'] - result['after_tokens']} tokens"
-            f"{files_note})\033[0m\n"
+            f"{files_note}{reflect_note})\033[0m\n"
         )
         sys.stdout.flush()
 

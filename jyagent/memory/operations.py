@@ -3,6 +3,7 @@
 
 import os
 import re
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +13,29 @@ from .. import config as _cfg
 # tests can patch config attributes *after* this module is imported.
 MAX_MEMORY_INDEX_LINES = _cfg.MAX_MEMORY_INDEX_LINES
 MAX_MEMORY_INDEX_BYTES = _cfg.MAX_MEMORY_INDEX_BYTES
+
+
+# ─── Concurrency ──────────────────────────────────────────────────────────────
+#
+# Every read-modify-write on MEMORY.md takes this reentrant lock. The lock is
+# reentrant because several call chains nest — e.g. ``supersede()`` calls
+# ``write_memory_md`` and then ``remember()`` which calls ``append_memory_md``.
+#
+# Why we need it (from the code review 2026-04-25):
+#   - The background extraction thread (extraction.py::_do_extract) and the
+#     main thread's synchronous manage_memory calls both mutate MEMORY.md.
+#   - Extraction's ADD/UPDATE pipeline does read → think → write; a parallel
+#     writer sneaking in between the read and the write silently drops one
+#     side's edits.
+#   - supersede() itself is two writes (write_memory_md + remember), so
+#     without a lock a concurrent reader can see the "old line struck, new
+#     line missing" intermediate state and act on it.
+#
+# Scope: only MEMORY.md mutations — topic and journal files have their own
+# semantics (journal uses O_EXCL for the header; topics are overwritten
+# wholesale and we accept last-writer-wins for them since the topic name
+# itself is the concurrency partition).
+_MEMORY_MD_LOCK = threading.RLock()
 
 
 def ensure_dirs() -> None:
@@ -51,37 +75,53 @@ def read_memory_index() -> str:
 
 
 def write_memory_md(content: str) -> None:
-    """Write content to MEMORY.md."""
+    """Write content to MEMORY.md (acquires the MEMORY.md lock)."""
     ensure_dirs()
-    with open(_cfg.MEMORY_MD_FILE, 'w', encoding='utf-8') as f:
-        f.write(content)
+    with _MEMORY_MD_LOCK:
+        with open(_cfg.MEMORY_MD_FILE, 'w', encoding='utf-8') as f:
+            f.write(content)
 
 
 def append_memory_md(text: str) -> None:
-    """Append a line to the end of MEMORY.md."""
+    """Append a line to the end of MEMORY.md.
+
+    If the existing file lacks a trailing newline (common when MEMORY.md was
+    hand-edited), prepend one to ``text`` so the new entry doesn't get
+    silently glued onto the previous last line — which would corrupt the
+    category prefix (`[gotcha] foo[tip] bar` instead of two separate lines).
+
+    Acquires the MEMORY.md lock to serialize against concurrent writers
+    (background extraction thread + main-thread tool calls).
+    """
     ensure_dirs()
-    existing = read_memory_md()
-    if existing and not existing.endswith("\n"):
-        existing += "\n"
-    with open(_cfg.MEMORY_MD_FILE, 'a', encoding='utf-8') as f:
-        if not existing:
-            f.write(f"# Agent Memory\n\n{text}\n")
-        else:
-            f.write(f"{text}\n")
+    with _MEMORY_MD_LOCK:
+        existing = read_memory_md()
+        with open(_cfg.MEMORY_MD_FILE, 'a', encoding='utf-8') as f:
+            if not existing:
+                f.write(f"# Agent Memory\n\n{text}\n")
+            elif not existing.endswith("\n"):
+                # Heal the missing terminator before appending.
+                f.write(f"\n{text}\n")
+            else:
+                f.write(f"{text}\n")
 
 
 def forget_from_memory_md(keyword: str) -> int:
-    """Remove lines containing keyword from MEMORY.md. Returns count removed."""
-    content = read_memory_md()
-    if not content:
-        return 0
-    lines = content.split("\n")
-    keyword_lower = keyword.lower()
-    new_lines = [l for l in lines if keyword_lower not in l.lower()]
-    removed = len(lines) - len(new_lines)
-    if removed > 0:
-        write_memory_md("\n".join(new_lines))
-    return removed
+    """Remove lines containing keyword from MEMORY.md. Returns count removed.
+
+    Read-modify-write sequence — guarded by the MEMORY.md lock.
+    """
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        if not content:
+            return 0
+        lines = content.split("\n")
+        keyword_lower = keyword.lower()
+        new_lines = [l for l in lines if keyword_lower not in l.lower()]
+        removed = len(lines) - len(new_lines)
+        if removed > 0:
+            write_memory_md("\n".join(new_lines))
+        return removed
 
 
 # ─── Topic file operations ────────────────────────────────────────────────────
@@ -136,9 +176,42 @@ def list_topics() -> list[str]:
     return topics
 
 
+# Strict topic-name allowlist. Closes the path-traversal lever surfaced in
+# the 2026-04-25 code review (H1) — without this, a topic name like
+# "../../../tmp/escape" would resolve outside TOPICS_DIR for read/write/delete.
+# Kept narrow on purpose: even `:` would let a future refactor confuse a
+# topic name with a frontmatter key.
+_VALID_TOPIC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,79}$")
+
+
+def _topic_path(name: str) -> str | None:
+    """Return the on-disk path for a topic name, or ``None`` if invalid.
+
+    Validation:
+      - Must match ``_VALID_TOPIC_NAME_RE`` (alnum + ``_.-``, ≤80 chars).
+      - Must not contain a path separator after normalization (defense in
+        depth — the regex already excludes ``/`` and ``\\``).
+      - The resolved absolute path must be a direct child of TOPICS_DIR.
+    """
+    if not name or not _VALID_TOPIC_NAME_RE.match(name):
+        return None
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return None
+
+    candidate = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
+    # Resolve symlinks / `..` defensively even though the regex blocks `..`.
+    real_dir = os.path.realpath(_cfg.TOPICS_DIR)
+    real_candidate = os.path.realpath(candidate)
+    if os.path.dirname(real_candidate) != real_dir:
+        return None
+    return candidate
+
+
 def read_topic(name: str) -> str:
-    """Read a topic file. Returns empty string if not found."""
-    filepath = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
+    """Read a topic file. Returns empty string if not found or name invalid."""
+    filepath = _topic_path(name)
+    if filepath is None:
+        return ""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             return f.read()
@@ -162,6 +235,76 @@ def read_topic_meta(name: str) -> dict:
         return {}
     meta, _ = _parse_frontmatter(raw)
     return meta
+
+
+# Match an ATX header line ("## Foo Bar") at column 0. Used by
+# read_topic_section to locate a single section without dragging in the
+# `re` import at call time.
+_SECTION_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+
+
+def read_topic_section(name: str, header: str) -> str:
+    """Return one section of a topic file, identified by its header text.
+
+    Section boundaries follow markdown convention: a section runs from its
+    own header line up to (but excluding) the next header at the same depth
+    or shallower. Comparison is case-insensitive and ignores leading ``#``
+    characters in the supplied ``header`` argument so callers can pass either
+    ``"Tier model"`` or ``"## Tier model"``.
+
+    Returns the empty string if the topic or the section is not found.
+    Sub-sections (deeper headers nested inside the matched one) are included.
+    """
+    body = read_topic_body(name)
+    if not body:
+        return ""
+
+    # Normalize the requested header — accept "## Foo" / "Foo" / "  Foo  ".
+    needle = header.lstrip("#").strip().lower()
+    if not needle:
+        return ""
+
+    matches = list(_SECTION_HEADER_RE.finditer(body))
+    if not matches:
+        return ""
+
+    target = None
+    for m in matches:
+        if m.group(2).strip().lower() == needle:
+            target = m
+            break
+    if target is None:
+        return ""
+
+    target_depth = len(target.group(1))
+    start = target.start()
+
+    # End at the next header of equal-or-shallower depth.
+    end = len(body)
+    for m in matches:
+        if m.start() <= start:
+            continue
+        if len(m.group(1)) <= target_depth:
+            end = m.start()
+            break
+
+    return body[start:end].rstrip()
+
+
+def list_topic_sections(name: str) -> list[str]:
+    """Return the H2/H3 section headers of a topic, in document order.
+
+    Useful when the agent wants to see which sub-sections exist before
+    requesting one — keeps section reads informed rather than guessing.
+    """
+    body = read_topic_body(name)
+    if not body:
+        return []
+    return [
+        m.group(2).strip()
+        for m in _SECTION_HEADER_RE.finditer(body)
+        if 2 <= len(m.group(1)) <= 3
+    ]
 
 
 # ─── Topic index helpers (keep MEMORY.md in sync) ────────────────────────────
@@ -320,9 +463,16 @@ def write_topic(name: str, content: str) -> None:
 
     For NEW topics (file doesn't exist yet), automatically adds an index entry
     to the ``## Topic Files Index`` section of MEMORY.md.
+
+    Raises ``ValueError`` for invalid topic names — closes the path-traversal
+    lever (code-review H1).
     """
     ensure_dirs()
-    filepath = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
+    filepath = _topic_path(name)
+    if filepath is None:
+        raise ValueError(
+            f"invalid topic name {name!r}: must match [A-Za-z0-9][A-Za-z0-9_.-]{{0,79}}"
+        )
     is_new = not os.path.exists(filepath)
 
     now = _now_iso()
@@ -355,9 +505,12 @@ def write_topic(name: str, content: str) -> None:
 def delete_topic(name: str) -> bool:
     """Delete a topic file and remove its index entry from MEMORY.md.
 
-    Returns True if the file was deleted.
+    Returns True if the file was deleted. Returns False on invalid name OR
+    on missing file — both are "topic does not exist" from the caller's POV.
     """
-    filepath = os.path.join(_cfg.TOPICS_DIR, f"{name}.md")
+    filepath = _topic_path(name)
+    if filepath is None:
+        return False
     try:
         os.remove(filepath)
         _remove_topic_index_entry(name)
@@ -688,6 +841,163 @@ def forget(keyword: str) -> str:
     if removed > 0:
         return f"Removed {removed} entries matching '{keyword}'"
     return f"No entries found matching '{keyword}'"
+
+
+# ─── Supersede (non-destructive update — Zep-inspired) ───────────────────────
+#
+# Why not just edit the line in place?
+#   - Letta / Mem0 / AgentCore all converged on "old fact stays, validity is
+#     marked" so the system has an audit trail when the user asks "wait,
+#     didn't the K8s host used to be wan2?".
+#   - Zep goes further with bi-temporal edges; we approximate that with a
+#     strikethrough + dated supersession comment, which is good enough for
+#     a single-user file-based memory.
+#
+# Format: an existing line ``[gotcha] foo``  becomes
+#         ``~~[gotcha] foo~~  (superseded YYYY-MM-DD: <new_text first 60 chars…>)``
+# and the new line is appended in the canonical format with category
+# ``superseding`` so a future ``forget`` keyword can find it.
+
+# Protect well-known structural markers from UPDATE-style supersession.
+# The LLM-driven reconciliation pipeline can emit an UPDATE directive whose
+# <old_keyword> matches a heading or behavioral rule by accident; striking
+# those through in the always-loaded index would confuse the model for the
+# rest of the session and is a one-line prompt-injection lever.
+#
+# Rules:
+#   - Any line starting with a markdown header (`#`) is untouchable.
+#   - Any line that lives inside the "## Behavioral Rules" section is
+#     untouchable — those are the hard agent rules set by the user.
+#   - The top-level "# Agent Memory" preamble is protected by rule 1.
+_PROTECTED_SECTION_HEADERS = {
+    "behavioral rules (critical)",
+    "behavioral rules",
+    "user preferences",
+    "user profile",
+}
+
+# UPDATE keywords shorter than this steamroll multiple unrelated lines on
+# common substrings — e.g. `UPDATE::k8s::…` would hit every k8s entry. The
+# prompt asks for a "unique" substring; enforce a floor here too.
+_MIN_SUPERSEDE_KEYWORD_LEN = 6
+
+
+def _iter_protected_line_indices(lines: list[str]) -> set[int]:
+    """Return the indices of lines that must never be superseded."""
+    protected: set[int] = set()
+    inside_protected_section = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            protected.add(i)
+            # Enter / exit protected section based on the header text.
+            heading_text = stripped.lstrip("#").strip().lower()
+            inside_protected_section = heading_text in _PROTECTED_SECTION_HEADERS
+            continue
+        if inside_protected_section:
+            protected.add(i)
+    return protected
+
+
+def supersede(old_keyword: str, new_text: str, category: str = "") -> str:
+    """Mark every line containing ``old_keyword`` as superseded and append ``new_text``.
+
+    Non-destructive: old lines are kept (wrapped in ``~~ …~~``) so the agent
+    can answer "what did this used to say?" questions and so accidental
+    keyword matches don't silently destroy unrelated content.
+
+    Safety rails (from the 2026-04-25 code review):
+      - Keyword must be at least ``_MIN_SUPERSEDE_KEYWORD_LEN`` chars — short
+        substrings hit too many unrelated lines.
+      - Headers (``# …``) and lines inside protected sections (Behavioral
+        Rules, User Preferences, User Profile) are skipped silently — the
+        LLM extraction pipeline otherwise becomes a prompt-injection lever.
+      - The whole read-modify-write runs under ``_MEMORY_MD_LOCK`` so a
+        concurrent background extraction can't lose the supersession.
+
+    Returns a human-readable summary. The prefix encodes the outcome
+    machine-parseably: lines starting ``♻️ Superseded`` indicate success;
+    lines starting ``No entries matched`` / ``Error:`` indicate no-write.
+    """
+    if not old_keyword.strip():
+        return "Error: supersede requires a non-empty keyword to match"
+    if not new_text.strip():
+        return "Error: supersede requires non-empty replacement text"
+    if len(old_keyword.strip()) < _MIN_SUPERSEDE_KEYWORD_LEN:
+        return (
+            f"Error: supersede keyword must be ≥{_MIN_SUPERSEDE_KEYWORD_LEN} "
+            f"chars (got {len(old_keyword.strip())}: {old_keyword!r}) — short "
+            "substrings tend to hit unrelated lines"
+        )
+
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        if not content:
+            return f"MEMORY.md is empty — nothing to supersede for '{old_keyword}'"
+
+        keyword_lower = old_keyword.lower()
+        today = datetime.now(ASIA_SHANGHAI_TZ).strftime("%Y-%m-%d")
+        snippet = new_text.strip().splitlines()[0][:60]
+
+        lines = content.split("\n")
+        protected = _iter_protected_line_indices(lines)
+        marked = 0
+        skipped_protected = 0
+        new_lines: list[str] = []
+        for i, line in enumerate(lines):
+            # Skip already-superseded lines so re-running supersede stays
+            # idempotent and doesn't double-wrap with `~~~~`.
+            is_hit = (
+                keyword_lower in line.lower()
+                and not line.lstrip().startswith("~~")
+            )
+            if is_hit and i in protected:
+                skipped_protected += 1
+                new_lines.append(line)
+                continue
+            if is_hit:
+                stripped = line.rstrip()
+                new_lines.append(
+                    f"~~{stripped}~~  (superseded {today}: {snippet}…)"
+                )
+                marked += 1
+            else:
+                new_lines.append(line)
+
+        if marked == 0:
+            # Nothing matched — don't write the new line either, since the
+            # caller almost certainly wants both halves of the supersession
+            # to land together. If the only matches were protected, say so
+            # explicitly so the agent learns to pick a better keyword.
+            if skipped_protected:
+                return (
+                    f"No entries matched '{old_keyword}' outside protected "
+                    f"sections ({skipped_protected} header/rule hit(s) "
+                    "ignored) — nothing superseded, no new line written"
+                )
+            return (
+                f"No entries matched '{old_keyword}' — nothing superseded, "
+                "no new line written"
+            )
+
+        write_memory_md("\n".join(new_lines))
+
+        # Append the new entry as a fresh durable rule. We deliberately
+        # reuse ``remember`` so soft-cap warnings, prefix formatting and
+        # category handling stay in one place. The lock is reentrant.
+        cat = category or "superseding"
+        remember(new_text, cat, suppress_warning=True)
+
+        warning = memory_index_size_warning()
+        suffix = f"\n{warning}" if warning else ""
+        skipped_note = (
+            f" ({skipped_protected} protected line(s) preserved)"
+            if skipped_protected else ""
+        )
+        return (
+            f"♻️ Superseded {marked} line(s) matching '{old_keyword}'"
+            f"{skipped_note} and appended new [{cat}] entry{suffix}"
+        )
 
 
 def show_memory() -> str:

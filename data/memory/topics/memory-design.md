@@ -57,8 +57,10 @@ Apply Anthropic's litmus test:
 | Action | Tier | Purpose |
 |---|---|---|
 | `remember` | 1 | Append a 1-line durable rule. Returns size warning if approaching cap. |
-| `forget` | 1 | Remove lines matching a keyword. |
-| `topic` (`list` / `read:` / `write:` / `delete:`) | 2 | Curated knowledge files; auto-indexed in MEMORY.md. |
+| `forget` | 1 | Remove lines matching a keyword (destructive). |
+| `supersede` | 1 | **Non-destructive update** (Zep-inspired). `text='<old_keyword>|<new_text>'`: matched lines wrapped in `~~ ~~` with dated supersession comment, new line appended. Headers + Behavioral Rules / User Preferences / User Profile sections skipped automatically. Min keyword length 6 chars. |
+| `search` | 2+3 | BM25 over topic + journal bodies, section-chunked. Returns top-5 hits. Use this BEFORE reading whole topic files. |
+| `topic` (`list` / `read:` / `read:<name>#<section>` / `sections:` / `write:` / `delete:`) | 2 | Curated knowledge files; auto-indexed in MEMORY.md. Section subaction reads one `##`/`###` block (with nested sub-sections). Topic names validated against `^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$`. |
 | `journal` | 3 | Append a dated session note to `data/memory/journal/YYYY-MM.md`. |
 | `note` | 3 | **Deprecated alias** for `journal`. Old call sites still work but are routed to Tier 3 (was Tier 1 — that was the bug). |
 | `consolidate` | 1 | Read-only analyzer: dedup candidates, oversized lines, dated notes that belong in journal. |
@@ -78,11 +80,42 @@ The warning is included in:
 
 ## Migration history
 
-- **2026-04-24** — Tier system introduced (this design). Migrated the
+- **2026-04-25** — **Five upgrades + post-review hardening**.
+  Five new capabilities (`search_memory` / reconciliation in `extraction.py` /
+  non-destructive `supersede` / reflection pass at compaction /
+  section-level topic reads) were added in `feat/memory-upgrades`.
+  Code review surfaced 3 CRITICAL bugs and 3 HIGH security issues; all
+  fixed before merge.
+  - **C1**: `append_memory_md` now heals a missing trailing newline so
+    auto-extracted entries don't get glued onto the previous last line of
+    a hand-edited MEMORY.md.
+  - **C2**: All MEMORY.md read-modify-write paths now hold a reentrant
+    `_MEMORY_MD_LOCK`. Closes the race between the background extraction
+    thread and synchronous `manage_memory` calls.
+  - **C3**: `_apply_directive` now distinguishes a real UPDATE from a
+    `supersede` no-match (returns `("skip", msg)` instead of counting it
+    as success). Hallucinated UPDATEs no longer crowd out real ADDs
+    against the per-turn cap.
+  - **H1**: Introduced `_topic_path(name)` with strict regex
+    `^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$` + `realpath` containment check.
+    Closes path-traversal in `read_topic` / `write_topic` /
+    `delete_topic` / `read_topic_section`.
+  - **H2**: `supersede()` enforces a 6-char minimum keyword and skips
+    markdown headers + lines inside Behavioral Rules / User Preferences /
+    User Profile sections. The LLM extraction reconciler can no longer be
+    coaxed into striking through hard agent rules.
+  - **H3**: `_apply_directive` now sanitizes bodies to one line, ≤120
+    chars, no leading `#` or `~~`. Closes the residual prompt-injection
+    surface in the reconciliation pipeline.
+  - 113 tests pass (28 feature tests + 11 hardening tests + the
+    pre-existing 49 + 28 + 25 across phase1/tiers/compaction).
+- **2026-04-24** — Tier system introduced. Migrated the
   `[note] 2026-04-18 Agent-loop upgrade` 1500-char dump into
   `topics/agent-loop-changelog.md`. Trimmed `[gotcha] Skill LLM router`,
   `[workflow] GFW fallback` and `[tip] run_background hardening` to 1-line
   index entries pointing at topic files. Added `journal/` tier; redirected
   `action='note'`. Net MEMORY.md size: ~9 KB → ~3 KB.
-- Tests: `tests/test_memory_tiers.py` (21 tests) plus the original
-  `test_memory_phase1.py` (28 tests).
+- Tests: `tests/test_memory_tiers.py` (29 tests) plus the original
+  `test_memory_phase1.py` (28 tests) plus `test_memory_upgrades.py`
+  (40 tests covering BM25 search, reconciliation, supersede, reflection,
+  section reads, and the post-review hardening).

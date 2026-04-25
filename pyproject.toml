@@ -42,3 +42,8 @@ include = ["jyagent*"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
