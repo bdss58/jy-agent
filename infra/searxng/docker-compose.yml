@@ -1,0 +1,48 @@
+# SearxNG — local private metasearch instance
+# Used by jy-agent's web_search tool (cascade: SearxNG -> DDG -> Brave -> Mojeek).
+# jy-agent reads SEARXNG_URL=http://localhost:18888 from the shell env.
+#
+# `settings.yml` is bind-mounted from this directory so it lives in git —
+# edit the file directly, then `docker compose restart`. The bind mount
+# sits ON TOP of the searxng-config volume mount, so the volume still holds
+# sibling files (backups, future state) without cluttering the repo.
+#
+# Volumes (`searxng-config`, `searxng-cache`) are declared `external: true`
+# so this file ADOPTS the existing volumes (created 2026-04-25) and never
+# deletes them on `docker compose down`.
+#
+# Usage:
+#   docker compose up -d        # start
+#   docker compose logs -f      # follow logs
+#   docker compose down         # stop (volumes preserved — they're external)
+#   docker compose pull && docker compose up -d   # upgrade image
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "18888:8080"
+    volumes:
+      - searxng-config:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+      # Bind-mount the single config file on top of the volume so it lives
+      # in git. Not :ro because the entrypoint tries to chown it on start
+      # (harmless warning if read-only, but cleaner without).
+      - ./settings.yml:/etc/searxng/settings.yml
+    # Original standalone container used `restart: no`. Switching to
+    # `unless-stopped` so SearxNG is back automatically after a Docker
+    # Desktop restart — comment out if you want manual control.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  searxng-config:
+    external: true
+  searxng-cache:
+    external: true

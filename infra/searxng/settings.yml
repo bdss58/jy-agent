@@ -1,0 +1,30 @@
+# SearxNG configuration overrides.
+#
+# `use_default_settings: true` makes SearxNG inherit everything from the
+# upstream default settings.yml baked into the searxng/searxng image
+# (/usr/local/searxng/searx/settings.yml). Only the keys we set below are
+# overridden. Keeps this file tiny and avoids drifting from upstream.
+#
+# Docs: https://docs.searxng.org/admin/settings/settings.html#use-default-settings
+#
+# Inspect the effective merged config:
+#   docker exec searxng /usr/local/searxng/.venv/bin/python -c \
+#     "from searx import settings; print(settings['search']['formats'])"
+
+use_default_settings: true
+
+general:
+  instance_name: "jy-agent searxng"
+
+server:
+  # MUST override — upstream default is the placeholder "ultrasecretkey"
+  # which SearxNG refuses to run with. Generated 2026-04-25 via
+  # `openssl rand -hex 32`. Local-only instance — rotate if exposed.
+  secret_key: "be4d05caa5b4d8c01f1b86302f7dc3240485d030e3146f0bd65b035c81b7f541"
+
+search:
+  # Default ships [html] only; jy-agent's web_search calls /search?format=json
+  # which 403s without `json` here, causing the cascade to fall through to DDG.
+  formats:
+    - html
+    - json
