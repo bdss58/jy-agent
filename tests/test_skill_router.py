@@ -30,7 +30,7 @@ from jyagent.llm.core import (
     _ADAPTERS,
 )
 from jyagent.llm.types import ModelSpec
-from jyagent.runtime.skills import SkillManager
+from jyagent.skills import SkillManager
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────
@@ -132,7 +132,7 @@ class TestSkillRouterLLM:
         ])
         _register_mock_adapter("rt_llm", '["web-search"]')
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_llm", model="mock-model")
@@ -160,7 +160,7 @@ class TestSkillRouterLLM:
         ])
         mock_adapter = _register_mock_adapter("rt_reasoning_check", '["web-search"]')
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_reasoning_check", model="mock-model")
@@ -190,7 +190,7 @@ class TestSkillRouterLLM:
         ])
         _register_mock_adapter("rt_deact", '["browser-automation"]')
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_deact", model="mock-model")
@@ -216,7 +216,7 @@ class TestSkillRouterLLM:
             '["web-search", "nonexistent-skill", "another-fake"]',
         )
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_unknown", model="mock-model")
@@ -237,7 +237,7 @@ class TestSkillRouterLLM:
         ])
         _register_mock_adapter("rt_fence", '```json\n["web-search"]\n```')
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_fence", model="mock-model")
@@ -264,7 +264,7 @@ class TestSkillRouterLLM:
         mock_adapter = _register_mock_adapter("rt_err", "ignored")
         mock_adapter.complete.side_effect = RuntimeError("boom")
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_err", model="mock-model")
@@ -290,7 +290,7 @@ class TestSkillRouterLLM:
         ])
         _register_mock_adapter("rt_badjson", "not json at all")
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_badjson", model="mock-model")
@@ -316,7 +316,7 @@ class TestAutoActivateForQueryUsesLLM:
         ])
         _register_mock_adapter("rt_e2e", '["browser-automation"]')
 
-        with patch("jyagent.runtime.skills.get_skill_router_model_spec") as mock_spec, \
+        with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
              patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_e2e", model="mock-model")

@@ -108,7 +108,7 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
 def manage_skills(action: str, name: str = "", description: str = "",
                   instructions: str = "", resource_path: str = "") -> ToolResult:
     """Manage Agent Skills (agentskills.io). Actions: 'list' (show all skills), 'activate'/'deactivate' (control which skills are loaded into context), 'info' (show skill details), 'create' (create new skill), 'delete' (remove skill), 'resources' (list skill files), 'read' (read a skill resource file), 'reload' (re-scan skills directory)."""
-    from ..runtime.skills import get_skill_manager
+    from ..skills import get_skill_manager
 
     try:
         mgr = get_skill_manager()
