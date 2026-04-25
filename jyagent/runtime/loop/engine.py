@@ -96,16 +96,20 @@ _tool_executor = _tool_dispatch_executor
 class _CostTracker:
     """Track estimated cost within a single run() for budget enforcement.
 
-    Uses the session_stats pricing machinery but keeps a local running total
-    so the loop can check against LoopConfig.max_cost_usd each step.
+    Delegates pricing math to ``stats.compute_call_cost`` so the engine
+    and ``SessionStats`` cannot drift on Anthropic 1M-context tier
+    multipliers, the ``input_tokens_include_cache_reads`` credit, or
+    cache-creation pricing.  Codex review 2026-04-25 Part 1 #9/#10:
+    the previous implementation reimplemented a simplified pricing
+    formula and quietly under-counted cost on long-context calls.
 
-    When a call's (provider, model) has no pricing entry, the call's tokens
-    are NOT included in the running total and ``unpriced_calls`` is bumped.
-    The budget check still runs on the partial total — i.e. the accounted
-    cost is a lower bound.  An earlier design returned ``None`` from
-    ``known_cost`` in that case, which silently disabled the budget entirely;
-    the current design reports a lower-bound cost and exposes
-    ``has_unpriced_usage`` so the caller can warn once.
+    When a call's (provider, model) has no pricing entry the call's
+    tokens are NOT included in the running total and ``unpriced_calls``
+    is bumped.  The budget check still runs on the partial total — i.e.
+    the accounted cost is a lower bound.  An earlier design returned
+    ``None`` from ``known_cost`` in that case, which silently disabled
+    the budget entirely; the current design reports a lower-bound cost
+    and exposes ``has_unpriced_usage`` so the caller can warn once.
     """
 
     def __init__(self):
@@ -113,22 +117,17 @@ class _CostTracker:
         self.unpriced_calls: int = 0
 
     def record(self, usage: dict, provider: str, model: str) -> None:
-        from ..stats import _lookup_pricing
-        pricing = _lookup_pricing(provider, model) if provider and model else None
-        if pricing is None:
+        from ..stats import compute_call_cost
+        breakdown = compute_call_cost(usage, provider, model)
+        if not breakdown.is_priced:
+            # Only count it as unpriced if there was actual token activity.
+            # ``compute_call_cost`` already reports ``is_priced=True`` for
+            # zero-token calls, so reaching this branch with no tokens is
+            # impossible — but be explicit.
             if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
                 self.unpriced_calls += 1
             return
-        input_t = usage.get("input_tokens", 0) or 0
-        output_t = usage.get("output_tokens", 0) or 0
-        cache_create = usage.get("cache_creation_input_tokens", 0) or 0
-        cache_read = usage.get("cache_read_input_tokens", 0) or 0
-        self.total_cost += (
-            input_t * pricing.input_per_million / 1_000_000
-            + output_t * pricing.output_per_million / 1_000_000
-            + cache_create * (pricing.cache_creation_per_million or 0.0) / 1_000_000
-            + cache_read * (pricing.cache_read_per_million or 0.0) / 1_000_000
-        )
+        self.total_cost += breakdown.cost_usd
 
     @property
     def has_unpriced_usage(self) -> bool:

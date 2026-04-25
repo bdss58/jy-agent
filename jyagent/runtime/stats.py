@@ -114,6 +114,104 @@ def set_model_pricing(
         _MODEL_PRICING.setdefault(provider, {})[model_prefix] = _coerce_pricing(pricing)
 
 
+# ─── Pure pricing function ────────────────────────────────────────────────
+#
+# Single source of pricing math for the whole codebase.  Before 2026-04
+# there were two implementations: ``SessionStats._record_cost`` (full
+# semantics — long-context multipliers, cache-read credit, unknown-cost
+# flags) and the engine's ``_CostTracker`` (simplified, missing both
+# the long-context multiplier and the ``input_tokens_include_cache_reads``
+# credit).  The two drifted on Anthropic 1M-context models: the session
+# status bar reported one cost while ``LoopConfig.max_cost_usd`` enforced
+# a different (lower) figure.  Codex review 2026-04-25 Part 1 #9/#10.
+#
+# Keep this function pure: no locks, no mutation, no I/O.  Both
+# ``SessionStats._record_cost`` and the engine's ``_CostTracker`` call
+# it; any future consumer (tracing, analytics, per-subagent budgeting)
+# should route through here too.
+
+
+@dataclass(frozen=True)
+class CostBreakdown:
+    """Result of ``compute_call_cost``.
+
+    ``is_priced`` is True iff the (provider, model) pair had full
+    pricing coverage for the token components present in ``usage``
+    (e.g. if the call used cache_creation but the pricing entry has
+    ``cache_creation_per_million=None``, the call is *unpriced* even
+    if other components were priceable).
+    """
+
+    cost_usd: float
+    is_priced: bool
+
+
+def compute_call_cost(
+    usage: dict | None,
+    provider: str,
+    model: str,
+) -> CostBreakdown:
+    """Price a single LLM call's token usage.
+
+    Honours long-context multipliers (Anthropic 1M-context tier) and
+    the ``input_tokens_include_cache_reads`` convention where the
+    provider reports cache_read tokens as part of input_tokens and the
+    caller must subtract them to avoid double billing.
+
+    ``usage`` is the normalised dict form produced by the runtime (see
+    ``llm.types.Usage``): keys ``input_tokens``, ``output_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens``.  A
+    ``None`` or empty usage yields a zero-cost priced breakdown — i.e.
+    the model made no billable call (e.g. client-side abort).
+
+    When pricing is missing for any required component the breakdown
+    reports ``is_priced=False`` and ``cost_usd=0.0``.  Callers decide
+    whether to surface this (a warning, a budget lower bound, or a
+    silent skip).
+    """
+    input_t = (usage or {}).get("input_tokens", 0) or 0
+    output_t = (usage or {}).get("output_tokens", 0) or 0
+    cache_create = (usage or {}).get("cache_creation_input_tokens", 0) or 0
+    cache_read = (usage or {}).get("cache_read_input_tokens", 0) or 0
+
+    # No token activity at all — trivially priced, zero cost.
+    if not (input_t or output_t or cache_create or cache_read):
+        return CostBreakdown(cost_usd=0.0, is_priced=True)
+
+    pricing = _lookup_pricing(provider, model) if provider and model else None
+    if pricing is None:
+        return CostBreakdown(cost_usd=0.0, is_priced=False)
+
+    # Component-pricing gaps make the whole call unpriced — better to
+    # surface a lower bound than silently under-report.
+    if cache_create and pricing.cache_creation_per_million is None:
+        return CostBreakdown(cost_usd=0.0, is_priced=False)
+    if cache_read and pricing.cache_read_per_million is None:
+        return CostBreakdown(cost_usd=0.0, is_priced=False)
+
+    prompt_tokens = input_t + cache_create + cache_read
+    input_multiplier = 1.0
+    output_multiplier = 1.0
+    if (
+        pricing.long_context_threshold_tokens is not None
+        and prompt_tokens > pricing.long_context_threshold_tokens
+    ):
+        input_multiplier = pricing.long_context_input_multiplier
+        output_multiplier = pricing.long_context_output_multiplier
+
+    billable_input = input_t
+    if pricing.input_tokens_include_cache_reads:
+        billable_input = max(0, input_t - cache_read)
+
+    cost = (
+        billable_input * pricing.input_per_million * input_multiplier / 1_000_000
+        + output_t * pricing.output_per_million * output_multiplier / 1_000_000
+        + cache_create * (pricing.cache_creation_per_million or 0.0) * input_multiplier / 1_000_000
+        + cache_read * (pricing.cache_read_per_million or 0.0) * input_multiplier / 1_000_000
+    )
+    return CostBreakdown(cost_usd=cost, is_priced=True)
+
+
 class SessionStats:
     """Accumulates token usage and cost for the current session."""
 
@@ -179,43 +277,30 @@ class SessionStats:
         provider: str,
         model: str,
     ) -> None:
-        pricing = _lookup_pricing(provider, model) if provider and model else None
-        if pricing is None:
+        """Add a single LLM call's cost to the running totals.
+
+        Delegates the pricing math to ``compute_call_cost`` (single
+        source of truth — see module docstring on the unification with
+        the engine's ``_CostTracker``).  This method only handles the
+        accounting side: bumping known/unknown totals and the per-turn
+        slice.
+        """
+        usage = {
+            "input_tokens": input_t,
+            "output_tokens": output_t,
+            "cache_creation_input_tokens": cache_create,
+            "cache_read_input_tokens": cache_read,
+        }
+        breakdown = compute_call_cost(usage, provider, model)
+        if not breakdown.is_priced:
+            # Token activity present but unpriced — flag for UI ("≈" or
+            # similar marker) without poisoning the numeric total.
             if input_t or output_t or cache_create or cache_read:
                 self._has_unknown_total_cost = True
                 self._has_unknown_turn_cost = True
             return
-
-        if cache_create and pricing.cache_creation_per_million is None:
-            self._has_unknown_total_cost = True
-            self._has_unknown_turn_cost = True
-            return
-
-        if cache_read and pricing.cache_read_per_million is None:
-            self._has_unknown_total_cost = True
-            self._has_unknown_turn_cost = True
-            return
-
-        prompt_tokens = input_t + cache_create + cache_read
-        input_multiplier = 1.0
-        output_multiplier = 1.0
-        if pricing.long_context_threshold_tokens is not None and prompt_tokens > pricing.long_context_threshold_tokens:
-            input_multiplier = pricing.long_context_input_multiplier
-            output_multiplier = pricing.long_context_output_multiplier
-
-        billable_input_tokens = input_t
-        if pricing.input_tokens_include_cache_reads:
-            billable_input_tokens = max(0, input_t - cache_read)
-
-        input_cost = billable_input_tokens * pricing.input_per_million * input_multiplier / 1_000_000
-        output_cost = output_t * pricing.output_per_million * output_multiplier / 1_000_000
-        cache_create_cost = (
-            cache_create * (pricing.cache_creation_per_million or 0.0) * input_multiplier / 1_000_000
-        )
-        cache_read_cost = cache_read * (pricing.cache_read_per_million or 0.0) * input_multiplier / 1_000_000
-        total = input_cost + output_cost + cache_create_cost + cache_read_cost
-        self._known_total_cost += total
-        self._known_turn_cost += total
+        self._known_total_cost += breakdown.cost_usd
+        self._known_turn_cost += breakdown.cost_usd
 
     def record_usage(self, usage, provider: str = "", model: str = ""):
         """Record token usage from a normalized runtime response."""
@@ -377,3 +462,13 @@ _stats = SessionStats()
 
 def get_stats() -> SessionStats:
     return _stats
+
+
+__all__ = [
+    "ModelPricing",
+    "CostBreakdown",
+    "SessionStats",
+    "compute_call_cost",
+    "get_stats",
+    "set_model_pricing",
+]
