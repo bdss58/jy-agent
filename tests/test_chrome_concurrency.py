@@ -304,17 +304,21 @@ class TestFetchChromeDelgation:
         assert call_kwargs.kwargs.get("timeout") == 15
         assert "js_function" in call_kwargs.kwargs
 
-    def test_search_url_uses_search_js(self):
-        """Search URLs should use the search-specific JS extractor."""
+    def test_search_url_uses_default_js(self):
+        """After Chrome-SERP removal, search URLs use the same default JS as any other page.
+
+        SERP scraping is now handled exclusively by the `web_search` tool's
+        multi-engine cascade, not by web_fetch+Chrome.
+        """
         mock_mgr = MagicMock()
         mock_mgr.chrome_fetch_page.return_value = "search results"
 
         with patch("jyagent.mcp_manager.get_manager", return_value=mock_mgr):
-            from jyagent.tools.web_fetch import _fetch_chrome, _CHROME_EXTRACT_SEARCH_JS
+            from jyagent.tools.web_fetch import _fetch_chrome, _CHROME_EXTRACT_JS
             _fetch_chrome("https://www.google.com/search?q=test")
 
         call_kwargs = mock_mgr.chrome_fetch_page.call_args
-        assert call_kwargs.kwargs["js_function"] == _CHROME_EXTRACT_SEARCH_JS
+        assert call_kwargs.kwargs["js_function"] == _CHROME_EXTRACT_JS
 
     def test_non_search_url_uses_default_js(self):
         """Non-search URLs should use the default JS extractor."""

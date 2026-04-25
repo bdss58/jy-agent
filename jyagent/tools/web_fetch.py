@@ -345,75 +345,13 @@ def _fetch_jina(url: str, timeout: int = 30) -> tuple:
 # Simple approach: call Chrome MCP tools directly (navigate → extract → close).
 # No LLM sub-call needed — just 3 deterministic tool calls.
 
-# JS to extract text content
+# JS to extract text content. Used for JS-heavy article/page fetches
+# (Twitter, Reddit, Zhihu, Weibo, etc.) as a last-resort fallback.
+#
+# NOTE: Chrome is NOT used for search-engine SERP scraping any more —
+# the `web_search` tool provides a dedicated multi-engine cascade
+# (DDG / Brave / Mojeek / SearxNG) that's far cheaper and more reliable.
 _CHROME_EXTRACT_JS = """() => {
-    return document.body.innerText;
-}"""
-
-# JS to extract search results with REAL href URLs.
-# Google/Bing/DuckDuckGo render truncated display URLs in innerText
-# (e.g. "dev.to › varshithvhegde › the-great-...") but the actual
-# <a href="..."> contains the full, correct URL.  This extractor
-# captures both the link text AND the real href so the agent (and
-# downstream web_fetch callers) get usable URLs.
-_CHROME_EXTRACT_SEARCH_JS = """() => {
-    // --- Google ---
-    const googleResults = [];
-    document.querySelectorAll('a').forEach(a => {
-        const h3 = a.querySelector('h3');
-        if (h3 && a.href && !a.href.includes('google.com')) {
-            googleResults.push({title: h3.textContent.trim(), url: a.href});
-        }
-    });
-    if (googleResults.length > 0) {
-        const lines = googleResults.map((r, i) =>
-            `${i+1}. ${r.title}\\n   ${r.url}`
-        );
-        // Also append the rest of innerText (snippets, knowledge panels, etc.)
-        const extra = document.body.innerText;
-        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
-    }
-
-    // --- Bing ---
-    const bingResults = [];
-    document.querySelectorAll('#b_results .b_algo h2 a').forEach(a => {
-        if (a.href) bingResults.push({title: a.textContent.trim(), url: a.href});
-    });
-    if (bingResults.length > 0) {
-        const lines = bingResults.map((r, i) =>
-            `${i+1}. ${r.title}\\n   ${r.url}`
-        );
-        const extra = document.body.innerText;
-        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
-    }
-
-    // --- DuckDuckGo ---
-    const ddgResults = [];
-    document.querySelectorAll('a.result__a').forEach(a => {
-        if (a.href) ddgResults.push({title: a.textContent.trim(), url: a.href});
-    });
-    if (ddgResults.length > 0) {
-        const lines = ddgResults.map((r, i) =>
-            `${i+1}. ${r.title}\\n   ${r.url}`
-        );
-        const extra = document.body.innerText;
-        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
-    }
-
-    // --- Baidu ---
-    const baiduResults = [];
-    document.querySelectorAll('.result h3 a, .c-container h3 a').forEach(a => {
-        if (a.href) baiduResults.push({title: a.textContent.trim(), url: a.href});
-    });
-    if (baiduResults.length > 0) {
-        const lines = baiduResults.map((r, i) =>
-            `${i+1}. ${r.title}\\n   ${r.url}`
-        );
-        const extra = document.body.innerText;
-        return lines.join('\\n\\n') + '\\n\\n---\\n' + extra;
-    }
-
-    // Fallback: plain innerText
     return document.body.innerText;
 }"""
 
@@ -427,18 +365,16 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
     - Explicit select_page before evaluate_script / take_snapshot
     - Automatic cleanup (close tab, restore original selection)
 
-    For search result pages, uses a specialised JS extractor that captures
-    real href URLs instead of truncated display text.
+    Used as a last-resort fallback for JS-heavy article pages only.
+    SERP scraping belongs in `web_search`, not here.
 
     Raises RuntimeError on failure (causes fallthrough to next strategy).
     """
     from ..mcp_manager import get_manager
 
     manager = get_manager()
-    extract_js = _CHROME_EXTRACT_SEARCH_JS if _is_search_url(url) else _CHROME_EXTRACT_JS
-
     content = manager.chrome_fetch_page(
-        url, timeout=timeout, js_function=extract_js,
+        url, timeout=timeout, js_function=_CHROME_EXTRACT_JS,
     )
     return 200, content
 
@@ -453,16 +389,11 @@ _STRATEGY_MAP = {
     "auto": [_fetch_cffi, _fetch_httpx, _fetch_jina, _fetch_chrome],
 }
 
-# For JS-heavy/anti-bot sites, skip simple HTTP and go straight to Jina/Chrome
+# For JS-heavy/anti-bot sites (Twitter/X, Reddit, Zhihu, Weibo, etc.), skip
+# simple HTTP and go straight to Jina/Chrome. Note: search engine SERPs are
+# now handled exclusively by the `web_search` tool, not by web_fetch+Chrome.
 _STRATEGY_MAP_JS_HEAVY = {
     "auto": [_fetch_jina, _fetch_cffi, _fetch_chrome],
-}
-
-# For search result pages on JS-heavy sites (Google, Bing, Baidu), prefer Chrome
-# because Chrome can extract real href URLs via _CHROME_EXTRACT_SEARCH_JS,
-# while Jina/innerText only gives truncated display URLs like "dev.to › ..."
-_STRATEGY_MAP_SEARCH = {
-    "auto": [_fetch_chrome, _fetch_jina, _fetch_cffi],
 }
 
 # Jina and Chrome snapshot both return pre-extracted text — skip HTML extraction
@@ -525,10 +456,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
     is_search = _is_search_url(url)
     js_heavy = _is_js_heavy(url)
 
-    if strategy == "auto" and is_search and js_heavy:
-        # Search pages on JS-heavy sites: prefer Chrome for real href extraction
-        fetchers = _STRATEGY_MAP_SEARCH["auto"]
-    elif strategy == "auto" and js_heavy:
+    if strategy == "auto" and js_heavy:
         fetchers = _STRATEGY_MAP_JS_HEAVY["auto"]
     else:
         fetchers = _STRATEGY_MAP.get(strategy, _STRATEGY_MAP["auto"])
