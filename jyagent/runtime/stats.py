@@ -57,6 +57,21 @@ _MODEL_PRICING = {
     },
 }
 
+# Guards concurrent reads (``_lookup_pricing``) and writes
+# (``set_model_pricing``).  On CPython 3.14 the GIL makes the canonical
+# race (``RuntimeError: dictionary changed size during iteration``)
+# extremely hard to reproduce — single dict ops are bytecode-atomic and
+# ``sorted()`` over an items() view holds the GIL for the duration of
+# its C-level iterator setup.  We still take the lock because:
+#   * Free-threaded CPython (PEP 703) removes the GIL — the same code
+#     becomes a real data race there.
+#   * Future MCP-style code may register many providers concurrently
+#     from background threads, widening the window.
+#   * The lock is uncontended on the hot path (one read per LLM call)
+#     so the cost is a couple of CAS instructions.
+# Codex review 2026-04-25 Part 1 #6.
+_PRICING_LOCK = threading.RLock()
+
 
 def _coerce_pricing(pricing: ModelPricing | tuple[float, float] | tuple[float, float, float | None, float | None]) -> ModelPricing:
     if isinstance(pricing, ModelPricing):
@@ -74,9 +89,17 @@ def _coerce_pricing(pricing: ModelPricing | tuple[float, float] | tuple[float, f
 
 
 def _lookup_pricing(provider: str, model: str) -> ModelPricing | None:
-    """Find pricing by longest prefix match."""
-    pricing_map = _MODEL_PRICING.get(provider, {})
-    for prefix, pricing in sorted(pricing_map.items(), key=lambda x: -len(x[0])):
+    """Find pricing by longest prefix match.
+
+    Thread-safe: takes ``_PRICING_LOCK`` so a concurrent
+    ``set_model_pricing`` cannot mutate the inner dict mid-iteration.
+    """
+    with _PRICING_LOCK:
+        pricing_map = _MODEL_PRICING.get(provider, {})
+        # Snapshot items inside the lock; the sort + linear scan happen on
+        # the local list so we hold the lock for O(N) not O(N log N).
+        items = list(pricing_map.items())
+    for prefix, pricing in sorted(items, key=lambda x: -len(x[0])):
         if model.startswith(prefix):
             return _coerce_pricing(pricing)
     return None
@@ -87,7 +110,8 @@ def set_model_pricing(
     model_prefix: str,
     pricing: ModelPricing | tuple[float, float] | tuple[float, float, float | None, float | None],
 ) -> None:
-    _MODEL_PRICING.setdefault(provider, {})[model_prefix] = _coerce_pricing(pricing)
+    with _PRICING_LOCK:
+        _MODEL_PRICING.setdefault(provider, {})[model_prefix] = _coerce_pricing(pricing)
 
 
 class SessionStats:
