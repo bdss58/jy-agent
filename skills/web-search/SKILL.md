@@ -11,15 +11,16 @@ description: >-
   known URL fetching (use web_fetch), weather/time queries (use appropriate
   APIs), questions answerable from existing knowledge alone, or comprehensive
   multi-source reports (use deep-research). This skill provides efficient web
-  search with smart query breakdown and cited answers.
+  search with smart query breakdown and cited answers. Backed by a resilient
+  multi-engine cascade (SearxNG → DuckDuckGo → Brave → Mojeek).
 metadata:
   author: jy-agent
-  version: "6.0"
+  version: "6.1"
 ---
 
 # Web Search
 
-Search the web using `web_search` (DuckDuckGo, primary), `web_fetch` (page-level),
+Search the web using `web_search` (SearxNG → DDG → Brave → Mojeek cascade), `web_fetch` (page-level),
 and `dispatch_agent` (parallel). Inspired by how Google, OpenAI, and Anthropic
 implement search in their AI agents — with query decomposition, iterative
 multi-hop search, dynamic filtering, and citation-first output.
@@ -93,7 +94,14 @@ web_search(query="latest AI regulation news 2026")
 
 ### Backend
 
-`web_search` is backed by **DuckDuckGo HTML search** (fast, free, no auth).
+`web_search` runs a **multi-engine cascade** (first non-empty wins):
+
+1. **SearxNG** — only if `SEARXNG_URL` env is set (self-hosted meta-search; aggregates Google/Bing/Brave/etc.)
+2. **DuckDuckGo HTML** — fast, free, no auth (default first hop)
+3. **Brave Search** — HTML scrape fallback
+4. **Mojeek** — independent index, third fallback
+
+Force a single engine with `WEB_SEARCH_ENGINE=searxng|ddg|brave|mojeek`.
 Returns up to `max_results` (default 10) hits with title, URL, snippet.
 
 For deeper coverage, the agent does the orchestration itself:
