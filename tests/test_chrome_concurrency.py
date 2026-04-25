@@ -25,7 +25,7 @@ def _make_manager():
 
 def _make_tool_result(content="", is_error=False):
     """Create a mock ToolResult."""
-    from jyagent.toolresult import ToolResult
+    from jyagent.runtime.tools.result import ToolResult
     return ToolResult(content, is_error=is_error)
 
 

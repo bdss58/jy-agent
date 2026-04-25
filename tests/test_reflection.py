@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from jyagent import loop_engine as le
-from jyagent import reflection
-from jyagent.reflection import (
+from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop import reflection
+from jyagent.runtime.loop.reflection import (
     REFLECTION_MARKER,
     SUBAGENT_TOOL_NAMES,
     build_reflection_prompt,

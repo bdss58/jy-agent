@@ -8,7 +8,7 @@ Controlled by env var AGENT_TRACE_ENABLED.  When disabled (the default),
 every RunTrace method is a no-op with zero overhead.
 
 Usage:
-    from jyagent.tracing import get_tracer, RunTrace
+    from jyagent.runtime.loop.tracing import get_tracer, RunTrace
 
     trace = get_tracer()            # None when disabled
     if trace:

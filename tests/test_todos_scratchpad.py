@@ -15,8 +15,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from jyagent import loop_engine as le
-from jyagent.todos import (
+from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop.todos import (
     TodoItem,
     WRITE_TODOS_SCHEMA,
     build_write_todos_tool,

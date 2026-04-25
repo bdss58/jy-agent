@@ -15,8 +15,8 @@ import threading
 
 import pytest
 
-from jyagent import loop_engine as le
-from jyagent.checkpoint import (
+from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop.checkpoint import (
     LoopCheckpoint,
     checkpoint_path,
     iso_utc_now,

@@ -308,7 +308,7 @@ class TestCancelEventInterruptsLoop:
     'interrupted' status."""
 
     def test_cancel_interrupts(self):
-        from jyagent.loop_engine import AgentLoop, LoopConfig
+        from jyagent.runtime.loop.engine import AgentLoop, LoopConfig
 
         cancel_event = threading.Event()
 
@@ -346,7 +346,7 @@ class TestCancelEventInterruptsLoop:
 
         # Provide a dummy tool so the loop can "execute" it
         def dummy_tool(**kwargs):
-            from jyagent.toolresult import ToolResult as TR
+            from jyagent.runtime.tools.result import ToolResult as TR
             return TR("ok")
 
         tool_schemas = [{"name": "dummy_tool", "input_schema": {"type": "object", "properties": {}}}]

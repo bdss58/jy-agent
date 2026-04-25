@@ -6,8 +6,8 @@ from __future__ import annotations
 
 import pytest
 
-from jyagent import loop_engine as le
-from jyagent.phases import PhaseDirective, default_phase_policy
+from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop.phases import PhaseDirective, default_phase_policy
 
 
 # ─── PhaseDirective ──────────────────────────────────────────────────────────

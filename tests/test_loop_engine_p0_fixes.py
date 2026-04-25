@@ -18,13 +18,13 @@ from dataclasses import dataclass
 import pytest
 
 from jyagent.runtime.loop import engine as le
-from jyagent.loop_engine import (
+from jyagent.runtime.loop.engine import (
     _execute_tool_with_timeout,
     _execute_tools,
     _tool_dispatch_executor,
     ToolCallRequest,
 )
-from jyagent.toolresult import ToolResult
+from jyagent.runtime.tools.result import ToolResult
 
 
 # ─── Shared fake registry ────────────────────────────────────────────────────

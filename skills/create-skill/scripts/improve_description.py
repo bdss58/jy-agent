@@ -273,7 +273,7 @@ def run_improvement_loop(skill_dir: str, eval_set: list[dict] = None,
             _update_skill_description(skill_dir, new_desc)
 
             # Re-discover skills (description changed)
-            from jyagent.skills import get_skill_manager
+            from jyagent.runtime.skills import get_skill_manager
             mgr = get_skill_manager()
             mgr.discover()
 
@@ -302,13 +302,13 @@ def run_improvement_loop(skill_dir: str, eval_set: list[dict] = None,
     # Apply best description
     if not dry_run and best_desc != original_desc:
         _update_skill_description(skill_dir, best_desc)
-        from jyagent.skills import get_skill_manager
+        from jyagent.runtime.skills import get_skill_manager
         get_skill_manager().discover()
         print(f"\n✅ Best description applied (score: {best_score:.0%})")
     elif best_desc == original_desc:
         # Restore original if no improvement
         _update_skill_description(skill_dir, original_desc)
-        from jyagent.skills import get_skill_manager
+        from jyagent.runtime.skills import get_skill_manager
         get_skill_manager().discover()
         print(f"\n📌 Original description kept (no improvement found)")
 

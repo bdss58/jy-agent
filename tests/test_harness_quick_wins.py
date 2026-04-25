@@ -10,8 +10,8 @@ import pytest
 
 # ─── Remediation messages ──────────────────────────────────────────────────
 
-from jyagent.toolresult import ToolResult
-from jyagent.remediation import enrich_error
+from jyagent.runtime.tools.result import ToolResult
+from jyagent.runtime.loop.remediation import enrich_error
 
 
 class TestRemediation:
@@ -102,7 +102,7 @@ class TestRemediation:
 
 # ─── Cost budget ───────────────────────────────────────────────────────────
 
-from jyagent.loop_engine import _CostTracker
+from jyagent.runtime.loop.engine import _CostTracker
 
 
 class TestCostTracker:
@@ -154,7 +154,7 @@ class TestCostTracker:
 
 # --- Response-aware stuck-loop detection ---
 
-from jyagent.loop_engine import _StuckLoopDetector, ToolCallRequest
+from jyagent.runtime.loop.engine import _StuckLoopDetector, ToolCallRequest
 
 
 class TestStuckLoopDetector:
@@ -343,7 +343,7 @@ class TestStuckLoopDetector:
 
 # --- Integration: LoopConfig ---
 
-from jyagent.loop_engine import LoopConfig
+from jyagent.runtime.loop.engine import LoopConfig
 
 
 class TestLoopConfigHarness:

@@ -30,7 +30,7 @@ from jyagent.llm.core import (
     _ADAPTERS,
 )
 from jyagent.llm.types import ModelSpec
-from jyagent.skills import SkillManager
+from jyagent.runtime.skills import SkillManager
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────

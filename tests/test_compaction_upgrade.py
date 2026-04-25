@@ -18,7 +18,7 @@ def test_thinking_blocks_pruned_from_old_messages():
     invalidate the cryptographic signature and the provider would reject
     the next turn).
     """
-    from jyagent.loop_engine import _compact_messages
+    from jyagent.runtime.loop.engine import _compact_messages
     import jyagent.tools  # noqa: triggers registration
 
     messages = []
@@ -75,7 +75,7 @@ def test_thinking_blocks_pruned_from_old_messages():
 
 def test_observation_masking_clears_far_tool_results():
     """Tier 1: tool results beyond OBSERVATION_MASK_DISTANCE are fully cleared."""
-    from jyagent.loop_engine import _compact_messages
+    from jyagent.runtime.loop.engine import _compact_messages
     import jyagent.tools  # noqa
 
     messages = []
@@ -103,7 +103,7 @@ def test_observation_masking_clears_far_tool_results():
 
 def test_ephemeral_tools_cleared_even_when_close():
     """Tier 2: ephemeral tools are cleared regardless of distance."""
-    from jyagent.loop_engine import _compact_messages
+    from jyagent.runtime.loop.engine import _compact_messages
     import jyagent.tools  # noqa
 
     # 6 messages: assistant+tool_result x 3. Message indices 0-5.
@@ -128,7 +128,7 @@ def test_ephemeral_tools_cleared_even_when_close():
 
 def test_persistent_tool_results_retained():
     """Persistent tool results (read_file, web_fetch) are NOT fully cleared."""
-    from jyagent.loop_engine import _compact_messages
+    from jyagent.runtime.loop.engine import _compact_messages
     import jyagent.tools  # noqa
 
     content_4k = "line of code\n" * 300  # ~3900 chars
@@ -158,7 +158,7 @@ def test_persistent_tool_results_retained():
 
 def test_last_two_messages_always_intact():
     """The last 2 messages are never modified regardless of content."""
-    from jyagent.loop_engine import _compact_messages
+    from jyagent.runtime.loop.engine import _compact_messages
     import jyagent.tools  # noqa
 
     big_thinking = {"type": "thinking", "thinking": "x" * 10000}
@@ -266,7 +266,7 @@ def test_file_reinjection_skips_missing_files():
 
 def test_compaction_priority_in_registry():
     """Registry correctly stores and retrieves compaction_priority."""
-    from jyagent.registry import ToolRegistry
+    from jyagent.runtime.tools.registry import ToolRegistry
 
     reg = ToolRegistry()
     reg.register("test_tool", lambda: None, {"name": "test_tool"},
@@ -278,7 +278,7 @@ def test_compaction_priority_in_registry():
 def test_builtin_tools_have_correct_priorities():
     """Built-in tools registered with expected compaction priorities."""
     import jyagent.tools  # noqa
-    from jyagent.registry import get_registry
+    from jyagent.runtime.tools.registry import get_registry
     r = get_registry()
 
     assert r.get_compaction_priority("run_shell") == "ephemeral"

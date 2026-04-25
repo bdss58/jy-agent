@@ -16,7 +16,7 @@ import pytest
 # Tracing
 # ═══════════════════════════════════════════════════════════════════════════
 
-from jyagent.tracing import RunTrace, SpanEvent, get_tracer, TRACE_ENABLED
+from jyagent.runtime.loop.tracing import RunTrace, SpanEvent, get_tracer, TRACE_ENABLED
 
 
 class TestSpanEvent:
@@ -151,7 +151,7 @@ class TestGetTracer:
 # Verification
 # ═══════════════════════════════════════════════════════════════════════════
 
-from jyagent.verification import (
+from jyagent.runtime.loop.verification import (
     should_verify,
     build_verification_prompt,
     VERIFY_TOOL_NAMES,

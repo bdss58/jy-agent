@@ -129,7 +129,7 @@ def test_trigger(skill_dir: str, eval_set: list[dict], runs_per_query: int = 1,
 
     Returns results dict with per-query outcomes and summary.
     """
-    from jyagent.skills import SkillManager
+    from jyagent.runtime.skills import SkillManager
 
     meta = _parse_skill_meta(skill_dir)
     target_name = meta["name"]
