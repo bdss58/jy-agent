@@ -65,9 +65,11 @@ old.should_verify(msg, 1)  →  False   # because should_verify reads new.VERIFI
 - **Mitigation**: tests should target the new path (`jyagent.runtime.loop.verification`). Document in CONTRIBUTING / README.
 
 ## Remaining work
-- Phase 5b: Re-run Codex review when network is healthier (got 85k tokens of useful probes before dying both times) — or skip; findings already documented
-- Open PR / merge to main
-- (Future) Remove shims one release after merge
+- ✅ Merged to main directly (no PR; branch + worktree deleted)
+- ✅ Pushed to `origin/main` (commits `f4674e0`..`a878c39`)
+- ✅ Skill-discovery smoke test added (`tests/test_skill_default_path.py`, commit `a30e3d7`) — guards against future `__file__`-depth bugs
+- ⏭️ Phase 5b Codex re-review — skipped; findings already documented
+- ⏳ Remove backward-compat shims one release after merge (13 modules at old paths)
 
 ## Out of scope (deferred — explicitly NOT done)
 - Splitting `skills.py` into a subpackage (still 771-line single file in runtime/)
