@@ -35,7 +35,12 @@ from ..config import (
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-DEFAULT_SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills")
+# Resolve to <repo_root>/skills. This file lives at jyagent/runtime/skills.py,
+# so we need THREE dirname calls: runtime/ → jyagent/ → <repo_root>.
+DEFAULT_SKILLS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "skills",
+)
 SKILL_FILENAME = "SKILL.md"
 
 # Progressive disclosure budgets

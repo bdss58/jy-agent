@@ -74,3 +74,36 @@ old.should_verify(msg, 1)  →  False   # because should_verify reads new.VERIFI
 - Moving `mcp_*` into `runtime/`
 - Moving `agent.py` into `jyagent/app/`
 - Cleaning up the runtime → cli/console dependency in skills.py (see Codex Q5 — flagged but not investigated due to mid-summary disconnect)
+
+
+## ⚠️ Post-merge bug: `__file__`-relative paths broke after move (2026-04-25)
+
+**Symptom**: `manage_skills(action='list')` returned "📦 No skills found. Create one with manage_skills(action='create', ...)" even though 7 skills were present at `<repo>/skills/*/SKILL.md`.
+
+**Root cause**: `runtime/skills.py:38` had:
+```python
+DEFAULT_SKILLS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills"
+)
+```
+Two `dirname()` calls were correct when the file lived at `jyagent/skills.py` (→ `<repo>/skills`). After `git mv jyagent/skills.py jyagent/runtime/skills.py` (one level deeper), the same two `dirname()`s now resolve to `jyagent/skills/` — which doesn't exist. Discovery silently returns empty.
+
+**Fix**: Add a third `dirname()`:
+```python
+# runtime/skills.py → runtime/ → jyagent/ → <repo_root>
+DEFAULT_SKILLS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "skills",
+)
+```
+Verified: fresh import discovers all 7 skills (browser-automation, claude-code, codex-cli, create-skill, deep-research, git-workflow, web-search).
+
+**Why tests didn't catch it**: pytest suite doesn't assert that skill discovery from the default path returns ≥1 skill on a real checkout. Skill tests likely use a tmp_path fixture and inject `skills_dir` explicitly.
+
+**Lesson — audit checklist for any future "move module deeper in package tree" refactor**:
+1. `grep -rn "__file__" <moved_files>` — every `dirname` chain on `__file__` is depth-coupled to the file's location and must be re-counted.
+2. Search for `Path(__file__).parent.parent` and `.parents[N]` patterns too — same trap.
+3. Add a smoke test: `assert len(SkillManager().list_skills()) >= 1` (or similar default-path discovery assertion) for any module that resolves repo-relative paths from `__file__`.
+4. After moving the file, do a fresh-process import + call the default-path resolver and assert the path exists, **not just that import succeeds**.
+
+**Status**: Fixed on main directly (one-line patch). No regression test added yet — TODO if this becomes a pattern.
