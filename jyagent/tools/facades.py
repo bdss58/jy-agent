@@ -5,12 +5,14 @@ from ..runtime.tools.result import ToolResult
 
 
 def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult:
-    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'show' (display all memories), 'topic' (manage curated topic files: list/read/write/delete), 'goal' (add/complete a goal), 'note' (DEPRECATED alias for journal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/)."""
+    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'supersede' (mark stale entries with strikethrough and append a corrected one — non-destructive update), 'show' (display all memories), 'search' (BM25 over topic+journal bodies), 'topic' (manage curated topic files: list/read/write/delete/sections), 'goal' (add/complete a goal), 'note' (DEPRECATED alias for journal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/)."""
     from ..memory.operations import (
-        remember, forget, show_memory,
+        remember, forget, supersede, show_memory,
         list_topics, read_topic, write_topic, delete_topic,
+        read_topic_section, list_topic_sections,
         append_journal, list_journals, read_journal, consolidate_memory,
     )
+    from ..memory.search import search_memory, render_hits
 
     try:
         if action == "remember":
@@ -22,6 +24,28 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
             if not text:
                 return ToolResult("Error: 'text' parameter required for 'forget' action (keyword to match)", is_error=True)
             return ToolResult(f"🧠 {forget(text)}")
+
+        elif action == "supersede":
+            # Format: '<old_keyword>|<new_text>'.  Non-destructive update:
+            # the matched line(s) get ~~struck-through~~ and the new entry
+            # is appended.  Inspired by Zep's bi-temporal validity model
+            # but cheap enough for a single-user file-based memory.
+            if not text or "|" not in text:
+                return ToolResult(
+                    "Error: format is 'supersede' with text='<old_keyword>|<new_text>'",
+                    is_error=True,
+                )
+            old, new = text.split("|", 1)
+            return ToolResult(f"🧠 {supersede(old.strip(), new.strip(), category)}")
+
+        elif action == "search":
+            if not text:
+                return ToolResult(
+                    "Error: 'text' parameter required for 'search' action (query string)",
+                    is_error=True,
+                )
+            hits = search_memory(text, top_k=5)
+            return ToolResult(render_hits(hits))
 
         elif action == "show":
             return ToolResult(show_memory())
@@ -38,7 +62,7 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
 
         elif action == "topic":
             if not text:
-                return ToolResult("Error: 'text' parameter required. Formats: 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'", is_error=True)
+                return ToolResult("Error: 'text' parameter required. Formats: 'list', 'read:<name>', 'read:<name>#<section>', 'sections:<name>', 'write:<name>|<content>', 'delete:<name>'", is_error=True)
 
             if text == "list":
                 topics = list_topics()
@@ -51,11 +75,43 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
                 return ToolResult("📂 Topic files (" + str(len(topics)) + "):\n" + "\n".join(lines))
 
             elif text.startswith("read:"):
-                name = text[5:].strip()
+                name_spec = text[5:].strip()
+                # Allow `read:<name>#<section>` to fetch one section instead
+                # of the whole file. The `#` separator is markdown-friendly
+                # and avoids ambiguity with topic names that contain `:`.
+                if "#" in name_spec:
+                    name, section = name_spec.split("#", 1)
+                    name = name.strip()
+                    section = section.strip()
+                    body = read_topic_section(name, section)
+                    if not body:
+                        sections = list_topic_sections(name)
+                        avail = ", ".join(sections) if sections else "(no sections)"
+                        return ToolResult(
+                            f"Section '{section}' not found in '{name}'. Available: {avail}",
+                            is_error=True,
+                        )
+                    return ToolResult(f"📄 Topic: {name}.md#{section}\n\n{body}")
+                name = name_spec
                 content = read_topic(name)
                 if not content:
                     return ToolResult(f"Topic '{name}' not found. Available: {', '.join(list_topics()) or 'none'}", is_error=True)
                 return ToolResult(f"📄 Topic: {name}.md" + "\n\n" + content)
+
+            elif text.startswith("sections:"):
+                name = text[9:].strip()
+                sections = list_topic_sections(name)
+                if not sections:
+                    if not read_topic(name):
+                        return ToolResult(
+                            f"Topic '{name}' not found. Available: {', '.join(list_topics()) or 'none'}",
+                            is_error=True,
+                        )
+                    return ToolResult(f"📄 {name}.md has no ## or ### sections")
+                lines = [f"  • {s}" for s in sections]
+                return ToolResult(
+                    f"📄 {name}.md sections ({len(sections)}):\n" + "\n".join(lines)
+                )
 
             elif text.startswith("write:"):
                 rest = text[6:]
@@ -64,7 +120,10 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
                 name, content = rest.split("|", 1)
                 name = name.strip()
                 content = content.strip()
-                write_topic(name, content)
+                try:
+                    write_topic(name, content)
+                except ValueError as e:
+                    return ToolResult(f"Error: {e}", is_error=True)
                 return ToolResult(f"📄 Topic '{name}.md' written ({len(content)} chars)")
 
             elif text.startswith("delete:"):
@@ -74,7 +133,7 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
                 return ToolResult(f"Topic '{name}' not found", is_error=True)
 
             else:
-                return ToolResult("Error: Unknown topic command. Use: 'list', 'read:<name>', 'write:<name>|<content>', 'delete:<name>'", is_error=True)
+                return ToolResult("Error: Unknown topic command. Use: 'list', 'read:<name>', 'read:<name>#<section>', 'sections:<name>', 'write:<name>|<content>', 'delete:<name>'", is_error=True)
 
         elif action == "goal":
             if not text:
@@ -99,7 +158,7 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
             )
 
         else:
-            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, show, topic, goal, note, journal, consolidate", is_error=True)
+            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, supersede, show, search, topic, goal, note, journal, consolidate", is_error=True)
 
     except Exception as e:
         return ToolResult(f"Error managing memory: {e}", is_error=True)
