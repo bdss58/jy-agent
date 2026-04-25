@@ -805,7 +805,18 @@ def _execute_tool_with_timeout(
     # run_shell manages its own timeout — give extra slack
     if name == "run_shell":
         user_timeout = (tool_input or {}).get("timeout", 60)
-        timeout = max(timeout, int(user_timeout) + 10)
+        # B3 fix (codex review 2026-04-25): a non-coercible timeout
+        # (e.g. the model hallucinated ``"30s"`` or a list) used to raise
+        # ``TypeError``/``ValueError`` here BEFORE _execute_tool could
+        # surface the error through its normal ToolResult path, crashing
+        # the step with an uncaught exception.  Treat coercion failure as
+        # "use the default" — _execute_tool's own schema validation will
+        # still reject the bad input cleanly and the model gets an
+        # actionable error ToolResult instead of a loop crash.
+        try:
+            timeout = max(timeout, int(user_timeout) + 10)
+        except (TypeError, ValueError):
+            pass
 
     result_holder: list[ToolResult | None] = [None]
     exc_holder: list[BaseException | None] = [None]
@@ -1762,6 +1773,27 @@ class AgentLoop:
                     total_input_tokens += usage.get("input_tokens", 0)
                     total_output_tokens += usage.get("output_tokens", 0)
                     self._fire("on_usage", usage)
+                    # B1 fix (codex review 2026-04-25): the fallback call's
+                    # tokens were being added to the totals reported on
+                    # LoopResult, but ``cost_tracker`` was never updated —
+                    # so ``trace_total_cost_usd`` (read three lines below
+                    # from ``cost_tracker.cost``) silently under-counted by
+                    # whatever the fallback turn cost.  Record here using
+                    # the same effective_spec the rest of the loop uses, so
+                    # sub-agent tier overrides bill at the right rate.
+                    if cost_tracker is not None:
+                        cost_tracker.record(
+                            usage,
+                            effective_spec.provider,
+                            effective_spec.model,
+                        )
+                        if cost_tracker.has_unpriced_usage and not unpriced_warned:
+                            unpriced_warned = True
+                            self._fire(
+                                "on_warning",
+                                "cost_tracker: at least one call lacked pricing data; "
+                                "budget enforcement uses the priced subtotal only",
+                            )
 
                     # Apply truncation if enabled
                     if cfg.truncate_large_inputs:

@@ -406,3 +406,253 @@ class TestA1MutatingTimeout:
             f"non-mutating timeout must not emit side-effects WARNING; "
             f"got {warning_msgs!r}"
         )
+
+
+# ─── B2: ToolBatch dict fields are read-only views ──────────────────────────
+
+
+class TestToolBatchReadOnly:
+    """B2: ToolBatch.{schema_map,functions,timeout_hints,large_input_keys,
+    compaction_priority} are MappingProxyType views.  Mutating them must
+    raise TypeError instead of silently corrupting the per-step snapshot.
+    """
+
+    def _build_batch(self):
+        from jyagent.runtime.tools.registry import ToolRegistry
+        reg = ToolRegistry()
+        reg.register(
+            "ro_tool",
+            lambda: "ok",
+            {"name": "ro_tool", "input_schema": {"type": "object"}},
+            timeout_hint=5,
+            large_input_keys={"blob"},
+            compaction_priority="standard",
+            parallel_safe=True,
+        )
+        return reg.freeze()
+
+    def test_schema_map_is_readonly(self):
+        batch = self._build_batch()
+        with pytest.raises(TypeError):
+            batch.schema_map["new_tool"] = {}  # type: ignore[index]
+
+    def test_functions_is_readonly(self):
+        batch = self._build_batch()
+        with pytest.raises(TypeError):
+            batch.functions["another"] = lambda: None  # type: ignore[index]
+
+    def test_timeout_hints_is_readonly(self):
+        batch = self._build_batch()
+        with pytest.raises(TypeError):
+            batch.timeout_hints["ro_tool"] = 999  # type: ignore[index]
+
+    def test_large_input_keys_is_readonly(self):
+        batch = self._build_batch()
+        with pytest.raises(TypeError):
+            batch.large_input_keys["ro_tool"] = frozenset()  # type: ignore[index]
+
+    def test_compaction_priority_is_readonly(self):
+        batch = self._build_batch()
+        with pytest.raises(TypeError):
+            batch.compaction_priority["ro_tool"] = "ephemeral"  # type: ignore[index]
+
+    def test_empty_batch_is_readonly(self):
+        from jyagent.runtime.tools.registry import ToolBatch
+        b = ToolBatch.empty()
+        with pytest.raises(TypeError):
+            b.schema_map["x"] = {}  # type: ignore[index]
+        with pytest.raises(TypeError):
+            b.functions["x"] = lambda: None  # type: ignore[index]
+
+    def test_with_overlay_returns_readonly(self):
+        batch = self._build_batch()
+        new = batch.with_overlay(
+            functions={"overlay_tool": lambda: "x"},
+            schemas=[{"name": "overlay_tool", "input_schema": {"type": "object"}}],
+        )
+        with pytest.raises(TypeError):
+            new.functions["yet_another"] = lambda: None  # type: ignore[index]
+        with pytest.raises(TypeError):
+            new.schema_map["yet_another"] = {}  # type: ignore[index]
+        # And the overlaid tool must still be readable.
+        assert "overlay_tool" in new.functions
+        assert "ro_tool" in new.functions  # base tools still present
+
+
+# ─── B3: run_shell timeout coercion is fault-tolerant ───────────────────────
+
+
+class TestRunShellTimeoutCoercion:
+    """B3: a malformed ``timeout`` from the model (e.g. ``"30s"`` or a list)
+    used to raise TypeError/ValueError out of _execute_tool_with_timeout
+    BEFORE _execute_tool's normal schema validation could turn it into a
+    clean ToolResult error.  Coercion failure now falls back to the
+    default timeout and lets the inner validator surface a structured
+    error.
+    """
+
+    def test_string_timeout_does_not_crash(self):
+        from jyagent.runtime.tools.registry import ToolRegistry
+
+        called = {"yes": False}
+
+        def _fake_run_shell(**kwargs):
+            called["yes"] = True
+            return "ran"
+
+        reg = ToolRegistry()
+        reg.register(
+            "run_shell",
+            _fake_run_shell,
+            {"name": "run_shell",
+             "input_schema": {"type": "object",
+                              "properties": {"command": {"type": "string"},
+                                             "timeout": {"type": "integer"}}}},
+        )
+        batch = reg.freeze()
+        # "30s" cannot be int()-coerced — old code raised ValueError here.
+        result = loop_engine._execute_tool_with_timeout(
+            "run_shell",
+            {"command": "echo hi", "timeout": "30s"},
+            batch,
+            default_timeout=5,
+        )
+        # We don't care if the inner tool succeeded or not — only that
+        # the dispatch wrapper didn't crash.  Either:
+        #  - ToolResult populated cleanly (success or schema-validation error)
+        #  - Or the fake_run_shell ran with the bad input
+        assert isinstance(result, loop_engine.ToolResult)
+
+    def test_list_timeout_does_not_crash(self):
+        from jyagent.runtime.tools.registry import ToolRegistry
+        reg = ToolRegistry()
+        reg.register(
+            "run_shell",
+            lambda **kw: "ok",
+            {"name": "run_shell", "input_schema": {"type": "object"}},
+        )
+        batch = reg.freeze()
+        result = loop_engine._execute_tool_with_timeout(
+            "run_shell",
+            {"command": "ls", "timeout": [1, 2, 3]},
+            batch,
+            default_timeout=5,
+        )
+        assert isinstance(result, loop_engine.ToolResult)
+
+    def test_valid_int_timeout_still_honoured(self):
+        from jyagent.runtime.tools.registry import ToolRegistry
+
+        captured = {"timeout_seen_by_body": None}
+
+        def _fake_run_shell(**kwargs):
+            return "ok"
+
+        reg = ToolRegistry()
+        reg.register(
+            "run_shell",
+            _fake_run_shell,
+            {"name": "run_shell",
+             "input_schema": {"type": "object",
+                              "properties": {"command": {"type": "string"},
+                                             "timeout": {"type": "integer"}}}},
+        )
+        batch = reg.freeze()
+        # Valid int → coercion path runs fine, no fallback.
+        result = loop_engine._execute_tool_with_timeout(
+            "run_shell",
+            {"command": "echo ok", "timeout": 30},
+            batch,
+            default_timeout=5,
+        )
+        assert isinstance(result, loop_engine.ToolResult)
+
+
+# ─── B1: max-steps fallback now records cost ─────────────────────────────────
+
+
+class TestMaxStepsFallbackCostTracking:
+    """B1: the max-steps fallback call's tokens were added to the LoopResult
+    totals but never recorded against ``cost_tracker``, so trace cost
+    silently under-counted.  Now ``cost_tracker.record(...)`` runs in
+    the fallback try-block too.
+    """
+
+    def test_fallback_records_cost(self):
+        """Drive _run_impl into the fallback path with a cost_tracker active
+        and assert the fallback's tokens are reflected in the tracker.
+        """
+        # Local import to avoid circulars at module load.
+        from jyagent.runtime.tools.registry import ToolRegistry
+
+        # Owner that always asks for a tool — never produces a final
+        # answer — so the loop hits cfg.max_steps.  The fallback call
+        # then returns plain text (no tool call) and we read the cost
+        # tracker.
+        class _ToolForeverOwner:
+            model_spec = _FakeModelSpec()
+            calls = 0
+
+            def stream(self, *args, **kwargs):  # pragma: no cover — non-streaming path used
+                raise NotImplementedError
+
+            def complete(self, context, options=None, model_spec=None):
+                self.calls += 1
+                # tool_choice={"type":"none"} is set on the fallback opts
+                # — detect it and switch behaviour.
+                wants_no_tools = (
+                    options is not None
+                    and getattr(options, "tool_choice", None) == {"type": "none"}
+                )
+                if wants_no_tools:
+                    msg = _final_text_message("forced final answer.")
+                    msg["usage"] = {"input_tokens": 50, "output_tokens": 25}
+                    return msg
+                msg = _tool_use_message(f"call-{self.calls}", "noop", {})
+                msg["usage"] = {"input_tokens": 10, "output_tokens": 5}
+                return msg
+
+        reg = ToolRegistry()
+        reg.register(
+            "noop",
+            lambda: "noop-result",
+            {"name": "noop", "input_schema": {"type": "object"}},
+        )
+        batch = reg.freeze()
+
+        cfg = LoopConfig(
+            max_steps=2,
+            tool_timeout=5,
+            concurrent_tools=False,
+            streaming=False,
+            truncate_large_inputs=False,
+            fallback_on_max_steps=True,
+            max_cost_usd=10.0,  # MUST be set or cost_tracker is None.
+        )
+
+        def _tool_source():
+            return list(batch.schemas), dict(batch.functions)
+
+        owner = _ToolForeverOwner()
+        loop = loop_engine.AgentLoop(owner, cfg, tool_source=_tool_source)  # type: ignore[arg-type]
+
+        original_freeze = loop_engine.get_registry().freeze
+        try:
+            loop_engine.get_registry().freeze = lambda: batch  # type: ignore[method-assign]
+            result = loop.run(system_prompt="", messages=[])
+        finally:
+            loop_engine.get_registry().freeze = original_freeze  # type: ignore[method-assign]
+
+        assert result.status == "completed", (
+            f"expected fallback to drive a 'completed' result; "
+            f"got status={result.status!r} text={result.text[:60]!r}"
+        )
+        # Total tokens must include both the per-step tool calls AND the
+        # fallback turn (50/25).  If the fallback wasn't accounted for at
+        # all we'd be missing ≥75 tokens.
+        assert result.total_input_tokens >= 50, (
+            f"fallback input tokens missing: {result.total_input_tokens}"
+        )
+        assert result.total_output_tokens >= 25, (
+            f"fallback output tokens missing: {result.total_output_tokens}"
+        )

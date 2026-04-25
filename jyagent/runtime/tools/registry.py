@@ -29,7 +29,25 @@ from __future__ import annotations
 import copy
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Optional
+
+
+def _readonly(d: Mapping) -> Mapping:
+    """Wrap ``d`` in a ``MappingProxyType`` for ToolBatch fields.
+
+    B2 fix (codex review 2026-04-25): ``@dataclass(frozen=True)`` only
+    freezes the *field references* on a ToolBatch instance — the dicts
+    they point to are still mutable.  We deep-copy at freeze() time, so
+    cross-batch mutation is already blocked, but a single batch's
+    schema_map / functions / timeout_hints / etc. used to be writeable
+    by any caller that held the batch reference.  ``MappingProxyType``
+    is a zero-cost read-only view that raises ``TypeError`` on every
+    mutating method (``__setitem__``, ``pop``, ``update``, ``clear``).
+
+    Re-wrapping an existing ``MappingProxyType`` is fine and still O(1).
+    """
+    return MappingProxyType(d) if not isinstance(d, MappingProxyType) else d
 
 
 @dataclass(frozen=True)
@@ -51,12 +69,12 @@ class ToolBatch:
 
     version: int  # registry version when frozen; -1 for ad-hoc batches (e.g. tool_source)
     schemas: tuple[dict, ...]  # deep-copied; safe to share across threads
-    schema_map: dict[str, dict]  # name → schema (also deep-copied)
-    functions: dict[str, Callable]  # name → callable
+    schema_map: Mapping[str, dict]  # name → schema (read-only view via MappingProxyType)
+    functions: Mapping[str, Callable]  # name → callable (read-only view)
     parallel_safe: frozenset[str]  # tool names with parallel_safe=True
-    timeout_hints: dict[str, int]  # name → timeout (seconds)
-    large_input_keys: dict[str, frozenset[str]]  # name → keys whose values to truncate
-    compaction_priority: dict[str, str]  # name → "ephemeral" | "standard" | "persistent"
+    timeout_hints: Mapping[str, int]  # name → timeout (seconds) — read-only view
+    large_input_keys: Mapping[str, frozenset[str]]  # name → keys to truncate — read-only
+    compaction_priority: Mapping[str, str]  # read-only: "ephemeral" | "standard" | "persistent"
     # Names of tools that perform externally-observable side effects (filesystem
     # writes, shell commands, sub-process spawns, sub-agent dispatches, MCP
     # calls).  Surfaced by ``is_mutating(name)`` so the dispatch loop can
@@ -115,12 +133,12 @@ class ToolBatch:
         return cls(
             version=-1,
             schemas=(),
-            schema_map={},
-            functions={},
+            schema_map=_readonly({}),
+            functions=_readonly({}),
             parallel_safe=frozenset(),
-            timeout_hints={},
-            large_input_keys={},
-            compaction_priority={},
+            timeout_hints=_readonly({}),
+            large_input_keys=_readonly({}),
+            compaction_priority=_readonly({}),
             mutating=frozenset(),
         )
 
@@ -159,8 +177,8 @@ class ToolBatch:
         return ToolBatch(
             version=self.version,
             schemas=new_schemas,
-            schema_map=new_schema_map,
-            functions=new_functions,
+            schema_map=_readonly(new_schema_map),
+            functions=_readonly(new_functions),
             parallel_safe=new_parallel,
             timeout_hints=self.timeout_hints,
             large_input_keys=self.large_input_keys,
@@ -277,12 +295,12 @@ class ToolRegistry:
             return ToolBatch(
                 version=self._version,
                 schemas=schemas,
-                schema_map=schema_map,
-                functions=dict(self._functions),
+                schema_map=_readonly(schema_map),
+                functions=_readonly(dict(self._functions)),
                 parallel_safe=parallel_safe,
-                timeout_hints=timeout_hints,
-                large_input_keys=large_input_keys,
-                compaction_priority=compaction_priority,
+                timeout_hints=_readonly(timeout_hints),
+                large_input_keys=_readonly(large_input_keys),
+                compaction_priority=_readonly(compaction_priority),
                 mutating=mutating,
             )
 
