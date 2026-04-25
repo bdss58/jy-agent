@@ -529,7 +529,7 @@ class TestRetryJitter:
 
 
 class _FakeRuntimeStream:
-    """Mimics RuntimeStream: yields a deterministic list of events."""
+    """Mimics LLMStream: yields a deterministic list of events."""
 
     def __init__(self, events):
         self._events = events
@@ -549,7 +549,7 @@ class _FakeRuntimeStream:
 
 
 class _FakeRuntimeOwner:
-    """Minimal RuntimeOwner replacement for streaming tests."""
+    """Minimal LLMOwner replacement for streaming tests."""
 
     def __init__(self, event_seqs):
         """event_seqs: list of event lists; each call to .stream() consumes one."""

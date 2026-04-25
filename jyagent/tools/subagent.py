@@ -21,7 +21,7 @@ try:
     )
     from ..loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from ..registry import get_registry
-    from ..llm import RuntimeOptions, RuntimeOwner
+    from ..llm import LLMOptions, LLMOwner
     from ..toolresult import ToolResult
     from ..session_stats import get_stats
 except ImportError:
@@ -30,7 +30,7 @@ except ImportError:
     )
     from jyagent.loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from jyagent.registry import get_registry
-    from jyagent.llm import RuntimeOptions, RuntimeOwner
+    from jyagent.llm import LLMOptions, LLMOwner
     from jyagent.toolresult import ToolResult
     from jyagent.session_stats import get_stats
 
@@ -70,7 +70,7 @@ def set_runtime_owner(runtime_owner):
 def set_client(runtime_owner):
     """Backward-compatible alias for older call sites/tests."""
     global _runtime_owner, _client
-    if isinstance(runtime_owner, RuntimeOwner):
+    if isinstance(runtime_owner, LLMOwner):
         set_runtime_owner(runtime_owner)
         return
     _runtime_owner = None
@@ -85,7 +85,7 @@ def _get_client():
 class _LegacyClientRuntimeOwner:
     """Compatibility shim for tests that still provide a fake Anthropic client.
 
-    DEPRECATED: Tests should use RuntimeOwner with mock adapters instead
+    DEPRECATED: Tests should use LLMOwner with mock adapters instead
     of injecting raw Anthropic SDK clients. This shim exists only to keep
     existing tests working during the migration.
     """
@@ -140,7 +140,7 @@ def _get_runtime_owner():
     if client is not None:
         return _LegacyClientRuntimeOwner(client)
     if _runtime_owner is None:
-        _runtime_owner = RuntimeOwner(get_active_model_spec())
+        _runtime_owner = LLMOwner(get_active_model_spec())
     return _runtime_owner
 
 
@@ -298,7 +298,7 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
             "system_prompt": _SUBAGENT_SYSTEM_PROMPT + _FINAL_SUFFIX,
             "messages": messages,
         },
-        options=RuntimeOptions(
+        options=LLMOptions(
             max_output_tokens=_DEFAULT_MAX_TOKENS_PER_RESPONSE,
             timeout=STREAM_TIMEOUT,
             reasoning=get_reasoning_config_for_provider(

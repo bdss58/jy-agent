@@ -15,7 +15,7 @@ from ..types import (
     Context,
     Message,
     ModelSpec,
-    RuntimeOptions,
+    LLMOptions,
     TextBlock,
     ThinkingBlock,
     ToolCallBlock,
@@ -336,7 +336,7 @@ def convert_tool_choice(tool_choice: dict[str, Any] | None) -> str | dict[str, A
 def build_request_kwargs(
     model_spec: ModelSpec,
     context: Context,
-    options: RuntimeOptions,
+    options: LLMOptions,
 ) -> dict[str, Any]:
     """Build the kwargs dict for ``client.responses.create()`` / ``.stream()``.
 

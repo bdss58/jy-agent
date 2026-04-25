@@ -60,7 +60,7 @@ class AssistantMessage(TypedDict, total=False):
     response_id: str
     id: str
     phase: Literal["commentary", "final_answer"]
-    runtime_warnings: list[str]
+    llm_warnings: list[str]
     error_message: str
 
 
@@ -207,7 +207,7 @@ class ModelSpec:
 
 
 @dataclass(frozen=True)
-class RuntimeOptions:
+class LLMOptions:
     max_output_tokens: int | None = None
     timeout: float | None = None
     reasoning: ReasoningConfig | None = None
@@ -215,7 +215,7 @@ class RuntimeOptions:
     tool_choice: ToolChoice | None = None
 
 
-class RuntimeStream(Protocol):
+class LLMStream(Protocol):
     """Sync streaming interface.
 
     Contract:
@@ -237,7 +237,7 @@ class RuntimeStream(Protocol):
     def close(self) -> None:
         ...
 
-    def __enter__(self) -> RuntimeStream:
+    def __enter__(self) -> LLMStream:
         ...
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:

@@ -22,7 +22,7 @@ from ..types import (
     Context,
     Message,
     ModelSpec,
-    RuntimeOptions,
+    LLMOptions,
     TextBlock,
     ThinkingBlock,
     ToolCallBlock,
@@ -177,7 +177,7 @@ def convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
 def build_request_kwargs(
     model_spec: ModelSpec,
     context: Context,
-    options: RuntimeOptions,
+    options: LLMOptions,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "model": model_spec.model,

@@ -1142,7 +1142,7 @@ class TestBuildAnthropicRequestReasoning:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# §7  core.py — adapter registry & RuntimeOwner
+# §7  core.py — adapter registry & LLMOwner
 # ════════════════════════════════════════════════════════════════════════════════
 
 from jyagent.llm.core import register_adapter, get_adapter, list_adapters, _ADAPTERS
@@ -1167,7 +1167,7 @@ class TestAdapterRegistry:
         assert get_adapter("test_provider") is mock_adapter
 
     def test_get_unknown_raises(self):
-        with pytest.raises(ValueError, match="Unknown runtime provider"):
+        with pytest.raises(ValueError, match="Unknown LLM provider"):
             get_adapter("nonexistent_provider_xyz")
 
     def test_list_adapters(self):
@@ -1185,10 +1185,10 @@ class TestAdapterRegistry:
 
 
 class TestRuntimeOwnerCompleteText:
-    """Test RuntimeOwner.complete_text convenience method (mock adapter)."""
+    """Test LLMOwner.complete_text convenience method (mock adapter)."""
 
     def test_complete_text_returns_concatenated_text(self):
-        from jyagent.llm.core import RuntimeOwner
+        from jyagent.llm.core import LLMOwner
 
         mock_adapter = MagicMock()
         mock_adapter.provider = "test_rt"
@@ -1213,7 +1213,7 @@ class TestRuntimeOwnerCompleteText:
                  patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
                 mock_bms.return_value = ModelSpec(provider="test_rt", model="test-model")
                 mock_grc.return_value = None
-                owner = RuntimeOwner(ModelSpec(provider="test_rt", model="test-model"))
+                owner = LLMOwner(ModelSpec(provider="test_rt", model="test-model"))
                 result = owner.complete_text("Say hello")
             assert result == "Hello World"
             mock_adapter.complete.assert_called_once()
@@ -1222,7 +1222,7 @@ class TestRuntimeOwnerCompleteText:
             _ADAPTERS.update(saved)
 
     def test_complete_text_with_only_thinking_returns_empty(self):
-        from jyagent.llm.core import RuntimeOwner
+        from jyagent.llm.core import LLMOwner
 
         mock_adapter = MagicMock()
         mock_adapter.provider = "test_rt2"
@@ -1245,7 +1245,7 @@ class TestRuntimeOwnerCompleteText:
                  patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
                 mock_bms.return_value = ModelSpec(provider="test_rt2", model="test-model2")
                 mock_grc.return_value = None
-                owner = RuntimeOwner(ModelSpec(provider="test_rt2", model="test-model2"))
+                owner = LLMOwner(ModelSpec(provider="test_rt2", model="test-model2"))
                 result = owner.complete_text("Think about it")
             assert result == ""
         finally:

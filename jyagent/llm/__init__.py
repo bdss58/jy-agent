@@ -1,4 +1,4 @@
-from .core import RuntimeOwner, get_adapter, list_adapters, register_adapter
+from .core import LLMOwner, get_adapter, list_adapters, register_adapter
 from .streams import ErrorStream, make_error_assistant_message
 from .types import (
     AssistantMessage,
@@ -10,7 +10,7 @@ from .types import (
     ModelSpec,
     OpenAIReasoningConfig,
     ReasoningConfig,
-    RuntimeOptions,
+    LLMOptions,
     StopReason,
     StreamDoneEvent,
     StreamErrorEvent,
@@ -51,8 +51,8 @@ __all__ = [
     "ModelSpec",
     "OpenAIReasoningConfig",
     "ReasoningConfig",
-    "RuntimeOptions",
-    "RuntimeOwner",
+    "LLMOptions",
+    "LLMOwner",
     "StopReason",
     "StreamDoneEvent",
     "StreamErrorEvent",

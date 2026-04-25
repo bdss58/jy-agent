@@ -3,21 +3,21 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from ..config import build_model_spec, get_reasoning_config_for_provider
-from .types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
+from .types import AssistantMessage, Context, ModelSpec, LLMOptions, LLMStream
 
 
-class RuntimeAdapter(Protocol):
+class ProviderAdapter(Protocol):
     provider: str
     api_name: str
 
-    def stream(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> RuntimeStream:
+    def stream(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> LLMStream:
         ...
 
-    def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
+    def complete(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> AssistantMessage:
         ...
 
 
-_ADAPTERS: dict[str, RuntimeAdapter] = {}
+_ADAPTERS: dict[str, ProviderAdapter] = {}
 
 # Sentinel for "caller did not pass a value" — lets callers explicitly pass
 # `reasoning=None` to disable reasoning while still keeping the default behavior
@@ -25,14 +25,14 @@ _ADAPTERS: dict[str, RuntimeAdapter] = {}
 _UNSET: Any = object()
 
 
-def register_adapter(adapter: RuntimeAdapter) -> None:
+def register_adapter(adapter: ProviderAdapter) -> None:
     _ADAPTERS[adapter.provider] = adapter
 
 
-def get_adapter(provider: str) -> RuntimeAdapter:
+def get_adapter(provider: str) -> ProviderAdapter:
     adapter = _ADAPTERS.get(provider)
     if adapter is None:
-        raise ValueError(f"Unknown runtime provider '{provider}'. Available: {sorted(_ADAPTERS)}")
+        raise ValueError(f"Unknown LLM provider '{provider}'. Available: {sorted(_ADAPTERS)}")
     return adapter
 
 
@@ -40,7 +40,7 @@ def list_adapters() -> list[str]:
     return sorted(_ADAPTERS)
 
 
-class RuntimeOwner:
+class LLMOwner:
     def __init__(self, model_spec: ModelSpec):
         resolved = build_model_spec(model_spec.provider, model_spec.model, source="model spec provider")
         get_adapter(resolved.provider)
@@ -59,11 +59,11 @@ class RuntimeOwner:
         self._model_spec = resolved
         return self._model_spec
 
-    def stream(self, context: Context, options: RuntimeOptions | None = None, model_spec: ModelSpec | None = None) -> RuntimeStream:
+    def stream(self, context: Context, options: LLMOptions | None = None, model_spec: ModelSpec | None = None) -> LLMStream:
         resolved = model_spec or self._model_spec
         return get_adapter(resolved.provider).stream(resolved, context, options)
 
-    def complete(self, context: Context, options: RuntimeOptions | None = None, model_spec: ModelSpec | None = None) -> AssistantMessage:
+    def complete(self, context: Context, options: LLMOptions | None = None, model_spec: ModelSpec | None = None) -> AssistantMessage:
         resolved = model_spec or self._model_spec
         return get_adapter(resolved.provider).complete(resolved, context, options)
 
@@ -94,12 +94,12 @@ class RuntimeOwner:
                 "system_prompt": system_prompt,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            options=RuntimeOptions(
+            options=LLMOptions(
                 max_output_tokens=max_output_tokens,
                 timeout=timeout,
                 reasoning=reasoning,
                 metadata={
-                    "component": "runtime_owner",
+                    "component": "llm_owner",
                     "mode": "complete_text",
                     **(metadata or {}),
                 },

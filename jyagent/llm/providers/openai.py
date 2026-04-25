@@ -1,6 +1,6 @@
 """OpenAI Responses API provider adapter.
 
-Implements the full RuntimeAdapter protocol using the OpenAI Python SDK
+Implements the full ProviderAdapter protocol using the OpenAI Python SDK
 with the Responses API (``client.responses.create()`` / ``.stream()``).
 """
 
@@ -23,8 +23,8 @@ from ..types import (
     AssistantMessage,
     Context,
     ModelSpec,
-    RuntimeOptions,
-    RuntimeStream,
+    LLMOptions,
+    LLMStream,
     Usage,
     compute_total_tokens,
 )
@@ -339,9 +339,9 @@ class OpenAIAdapter:
         self,
         model_spec: ModelSpec,
         context: Context,
-        options: RuntimeOptions | None = None,
-    ) -> RuntimeStream:
-        options = options or RuntimeOptions()
+        options: LLMOptions | None = None,
+    ) -> LLMStream:
+        options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
         try:
@@ -357,9 +357,9 @@ class OpenAIAdapter:
         self,
         model_spec: ModelSpec,
         context: Context,
-        options: RuntimeOptions | None = None,
+        options: LLMOptions | None = None,
     ) -> AssistantMessage:
-        options = options or RuntimeOptions()
+        options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
         client = self._client()

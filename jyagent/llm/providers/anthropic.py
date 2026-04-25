@@ -8,7 +8,7 @@ import httpx
 
 from ..core import register_adapter
 from ..streams import BaseStream, ErrorStream, make_error_assistant_message
-from ..types import AssistantMessage, Context, ModelSpec, RuntimeOptions, RuntimeStream
+from ..types import AssistantMessage, Context, ModelSpec, LLMOptions, LLMStream
 from ._anthropic_helpers import (
     assistant_from_response,
     build_request_kwargs,
@@ -128,8 +128,8 @@ class AnthropicAdapter:
         self._cached_auth_token = auth_token
         return self._cached_client
 
-    def stream(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> RuntimeStream:
-        options = options or RuntimeOptions()
+    def stream(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> LLMStream:
+        options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
         try:
@@ -139,8 +139,8 @@ class AnthropicAdapter:
             return ErrorStream(model_spec, err)
         return _AnthropicStream(stream_cm, model_spec)
 
-    def complete(self, model_spec: ModelSpec, context: Context, options: RuntimeOptions | None = None) -> AssistantMessage:
-        options = options or RuntimeOptions()
+    def complete(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> AssistantMessage:
+        options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
         timeout = options.timeout
         client = self._client()

@@ -18,7 +18,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .llm import RuntimeOwner, RuntimeOptions
+from .llm import LLMOwner, LLMOptions
 from .llm.types import ModelSpec
 from .config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from .registry import get_registry
@@ -830,14 +830,14 @@ def _is_transient_error(error: BaseException) -> bool:
 
 
 def _build_runtime_options(
-    runtime_owner: RuntimeOwner,
+    runtime_owner: LLMOwner,
     max_output_tokens: int,
     model_spec: ModelSpec | None = None,
     metadata: dict | None = None,
-) -> RuntimeOptions:
-    """Build RuntimeOptions with reasoning config for the active provider."""
+) -> LLMOptions:
+    """Build LLMOptions with reasoning config for the active provider."""
     spec = model_spec or runtime_owner.model_spec
-    return RuntimeOptions(
+    return LLMOptions(
         max_output_tokens=max_output_tokens,
         timeout=STREAM_TIMEOUT,
         reasoning=get_reasoning_config_for_provider(
@@ -860,7 +860,7 @@ class AgentLoop:
 
     def __init__(
         self,
-        runtime_owner: RuntimeOwner,
+        runtime_owner: LLMOwner,
         config: LoopConfig,
         callbacks: LoopCallbacks | None = None,
         tool_source: ToolSource | None = None,
@@ -1161,7 +1161,7 @@ class AgentLoop:
                                 tool_name=directive.phase,
                             )
                         if directive.tool_choice is not None:
-                            opts = RuntimeOptions(
+                            opts = LLMOptions(
                                 max_output_tokens=opts.max_output_tokens,
                                 timeout=opts.timeout,
                                 reasoning=opts.reasoning,
@@ -1176,7 +1176,7 @@ class AgentLoop:
                 llm_dur_ms = (time.perf_counter() - llm_t0) * 1000
 
                 # Fire runtime warnings
-                for warning in final_message.get("runtime_warnings", []):
+                for warning in final_message.get("llm_warnings", []):
                     self._fire("on_warning", warning)
 
                 # Accumulate usage
@@ -1549,7 +1549,7 @@ class AgentLoop:
                         model_spec=self._model_spec,
                         metadata={"component": "loop_engine", "step": cfg.max_steps + 1, "fallback": True},
                     )
-                    fallback_opts = RuntimeOptions(
+                    fallback_opts = LLMOptions(
                         max_output_tokens=_base.max_output_tokens,
                         timeout=_base.timeout,
                         reasoning=_base.reasoning,
@@ -1654,7 +1654,7 @@ class AgentLoop:
     def _call_llm_with_retry(
         self,
         context: dict,
-        options: RuntimeOptions,
+        options: LLMOptions,
         step: int,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
@@ -1707,7 +1707,7 @@ class AgentLoop:
     def _call_complete(
         self,
         context: dict,
-        options: RuntimeOptions,
+        options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Non-streaming: runtime_owner.complete() -> extract text/tool_calls."""
         final_message = self._runtime_owner.complete(
@@ -1731,9 +1731,9 @@ class AgentLoop:
     def _call_streaming(
         self,
         context: dict,
-        options: RuntimeOptions,
+        options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Streaming: consume RuntimeStream events and fire callbacks.
+        """Streaming: consume LLMStream events and fire callbacks.
 
         Delta-emission policy is controlled by ``cfg.buffered_streaming``:
 

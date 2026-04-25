@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .types import AssistantMessage, ModelSpec, RuntimeStream
+from .types import AssistantMessage, ModelSpec, LLMStream
 
 
 def make_error_assistant_message(
@@ -69,8 +69,8 @@ class BaseStream:
         self.close()
 
 
-class ErrorStream(RuntimeStream):
-    """A ``RuntimeStream`` that immediately yields a terminal error event.
+class ErrorStream(LLMStream):
+    """A ``LLMStream`` that immediately yields a terminal error event.
 
     Reusable by any provider adapter when stream creation itself fails.
     """

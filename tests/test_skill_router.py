@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from jyagent.llm.core import (
-    RuntimeOwner,
+    LLMOwner,
     register_adapter,
     _ADAPTERS,
 )
@@ -83,14 +83,14 @@ class TestCompleteTextReasoningOverride:
         with patch("jyagent.llm.core.build_model_spec") as mock_bms, \
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             mock_bms.return_value = ModelSpec(provider="rt_none", model="m")
-            owner = RuntimeOwner(ModelSpec(provider="rt_none", model="m"))
+            owner = LLMOwner(ModelSpec(provider="rt_none", model="m"))
             result = owner.complete_text("hi", reasoning=None)
         assert result == "ok"
         # Critical: when caller passes reasoning=None, we must NOT call
         # get_reasoning_config_for_provider (that's what was blowing up).
         mock_grc.assert_not_called()
         # Adapter.complete is called positionally (model_spec, context, options);
-        # the third positional is our RuntimeOptions with reasoning=None.
+        # the third positional is our LLMOptions with reasoning=None.
         args, _ = mock_adapter.complete.call_args
         assert len(args) >= 3
         assert args[2].reasoning is None
@@ -102,7 +102,7 @@ class TestCompleteTextReasoningOverride:
              patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             mock_bms.return_value = ModelSpec(provider="rt_auto", model="m")
             mock_grc.return_value = None
-            owner = RuntimeOwner(ModelSpec(provider="rt_auto", model="m"))
+            owner = LLMOwner(ModelSpec(provider="rt_auto", model="m"))
             owner.complete_text("hi")
         mock_grc.assert_called_once()
 
@@ -113,7 +113,7 @@ class TestCompleteTextReasoningOverride:
              patch("jyagent.llm.core.get_reasoning_config_for_provider",
                    side_effect=ValueError("adaptive thinking not supported")):
             mock_bms.return_value = ModelSpec(provider="rt_broken", model="m")
-            owner = RuntimeOwner(ModelSpec(provider="rt_broken", model="m"))
+            owner = LLMOwner(ModelSpec(provider="rt_broken", model="m"))
             # With reasoning=None, must not touch the broken config fn.
             result = owner.complete_text("hi", reasoning=None)
             assert result == "ok"
@@ -142,7 +142,7 @@ class TestSkillRouterLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("what's the latest python release?",
                                     runtime_owner=owner)
 
@@ -171,7 +171,7 @@ class TestSkillRouterLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("python release", runtime_owner=owner)
 
         # Must succeed despite broken reasoning config, because router passes
@@ -201,7 +201,7 @@ class TestSkillRouterLLM:
             mgr = SkillManager(skills_dir)
             mgr.discover()
             mgr.activate("web-search")  # stale active
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("screenshot google", runtime_owner=owner)
 
         assert result == ["browser-automation"]
@@ -226,7 +226,7 @@ class TestSkillRouterLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("python release", runtime_owner=owner)
 
         assert result == ["web-search"]
@@ -247,7 +247,7 @@ class TestSkillRouterLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("python release", runtime_owner=owner)
 
         assert result == ["web-search"]
@@ -274,7 +274,7 @@ class TestSkillRouterLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("anything", runtime_owner=owner)
 
         assert result is None
@@ -300,7 +300,7 @@ class TestSkillRouterLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr._route_llm("anything", runtime_owner=owner)
 
         assert result is None
@@ -326,7 +326,7 @@ class TestAutoActivateForQueryUsesLLM:
 
             mgr = SkillManager(skills_dir)
             mgr.discover()
-            owner = RuntimeOwner(spec)
+            owner = LLMOwner(spec)
             result = mgr.auto_activate_for_query(
                 "screenshot google",
                 runtime_owner=owner,

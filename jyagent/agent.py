@@ -15,7 +15,7 @@ from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
-from .llm import RuntimeOwner
+from .llm import LLMOwner
 from .session_stats import get_stats
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
@@ -195,7 +195,7 @@ def _cmd_stats(cli, **_):
     cli.print_system("\n".join(lines))
 
 
-def _cmd_model(cli, runtime_owner: RuntimeOwner, user_input: str, **_):
+def _cmd_model(cli, runtime_owner: LLMOwner, user_input: str, **_):
     """Show or switch the active provider:model for future turns."""
     parts = user_input.split()
     if len(parts) == 1:
@@ -295,7 +295,7 @@ def _graceful_exit(cli, conversation=None):
 _cached_memory_context: str | None = None
 
 
-def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: RuntimeOwner,
+def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: LLMOwner,
                               force_rebuild: bool = False,
                               recent_messages: list | None = None) -> str:
     """Build the complete system prompt with memory, skills, and verification context.
@@ -326,7 +326,7 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_
 
 # ─── Main agent loop ─────────────────────────────────────────────────────────
 
-def run(runtime_owner: RuntimeOwner) -> None:
+def run(runtime_owner: LLMOwner) -> None:
     global _cached_memory_context
     # Initialize before try block to avoid unbound variable risk in outer except
     cli = None

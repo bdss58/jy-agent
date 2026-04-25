@@ -13,15 +13,15 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .llm import RuntimeOwner
+    from .llm import LLMOwner
 
 
-def create_runtime_owner() -> RuntimeOwner:
+def create_runtime_owner() -> LLMOwner:
     """Create the default runtime owner from environment configuration."""
     from .config import get_active_model_spec
-    from .llm import RuntimeOwner
+    from .llm import LLMOwner
 
-    return RuntimeOwner(get_active_model_spec())
+    return LLMOwner(get_active_model_spec())
 
 
 def _load_dotenv() -> None:

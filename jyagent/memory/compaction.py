@@ -294,7 +294,7 @@ def _complete_with_system_prompt(
     user message under the existing system prompt — so the prompt prefix
     stays cached.
     """
-    from ..llm.types import RuntimeOptions
+    from ..llm.types import LLMOptions
     from ..config import get_reasoning_config_for_provider
 
     message = runtime_owner.complete(
@@ -302,7 +302,7 @@ def _complete_with_system_prompt(
             "system_prompt": system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
         },
-        options=RuntimeOptions(
+        options=LLMOptions(
             max_output_tokens=min(4096, DEFAULT_MAX_TOKENS),
             timeout=120.0,
             reasoning=get_reasoning_config_for_provider(

@@ -118,7 +118,7 @@ class TestRunImplWiresPhasePolicy:
         assert "cfg.phase_policy(" in source, (
             "phase policy is not invoked inside _run_impl"
         )
-        # Override must rebuild RuntimeOptions with the directive's tool_choice.
+        # Override must rebuild LLMOptions with the directive's tool_choice.
         assert "tool_choice=directive.tool_choice" in source, (
             "policy's tool_choice override is not propagated into opts"
         )
@@ -151,12 +151,12 @@ class TestRunImplWiresPhasePolicy:
 
 class TestOptionsOverrideIntegration:
     """We can't cheaply spin up a full runtime here, but we can verify the
-    RuntimeOptions constructor accepts the tool_choice the directive would
+    LLMOptions constructor accepts the tool_choice the directive would
     supply and that the post-override object carries it."""
 
     def test_runtime_options_carries_tool_choice(self):
-        from jyagent.llm.types import RuntimeOptions
-        opts = RuntimeOptions(
+        from jyagent.llm.types import LLMOptions
+        opts = LLMOptions(
             max_output_tokens=1000,
             timeout=60,
             reasoning=None,

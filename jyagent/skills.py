@@ -452,8 +452,8 @@ class SkillManager:
         """
         if runtime_owner is None:
             try:
-                from .llm import RuntimeOwner
-                runtime_owner = RuntimeOwner(get_skill_router_model_spec())
+                from .llm import LLMOwner
+                runtime_owner = LLMOwner(get_skill_router_model_spec())
             except Exception:
                 return None
 
