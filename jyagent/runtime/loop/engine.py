@@ -649,6 +649,7 @@ def _execute_tools(
     max_workers: int,
     timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
+    partial_side_effects: list[str] | None = None,
 ) -> list[tuple[ToolCallRequest, ToolResult]]:
     """Execute tool calls with selective parallelisation.
 
@@ -664,6 +665,13 @@ def _execute_tools(
     All ``parallel_safe`` decisions read from the immutable ``batch`` — a
     concurrent registry mutation cannot flip a tool's flag mid-partition
     (Codex Part 1 #11).
+
+    ``partial_side_effects`` (optional) is an accumulator list the caller owns
+    — every mutating-tool timeout appends its name to this list so
+    ``AgentLoop`` can surface it on ``LoopResult.partial_side_effects`` (A1
+    fix, codex review 2026-04-25).  Non-mutating timeouts and successful
+    calls never touch it.  ``None`` disables the accumulator (for ad-hoc
+    callers that don't care).
     """
     if not blocks:
         return []
@@ -672,7 +680,10 @@ def _execute_tools(
     if len(blocks) <= 1 or not concurrent_mode:
         results = []
         for block in blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
+            result = _execute_tool_with_timeout(
+                block.name, block.input, batch, timeout,
+                partial_side_effects=partial_side_effects,
+            )
             results.append((block, result))
         return results
 
@@ -680,7 +691,10 @@ def _execute_tools(
     if not any(batch.is_parallel_safe(b.name) for b in blocks):
         results = []
         for block in blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
+            result = _execute_tool_with_timeout(
+                block.name, block.input, batch, timeout,
+                partial_side_effects=partial_side_effects,
+            )
             results.append((block, result))
         return results
 
@@ -704,6 +718,7 @@ def _execute_tools(
                     _execute_tool_with_timeout,
                     block.name, block.input, batch, timeout,
                     body_permits=body_permits,
+                    partial_side_effects=partial_side_effects,
                 ): (idx, block)
                 for idx, block in parallel_batch
             }
@@ -719,7 +734,10 @@ def _execute_tools(
                     ))
         else:
             block = blocks[i]
-            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
+            result = _execute_tool_with_timeout(
+                block.name, block.input, batch, timeout,
+                partial_side_effects=partial_side_effects,
+            )
             results_arr[i] = (block, result)
             i += 1
 
@@ -737,6 +755,7 @@ def _execute_tool_with_timeout(
     default_timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     body_permits: threading.BoundedSemaphore | None = None,
+    partial_side_effects: list[str] | None = None,
 ) -> ToolResult:
     """Execute a tool body with a timeout.
 
@@ -766,6 +785,17 @@ def _execute_tool_with_timeout(
     The per-step ``batch`` snapshot supplies the timeout hint, function,
     and schema — no live registry reads, so a concurrent registration
     cannot change the effective timeout mid-call.
+
+    ``partial_side_effects`` (optional, A1 fix — codex review 2026-04-25):
+    when the tool is flagged mutating and times out, its name is appended
+    to this list and a WARNING is logged on the module ``_logger``.  The
+    returned ToolResult also gets a stronger error message that tells the
+    model the operation *may have completed in the background*, so the
+    follow-up plan should verify state rather than blindly retrying.
+    Non-mutating timeouts retain their historical "consider smaller steps"
+    hint — a read-only tool's timeout is safe to retry verbatim.  Passing
+    ``None`` disables the accumulator (the warning + error-text rewrite
+    still fire).
     """
     timeout = default_timeout
     hint = batch.get_timeout_hint(name)
@@ -805,7 +835,33 @@ def _execute_tool_with_timeout(
 
     if timed_out:
         # Timeout — the daemon thread continues running but holds no pool
-        # slot, so there's nothing to leak.  We just report the timeout.
+        # slot, so there's nothing to leak in terms of worker capacity.
+        # However, for MUTATING tools (run_shell, edit_file, write_file,
+        # run_background, mcp, dispatch_agent) the *side effect* is still
+        # in flight in the background thread and may partially or fully
+        # complete after we've told the model "timeout, try something
+        # else".  A1 fix (codex review 2026-04-25): classify the timeout,
+        # log loudly, rewrite the error text so the model knows to verify
+        # state, and accumulate the name for LoopResult.partial_side_effects
+        # so outer layers can reconcile.  A future PR will tackle the full
+        # subprocess-isolation / hard-kill story for shell-class tools.
+        if batch.is_mutating(name):
+            _logger.warning(
+                "mutating tool '%s' timed out after %ds — "
+                "side effects may have occurred and are now untracked",
+                name, timeout,
+            )
+            if partial_side_effects is not None:
+                partial_side_effects.append(name)
+            return ToolResult(
+                f"Error: Tool '{name}' timed out after {timeout}s. "
+                f"NOTE: This is a mutating tool — the operation may have "
+                f"partially or fully completed in the background. The agent "
+                f"should verify state before retrying.",
+                is_error=True,
+            )
+        # Non-mutating (read-only / queryable) timeout: safe to retry
+        # verbatim, so keep the historical hint.
         return ToolResult(
             f"Error: Tool '{name}' timed out after {timeout}s. "
             f"Consider breaking the operation into smaller steps.",
@@ -945,6 +1001,13 @@ class AgentLoop:
         # `write_todos` tool and seeded optionally via run(initial_todos=...)
         # so outer layers can carry the plan across turns.
         self._todos: list = []
+        # A1 fix (codex review 2026-04-25): accumulator for mutating-tool
+        # timeouts.  Populated by ``_execute_tool_with_timeout`` via the
+        # ``partial_side_effects=`` kwarg threaded through ``_execute_tools``;
+        # snapshotted onto ``LoopResult.partial_side_effects`` in ``run()``.
+        # Reset at the top of ``_run_impl`` so back-to-back .run() calls on
+        # the same AgentLoop instance don't bleed state across turns.
+        self._partial_side_effects: list[str] = []
         # Run id for checkpointing.  Fresh per AgentLoop; outer layers can
         # override via `set_run_id()` before calling run() to correlate
         # checkpoints with an external request/session.
@@ -1051,6 +1114,13 @@ class AgentLoop:
             # Serialize to dict-form for easy JSON persistence by outer layers.
             from .todos import todo_to_dict
             result.todos = [todo_to_dict(t) for t in self._todos]
+        # A1 (codex review 2026-04-25): mirror the todos pattern — snapshot
+        # the mutating-timeout accumulator onto the result so every exit
+        # path benefits without having to thread the list through every
+        # _finalize_run() call site.  Copy defensively so a caller that
+        # retains the returned list can't mutate the AgentLoop's internal
+        # state on the next run.
+        result.partial_side_effects = list(self._partial_side_effects)
         if self._config.checkpoint_dir:
             # Terminal ("final") checkpoint — includes status + error.
             self._write_checkpoint(
@@ -1080,6 +1150,10 @@ class AgentLoop:
         total_output_tokens = 0
         tool_calls_count = 0
         last_reflection_count = 0  # tool_calls_count at last reflection injection
+        # A1 (codex review 2026-04-25): reset the mutating-timeout
+        # accumulator at the top of every run so back-to-back turns on the
+        # same AgentLoop instance don't carry stale names forward.
+        self._partial_side_effects = []
         # Boundary between prior-turn history and this-turn appends.
         # Passed to ``should_verify`` so a replayed historical mutation
         # cannot re-arm the verification gate on a non-mutating new turn
@@ -1184,6 +1258,13 @@ class AgentLoop:
                         timeout_hints=reg_batch.timeout_hints,
                         large_input_keys=reg_batch.large_input_keys,
                         compaction_priority=reg_batch.compaction_priority,
+                        # Inherit mutating classification from the registry
+                        # freeze — tool_source functions that happen to share
+                        # a registered name pick up the registered metadata;
+                        # purely dynamic names (e.g. MCP tools that
+                        # auto-registered via the real register() path)
+                        # bring their own.  A1 fix (codex review 2026-04-25).
+                        mutating=reg_batch.mutating,
                     )
                 elif step == 0 or registry.version != tools_batch.version:
                     # Re-freeze only when the registry has changed.  The
@@ -1490,6 +1571,7 @@ class AgentLoop:
                     cfg.max_tool_workers,
                     cfg.tool_timeout,
                     executor=self._executor,
+                    partial_side_effects=self._partial_side_effects,
                 )
                 tools_dur_ms = (time.perf_counter() - tools_t0) * 1000
 

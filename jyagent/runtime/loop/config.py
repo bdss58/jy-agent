@@ -78,6 +78,17 @@ class LoopResult:
     # disabled or the model never wrote any.  Outer layers (agent.py) are
     # expected to persist this across turns.
     todos: list = field(default_factory=list)
+    # Names of mutating tools (run_shell, edit_file, write_file, mcp,
+    # dispatch_agent, run_background) that hit the dispatch-loop timeout
+    # during this run.  A1 fix (codex review 2026-04-25): a timed-out
+    # mutating tool's daemon thread keeps running past the timeout report,
+    # so its side effect may have partially or fully landed in the
+    # environment while the model received an "error" ToolResult.  Outer
+    # layers that replay or retry a turn should consult this list to
+    # reconcile environment state (e.g. re-read edited files, re-check
+    # spawned backgrounds) before trusting the LLM's follow-up plan.
+    # Empty list when no mutating timeouts occurred (the common case).
+    partial_side_effects: list[str] = field(default_factory=list)
 
 
 __all__ = ["LoopConfig", "LoopResult"]

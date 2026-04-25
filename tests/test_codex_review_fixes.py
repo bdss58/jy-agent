@@ -1,6 +1,7 @@
 """Regression tests for Codex review 2026-04-25 Tier-A fixes.
 
 Covers:
+    A1 — mutating-tool timeouts surface on LoopResult.partial_side_effects
     A2 — `_tool_dispatch_executor` grows to honour `LoopConfig.max_tool_workers`
     A3 — tracing finalize errors are logged, not raised
     A4 — `run_id` containing `..` cannot escape `checkpoint_dir`
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import types
 
 import pytest
@@ -16,6 +18,7 @@ import pytest
 from jyagent.runtime.loop import checkpoint
 from jyagent.runtime.loop import engine as loop_engine
 from jyagent.runtime.loop.config import LoopConfig
+from jyagent.runtime.tools.registry import ToolRegistry
 
 
 # ─── A4: path sanitisation ──────────────────────────────────────────────────
@@ -168,3 +171,238 @@ class TestDispatchExecutorGrowsWithConfig:
         loop_engine.AgentLoop(owner, cfg)  # type: ignore[arg-type]
 
         assert captured["min_workers"] == 12
+
+
+# ─── A1: mutating-tool timeouts surface on LoopResult ───────────────────────
+#
+# The dispatch loop runs every tool body in a daemon thread.  On timeout the
+# thread keeps running but we return an error ToolResult and move on — fine
+# for read-only tools (retry is idempotent), but for MUTATING tools
+# (run_shell, edit_file, write_file, dispatch_agent, run_background, mcp)
+# the side effect may complete invisibly in the background while the model
+# receives "timeout, try something else".  A1 scope: classify + surface
+# (warn, clearer error text, accumulate names into LoopResult); full
+# subprocess hard-kill is out-of-scope for this PR.
+
+
+class _FakeModelSpec:
+    """Minimal ModelSpec stand-in for the AgentLoop fake-owner tests."""
+
+    provider = "anthropic"
+    model = "claude-opus-4-6"
+
+    @staticmethod
+    def label() -> str:
+        return "anthropic:claude-opus-4-6"
+
+
+class _ScriptedOwner:
+    """Hand-scripted LLMClient: returns a fixed sequence of messages on
+    complete().  Enough to drive AgentLoop through a single tool-use step
+    followed by a clean no-tools terminal step.
+
+    Streaming is not needed (LoopConfig defaults to streaming=False), so
+    stream() raises if called.  We only implement what the engine touches.
+    """
+
+    def __init__(self, messages: list[dict]):
+        self._messages = list(messages)
+        self._idx = 0
+        self.model_spec = _FakeModelSpec()
+
+    def complete(self, context, options=None, model_spec=None):
+        if self._idx >= len(self._messages):
+            # Defensive: loop should have terminated by now.
+            raise AssertionError("scripted owner exhausted")
+        msg = self._messages[self._idx]
+        self._idx += 1
+        return msg
+
+    def stream(self, *args, **kwargs):
+        raise AssertionError("_ScriptedOwner.stream() should not be called "
+                             "(LoopConfig.streaming must be False)")
+
+
+def _tool_use_message(tool_id: str, tool_name: str, tool_input: dict) -> dict:
+    """Build an AssistantMessage that issues exactly one tool_call block."""
+    return {
+        "role": "assistant",
+        "content": [{
+            "type": "tool_call",
+            "id": tool_id,
+            "name": tool_name,
+            "arguments": tool_input,
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+def _final_text_message(text: str) -> dict:
+    """Build an AssistantMessage with only a text block — terminates the loop."""
+    return {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "stop",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+
+class TestA1MutatingTimeout:
+    def test_mutating_metadata_propagates_to_batch(self):
+        """A tool registered with mutating=True surfaces on batch.is_mutating()."""
+        reg = ToolRegistry()
+        reg.register(
+            "fake_mutator",
+            lambda: "ok",
+            {"name": "fake_mutator", "input_schema": {"type": "object"}},
+            mutating=True,
+        )
+        batch = reg.freeze()
+        assert batch.is_mutating("fake_mutator") is True
+        # And the frozenset itself is populated (not just the helper).
+        assert "fake_mutator" in batch.mutating
+
+    def test_nonmutating_default_false(self):
+        """Default registration (no mutating kwarg) → batch.is_mutating() False."""
+        reg = ToolRegistry()
+        reg.register(
+            "fake_reader",
+            lambda: "ok",
+            {"name": "fake_reader", "input_schema": {"type": "object"}},
+        )
+        batch = reg.freeze()
+        assert batch.is_mutating("fake_reader") is False
+        # Unknown names also default False (important for overlaid tools).
+        assert batch.is_mutating("never_registered") is False
+
+    def test_mutating_timeout_surfaces_in_loop_result(self, caplog):
+        """End-to-end: a mutating tool that sleeps past its timeout must
+        (a) log a WARNING on the engine logger, and
+        (b) populate LoopResult.partial_side_effects with the tool name.
+        """
+        caplog.set_level(logging.WARNING, logger=loop_engine.__name__)
+
+        # Build a per-test registry with exactly one slow mutating tool, so
+        # the test is independent of the process-wide singleton state.
+        def _slow_body():
+            time.sleep(5.0)  # far past the 1s tool_timeout below
+            return "should never land — dispatch loop has already moved on"
+
+        reg = ToolRegistry()
+        reg.register(
+            "slow_mutator",
+            _slow_body,
+            {"name": "slow_mutator", "input_schema": {"type": "object"}},
+            mutating=True,
+        )
+        batch = reg.freeze()
+
+        # Script: step 0 calls slow_mutator; step 1 returns a text message
+        # so the loop exits via the "completed" path (partial_side_effects
+        # is attached by run() regardless of the exit status, but driving
+        # the happy path exercises the clean common case).
+        owner = _ScriptedOwner([
+            _tool_use_message("call-0", "slow_mutator", {}),
+            _final_text_message("done verifying."),
+        ])
+
+        cfg = LoopConfig(
+            max_steps=3,
+            tool_timeout=1,       # 1s → slow_mutator's 5s sleep always times out
+            concurrent_tools=False,
+            streaming=False,
+            truncate_large_inputs=False,
+        )
+        # Feed the hand-built batch through _tool_source so the engine
+        # skips the global registry entirely for this test.
+        def _tool_source():
+            return list(batch.schemas), dict(batch.functions)
+
+        loop = loop_engine.AgentLoop(
+            owner,  # type: ignore[arg-type]
+            cfg,
+            tool_source=_tool_source,
+        )
+        # The tool_source path copies metadata (including mutating) from
+        # the real registry's freeze() — not from our hand-built batch.
+        # Patch it to return our batch's mutating set so the classification
+        # happens against the test tool.  This mirrors the production path
+        # where tools/__init__.py has already registered mutating metadata
+        # by the time _tool_source runs.
+        original_freeze = loop_engine.get_registry().freeze
+        try:
+            loop_engine.get_registry().freeze = lambda: batch  # type: ignore[method-assign]
+            result = loop.run(system_prompt="", messages=[])
+        finally:
+            loop_engine.get_registry().freeze = original_freeze  # type: ignore[method-assign]
+
+        assert "slow_mutator" in result.partial_side_effects, (
+            f"expected 'slow_mutator' in partial_side_effects, "
+            f"got {result.partial_side_effects!r}"
+        )
+        # WARNING must be logged on the engine's module logger.
+        warning_msgs = [r.getMessage() for r in caplog.records
+                        if r.levelno >= logging.WARNING]
+        assert any("slow_mutator" in m and "side effects" in m for m in warning_msgs), (
+            f"expected mutating-timeout WARNING, got {warning_msgs!r}"
+        )
+
+    def test_nonmutating_timeout_does_not_populate(self, caplog):
+        """A non-mutating tool that times out must NOT populate
+        partial_side_effects (retries are idempotent) AND must NOT log the
+        mutating-timeout warning."""
+        caplog.set_level(logging.WARNING, logger=loop_engine.__name__)
+
+        def _slow_read():
+            time.sleep(5.0)
+            return "x"
+
+        reg = ToolRegistry()
+        reg.register(
+            "slow_reader",
+            _slow_read,
+            {"name": "slow_reader", "input_schema": {"type": "object"}},
+            # mutating defaults to False — that's the whole point.
+        )
+        batch = reg.freeze()
+
+        owner = _ScriptedOwner([
+            _tool_use_message("call-0", "slow_reader", {}),
+            _final_text_message("ok."),
+        ])
+
+        cfg = LoopConfig(
+            max_steps=3,
+            tool_timeout=1,
+            concurrent_tools=False,
+            streaming=False,
+            truncate_large_inputs=False,
+        )
+
+        def _tool_source():
+            return list(batch.schemas), dict(batch.functions)
+
+        loop = loop_engine.AgentLoop(
+            owner,  # type: ignore[arg-type]
+            cfg,
+            tool_source=_tool_source,
+        )
+        original_freeze = loop_engine.get_registry().freeze
+        try:
+            loop_engine.get_registry().freeze = lambda: batch  # type: ignore[method-assign]
+            result = loop.run(system_prompt="", messages=[])
+        finally:
+            loop_engine.get_registry().freeze = original_freeze  # type: ignore[method-assign]
+
+        assert result.partial_side_effects == [], (
+            f"non-mutating timeout must not populate partial_side_effects; "
+            f"got {result.partial_side_effects!r}"
+        )
+        # And no mutating-timeout warning should have fired.
+        warning_msgs = [r.getMessage() for r in caplog.records
+                        if r.levelno >= logging.WARNING]
+        assert not any("side effects may have occurred" in m for m in warning_msgs), (
+            f"non-mutating timeout must not emit side-effects WARNING; "
+            f"got {warning_msgs!r}"
+        )
