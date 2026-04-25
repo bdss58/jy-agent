@@ -65,3 +65,6 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 
 ## Goals
 - Long-term: guide user through nano-vLLM to master LLM inference. Progress in `topics/nano-vllm-learning.md`. On any session mentioning nano-vLLM / learning / LLM study, read that file first.
+[user_stated] OpenClaw architecture: ocaw-run pod runs openclaw supervisor + openclaw-gateway (Python WebSocket on port 18789); browser/OCR/LLM delegated to separate services (browser-service, processor-service, model-gateway)
+[user_stated] OpenClaw ocaw-run pods steady-state: ~510 MiB RSS+cache (max 652), 1-3 millicores CPU; 0 OOMs across 1600+ pod-hours observed
+[preference] For sizing recommendations, prefer empirical measurement (live pod inspection, cgroup memory.events) over guessing; recommend Burstable QoS over Gu
