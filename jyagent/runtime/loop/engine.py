@@ -1019,6 +1019,18 @@ class AgentLoop:
         # Reset at the top of ``_run_impl`` so back-to-back .run() calls on
         # the same AgentLoop instance don't bleed state across turns.
         self._partial_side_effects: list[str] = []
+        # C2 (codex review 2026-04-25): AgentLoop holds substantial per-run
+        # state on the instance (_todos, _run_id, _partial_side_effects,
+        # closures, etc).  Concurrent .run() calls on a single instance
+        # would silently corrupt that state — they'd share the todo list,
+        # the same checkpoint identity, and the same mutating-timeout
+        # accumulator.  Enforce single-run ownership with an exclusive
+        # threading.Lock acquired non-blockingly at the top of run() so the
+        # second caller sees a clear RuntimeError instead of a silent race.
+        # ``threading.Lock`` (not RLock) by design: even nested .run() from
+        # the same thread is wrong (the inner call would clobber the outer
+        # call's _partial_side_effects on entry).
+        self._run_lock = threading.Lock()
         # Run id for checkpointing.  Fresh per AgentLoop; outer layers can
         # override via `set_run_id()` before calling run() to correlate
         # checkpoints with an external request/session.
@@ -1119,31 +1131,56 @@ class AgentLoop:
         Thin wrapper around ``_run_impl`` that attaches the final todos
         scratchpad and writes a terminal checkpoint (if enabled),
         regardless of which exit path fired.
+
+        Raises ``RuntimeError`` if a previous ``run()`` on this instance
+        is still in flight (C2 fix, codex review 2026-04-25): AgentLoop
+        owns per-run mutable state (_todos, _run_id, _partial_side_effects,
+        closures over _todos) that concurrent or re-entrant runs would
+        silently corrupt.
         """
-        result = self._run_impl(system_prompt, messages, initial_todos)
-        if self._config.todos_enabled:
-            # Serialize to dict-form for easy JSON persistence by outer layers.
-            from .todos import todo_to_dict
-            result.todos = [todo_to_dict(t) for t in self._todos]
-        # A1 (codex review 2026-04-25): mirror the todos pattern — snapshot
-        # the mutating-timeout accumulator onto the result so every exit
-        # path benefits without having to thread the list through every
-        # _finalize_run() call site.  Copy defensively so a caller that
-        # retains the returned list can't mutate the AgentLoop's internal
-        # state on the next run.
-        result.partial_side_effects = list(self._partial_side_effects)
-        if self._config.checkpoint_dir:
-            # Terminal ("final") checkpoint — includes status + error.
-            self._write_checkpoint(
-                step="final",
-                messages=result.messages,
-                total_input_tokens=result.total_input_tokens,
-                total_output_tokens=result.total_output_tokens,
-                tool_calls_count=result.tool_calls_count,
-                status=result.status,
-                error=result.error,
+        # Lazy-init: test utilities that build AgentLoop via __new__ to
+        # skip __init__ don't set _run_lock.  Installing it on first call
+        # is safe because the very first .run() caller has exclusive
+        # access by construction.
+        if not hasattr(self, "_run_lock"):
+            self._run_lock = threading.Lock()
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "AgentLoop.run() is already in progress on this instance. "
+                "AgentLoop is not reentrant; construct a new AgentLoop "
+                "(or wait for the previous run to return) before calling "
+                "run() again."
             )
-        return result
+        try:
+            result = self._run_impl(system_prompt, messages, initial_todos)
+            if self._config.todos_enabled:
+                # Serialize to dict-form for easy JSON persistence by outer layers.
+                from .todos import todo_to_dict
+                result.todos = [todo_to_dict(t) for t in self._todos]
+            # A1 (codex review 2026-04-25): mirror the todos pattern — snapshot
+            # the mutating-timeout accumulator onto the result so every exit
+            # path benefits without having to thread the list through every
+            # _finalize_run() call site.  Copy defensively so a caller that
+            # retains the returned list can't mutate the AgentLoop's internal
+            # state on the next run.
+            result.partial_side_effects = list(self._partial_side_effects)
+            if self._config.checkpoint_dir:
+                # Terminal ("final") checkpoint — includes status + error.
+                self._write_checkpoint(
+                    step="final",
+                    messages=result.messages,
+                    total_input_tokens=result.total_input_tokens,
+                    total_output_tokens=result.total_output_tokens,
+                    tool_calls_count=result.tool_calls_count,
+                    status=result.status,
+                    error=result.error,
+                )
+            return result
+        finally:
+            # C2: release the reentrance guard regardless of how _run_impl
+            # exited (return, raise, KeyboardInterrupt) so a subsequent
+            # run() on the same instance is not deadlocked.
+            self._run_lock.release()
 
     def _run_impl(
         self,

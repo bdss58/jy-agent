@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import types
 
@@ -655,4 +656,140 @@ class TestMaxStepsFallbackCostTracking:
         )
         assert result.total_output_tokens >= 25, (
             f"fallback output tokens missing: {result.total_output_tokens}"
+        )
+
+
+# ─── C2: AgentLoop reentrance guard ─────────────────────────────────────────
+
+
+class TestAgentLoopReentranceGuard:
+    """C2: a second run() invocation on the same AgentLoop instance — whether
+    concurrent (from another thread) or nested (mid-callback) — must raise
+    RuntimeError instead of silently corrupting per-run state.
+    """
+
+    def _make_loop(self):
+        # Mirror the test_todos_scratchpad.TestAgentLoopTodosWiring fixture:
+        # build the loop via __new__ to skip __init__'s heavy wiring.
+        owner = types.SimpleNamespace(model_spec=_FakeModelSpec())
+        loop = loop_engine.AgentLoop.__new__(loop_engine.AgentLoop)
+        loop._runtime_owner = owner
+        loop._config = LoopConfig(max_steps=0)  # zero-step → exits immediately
+        loop._callbacks = loop_engine.LoopCallbacks()
+        loop._tool_source = None
+        loop._model_spec = None
+        loop._cancel_event = None
+        loop._executor = loop_engine._tool_dispatch_executor
+        loop._todos = []
+        loop._partial_side_effects = []
+        return loop
+
+    def test_concurrent_runs_raise_runtime_error(self):
+        """Hold the lock from one thread, second thread's run() must raise."""
+        loop = self._make_loop()
+        # Pre-acquire the lock to simulate an in-flight run().
+        loop._run_lock = threading.Lock()
+        loop._run_lock.acquire()
+        try:
+            with pytest.raises(RuntimeError, match="already in progress"):
+                loop.run("system", [])
+        finally:
+            loop._run_lock.release()
+
+    def test_lock_released_on_normal_exit(self):
+        """After a clean run() returns, a subsequent run() must succeed."""
+        loop = self._make_loop()
+        # First run — should complete (max_steps=0 means immediate max_steps exit).
+        result1 = loop.run("system", [])
+        assert result1 is not None
+        # Second run on same instance — must NOT raise.
+        result2 = loop.run("system", [])
+        assert result2 is not None
+
+    def test_lock_released_on_exception_path(self, monkeypatch):
+        """If _run_impl raises, the lock must still release for the next call."""
+        loop = self._make_loop()
+
+        # Force _run_impl to raise on the first call only.
+        original_run_impl = loop._run_impl
+        call_count = {"n": 0}
+
+        def _raising_run_impl(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ValueError("simulated failure")
+            return original_run_impl(*args, **kwargs)
+
+        loop._run_impl = _raising_run_impl  # type: ignore[method-assign]
+
+        with pytest.raises(ValueError):
+            loop.run("system", [])
+        # Lock must be released — second run() succeeds.
+        result = loop.run("system", [])
+        assert result is not None
+
+    def test_lazy_lock_init_for_legacy_construction(self):
+        """AgentLoop built via __new__ (no __init__) must still get a lock."""
+        loop = self._make_loop()
+        # _make_loop() does NOT set _run_lock — verify .run() lazy-installs it.
+        assert not hasattr(loop, "_run_lock")
+        loop.run("system", [])
+        assert hasattr(loop, "_run_lock")
+        assert isinstance(loop._run_lock, type(threading.Lock()))
+
+
+# ─── C3: SessionStats locked readers ────────────────────────────────────────
+
+
+class TestSessionStatsLockedReaders:
+    """C3: provider/model property reads now acquire self._lock so they're
+    correct under free-threaded CPython AND consistent with the writer
+    contract (set_active_model takes the same lock).
+    """
+
+    def test_provider_read_under_lock(self):
+        from jyagent.runtime.stats import SessionStats
+        stats = SessionStats()
+        stats.set_active_model("openai", "gpt-5.5")
+        assert stats.provider == "openai"
+        assert stats.model == "gpt-5.5"
+
+    def test_concurrent_writes_visible_to_reader(self):
+        """Sanity-check: a 100-iteration concurrent write/read loop never
+        tears (provider/model strings stay consistent with whatever the
+        writer last set).
+        """
+        import threading as _t
+        from jyagent.runtime.stats import SessionStats
+
+        stats = SessionStats()
+        stats.set_active_model("openai", "gpt-5.5")
+        observed: list[tuple[str, str]] = []
+        stop = _t.Event()
+
+        def _reader():
+            while not stop.is_set():
+                observed.append((stats.provider, stats.model))
+
+        def _writer():
+            for i in range(100):
+                if i % 2 == 0:
+                    stats.set_active_model("anthropic", "claude-opus-4-6")
+                else:
+                    stats.set_active_model("openai", "gpt-5.5")
+            stop.set()
+
+        rt = _t.Thread(target=_reader, daemon=True)
+        wt = _t.Thread(target=_writer, daemon=True)
+        rt.start()
+        wt.start()
+        wt.join(timeout=5.0)
+        rt.join(timeout=5.0)
+
+        # Every observed (provider, model) tuple must be one of the two
+        # consistent pairs the writer set — never a torn (anthropic, gpt-5.5).
+        valid_pairs = {("openai", "gpt-5.5"), ("anthropic", "claude-opus-4-6")}
+        torn = [pair for pair in observed if pair not in valid_pairs]
+        assert not torn, (
+            f"observed torn provider/model pairs (read without lock): {torn[:5]}"
         )
