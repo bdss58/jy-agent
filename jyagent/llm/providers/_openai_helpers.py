@@ -142,7 +142,7 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
                 parsed_args = json.loads(arguments_str)
             except (json.JSONDecodeError, TypeError) as exc:
                 import logging
-                logging.getLogger("jyagent.runtime").warning(
+                logging.getLogger("jyagent.llm").warning(
                     "Malformed tool-call arguments from OpenAI (call_id=%s, name=%s): %s",
                     getattr(item, "call_id", "?"), getattr(item, "name", "?"), exc,
                 )

@@ -18,8 +18,8 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .runtime import RuntimeOwner, RuntimeOptions
-from .runtime.types import ModelSpec
+from .llm import RuntimeOwner, RuntimeOptions
+from .llm.types import ModelSpec
 from .config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from .registry import get_registry
 from .toolresult import ToolResult

@@ -294,7 +294,7 @@ def _complete_with_system_prompt(
     user message under the existing system prompt — so the prompt prefix
     stays cached.
     """
-    from ..runtime.types import RuntimeOptions
+    from ..llm.types import RuntimeOptions
     from ..config import get_reasoning_config_for_provider
 
     message = runtime_owner.complete(

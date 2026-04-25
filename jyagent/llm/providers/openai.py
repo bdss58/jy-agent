@@ -272,7 +272,7 @@ class _OpenAIStream(BaseStream):
                     parsed_args = json.loads(acc["arguments"]) if acc["arguments"] else {}
                 except (json.JSONDecodeError, TypeError) as exc:
                     import logging
-                    logging.getLogger("jyagent.runtime").warning(
+                    logging.getLogger("jyagent.llm").warning(
                         "Malformed tool-call arguments from OpenAI (call_id=%s, name=%s): %s",
                         acc.get("call_id", "?"), acc.get("name", "?"), exc,
                     )

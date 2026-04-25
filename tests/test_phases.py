@@ -155,7 +155,7 @@ class TestOptionsOverrideIntegration:
     supply and that the post-override object carries it."""
 
     def test_runtime_options_carries_tool_choice(self):
-        from jyagent.runtime.types import RuntimeOptions
+        from jyagent.llm.types import RuntimeOptions
         opts = RuntimeOptions(
             max_output_tokens=1000,
             timeout=60,

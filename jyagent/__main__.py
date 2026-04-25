@@ -13,13 +13,13 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .runtime import RuntimeOwner
+    from .llm import RuntimeOwner
 
 
 def create_runtime_owner() -> RuntimeOwner:
     """Create the default runtime owner from environment configuration."""
     from .config import get_active_model_spec
-    from .runtime import RuntimeOwner
+    from .llm import RuntimeOwner
 
     return RuntimeOwner(get_active_model_spec())
 

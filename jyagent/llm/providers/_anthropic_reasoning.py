@@ -1,8 +1,8 @@
 """Anthropic-specific reasoning validation and type definitions.
 
 This module contains all the Anthropic reasoning configuration types
-and validation logic that was previously in runtime/reasoning.py and
-the Anthropic-specific types from runtime/types.py.
+and validation logic that was previously in llm/reasoning.py and
+the Anthropic-specific types from llm/types.py.
 """
 
 from __future__ import annotations

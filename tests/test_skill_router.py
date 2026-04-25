@@ -24,12 +24,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from jyagent.runtime.core import (
+from jyagent.llm.core import (
     RuntimeOwner,
     register_adapter,
     _ADAPTERS,
 )
-from jyagent.runtime.types import ModelSpec
+from jyagent.llm.types import ModelSpec
 from jyagent.skills import SkillManager
 
 
@@ -80,8 +80,8 @@ class TestCompleteTextReasoningOverride:
 
     def test_reasoning_none_disables_auto_derivation(self, adapter_cleanup):
         mock_adapter = _register_mock_adapter("rt_none", "ok")
-        with patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+        with patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             mock_bms.return_value = ModelSpec(provider="rt_none", model="m")
             owner = RuntimeOwner(ModelSpec(provider="rt_none", model="m"))
             result = owner.complete_text("hi", reasoning=None)
@@ -98,8 +98,8 @@ class TestCompleteTextReasoningOverride:
     def test_default_still_auto_derives(self, adapter_cleanup):
         """Backward compat: no kwarg == auto-derive from env, as before."""
         _register_mock_adapter("rt_auto", "ok")
-        with patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+        with patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             mock_bms.return_value = ModelSpec(provider="rt_auto", model="m")
             mock_grc.return_value = None
             owner = RuntimeOwner(ModelSpec(provider="rt_auto", model="m"))
@@ -109,8 +109,8 @@ class TestCompleteTextReasoningOverride:
     def test_reasoning_none_survives_broken_reasoning_config(self, adapter_cleanup):
         """Simulates the real bug: auto-derive would raise, but reasoning=None bypasses it."""
         _register_mock_adapter("rt_broken", "ok")
-        with patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider",
+        with patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider",
                    side_effect=ValueError("adaptive thinking not supported")):
             mock_bms.return_value = ModelSpec(provider="rt_broken", model="m")
             owner = RuntimeOwner(ModelSpec(provider="rt_broken", model="m"))
@@ -133,8 +133,8 @@ class TestSkillRouterLLM:
         _register_mock_adapter("rt_llm", '["web-search"]')
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_llm", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -161,8 +161,8 @@ class TestSkillRouterLLM:
         mock_adapter = _register_mock_adapter("rt_reasoning_check", '["web-search"]')
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_reasoning_check", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -191,8 +191,8 @@ class TestSkillRouterLLM:
         _register_mock_adapter("rt_deact", '["browser-automation"]')
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_deact", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -217,8 +217,8 @@ class TestSkillRouterLLM:
         )
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_unknown", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -238,8 +238,8 @@ class TestSkillRouterLLM:
         _register_mock_adapter("rt_fence", '```json\n["web-search"]\n```')
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_fence", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -265,8 +265,8 @@ class TestSkillRouterLLM:
         mock_adapter.complete.side_effect = RuntimeError("boom")
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_err", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -291,8 +291,8 @@ class TestSkillRouterLLM:
         _register_mock_adapter("rt_badjson", "not json at all")
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_badjson", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec
@@ -317,8 +317,8 @@ class TestAutoActivateForQueryUsesLLM:
         _register_mock_adapter("rt_e2e", '["browser-automation"]')
 
         with patch("jyagent.skills.get_skill_router_model_spec") as mock_spec, \
-             patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-             patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+             patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+             patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
             spec = ModelSpec(provider="rt_e2e", model="mock-model")
             mock_spec.return_value = spec
             mock_bms.return_value = spec

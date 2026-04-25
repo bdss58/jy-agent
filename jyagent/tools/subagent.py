@@ -21,7 +21,7 @@ try:
     )
     from ..loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from ..registry import get_registry
-    from ..runtime import RuntimeOptions, RuntimeOwner
+    from ..llm import RuntimeOptions, RuntimeOwner
     from ..toolresult import ToolResult
     from ..session_stats import get_stats
 except ImportError:
@@ -30,7 +30,7 @@ except ImportError:
     )
     from jyagent.loop_engine import AgentLoop, LoopConfig, LoopCallbacks
     from jyagent.registry import get_registry
-    from jyagent.runtime import RuntimeOptions, RuntimeOwner
+    from jyagent.llm import RuntimeOptions, RuntimeOwner
     from jyagent.toolresult import ToolResult
     from jyagent.session_stats import get_stats
 
@@ -96,8 +96,8 @@ class _LegacyClientRuntimeOwner:
 
     def complete(self, context, options=None, model_spec=None):
         # Lazy imports: only needed when running through the legacy shim
-        from ..runtime.reasoning import build_anthropic_request_reasoning
-        from ..runtime.providers._anthropic_helpers import (
+        from ..llm.reasoning import build_anthropic_request_reasoning
+        from ..llm.providers._anthropic_helpers import (
             assistant_from_response, convert_messages,
         )
 

@@ -116,7 +116,7 @@ def validate_runtime_provider(provider: str, *, source: str) -> str:
 
 
 def build_model_spec(provider: str, model: str, *, source: str):
-    from .runtime.types import ModelSpec
+    from .llm.types import ModelSpec
 
     return ModelSpec(provider=validate_runtime_provider(provider, source=source), model=model)
 
@@ -134,7 +134,7 @@ def get_reasoning_config_for_provider(
     max_output_tokens: int | None = None,
     model: str | None = None,
 ):
-    from .runtime.providers._anthropic_reasoning import validate_anthropic_reasoning
+    from .llm.providers._anthropic_reasoning import validate_anthropic_reasoning
 
     provider = validate_runtime_provider(provider, source="reasoning provider")
 

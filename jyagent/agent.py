@@ -15,7 +15,7 @@ from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .loop_engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
 from .skills import SkillManager, get_skill_manager, init_skills
-from .runtime import RuntimeOwner
+from .llm import RuntimeOwner
 from .session_stats import get_stats
 from .config import (
     DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,

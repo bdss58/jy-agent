@@ -1,4 +1,4 @@
-"""Comprehensive test suite for jyagent/runtime module.
+"""Comprehensive test suite for jyagent/llm module.
 
 Covers types, messages, streams, core, and provider helper modules.
 Uses unittest.mock throughout — no actual anthropic/openai SDK required.
@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 # §1  types.py
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.types import (
+from jyagent.llm.types import (
     AssistantMessage,
     ThinkingBlock,
     Usage,
@@ -93,7 +93,7 @@ class TestModelSpec:
 # §2  messages.py
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.messages import (
+from jyagent.llm.messages import (
     assistant_text,
     inject_missing_tool_results,
     normalize_anthropic_tool_call_id,
@@ -419,7 +419,7 @@ class TestInjectMissingToolResults:
 # §3  streams.py
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.streams import BaseStream, ErrorStream, make_error_assistant_message
+from jyagent.llm.streams import BaseStream, ErrorStream, make_error_assistant_message
 
 
 class TestMakeErrorAssistantMessage:
@@ -505,7 +505,7 @@ class TestBaseStream:
 # §4  providers/_openai_helpers.py
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.providers._openai_helpers import (
+from jyagent.llm.providers._openai_helpers import (
     validate_openai_reasoning,
     map_stop_reason as openai_map_stop_reason,
     usage_from_response as openai_usage_from_response,
@@ -694,7 +694,7 @@ class TestOpenAIAssistantFromResponse:
 # §5  providers/_anthropic_helpers.py
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.providers._anthropic_helpers import (
+from jyagent.llm.providers._anthropic_helpers import (
     map_stop_reason as anthropic_map_stop_reason,
     usage_from_response as anthropic_usage_from_response,
     assistant_from_response as anthropic_assistant_from_response,
@@ -942,7 +942,7 @@ class TestAnthropicConvertTools:
 # §6  providers/_anthropic_reasoning.py
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.providers._anthropic_reasoning import (
+from jyagent.llm.providers._anthropic_reasoning import (
     validate_anthropic_reasoning,
     build_anthropic_request_reasoning,
 )
@@ -1145,7 +1145,7 @@ class TestBuildAnthropicRequestReasoning:
 # §7  core.py — adapter registry & RuntimeOwner
 # ════════════════════════════════════════════════════════════════════════════════
 
-from jyagent.runtime.core import register_adapter, get_adapter, list_adapters, _ADAPTERS
+from jyagent.llm.core import register_adapter, get_adapter, list_adapters, _ADAPTERS
 
 
 class TestAdapterRegistry:
@@ -1188,7 +1188,7 @@ class TestRuntimeOwnerCompleteText:
     """Test RuntimeOwner.complete_text convenience method (mock adapter)."""
 
     def test_complete_text_returns_concatenated_text(self):
-        from jyagent.runtime.core import RuntimeOwner
+        from jyagent.llm.core import RuntimeOwner
 
         mock_adapter = MagicMock()
         mock_adapter.provider = "test_rt"
@@ -1209,8 +1209,8 @@ class TestRuntimeOwnerCompleteText:
         try:
             register_adapter(mock_adapter)
             # Patch config functions to bypass env-dependent validation
-            with patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-                 patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+            with patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+                 patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
                 mock_bms.return_value = ModelSpec(provider="test_rt", model="test-model")
                 mock_grc.return_value = None
                 owner = RuntimeOwner(ModelSpec(provider="test_rt", model="test-model"))
@@ -1222,7 +1222,7 @@ class TestRuntimeOwnerCompleteText:
             _ADAPTERS.update(saved)
 
     def test_complete_text_with_only_thinking_returns_empty(self):
-        from jyagent.runtime.core import RuntimeOwner
+        from jyagent.llm.core import RuntimeOwner
 
         mock_adapter = MagicMock()
         mock_adapter.provider = "test_rt2"
@@ -1241,8 +1241,8 @@ class TestRuntimeOwnerCompleteText:
         saved = dict(_ADAPTERS)
         try:
             register_adapter(mock_adapter)
-            with patch("jyagent.runtime.core.build_model_spec") as mock_bms, \
-                 patch("jyagent.runtime.core.get_reasoning_config_for_provider") as mock_grc:
+            with patch("jyagent.llm.core.build_model_spec") as mock_bms, \
+                 patch("jyagent.llm.core.get_reasoning_config_for_provider") as mock_grc:
                 mock_bms.return_value = ModelSpec(provider="test_rt2", model="test-model2")
                 mock_grc.return_value = None
                 owner = RuntimeOwner(ModelSpec(provider="test_rt2", model="test-model2"))
