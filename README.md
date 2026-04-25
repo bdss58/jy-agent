@@ -183,7 +183,7 @@ loop = AgentLoop(
 messages = [{"role": "user", "content": "Summarize all TODO comments in this repo."}]
 result = loop.run(system_prompt="You are a focused code-spelunking assistant.",
                   messages=messages)
-print(f"\nstatus={result.status}  steps={result.steps_taken}  "
+print(f"\nstatus={result.status}  steps={result.steps}  "
       f"tokens={result.total_input_tokens}/{result.total_output_tokens}")
 ```
 
