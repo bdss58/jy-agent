@@ -68,8 +68,10 @@ old.should_verify(msg, 1)  →  False   # because should_verify reads new.VERIFI
 - ✅ Merged to main directly (no PR; branch + worktree deleted)
 - ✅ Pushed to `origin/main` (commits `f4674e0`..`a878c39`)
 - ✅ Skill-discovery smoke test added (`tests/test_skill_default_path.py`, commit `a30e3d7`) — guards against future `__file__`-depth bugs
-- ⏭️ Phase 5b Codex re-review — skipped; findings already documented
-- ⏳ Remove backward-compat shims one release after merge (13 modules at old paths)
+- ✅ **Backward-compat shims removed** (commit `10e7982`) — 13 modules deleted, 11 tests + 2 skill scripts + README updated; 489/1 tests still green; the shim-asymmetry gotcha is now historical
+- ⏭️ Phase 5b Codex re-review — skipped; findings already documented (and now obsolete since shims are gone)
+
+**Status: COMPLETE.** Out-of-scope items (split skills.py, move mcp_*, move agent.py, runtime→cli/console dep) remain deferred — each is its own refactor, not blocking.
 
 ## Out of scope (deferred — explicitly NOT done)
 - Splitting `skills.py` into a subpackage (still 771-line single file in runtime/)
