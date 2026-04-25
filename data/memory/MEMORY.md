@@ -43,6 +43,7 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - **openclaw-offline-update.md** — OpenClaw offline bundle update process (preflight, docker-compose schema migration, build-artifact staleness). Read on any OpenClaw customer-deployment question.
 - **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read on any session mentioning nano-vLLM / learning / LLM study.
 - **runtime-refactor.md** — Runtime Package Refactor
+- **runtime-review-2026-04-25.md** — Runtime Design + Implementation Review (Codex)
 ## Repo Snapshot
 - Provider-neutral LLM layer: Anthropic Messages + OpenAI Responses adapters under `jyagent/llm/`
 - `LLMOwner` owns the active `provider:model`; `/model <provider> <model>` switches future turns
@@ -71,3 +72,6 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 [tip] web_search backend: cascade DDG → Brave → Mojeek; SearxNG (via SEARXNG_URL env) jumps to first if set. WEB_SEARCH_ENGINE forces single engine. Chrome-tier no longer scrapes SERPs (removed; was slow + bot-detected).
 [gotcha] git worktree shares the parent repo's editable-install `.venv` — `uv run` from the worktree imports the package from the MAIN worktree's path (per `__editable___*_finder.py` MAPPING), NOT the worktree's source. Tests run in a worktree may silently exercise the WRONG code. Fix: install a local editable venv in the worktree (`uv sync` inside it) before testing, OR run tests on main after merge.
 [gotcha] When moving a Python module deeper in a package tree, audit every `os.path.dirname(__file__)` chain and `Path(__file__).parents[N]` — depth count is coupled to file location and silently resolves to the wrong path (no ImportError). Check skills.py-style "no items found" symptoms first.
+[tip] SearxNG settings.yml supports `use_default_settings: true` — write only your overrides; everything else (incl. 281 engines) inherits from the default in the searxng/searxng image. Must still override `server.secret_key` (default placeholder `ultrasecretkey` makes the app refuse to start).
+[tip] SearxNG only honors a few env overrides (SEARXNG_PORT, BIND_ADDRESS, SECRET_KEY, LIMITER, PUBLIC_INSTANCE); search.formats must come from settings.yml
+[tip] Docker Compose v2.23+ supports inline `configs.content:` to embed file contents in docker-compose.yml, avoiding companion files
