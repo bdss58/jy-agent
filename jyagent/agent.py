@@ -12,7 +12,7 @@ from .memory import (
     record_file_access,
 )
 from .terminal_ux import build_streaming_callbacks, _interrupted_msg
-from .loop_engine import AgentLoop, LoopConfig, LoopResult
+from .runtime.loop.engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
 from .runtime.skills import SkillManager, get_skill_manager, init_skills
 from .llm import LLMOwner

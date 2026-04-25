@@ -5,7 +5,7 @@ import time
 import threading
 from dataclasses import dataclass
 from .runtime.tools.registry import get_registry
-from .loop_engine import LoopCallbacks
+from .runtime.loop.engine import LoopCallbacks
 from .cli import console
 
 
