@@ -196,23 +196,17 @@ ToolChoice = ToolChoiceAuto | ToolChoiceAny | ToolChoiceNone | ToolChoiceTool
 
 
 # ─── Model / options / stream ────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class ModelSpec:
-    provider: str
-    model: str
-
-    def label(self) -> str:
-        return f"{self.provider}:{self.model}"
-
-
-@dataclass(frozen=True)
-class LLMOptions:
-    max_output_tokens: int | None = None
-    timeout: float | None = None
-    reasoning: ReasoningConfig | None = None
-    metadata: dict[str, Any] | None = None
-    tool_choice: ToolChoice | None = None
+#
+# ``ModelSpec`` and ``LLMOptions`` were moved into
+# ``jyagent.runtime.loop.llm_types`` as part of closing the
+# runtime → llm dependency reversal flagged in Codex review 2026-04-25
+# Part 3 #5.  The runtime owns the *shape* of these inputs because they
+# are constructed by the engine and consumed by the LLM client; placing
+# them on the consumer side rather than the producer side reverses the
+# import direction.  We re-export here so existing
+# ``from jyagent.llm.types import LLMOptions, ModelSpec`` continues to
+# work — this is a pure reorganisation, not an API break.
+from ..runtime.loop.llm_types import LLMOptions, ModelSpec  # noqa: F401
 
 
 class LLMStream(Protocol):

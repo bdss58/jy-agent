@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     # does NOT eagerly import the LLM provider package.  Concrete providers
     # supply the real classes at runtime; the Protocol just describes the
     # shape.
-    from ...llm.types import LLMOptions, ModelSpec
+    from .llm_types import LLMOptions, ModelSpec
 
 
 @runtime_checkable

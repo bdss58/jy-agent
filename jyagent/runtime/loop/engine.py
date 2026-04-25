@@ -23,17 +23,14 @@ from typing import Any, Callable
 # satisfy the Protocol structurally — no inheritance required.
 from .llm_client import LLMClient
 
-# Type-only dependency: `LLMOptions` and `ModelSpec` are bag-of-fields
-# value types shared across provider implementations.  The engine
-# constructs `LLMOptions` (in `_build_runtime_options`) and accepts
-# `ModelSpec` overrides for sub-agent tier swaps.  Codex review Part
-# 3 #5 noted this lingering coupling — moving these types into a
-# neutral package is a separate, larger refactor (touches every
-# provider).  Keeping them in `llm.types` for now; the engine no
-# longer depends on `llm.LLMOwner` *behaviour*, which is the half
-# that mattered for testability and provider-pluggability.
-from ...llm import LLMOptions
-from ...llm.types import ModelSpec
+# Value-type dependency: `LLMOptions` and `ModelSpec` are bag-of-fields
+# dataclasses the engine constructs (in `_build_runtime_options`) and
+# threads through sub-agent tier swaps.  They live under the runtime
+# package itself (`runtime.loop.llm_types`) — provider packages
+# re-export from `jyagent.llm.types` for backward compat.  After this
+# move (Codex review 2026-04-25 Part 3 #5, follow-up commit), the
+# runtime has **zero** runtime-import of `jyagent.llm`.
+from .llm_types import LLMOptions, ModelSpec
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from ..tools.registry import get_registry, ToolBatch
 from ..tools.result import ToolResult

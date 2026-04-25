@@ -10,6 +10,7 @@ dependency on it.
 """
 from .loop import AgentLoop, LoopConfig, LoopResult, LoopCallbacks
 from .loop.llm_client import LLMClient
+from .loop.llm_types import LLMOptions, ModelSpec
 from .tools import get_registry, ToolResult
 from .stats import get_stats, SessionStats
 
@@ -19,6 +20,8 @@ __all__ = [
     "LoopResult",
     "LoopCallbacks",
     "LLMClient",
+    "LLMOptions",
+    "ModelSpec",
     "get_registry",
     "ToolResult",
     "get_stats",
