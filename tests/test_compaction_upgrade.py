@@ -6,6 +6,7 @@
 
 import os
 import tempfile
+from jyagent.runtime.tools.registry import get_registry
 import pytest
 
 # ─── Phase 1: P0.1 + P0.2 — Observation masking + thinking pruning ──────────
@@ -44,7 +45,7 @@ def test_thinking_blocks_pruned_from_old_messages():
             "tool_name": "run_shell", "content": "output " * 500,
         })
 
-    result = _compact_messages(messages, max_tokens=1000, compact_chars=2000)
+    result = _compact_messages(messages, max_tokens=1000, compact_chars=2000, batch=get_registry().freeze())
     assert result is not messages
 
     # Walk old messages (all but last 2) and check thinking-block state.
@@ -90,7 +91,7 @@ def test_observation_masking_clears_far_tool_results():
             "tool_name": "run_shell", "content": "long output " * 500,
         })
 
-    result = _compact_messages(messages, max_tokens=500, compact_chars=2000)
+    result = _compact_messages(messages, max_tokens=500, compact_chars=2000, batch=get_registry().freeze())
 
     # Far-away ephemeral results should be fully cleared
     for i in [1, 3, 5, 7, 9, 11, 13]:  # tool_results at odd indices
@@ -119,7 +120,7 @@ def test_ephemeral_tools_cleared_even_when_close():
         {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
     ]
 
-    result = _compact_messages(messages, max_tokens=100, compact_chars=2000)
+    result = _compact_messages(messages, max_tokens=100, compact_chars=2000, batch=get_registry().freeze())
 
     # Both list_directory and grep_files are ephemeral → cleared
     assert result[1]["content"] == "[Tool result cleared]"
@@ -144,7 +145,7 @@ def test_persistent_tool_results_retained():
         {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
     ]
 
-    result = _compact_messages(messages, max_tokens=100, compact_chars=2000)
+    result = _compact_messages(messages, max_tokens=100, compact_chars=2000, batch=get_registry().freeze())
 
     # read_file (persistent): should NOT be "[Tool result cleared]" but may be truncated
     rf_content = result[1]["content"]
@@ -170,7 +171,7 @@ def test_last_two_messages_always_intact():
         {"role": "assistant", "content": [big_thinking, {"type": "text", "text": "answer"}]},
     ]
 
-    result = _compact_messages(messages, max_tokens=100, compact_chars=500)
+    result = _compact_messages(messages, max_tokens=100, compact_chars=500, batch=get_registry().freeze())
 
     # Last 2 messages unchanged
     assert result[-1]["content"][0]["thinking"] == "x" * 10000

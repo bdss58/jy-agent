@@ -21,7 +21,7 @@ from typing import Any, Callable
 from ...llm import LLMOwner, LLMOptions
 from ...llm.types import ModelSpec
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
-from ..tools.registry import get_registry
+from ..tools.registry import get_registry, ToolBatch
 from ..tools.result import ToolResult
 from ..tools.validation import validate_tool_input
 from ...memory.conversation import estimate_conversation_tokens
@@ -359,6 +359,7 @@ def _compact_messages(
     messages: list,
     max_tokens: int,
     compact_chars: int,
+    batch: ToolBatch,
 ) -> list:
     """Multi-tier context compaction for messages sent to the LLM.
 
@@ -373,6 +374,11 @@ def _compact_messages(
 
     Keeps the last 2 messages fully intact (the LLM needs them for reasoning).
     Returns the original list unchanged if no modification was performed.
+
+    ``batch`` is the per-step tool snapshot used for compaction-priority
+    lookups.  Tools that have been unregistered between the step that called
+    them and now degrade gracefully to ``"standard"`` priority — the
+    optimisation is lost but no behaviour is incorrect.
     """
     from ...config import OBSERVATION_MASK_DISTANCE
 
@@ -380,7 +386,6 @@ def _compact_messages(
     if estimated <= max_tokens:
         return messages
 
-    registry = get_registry()
     n = len(messages)
     keep_intact = 2  # always preserve last 2 messages verbatim
 
@@ -441,7 +446,7 @@ def _compact_messages(
         if msg.get("role") == "tool_result":
             result_text = str(msg.get("content", ""))
             tool_name = msg.get("tool_name", "")
-            priority = registry.get_compaction_priority(tool_name) if tool_name else "standard"
+            priority = batch.get_compaction_priority(tool_name) if tool_name else "standard"
 
             if far_away or priority == "ephemeral":
                 # Full clear — observation masking
@@ -465,7 +470,7 @@ def _compact_messages(
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     result_text = str(block.get("content", ""))
                     tool_name = block.get("tool_name", "")
-                    priority = registry.get_compaction_priority(tool_name) if tool_name else "standard"
+                    priority = batch.get_compaction_priority(tool_name) if tool_name else "standard"
 
                     if far_away or priority == "ephemeral":
                         block = dict(block)
@@ -489,13 +494,18 @@ def _compact_messages(
     return compacted
 
 
-def _truncate_tool_call_blocks(blocks: list) -> list:
-    """Truncate large tool_call argument fields in normalized assistant content."""
-    registry = get_registry()
+def _truncate_tool_call_blocks(blocks: list, batch: ToolBatch) -> list:
+    """Truncate large tool_call argument fields in normalized assistant content.
+
+    ``batch`` is the per-step tool snapshot used for ``large_input_keys``
+    metadata.  Tools not in the batch (e.g. unregistered between dispatch
+    and the next assistant transformation) degrade to no-truncation —
+    safer than mid-step live registry reads (Codex Part 1 #4).
+    """
     out = []
     for block in blocks:
         if isinstance(block, dict) and block.get("type") == "tool_call":
-            large_keys = registry.get_large_input_keys(block.get("name", ""))
+            large_keys = batch.get_large_input_keys(block.get("name", ""))
             if large_keys:
                 inp = block.get("arguments", {})
                 truncated_inp = {}
@@ -519,18 +529,23 @@ def _truncate_tool_call_blocks(blocks: list) -> list:
 def _execute_tool(
     name: str,
     tool_input: dict,
-    functions: dict[str, Callable],
-    registry,
+    batch: ToolBatch,
 ) -> ToolResult:
-    """Execute a single tool call with validation.  Always returns ToolResult."""
-    fn = functions.get(name)
+    """Execute a single tool call with validation.  Always returns ToolResult.
+
+    All tool resolution (function lookup, schema for validation) goes
+    through the per-step ``batch`` snapshot — no live registry reads
+    here, so a concurrent ``register()``/``unregister()`` cannot pair
+    a function with a different schema mid-batch (Codex Part 1 #4).
+    """
+    fn = batch.get_function(name)
     if fn is None:
         return enrich_error(ToolResult(
-            f"Error: Unknown tool '{name}'. Available: {sorted(functions.keys())[:20]}",
+            f"Error: Unknown tool '{name}'. Available: {batch.list_tools()[:20]}",
             is_error=True,
         ), name)
 
-    tool_schema = registry.get_schema(name)
+    tool_schema = batch.get_schema(name)
     validation_error = validate_tool_input(name, tool_input, fn, tool_schema)
     if validation_error:
         return enrich_error(ToolResult(validation_error, is_error=True), name)
@@ -554,8 +569,7 @@ def _execute_tool(
 
 def _execute_tools(
     blocks: list[ToolCallRequest],
-    functions: dict[str, Callable],
-    registry,
+    batch: ToolBatch,
     concurrent_mode: bool,
     max_workers: int,
     timeout: int,
@@ -571,6 +585,10 @@ def _execute_tools(
     on top of the shared dispatch pool so the shared pool can stay hot (with
     a larger worker count) without violating per-loop concurrency preferences.
     Sequential paths don't acquire permits — they're serial by construction.
+
+    All ``parallel_safe`` decisions read from the immutable ``batch`` — a
+    concurrent registry mutation cannot flip a tool's flag mid-partition
+    (Codex Part 1 #11).
     """
     if not blocks:
         return []
@@ -579,15 +597,15 @@ def _execute_tools(
     if len(blocks) <= 1 or not concurrent_mode:
         results = []
         for block in blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, functions, registry, timeout)
+            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
             results.append((block, result))
         return results
 
     # Check if any tool is parallel-safe
-    if not any(registry.is_parallel_safe(b.name) for b in blocks):
+    if not any(batch.is_parallel_safe(b.name) for b in blocks):
         results = []
         for block in blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, functions, registry, timeout)
+            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
             results.append((block, result))
         return results
 
@@ -599,9 +617,9 @@ def _execute_tools(
     results_arr: list[tuple[ToolCallRequest, ToolResult] | None] = [None] * len(blocks)
     i = 0
     while i < len(blocks):
-        if registry.is_parallel_safe(blocks[i].name):
+        if batch.is_parallel_safe(blocks[i].name):
             parallel_batch = []
-            while i < len(blocks) and registry.is_parallel_safe(blocks[i].name):
+            while i < len(blocks) and batch.is_parallel_safe(blocks[i].name):
                 parallel_batch.append((i, blocks[i]))
                 i += 1
 
@@ -609,7 +627,7 @@ def _execute_tools(
             futures = {
                 pool.submit(
                     _execute_tool_with_timeout,
-                    block.name, block.input, functions, registry, timeout,
+                    block.name, block.input, batch, timeout,
                     body_permits=body_permits,
                 ): (idx, block)
                 for idx, block in parallel_batch
@@ -626,7 +644,7 @@ def _execute_tools(
                     ))
         else:
             block = blocks[i]
-            result = _execute_tool_with_timeout(block.name, block.input, functions, registry, timeout)
+            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
             results_arr[i] = (block, result)
             i += 1
 
@@ -640,8 +658,7 @@ def _execute_tools(
 def _execute_tool_with_timeout(
     name: str,
     tool_input: dict,
-    functions: dict[str, Callable],
-    registry,
+    batch: ToolBatch,
     default_timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     body_permits: threading.BoundedSemaphore | None = None,
@@ -670,9 +687,13 @@ def _execute_tool_with_timeout(
     Released as soon as ``done.wait(timeout)`` returns, so a tool that
     times out does not hold a permit while its daemon thread continues in
     the background.
+
+    The per-step ``batch`` snapshot supplies the timeout hint, function,
+    and schema — no live registry reads, so a concurrent registration
+    cannot change the effective timeout mid-call.
     """
     timeout = default_timeout
-    hint = registry.get_timeout_hint(name)
+    hint = batch.get_timeout_hint(name)
     if hint is not None:
         timeout = max(timeout, hint)
 
@@ -687,7 +708,7 @@ def _execute_tool_with_timeout(
 
     def _run_body() -> None:
         try:
-            result_holder[0] = _execute_tool(name, tool_input, functions, registry)
+            result_holder[0] = _execute_tool(name, tool_input, batch)
         except BaseException as e:  # noqa: BLE001 — we need to propagate everything
             exc_holder[0] = e
         finally:
@@ -1040,11 +1061,12 @@ class AgentLoop:
         unpriced_warned = False  # one-shot flag for cost_tracker.has_unpriced_usage
         stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
 
-        # Resolve tools
-        tool_schemas: list[dict] = []
-        tool_functions: dict[str, Callable] = {}
-
-        reg_version: int | None = None
+        # Resolve tools.  ``tools_batch`` is the immutable per-step snapshot
+        # consumed by every dispatch/compaction helper.  Built once per step
+        # via ``ToolRegistry.freeze()`` (or from ``_tool_source()`` when
+        # provided), so concurrent registry mutations cannot race against
+        # in-flight metadata reads (Codex Part 1 #4, #11, #12).
+        tools_batch: ToolBatch = ToolBatch.empty()
 
         try:
             for step in range(cfg.max_steps):
@@ -1054,11 +1076,39 @@ class AgentLoop:
                 if self._is_cancelled():
                     break
 
-                # Refresh tool source each step
+                # Refresh tool batch each step.
+                #
+                # When ``_tool_source`` is provided (e.g. MCP integration that
+                # builds tool sets dynamically per turn), its (schemas,
+                # functions) supersede the registry's, but we still freeze
+                # the registry to inherit metadata (parallel_safe, timeout
+                # hints, large_input_keys, compaction_priority) for any
+                # tool whose name happens to be registered too.  This
+                # preserves the historical "tool_source funcs + registry
+                # metadata" behaviour but now atomically.
                 if self._tool_source is not None:
-                    tool_schemas, tool_functions = self._tool_source()
-                elif step == 0 or (reg_version is not None and registry.version != reg_version):
-                    reg_version, tool_schemas, tool_functions = registry.snapshot()
+                    src_schemas, src_functions = self._tool_source()
+                    reg_batch = registry.freeze()
+                    src_schema_map = {
+                        s.get("name"): s for s in src_schemas if s.get("name")
+                    }
+                    tools_batch = ToolBatch(
+                        version=reg_batch.version,
+                        schemas=tuple(src_schemas),
+                        schema_map=src_schema_map,
+                        functions=dict(src_functions),
+                        parallel_safe=reg_batch.parallel_safe,
+                        timeout_hints=reg_batch.timeout_hints,
+                        large_input_keys=reg_batch.large_input_keys,
+                        compaction_priority=reg_batch.compaction_priority,
+                    )
+                elif step == 0 or registry.version != tools_batch.version:
+                    # Re-freeze only when the registry has changed.  The
+                    # version read is locked (defense-in-depth), and even
+                    # if a stale-by-one read causes us to skip a freeze,
+                    # the next step will catch up — at most one step uses
+                    # slightly-stale metadata, never inconsistent metadata.
+                    tools_batch = registry.freeze()
 
                 # Overlay the per-loop write_todos tool on top of the
                 # registry snapshot when todos are enabled.  This is the
@@ -1066,15 +1116,26 @@ class AgentLoop:
                 # review (avoids ContextVar propagation issues with our
                 # daemon-thread tool executor).
                 if cfg.todos_enabled:
-                    tool_schemas = list(tool_schemas) + [WRITE_TODOS_SCHEMA]
-                    tool_functions = dict(tool_functions)
-                    tool_functions["write_todos"] = _write_todos_fn
+                    step_batch = tools_batch.with_overlay(
+                        functions={"write_todos": _write_todos_fn},
+                        schemas=[WRITE_TODOS_SCHEMA],
+                        # write_todos must NOT be parallel-safe — it would
+                        # then run concurrently with itself in a batch and
+                        # the replace-all semantics would silently drop
+                        # one of the writes (Codex Part 2 #4).
+                    )
+                else:
+                    step_batch = tools_batch
+
+                tool_schemas = list(step_batch.schemas)
+                tool_functions = step_batch.functions
 
                 # Context compaction
                 if cfg.compact_messages:
                     before_len = len(messages)
                     messages_maybe = _compact_messages(
                         messages, cfg.max_working_tokens, cfg.compact_tool_result_chars,
+                        step_batch,
                     )
                     if messages_maybe is not messages:
                         after_len = len(messages_maybe)
@@ -1241,7 +1302,7 @@ class AgentLoop:
                     if cfg.truncate_large_inputs:
                         content = final_message.get("content", [])
                         final_message = dict(final_message)
-                        final_message["content"] = _truncate_tool_call_blocks(content)
+                        final_message["content"] = _truncate_tool_call_blocks(content, step_batch)
 
                     # Allow caller to transform before append
                     cb_am = self._callbacks.on_assistant_message
@@ -1302,7 +1363,7 @@ class AgentLoop:
                 if cfg.truncate_large_inputs:
                     content = final_message.get("content", [])
                     final_message = dict(final_message)
-                    final_message["content"] = _truncate_tool_call_blocks(content)
+                    final_message["content"] = _truncate_tool_call_blocks(content, step_batch)
 
                 cb_am = self._callbacks.on_assistant_message
                 if cb_am is not None:
@@ -1341,8 +1402,7 @@ class AgentLoop:
                 tools_t0 = time.perf_counter()
                 tool_results_tuples = _execute_tools(
                     tool_call_blocks,
-                    tool_functions,
-                    registry,
+                    step_batch,
                     cfg.concurrent_tools,
                     cfg.max_tool_workers,
                     cfg.tool_timeout,
@@ -1542,7 +1602,7 @@ class AgentLoop:
                     if cfg.truncate_large_inputs:
                         content = fallback_message.get("content", [])
                         fallback_message = dict(fallback_message)
-                        fallback_message["content"] = _truncate_tool_call_blocks(content)
+                        fallback_message["content"] = _truncate_tool_call_blocks(content, step_batch)
 
                     # Append fallback response
                     messages.append(fallback_message)

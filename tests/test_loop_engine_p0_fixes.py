@@ -25,26 +25,45 @@ from jyagent.runtime.loop.engine import (
     ToolCallRequest,
 )
 from jyagent.runtime.tools.result import ToolResult
+from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
 
 
 # ─── Shared fake registry ────────────────────────────────────────────────────
 
 
-class _FakeRegistry:
-    """Minimal registry stub for tests — everything is parallel-safe."""
+# ─── Shared per-test ToolBatch builder ───────────────────────────────────────
 
-    def __init__(self, parallel_safe: bool = True, timeout_hint: int | None = None):
-        self._parallel = parallel_safe
-        self._timeout_hint = timeout_hint
 
-    def is_parallel_safe(self, name: str) -> bool:
-        return self._parallel
+def _make_batch(
+    *,
+    functions: dict | None = None,
+    schemas: list | None = None,
+    parallel_safe: bool = True,
+    timeout_hint: int | None = None,
+) -> ToolBatch:
+    """Construct a real ``ToolBatch`` from a dict of test functions.
 
-    def get_timeout_hint(self, name: str) -> int | None:
-        return self._timeout_hint
-
-    def get_schema(self, name: str):
-        return None
+    Replaces the old ``_FakeRegistry`` duck-typed stub.  After the
+    runtime-tool-batch-snapshot refactor (2026-04), all dispatch helpers
+    consume an immutable ``ToolBatch`` rather than a registry — building
+    one from a real ``ToolRegistry.freeze()`` keeps tests honest about
+    the production code path (no mock surface drift).
+    """
+    funcs = functions or {}
+    reg = ToolRegistry()
+    for name, fn in funcs.items():
+        # Each test function gets an empty schema by default; tests that
+        # need schema validation pass their own list via ``schemas``.
+        schema = next(
+            (s for s in (schemas or []) if s.get("name") == name),
+            {"name": name, "input_schema": {"type": "object"}},
+        )
+        reg.register(
+            name, fn, schema,
+            parallel_safe=parallel_safe,
+            timeout_hint=timeout_hint,
+        )
+    return reg.freeze()
 
 
 def _sleep_tool(ms: int):
@@ -80,8 +99,8 @@ class TestNoNestedPoolDeadlock:
         # Match dispatch width — this is the failure mode of the old design.
         n = _tool_dispatch_executor._max_workers  # type: ignore[attr-defined]
         sleep_ms = 150
-        registry = _FakeRegistry(parallel_safe=True)
         functions = {f"t{i}": _sleep_tool(sleep_ms) for i in range(n)}
+        batch = _make_batch(functions=functions, parallel_safe=True)
         blocks = [
             ToolCallRequest(id=f"id{i}", name=f"t{i}", input={"label": f"t{i}"})
             for i in range(n)
@@ -94,8 +113,7 @@ class TestNoNestedPoolDeadlock:
         def _run():
             return _execute_tools(
                 blocks=blocks,
-                functions=functions,
-                registry=registry,
+                batch=batch,
                 concurrent_mode=True,
                 max_workers=n,
                 timeout=10,
@@ -131,9 +149,8 @@ class TestNoNestedPoolDeadlock:
         """A fast tool completes via the daemon-thread timeout wrapper with
         no pool involvement (post-2026-04 fix replaced the inner pool with
         per-call daemon threads)."""
-        registry = _FakeRegistry()
-        functions = {"t": _sleep_tool(10)}
-        result = _execute_tool_with_timeout("t", {"label": "t"}, functions, registry, 5)
+        batch = _make_batch(functions={"t": _sleep_tool(10)})
+        result = _execute_tool_with_timeout("t", {"label": "t"}, batch, 5)
         assert not result.is_error
         assert result.content == "t-done"
 
@@ -814,7 +831,7 @@ class TestCompactionPreservesThinkingAdjacency:
     def test_thinking_preserved_when_paired_with_tool_use(self):
         msgs, _, _ = self._make_conv(n_padding=30)
         # Aggressive token budget — force compaction to run.
-        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200)
+        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
         # Must be a different list (compaction ran).
         assert compacted is not msgs, "compaction did not run — test setup issue"
 
@@ -840,7 +857,7 @@ class TestCompactionPreservesThinkingAdjacency:
 
     def test_standalone_thinking_still_stripped_for_token_economy(self):
         msgs, _, _ = self._make_conv(n_padding=30)
-        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200)
+        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
         # Find the standalone assistant (text "Here's my answer.").
         stand = None
         for m in compacted:
@@ -870,15 +887,14 @@ class TestDaemonThreadTimeout:
 
     def test_timeout_returns_clean_error(self):
         """A tool body that exceeds the timeout returns a structured error."""
-        registry = _FakeRegistry(parallel_safe=False, timeout_hint=None)
-
         def _slow(label: str = "x"):
             time.sleep(5.0)  # way over the 0.3s test timeout
             return "done"
 
+        batch = _make_batch(functions={"slow_tool": _slow}, parallel_safe=False)
         t0 = time.perf_counter()
         result = le._execute_tool_with_timeout(
-            "slow_tool", {"label": "x"}, {"slow_tool": _slow}, registry, 1,
+            "slow_tool", {"label": "x"}, batch, 1,
         )
         elapsed = time.perf_counter() - t0
         # Timeout should be honored within a small margin (inner +10s slack
@@ -900,8 +916,6 @@ class TestDaemonThreadTimeout:
         The daemon-thread design holds no pool slot so a fast tool runs
         immediately regardless of how many long-running bodies are orphaned.
         """
-        registry = _FakeRegistry(parallel_safe=False, timeout_hint=None)
-
         def _slow(label: str = "x"):
             # Sleep for longer than the total test budget so orphaned bodies
             # are definitely still running when we issue the fast tool.
@@ -911,11 +925,14 @@ class TestDaemonThreadTimeout:
         def _fast(label: str = "x"):
             return "ok"
 
+        slow_batch = _make_batch(functions={"slow": _slow}, parallel_safe=False)
+        fast_batch = _make_batch(functions={"fast": _fast}, parallel_safe=False)
+
         # Fire 20 timeouts.  Under the old design this would pin 16+ pool
         # workers indefinitely.  Budget: 20 × 1s ≈ 20s + overhead.
         for _ in range(20):
             r = le._execute_tool_with_timeout(
-                "slow", {"label": "x"}, {"slow": _slow}, registry, 1,
+                "slow", {"label": "x"}, slow_batch, 1,
             )
             assert r.is_error and "timed out" in r.content.lower()
 
@@ -926,7 +943,7 @@ class TestDaemonThreadTimeout:
         # Under the new design: daemon thread, instant start.
         t0 = time.perf_counter()
         result = le._execute_tool_with_timeout(
-            "fast", {"label": "x"}, {"fast": _fast}, registry, 5,
+            "fast", {"label": "x"}, fast_batch, 5,
         )
         elapsed_fast = time.perf_counter() - t0
         assert not result.is_error
@@ -1023,7 +1040,7 @@ class TestCompactionThinkingPairedWithToolCall:
 
     def test_thinking_preserved_when_paired_with_tool_call(self):
         msgs, _ = self._make_conv(tool_block_type="tool_call")
-        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200)
+        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
         assert compacted is not msgs, "compaction did not run — test setup issue"
         # Locate the signed assistant message.
         signed_after = None
@@ -1208,7 +1225,6 @@ class TestMaxToolWorkersApplied:
         """With max_workers=2, only 2 of 5 parallel-safe tools run at once."""
         import concurrent.futures as cf
 
-        registry = _FakeRegistry(parallel_safe=True)
         active = 0
         peak = 0
         lock = threading.Lock()
@@ -1231,15 +1247,14 @@ class TestMaxToolWorkersApplied:
             ToolCallRequest(id=f"id{i}", name="t", input={"label": f"t{i}"})
             for i in range(n)
         ]
-        functions = {"t": _tracked}
+        batch = _make_batch(functions={"t": _tracked}, parallel_safe=True)
 
         t0 = time.perf_counter()
         caller = cf.ThreadPoolExecutor(max_workers=1)
         fut = caller.submit(
             _execute_tools,
             blocks=blocks,
-            functions=functions,
-            registry=registry,
+            batch=batch,
             concurrent_mode=True,
             max_workers=2,
             timeout=5,
@@ -1312,4 +1327,198 @@ class TestCostTrackerLowerBound:
         assert "has_unpriced_usage" in source, (
             "loop must surface has_unpriced_usage via on_warning so the "
             "lower-bound nature of the budget is visible"
+        )
+
+
+# ─── Per-step ToolBatch isolates dispatch from concurrent registry mutation ──
+
+
+class TestToolBatchSnapshotIsolation:
+    """``ToolRegistry.freeze()`` must produce an immutable per-step snapshot
+    such that a concurrent ``register()``/``unregister()``/schema mutation
+    cannot affect any helper that consumed the snapshot.
+
+    Codex review 2026-04-25 (Part 1 #4, #11, #12) flagged three concrete
+    races the engine had under the old "live registry reads everywhere"
+    design:
+
+      * #4  — ``get_schema(name)`` was a live unlocked lookup, so validation
+              could pair the per-step ``functions`` snapshot with a *new*
+              schema or no schema mid-step.
+      * #11 — ``is_parallel_safe(name)`` was a live unlocked read called
+              three times during partition, so the same batch could see a
+              tool as serial in one place and parallel in another.
+      * #12 — ``snapshot()`` returned shared schema dict references, so a
+              caller that retained a registered schema dict could mutate
+              the snapshot through aliasing.
+
+    These tests exercise the snapshot contract directly.
+    """
+
+    def test_freeze_is_atomic_under_concurrent_registration(self):
+        """Race a thread that hammers register()/unregister() against
+        repeated freeze() calls.  Each frozen batch must be internally
+        consistent: every name in ``functions`` must also have a schema
+        and metadata entry; ``parallel_safe`` membership must agree with
+        ``schema_map`` membership for any tool registered with that flag.
+        """
+        reg = ToolRegistry()
+
+        def _churn(stop: threading.Event, idx_holder: list):
+            i = 0
+            while not stop.is_set():
+                name = f"churn_{i % 8}"
+                if i % 2 == 0:
+                    reg.register(
+                        name, lambda **_: "ok",
+                        {"name": name, "input_schema": {"type": "object"}},
+                        parallel_safe=(i % 4 == 0),
+                        timeout_hint=10,
+                    )
+                else:
+                    reg.unregister(name)
+                i += 1
+                idx_holder[0] = i
+
+        stop = threading.Event()
+        idx_holder = [0]
+        churner = threading.Thread(target=_churn, args=(stop, idx_holder), daemon=True)
+        churner.start()
+
+        try:
+            # Take 200 freezes against the churn.  Every batch must satisfy
+            # the consistency invariants below, regardless of churn timing.
+            for _ in range(200):
+                batch = reg.freeze()
+                for name in batch.functions:
+                    assert name in batch.schema_map, (
+                        f"tool {name!r} in batch.functions but missing from "
+                        f"batch.schema_map — non-atomic freeze()"
+                    )
+                # parallel_safe must be a subset of registered tools (a tool
+                # can't be parallel_safe if it isn't in the batch).
+                assert batch.parallel_safe <= set(batch.functions), (
+                    f"parallel_safe contains names absent from functions: "
+                    f"{batch.parallel_safe - set(batch.functions)}"
+                )
+        finally:
+            stop.set()
+            churner.join(timeout=2.0)
+
+        assert idx_holder[0] > 100, (
+            "churner did not run enough iterations for the test to be "
+            f"meaningful (only {idx_holder[0]} cycles)"
+        )
+
+    def test_batch_isolates_schema_from_post_freeze_mutation(self):
+        """Codex Part 1 #12: the OLD ``snapshot()`` returned the original
+        schema dict by reference, so a caller mutating the dict it had
+        passed to ``register()`` could change what the snapshot exposed.
+        ``freeze()`` deep-copies — post-freeze mutation must not leak in.
+        """
+        reg = ToolRegistry()
+        live_schema = {
+            "name": "shared",
+            "description": "ORIGINAL",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        reg.register("shared", lambda **_: "ok", live_schema, parallel_safe=True)
+
+        batch = reg.freeze()
+        # Mutate the dict we registered with.  A correctly-isolating
+        # freeze() must not propagate this into the frozen schema_map.
+        live_schema["description"] = "MUTATED"
+        live_schema["input_schema"]["properties"]["sneaky"] = {"type": "string"}
+
+        snap = batch.get_schema("shared")
+        assert snap is not None
+        assert snap["description"] == "ORIGINAL", (
+            "freeze() did not deep-copy schema['description']; post-register "
+            "mutation leaked into the snapshot"
+        )
+        assert "sneaky" not in snap["input_schema"]["properties"], (
+            "freeze() did not deep-copy nested schema dicts; post-register "
+            "mutation leaked into input_schema"
+        )
+
+    def test_dispatch_partition_consistent_when_parallel_safe_flips_mid_step(self):
+        """Codex Part 1 #11: ``_execute_tools`` historically called
+        ``registry.is_parallel_safe(name)`` three times during partition
+        (the outer `any(...)` check, the contiguous-group head check, and
+        the contiguous-group extend check).  If a concurrent register()
+        flipped the flag between those reads, the same batch could be
+        partitioned inconsistently.
+
+        With ``ToolBatch`` the flag lives in a frozen ``frozenset``: no
+        amount of concurrent registry churn can change what a frozen
+        batch sees.  This test verifies the invariant by mutating the
+        registry while ``_execute_tools`` runs against a previously
+        frozen batch.
+        """
+        reg = ToolRegistry()
+
+        def _slow(label: str = "x"):
+            time.sleep(0.05)
+            return f"{label}-done"
+
+        # Register `t` as parallel_safe.
+        reg.register(
+            "t", _slow,
+            {"name": "t", "input_schema": {"type": "object"}},
+            parallel_safe=True,
+        )
+        batch = reg.freeze()
+
+        # Sanity: the frozen batch sees `t` as parallel-safe.
+        assert batch.is_parallel_safe("t")
+
+        # Concurrently flip `t`'s parallel_safe flag (re-register) while
+        # _execute_tools runs.  The frozen batch must NOT observe the
+        # flip.  Without the snapshot, the partition logic could see
+        # "parallel_safe" for `any(...)` but "not parallel_safe" by the
+        # time the inner while-loop reads — a mismatched partition.
+        flipper_done = threading.Event()
+
+        def _flip_repeatedly():
+            for i in range(50):
+                if flipper_done.is_set():
+                    return
+                reg.register(
+                    "t", _slow,
+                    {"name": "t", "input_schema": {"type": "object"}},
+                    parallel_safe=(i % 2 == 0),
+                )
+
+        flipper = threading.Thread(target=_flip_repeatedly, daemon=True)
+        flipper.start()
+
+        try:
+            blocks = [
+                ToolCallRequest(id=f"id{i}", name="t", input={"label": f"t{i}"})
+                for i in range(8)
+            ]
+            results = _execute_tools(
+                blocks=blocks,
+                batch=batch,  # frozen — flipper cannot affect this
+                concurrent_mode=True,
+                max_workers=4,
+                timeout=5,
+            )
+            # All tools must complete successfully.  If partition was
+            # inconsistent we'd see dispatch errors or hangs.
+            assert len(results) == len(blocks)
+            for block, r in results:
+                assert not r.is_error, (
+                    f"tool {block.id} failed under concurrent registry churn — "
+                    f"frozen batch should isolate dispatch from registry: {r.content!r}"
+                )
+        finally:
+            flipper_done.set()
+            flipper.join(timeout=2.0)
+
+        # Post-condition: the frozen batch's view is unchanged regardless
+        # of what the registry now thinks.
+        assert batch.is_parallel_safe("t"), (
+            "frozen batch's parallel_safe membership changed during dispatch — "
+            "frozenset is supposed to be immutable"
         )
