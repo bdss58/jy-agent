@@ -77,9 +77,31 @@ Single broad review died at 103k tokens (network errors mid-summary — same pat
 
 ## Recommended next refactors (ranked by ROI)
 
-1. ✅ **DONE 2026-04-25** (commit `a043259`, branch `fix/runtime-finalize-funnel`) — `_finalize_run()` helper added, all 9 `_run_impl` exits funneled through it. Fixes Part 2 #6 (cost_limit), #7 (repeated truncation), #12 (cooperative cancel) + missing trace.finish on truncation-error and fallback-success paths + Part 3 #8 (`on_tool_end` on cancellation-during-tool-batch). Static invariant test `test_no_bare_LoopResult_returns_in_run_impl` prevents regression. 491 passed, 1 skipped.
-2. **Snapshot tool metadata atomically per batch** (Part 1 #4, #11, #12). Extend `registry.snapshot()` to return a frozen `ToolBatch` namedtuple containing `(functions, schemas, parallel_safe_set, timeout_hints, version)`. Engine consumes that snapshot for the whole step. Add a test that mutates registry mid-batch and asserts dispatch sees consistent metadata.
-3. **Lift `SkillManager` out of `runtime/`** into `jyagent/skills/` (or `jyagent/app/skills/`). Make it depend on `runtime`, not the other way around. Engine never needed it. This also fixes the runtime → llm dependency direction issue when paired with extracting an `LLMClient` Protocol that runtime defines and providers implement.
+1. ✅ **DONE 2026-04-25** (commit `a043259`, branch `fix/runtime-finalize-funnel`, merged `bf34a31`'s parent in `07ff20b` lineage) — `_finalize_run()` helper added, all 9 `_run_impl` exits funneled through it. Fixes Part 2 #6 (cost_limit), #7 (repeated truncation), #12 (cooperative cancel) + missing trace.finish on truncation-error and fallback-success paths + Part 3 #8 (`on_tool_end` on cancellation-during-tool-batch). Static invariant test `test_no_bare_LoopResult_returns_in_run_impl` prevents regression.
+2. ✅ **DONE 2026-04-25** (commit `6c453fe`, branch `fix/runtime-tool-batch-snapshot`, merged `bf34a31`) — Atomic per-step `ToolBatch` snapshot. New `ToolBatch` frozen dataclass + `ToolRegistry.freeze()` + 5 dispatch/compaction helpers refactored to consume it. Defense-in-depth lock added on registry's individual metadata getters. 3 new race tests cover Codex Part 1 #4, #11, #12.
+3. ✅ **DONE 2026-04-25** (commits `c8a0cc0` + `4046792`, branch `fix/runtime-skill-extraction`, merged `07ff20b`) — Two parts:
+   * **Part A**: `git mv jyagent/runtime/skills.py jyagent/skills.py` (770 LOC out of `runtime/`); `__file__`-depth dirname count adjusted from 3 → 2 with audit-checklist comment; runtime/__init__.py docstring updated.
+   * **Part B**: `LLMClient` Protocol extracted to `jyagent/runtime/loop/llm_client.py`; engine type-annotates with the Protocol instead of concrete `LLMOwner`. Three contract tests (non-regression / liveness / minimal-surface) in `tests/test_llm_client_protocol.py`.
+
+**Final test count after all 3 merges: 497 passed, 1 skipped** (was 486 at review-time baseline, +11 across the three branches: 2 funnel + 3 batch-snapshot + 3 protocol + 1 implicit from removing dead `_FakeRegistry` paths + 2 protocol contract guards).
+
+## Deferred follow-ups (not addressed)
+
+The original review's 34 findings included items beyond the top-3 refactors. Notable deferrals worth picking up later:
+
+- **Codex Part 3 #4** — `SkillManager._route_llm` still instantiates `LLMOwner` directly and prints colored stderr UX. Wants a "router protocol + observer callback" abstraction so `SkillManager` becomes a pure catalog/context builder. Now that `skills.py` lives in its own package, this is a contained refactor.
+- **`LLMOptions` / `ModelSpec` neutral package** — completes the Codex Part 3 #5 inversion. The engine still imports these as type-only from `jyagent.llm.types` (annotated with rationale comment). Worth moving only if a second non-`LLMOwner` client is actually being added.
+- **Codex Part 1 #6** — `set_model_pricing()` mutation unsynchronized with `_lookup_pricing()` iteration. Quick fix (add `_pricing_lock`).
+- **Codex Part 1 #5** — `SessionStats.provider/model/elapsed` properties bypass `_lock`. Mirror of #5; same fix pattern as the registry getters in this PR.
+- **Codex Part 2 #3** — checkpoint writes are atomic at filename level but not durable across crash (no `fsync()`). Trivial fix.
+- **Codex Part 2 #5** — `should_verify()` scans entire history for mutations; replayed messages can trigger verification on a non-mutating new run. Wants a "mutations since last verification" counter.
+- **Codex Part 2 #8** — checkpoint replay loses `last_reflection_count`, `verification_injected`, truncation-retry, stuck-detector state. Wants `LoopCheckpoint` to capture loop-control state.
+- **Codex Part 2 #10** — max-step fallback sends `tool_choice={"type":"none"}` after deleting `tools`; provider may reject and exception is swallowed. Provider guard needed.
+- **Codex Part 3 #6** — `on_assistant_message` exception handling inconsistent with `_fire`'s isolation. Documentation fix or wrap in `_fire_transform`.
+- **Codex Part 3 #7** — `LoopCallbacks` is sync-only; async callbacks silently no-op. Either document explicitly or add `inspect.isawaitable` handling.
+- **Codex Part 3 #9** — `on_assistant_message` not applied to verification (engine.py:1161-1166) or fallback (engine.py:1473-1480) append paths. Inconsistent contract.
+
+These are smaller, more independent items than the three big refactors — picking off any 2-3 in a "Codex review cleanup batch" PR would close most of the remaining tail.
 
 ## What the runtime got right (per Codex)
 
