@@ -42,6 +42,7 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - **gfw-proxy-fallback.md** — SSH SOCKS5 tunnel workflow for GFW-blocked hosts (ghcr.io, raw.githubusercontent.com, huggingface.co, etc.). Read when a network call fails against a likely-blocked host.
 - **openclaw-offline-update.md** — OpenClaw offline bundle update process (preflight, docker-compose schema migration, build-artifact staleness). Read on any OpenClaw customer-deployment question.
 - **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read on any session mentioning nano-vLLM / learning / LLM study.
+- **runtime-refactor.md** — Runtime Package Refactor
 ## Repo Snapshot
 - Provider-neutral LLM layer: Anthropic Messages + OpenAI Responses adapters under `jyagent/llm/`
 - `LLMOwner` owns the active `provider:model`; `/model <provider> <model>` switches future turns
