@@ -10,9 +10,9 @@ Engine cascade (first non-empty wins):
   1. SearxNG      — if SEARXNG_URL env is set. Aggregates Google+Bing+Brave+
                     DDG+70 others via one self-hosted JSON endpoint.
                     No API key, best quality.
-  2. DuckDuckGo   — HTML endpoint. Zero-config default.
-  3. Brave Search — HTML endpoint. Independent index of ~8B docs.
-  4. Mojeek       — HTML endpoint. Independent crawler, tiny but unique.
+  2. Brave Search — HTML endpoint. Independent index of ~8B docs.
+  3. Mojeek       — HTML endpoint. Independent crawler, tiny but unique.
+  4. DuckDuckGo   — HTML endpoint. Last-resort fallback (most rate-limited).
 
 Each engine has its own parser, but they all return the same
 {title, url, snippet} dict shape so the caller never needs to care
@@ -256,12 +256,14 @@ def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
     if forced and forced in _ENGINES:
         engines = [(forced, _ENGINES[forced])]
     else:
-        # SearxNG first (only active if SEARXNG_URL is set; otherwise returns [])
+        # SearxNG first (only active if SEARXNG_URL is set; otherwise returns []).
+        # DDG is intentionally LAST: it has been the flakiest engine in practice
+        # (rate limiting, intermittent empty HTML, redirect-wrapped URLs).
         engines = [
             ("searxng", _ENGINES["searxng"]),
-            ("ddg", _ENGINES["ddg"]),
             ("brave", _ENGINES["brave"]),
             ("mojeek", _ENGINES["mojeek"]),
+            ("ddg", _ENGINES["ddg"]),
         ]
 
     errors: list[str] = []
