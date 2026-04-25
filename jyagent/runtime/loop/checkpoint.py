@@ -64,13 +64,45 @@ class LoopCheckpoint:
     # ── File I/O ─────────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
-        """Write to *path*.  Parent directory is created if missing."""
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        """Write to *path* with crash-durable atomic semantics.
+
+        Sequence (matters for the durability claim):
+          1. Write content to a temp file in the same directory.
+          2. ``flush()`` + ``fsync(fd)`` on the temp file — guarantees the
+             bytes are on the storage medium, not just in the kernel page
+             cache.
+          3. ``os.replace(tmp, path)`` — atomic on POSIX.
+          4. ``fsync()`` on the parent directory — guarantees the rename
+             itself is durable (without this, the file may revert to its
+             pre-rename name after a crash on ext4/xfs).
+
+        Without steps 2 and 4 the rename in step 3 only gives "atomic
+        visibility within the running kernel", not crash durability —
+        the prior implementation would happily lose the checkpoint on
+        power-loss. The parent-dir fsync is silently a no-op on
+        platforms where ``os.open(dir)`` is not permitted (notably
+        Windows); we suppress that one error and keep the temp/file
+        fsync which is what matters most.
+        """
+        parent = os.path.dirname(path) or "."
+        os.makedirs(parent, exist_ok=True)
         tmp = f"{path}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(self.to_json())
+            fh.flush()
+            os.fsync(fh.fileno())
         # Atomic rename so a partial write never shadows a good checkpoint.
         os.replace(tmp, path)
+        # Durability of the rename itself — best effort; not all platforms
+        # allow opening a directory as a file descriptor.
+        try:
+            dir_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
     @classmethod
     def load(cls, path: str) -> "LoopCheckpoint":

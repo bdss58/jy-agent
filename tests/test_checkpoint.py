@@ -108,6 +108,38 @@ class TestLoopCheckpointSaveLoad:
         assert loaded.step == 5
         assert loaded.tool_calls_count == 12
 
+    def test_save_fsyncs_for_crash_durability(self, tmp_path, monkeypatch):
+        """save() must fsync the temp-file fd before rename and the parent
+        directory after rename.  Without both, ``os.replace`` only gives
+        atomic visibility to the running kernel — a crash after rename can
+        still revert the file to its pre-rename name on ext4/xfs.
+
+        Codex review 2026-04-25 Part 2 #3: docstring claimed atomicity but
+        had neither fsync.  This regression test pins the fix.
+        """
+        fsynced_fds: list[int] = []
+        real_fsync = os.fsync
+
+        def _spy_fsync(fd: int) -> None:
+            fsynced_fds.append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", _spy_fsync)
+
+        path = tmp_path / "cp.json"
+        cp = _sample_checkpoint()
+        cp.save(str(path))
+
+        # Expect at least one fsync (the temp file).  Parent-dir fsync may
+        # be skipped on platforms that disallow opening a directory as fd
+        # (Windows), so we don't assert on count == 2 — only that the
+        # temp-file fsync happened.
+        assert len(fsynced_fds) >= 1, (
+            "LoopCheckpoint.save did not fsync — durability claim is a lie"
+        )
+        assert path.exists()
+        assert not (tmp_path / "cp.json.tmp").exists()
+
 
 class TestCheckpointPath:
     def test_int_step_uses_zero_padded_filename(self):
