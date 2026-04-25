@@ -18,7 +18,21 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...llm import LLMOwner, LLMOptions
+# Behavioural dependency: the runtime engine consumes an `LLMClient`
+# (Protocol).  Concrete provider classes such as `jyagent.llm.LLMOwner`
+# satisfy the Protocol structurally — no inheritance required.
+from .llm_client import LLMClient
+
+# Type-only dependency: `LLMOptions` and `ModelSpec` are bag-of-fields
+# value types shared across provider implementations.  The engine
+# constructs `LLMOptions` (in `_build_runtime_options`) and accepts
+# `ModelSpec` overrides for sub-agent tier swaps.  Codex review Part
+# 3 #5 noted this lingering coupling — moving these types into a
+# neutral package is a separate, larger refactor (touches every
+# provider).  Keeping them in `llm.types` for now; the engine no
+# longer depends on `llm.LLMOwner` *behaviour*, which is the half
+# that mattered for testability and provider-pluggability.
+from ...llm import LLMOptions
 from ...llm.types import ModelSpec
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from ..tools.registry import get_registry
@@ -728,7 +742,7 @@ def _is_transient_error(error: BaseException) -> bool:
 
 
 def _build_runtime_options(
-    runtime_owner: LLMOwner,
+    runtime_owner: LLMClient,
     max_output_tokens: int,
     model_spec: ModelSpec | None = None,
     metadata: dict | None = None,
@@ -758,7 +772,7 @@ class AgentLoop:
 
     def __init__(
         self,
-        runtime_owner: LLMOwner,
+        runtime_owner: LLMClient,
         config: LoopConfig,
         callbacks: LoopCallbacks | None = None,
         tool_source: ToolSource | None = None,

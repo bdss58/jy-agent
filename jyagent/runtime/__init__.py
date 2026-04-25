@@ -9,6 +9,7 @@ out of this package precisely because the loop engine has zero
 dependency on it.
 """
 from .loop import AgentLoop, LoopConfig, LoopResult, LoopCallbacks
+from .loop.llm_client import LLMClient
 from .tools import get_registry, ToolResult
 from .stats import get_stats, SessionStats
 
@@ -17,6 +18,7 @@ __all__ = [
     "LoopConfig",
     "LoopResult",
     "LoopCallbacks",
+    "LLMClient",
     "get_registry",
     "ToolResult",
     "get_stats",
