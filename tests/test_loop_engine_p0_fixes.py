@@ -428,20 +428,26 @@ class TestVerificationGateBoundary:
         """Defense-in-depth: if somehow a verification prompt ends up at the
         tail of messages when max_steps is hit, the loop must clear it.
 
-        After the P2 refactor, cleanup is delegated to the
-        ``_strip_dangling_verification`` helper — the behavioural contract
-        (pop a trailing [VERIFICATION] user message) is unchanged.  See
-        ``TestVerificationCleanupParity`` for helper-level coverage across
-        all three exit paths.
+        After the runtime-finalize-funnel refactor (2026-04), cleanup is
+        guaranteed by routing every exit through ``_finalize_run`` which
+        unconditionally calls ``_strip_dangling_verification``.  See
+        ``TestVerificationCleanupParity.test_no_bare_LoopResult_returns_in_run_impl``
+        for the static funnel invariant covering all exit paths at once.
         """
         import inspect
         source = inspect.getsource(le.AgentLoop._run_impl)
-        # The cleanup must be present in the max-steps code path.
-        anchor = source.find("# Max steps reached")
-        assert anchor != -1
+        anchor = source.find("# ── max_steps exit ")
+        assert anchor != -1, (
+            "Could not find the max_steps exit anchor — refactor may have "
+            "renamed the section"
+        )
         tail_block = source[anchor : anchor + 2500]
-        assert "_strip_dangling_verification(messages)" in tail_block, (
-            "Missing dangling-[VERIFICATION] cleanup in the max_steps handler."
+        assert "_finalize_run(" in tail_block, (
+            "max_steps exit must funnel through _finalize_run() (which calls "
+            "_strip_dangling_verification unconditionally)"
+        )
+        assert 'status="max_steps"' in tail_block, (
+            "max_steps exit must report status='max_steps'"
         )
 
 
@@ -1080,18 +1086,20 @@ class TestVerificationCleanupParity:
         assert mixed == [{"role": "user", "content": "hi"}, "not-a-dict"]
 
     def test_source_calls_helper_in_max_steps_path(self):
+        """After the runtime-finalize-funnel refactor, the max_steps exit
+        funnels through ``_finalize_run`` which always strips."""
         import inspect
         source = inspect.getsource(le.AgentLoop._run_impl)
-        anchor = source.find("# Max steps reached")
+        anchor = source.find("# ── max_steps exit ")
         assert anchor != -1
         tail_block = source[anchor : anchor + 3000]
-        assert "_strip_dangling_verification(messages)" in tail_block, (
-            "max_steps path must call _strip_dangling_verification(messages)"
+        assert "_finalize_run(" in tail_block, (
+            "max_steps path must exit through _finalize_run()"
         )
 
     def test_source_calls_helper_in_keyboardinterrupt_path(self):
         """The outer KeyboardInterrupt handler (the one that finalises the
-        trace with status='interrupted') must strip the dangling prompt.
+        trace with status='interrupted') must funnel through _finalize_run.
 
         There is an inner ``except KeyboardInterrupt: raise`` nested inside
         the max_steps fallback try/except — that one is intentionally a
@@ -1100,7 +1108,7 @@ class TestVerificationCleanupParity:
         import inspect
         source = inspect.getsource(le.AgentLoop._run_impl)
         # Find every ``except KeyboardInterrupt:`` and keep the one whose
-        # body contains the interrupted-trace finalisation.
+        # body contains the interrupted-status return.
         import re as _re
         outer_handler = None
         for m in _re.finditer(r"except KeyboardInterrupt:", source):
@@ -1111,15 +1119,15 @@ class TestVerificationCleanupParity:
         assert outer_handler is not None, (
             "Could not locate the outer KeyboardInterrupt handler in _run_impl"
         )
-        assert "_strip_dangling_verification(messages)" in outer_handler, (
-            "KeyboardInterrupt handler must strip dangling [VERIFICATION] so "
-            "Ctrl-C mid-turn doesn't leak the unanswered prompt into the next "
-            "persisted session"
+        assert "_finalize_run(" in outer_handler, (
+            "KeyboardInterrupt handler must exit through _finalize_run() so "
+            "Ctrl-C mid-turn doesn't leak the unanswered [VERIFICATION] prompt "
+            "into the next persisted session"
         )
 
     def test_source_calls_helper_in_exception_path(self):
         """The outer generic Exception handler (the one that finalises the
-        trace with status='error') must strip the dangling prompt."""
+        trace with status='error') must funnel through _finalize_run."""
         import inspect
         import re as _re
         source = inspect.getsource(le.AgentLoop._run_impl)
@@ -1132,9 +1140,58 @@ class TestVerificationCleanupParity:
         assert outer_handler is not None, (
             "Could not locate the outer Exception handler in _run_impl"
         )
-        assert "_strip_dangling_verification(messages)" in outer_handler, (
-            "generic Exception handler must also clean up the dangling prompt"
+        assert "_finalize_run(" in outer_handler, (
+            "generic Exception handler must also funnel through _finalize_run()"
         )
+
+    def test_no_bare_LoopResult_returns_in_run_impl(self):
+        """**Funnel invariant.**  Every exit from ``_run_impl`` must go
+        through ``_finalize_run`` so that dangling [VERIFICATION] cleanup
+        and trace finalisation cannot be bypassed by a new exit path.
+
+        This is the static guard that prevents regression of the bug class
+        the funnel was built to eliminate (3 exit paths historically forgot
+        to call ``_strip_dangling_verification``).  If you intentionally
+        need a new exit path, route it through ``_finalize_run`` — do not
+        weaken this test.
+        """
+        import inspect
+        import re as _re
+        source = inspect.getsource(le.AgentLoop._run_impl)
+        # Look for `return LoopResult(` — the pre-funnel pattern.  The
+        # only acceptable return shape is `return _finalize_run(...)`.
+        bare_returns = _re.findall(r"return\s+LoopResult\s*\(", source)
+        assert bare_returns == [], (
+            f"Found {len(bare_returns)} bare `return LoopResult(...)` in "
+            f"_run_impl — every exit must funnel through _finalize_run() so "
+            f"_strip_dangling_verification cannot be bypassed.  See "
+            f"data/memory/topics/runtime-review-2026-04-25.md for context."
+        )
+
+    def test_finalize_run_always_strips_dangling_verification(self):
+        """Behavioural guarantee of the funnel: calling ``_finalize_run`` on
+        a messages list ending in a [VERIFICATION] prompt always pops it,
+        regardless of whether trace is None or which status is reported."""
+        for status in ("max_steps", "interrupted", "error", "cost_limit",
+                       "dedup_break", "completed"):
+            msgs = [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "[VERIFICATION] please self-check"},
+            ]
+            le._finalize_run(
+                status=status,
+                text="", final_text="",
+                messages=msgs, steps=1,
+                total_input_tokens=0, total_output_tokens=0,
+                tool_calls_count=0,
+                trace=None,
+            )
+            assert len(msgs) == 2, (
+                f"_finalize_run(status={status!r}) must strip dangling "
+                f"[VERIFICATION] but messages still has {len(msgs)} entries"
+            )
+            assert msgs[-1]["role"] == "assistant"
 
 
 # ─── max_tool_workers honours LoopConfig ─────────────────────────────────────

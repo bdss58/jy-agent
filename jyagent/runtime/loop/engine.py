@@ -260,7 +260,12 @@ def _strip_dangling_verification(messages: list) -> None:
     check before returning.  If the loop exits before the model replies
     (max_steps, KeyboardInterrupt, uncaught exception), that unanswered user
     message would leak into the persisted session and poison the next turn.
-    Called from every terminal path that could fire *after* the gate.
+
+    Idempotent: safe to call on every terminal path regardless of whether a
+    verification was actually injected.  This is why the canonical exit
+    helper ``_finalize_run`` calls it unconditionally — gating on a
+    ``verification_injected`` flag is a micro-optimization that historically
+    led to bugs (cleanup forgotten on new exit paths).
     """
     if not messages:
         return
@@ -272,6 +277,68 @@ def _strip_dangling_verification(messages: list) -> None:
     tail_content = tail.get("content", "")
     if isinstance(tail_content, str) and tail_content.startswith("[VERIFICATION]"):
         messages.pop()
+
+
+def _finalize_run(
+    *,
+    status: str,
+    text: str,
+    final_text: str,
+    messages: list,
+    steps: int,
+    total_input_tokens: int,
+    total_output_tokens: int,
+    tool_calls_count: int,
+    error: str | None = None,
+    trace=None,
+    trace_status: str | None = None,
+    trace_total_steps: int | None = None,
+    trace_total_cost_usd: float | None = None,
+) -> LoopResult:
+    """Centralized exit path for ``_run_impl``.
+
+    Every ``return LoopResult(...)`` in the loop must funnel through here so
+    that:
+
+      1. Dangling ``[VERIFICATION]`` user messages are *always* stripped
+         (idempotent — see ``_strip_dangling_verification``).  Historically
+         this was open-coded at every exit, and three exit paths
+         (``cost_limit``, repeated truncation, cooperative cancellation)
+         were missed, leaking unanswered prompts into persisted sessions.
+
+      2. Trace finish + flush happens uniformly, eliminating exit paths
+         that emitted a ``LoopResult`` but never closed the trace span.
+
+    The ``trace_*`` overrides exist for cases where the trace status string
+    or step count differs from the ``LoopResult`` (currently only
+    ``max_steps`` uses ``trace_total_steps=cfg.max_steps`` while reporting
+    ``steps=cfg.max_steps`` — both happen to match, but the override keeps
+    the seam explicit for future use).
+
+    Keyword-only by design: every field is named at the call site so that
+    a careless ``LoopResult(*args)`` style cannot regress the contract.
+    """
+    _strip_dangling_verification(messages)
+    if trace is not None:
+        finish_kwargs: dict = {
+            "status": trace_status or status,
+            "total_steps": trace_total_steps if trace_total_steps is not None else steps,
+        }
+        if trace_total_cost_usd is not None:
+            finish_kwargs["total_cost_usd"] = trace_total_cost_usd
+        trace.finish(**finish_kwargs)
+        trace.flush()
+    return LoopResult(
+        status=status,
+        text=text,
+        final_text=final_text,
+        messages=messages,
+        steps=steps,
+        total_input_tokens=total_input_tokens,
+        total_output_tokens=total_output_tokens,
+        tool_calls_count=tool_calls_count,
+        error=error,
+    )
 
 
 def _truncate_result(content: str, max_chars: int, is_error: bool = False) -> str:
@@ -1122,9 +1189,7 @@ class AgentLoop:
                         if trace:
                             trace.add_span(step=step, event_type="cost_check", success=False,
                                            error=f"budget ${cfg.max_cost_usd} exceeded")
-                            trace.finish(status="cost_limit", total_steps=step + 1, total_cost_usd=current_cost)
-                            trace.flush()
-                        return LoopResult(
+                        return _finalize_run(
                             status="cost_limit",
                             text=all_text or "",
                             final_text=final_text,
@@ -1134,6 +1199,8 @@ class AgentLoop:
                             total_output_tokens=total_output_tokens,
                             tool_calls_count=tool_calls_count,
                             error=f"Cost budget exceeded: ${current_cost:.4f} >= ${cfg.max_cost_usd:.4f}",
+                            trace=trace,
+                            trace_total_cost_usd=current_cost,
                         )
 
                 all_text += step_text
@@ -1183,13 +1250,8 @@ class AgentLoop:
                     messages.append(final_message)
                     result_text = all_text if all_text else "I processed your request but had no text response to return."
 
-                    # ── Flush trace ────────────────────────────────────
-                    if trace:
-                        cost = cost_tracker.cost if cost_tracker else 0.0
-                        trace.finish(status="completed", total_steps=step + 1, total_cost_usd=cost or 0.0)
-                        trace.flush()
-
-                    return LoopResult(
+                    cost = cost_tracker.cost if cost_tracker else 0.0
+                    return _finalize_run(
                         status="completed",
                         text=result_text,
                         final_text=final_text,
@@ -1198,13 +1260,16 @@ class AgentLoop:
                         total_input_tokens=total_input_tokens,
                         total_output_tokens=total_output_tokens,
                         tool_calls_count=tool_calls_count,
+                        trace=trace,
+                        trace_total_cost_usd=cost or 0.0,
                     )
 
                 # Truncation detection → scale up and retry step
                 if cfg.auto_scale_on_truncation and _is_truncated(stop_reason, tool_call_blocks):
                     consecutive_truncations += 1
                     if consecutive_truncations > max_truncation_retries:
-                        return LoopResult(
+                        cost = cost_tracker.cost if cost_tracker else 0.0
+                        return _finalize_run(
                             status="error",
                             text=all_text or "",
                             final_text="",
@@ -1214,6 +1279,8 @@ class AgentLoop:
                             total_output_tokens=total_output_tokens,
                             tool_calls_count=tool_calls_count,
                             error=f"Repeated truncation ({consecutive_truncations}x) — model output exceeds capacity",
+                            trace=trace,
+                            trace_total_cost_usd=cost or 0.0,
                         )
                     self._fire("on_truncation")
                     # Also fire the unified stream-retry hook so UIs that
@@ -1255,7 +1322,11 @@ class AgentLoop:
                 # Execute tools
                 # ── Cooperative cancellation check (before tools) ────
                 if self._is_cancelled():
-                    # Return error results for all pending tool calls
+                    # Return error results for all pending tool calls.
+                    # Fire on_tool_end for each so callbacks see the matching
+                    # close event for the on_tool_start fired above
+                    # (without this, UIs that count starts vs. ends — e.g.
+                    # spinners, progress bars — leak resources on cancel).
                     for block in tool_call_blocks:
                         messages.append({
                             "role": "tool_result",
@@ -1264,6 +1335,7 @@ class AgentLoop:
                             "content": "Cancelled",
                             "is_error": True,
                         })
+                        self._fire("on_tool_end", block.name, "Cancelled", True)
                     break
 
                 tools_t0 = time.perf_counter()
@@ -1337,12 +1409,10 @@ class AgentLoop:
                         stuck_feedback = feedback
                 if stuck_feedback:
                     self._fire("on_warning", stuck_feedback)
+                    cost = cost_tracker.cost if cost_tracker else 0.0
                     if trace:
                         trace.add_span(step=step, event_type="dedup_break", success=False, error=stuck_feedback)
-                        cost = cost_tracker.cost if cost_tracker else 0.0
-                        trace.finish(status="dedup_break", total_steps=step + 1, total_cost_usd=cost or 0.0)
-                        trace.flush()
-                    return LoopResult(
+                    return _finalize_run(
                         status="dedup_break",
                         text=all_text or "",
                         final_text=final_text,
@@ -1352,6 +1422,8 @@ class AgentLoop:
                         total_output_tokens=total_output_tokens,
                         tool_calls_count=tool_calls_count,
                         error=stuck_feedback,
+                        trace=trace,
+                        trace_total_cost_usd=cost or 0.0,
                     )
 
                 # ── Cooperative cancellation check (after tools) ─────
@@ -1403,10 +1475,7 @@ class AgentLoop:
 
             # ── Cooperative cancellation — early exit ────────────────
             if self._is_cancelled():
-                if trace:
-                    trace.finish(status="interrupted", total_steps=step + 1)
-                    trace.flush()
-                return LoopResult(
+                return _finalize_run(
                     status="interrupted",
                     text=all_text or "",
                     final_text=final_text,
@@ -1415,6 +1484,7 @@ class AgentLoop:
                     total_input_tokens=total_input_tokens,
                     total_output_tokens=total_output_tokens,
                     tool_calls_count=tool_calls_count,
+                    trace=trace,
                 )
 
             # Max steps reached
@@ -1424,14 +1494,12 @@ class AgentLoop:
             # (Old condition `not final_text` was wrong — `final_text` is
             # written on every step including ones that also had tool calls.)
             #
-            # Defense-in-depth (P0 fix): if a verification prompt was injected
-            # and the model never produced a follow-up reply before we ran out
-            # of steps, strip the trailing `[VERIFICATION]` user message so
-            # it doesn't leak into the persisted session and poison the next
-            # turn.  The boundary guard above should already prevent this,
-            # but we clean up anyway in case of a race.
-            if verification_injected:
-                _strip_dangling_verification(messages)
+            # Defense-in-depth: the canonical _finalize_run() path always
+            # strips dangling [VERIFICATION] (idempotently), so we no longer
+            # need a guarded pre-strip here.  The boundary guard at the
+            # gate (step + 1 < cfg.max_steps) should already prevent the
+            # leak, but _finalize_run cleans up unconditionally as belt-
+            # and-suspenders.
 
             if cfg.fallback_on_max_steps:
                 # Try one more streaming call with system instruction to avoid tools
@@ -1479,8 +1547,11 @@ class AgentLoop:
                     # Append fallback response
                     messages.append(fallback_message)
 
-                    # Return completed since we got a final answer
-                    return LoopResult(
+                    # Return completed since we got a final answer.
+                    # Note: previously this path skipped trace.finish() — the
+                    # max_steps trace block below was unreachable on success.
+                    cost = cost_tracker.cost if cost_tracker else 0.0
+                    return _finalize_run(
                         status="completed",
                         text=fallback_text or all_text,
                         final_text=fallback_text,
@@ -1489,6 +1560,8 @@ class AgentLoop:
                         total_input_tokens=total_input_tokens,
                         total_output_tokens=total_output_tokens,
                         tool_calls_count=tool_calls_count,
+                        trace=trace,
+                        trace_total_cost_usd=cost or 0.0,
                     )
                 except KeyboardInterrupt:
                     raise
@@ -1496,13 +1569,9 @@ class AgentLoop:
                     # If fallback fails, fall through to normal max_steps handling
                     pass
 
-            # ── Trace max_steps ────────────────────────────────────────
-            if trace:
-                cost = cost_tracker.cost if cost_tracker else 0.0
-                trace.finish(status="max_steps", total_steps=cfg.max_steps, total_cost_usd=cost or 0.0)
-                trace.flush()
-
-            return LoopResult(
+            # ── max_steps exit ─────────────────────────────────────────
+            cost = cost_tracker.cost if cost_tracker else 0.0
+            return _finalize_run(
                 status="max_steps",
                 text=all_text or "",
                 final_text=final_text,
@@ -1511,15 +1580,12 @@ class AgentLoop:
                 total_input_tokens=total_input_tokens,
                 total_output_tokens=total_output_tokens,
                 tool_calls_count=tool_calls_count,
+                trace=trace,
+                trace_total_cost_usd=cost or 0.0,
             )
 
         except KeyboardInterrupt:
-            if verification_injected:
-                _strip_dangling_verification(messages)
-            if trace:
-                trace.finish(status="interrupted", total_steps=step + 1)
-                trace.flush()
-            return LoopResult(
+            return _finalize_run(
                 status="interrupted",
                 text=all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]",
                 final_text="",
@@ -1528,14 +1594,10 @@ class AgentLoop:
                 total_input_tokens=total_input_tokens,
                 total_output_tokens=total_output_tokens,
                 tool_calls_count=tool_calls_count,
+                trace=trace,
             )
         except Exception as e:
-            if verification_injected:
-                _strip_dangling_verification(messages)
-            if trace:
-                trace.finish(status="error", total_steps=step + 1)
-                trace.flush()
-            return LoopResult(
+            return _finalize_run(
                 status="error",
                 text=all_text or "",
                 final_text="",
@@ -1545,6 +1607,7 @@ class AgentLoop:
                 total_output_tokens=total_output_tokens,
                 tool_calls_count=tool_calls_count,
                 error=str(e),
+                trace=trace,
             )
 
     # ── LLM call with retry ──────────────────────────────────────────────
