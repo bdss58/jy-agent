@@ -140,7 +140,7 @@ jyagent/
 
 data/
   memory/               # MEMORY.md index + topics/ + journal/
-skills/                 # Agent skills (loaded by jyagent/runtime/skills.py)
+skills/                 # Agent skills (loaded by jyagent/skills.py)
 tests/                  # pytest suite (background, subagent, runtime, memory, …)
 .mcp.json               # Default MCP servers (Chrome DevTools)
 ```

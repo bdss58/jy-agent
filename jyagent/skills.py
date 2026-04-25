@@ -25,7 +25,7 @@ import sys
 import time
 from typing import Optional
 
-from ..config import (
+from .config import (
     MAX_INSTRUCTIONS_CHARS,
     MAX_RESOURCE_CHARS,
     SKILL_ROUTER_TIMEOUT,
@@ -35,10 +35,16 @@ from ..config import (
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-# Resolve to <repo_root>/skills. This file lives at jyagent/runtime/skills.py,
-# so we need THREE dirname calls: runtime/ → jyagent/ → <repo_root>.
+# Resolve to <repo_root>/skills.  This file lives at jyagent/skills.py, so
+# we need TWO dirname calls: jyagent/ → <repo_root>.
+#
+# **Audit checklist when moving this file:** every `__file__`-relative path
+# is depth-coupled to the file's location.  See data/memory/MEMORY.md
+# "Durable Gotchas" — the reverse of this fix happened in 2026-04 when
+# skills.py moved from jyagent/ → jyagent/runtime/ and silently returned
+# zero skills until the dirname count was bumped to three.
 DEFAULT_SKILLS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "skills",
 )
 SKILL_FILENAME = "SKILL.md"
@@ -457,7 +463,7 @@ class SkillManager:
         """
         if runtime_owner is None:
             try:
-                from ..llm import LLMOwner
+                from .llm import LLMOwner
                 runtime_owner = LLMOwner(get_skill_router_model_spec())
             except Exception:
                 return None

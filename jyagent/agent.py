@@ -14,7 +14,7 @@ from .memory import (
 from .terminal_ux import build_streaming_callbacks, _interrupted_msg
 from .runtime.loop.engine import AgentLoop, LoopConfig, LoopResult
 from .cli import CLI, console
-from .runtime.skills import SkillManager, get_skill_manager, init_skills
+from .skills import SkillManager, get_skill_manager, init_skills
 from .llm import LLMOwner
 from .runtime.stats import get_stats
 from .config import (
