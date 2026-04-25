@@ -52,7 +52,7 @@ orchestration, MCP integration, durable cross-session memory, and a skills syste
 - Rich markdown rendering, syntax highlighting, multi-line input.
 - Session stats with per-provider cost tracking (prompt / output / cache-read /
   cache-write tokens, sub-agent attribution) using a static pricing table in
-  `jyagent/session_stats.py`. Models without a pricing entry are reported as
+  `jyagent/runtime/stats.py`. Models without a pricing entry are reported as
   unknown-cost; extend via `set_model_pricing(...)`.
 - Commands: `/help /quit /new /continue /history /tools /model /multi /markdown /stats /skills /skill <name>`.
 
@@ -94,26 +94,116 @@ The runtime preserves conversation state across switches.
 
 ```
 jyagent/
-  agent.py              # Top-level loop, slash commands, runtime owner
+  agent.py              # Reference application: top-level loop, slash commands, runtime owner
   cli.py                # Rich CLI, history rendering, help
-  runtime/
-    core.py             # Provider-neutral conversation state
+  __main__.py           # python -m jyagent entry point
+
+  runtime/              # ─── Reusable agent runtime (library surface) ───
+    __init__.py         #   Public API: AgentLoop, LoopConfig, LoopResult, LoopCallbacks,
+                        #               get_registry, ToolResult, get_stats, SessionStats
+    loop/
+      engine.py         #   AgentLoop — streaming tool-use loop, dispatch, retries
+      callbacks.py      #   LoopCallbacks protocol — UI/observer seam
+      config.py         #   LoopConfig, LoopResult dataclasses
+      phases.py         #   Multi-phase planning helper
+      reflection.py     #   Periodic self-reflection
+      checkpoint.py     #   Conversation checkpointing
+      todos.py          #   In-loop TODO scratchpad
+      verification.py   #   Pre-completion self-check gate
+      remediation.py    #   Tool-error enrichment
+      tracing.py        #   JSONL run tracing
+    tools/
+      registry.py       #   Tool registry (parallel-safe / timeout metadata)
+      result.py         #   ToolResult value type
+      validation.py     #   Tool input validation
+    stats.py            #   SessionStats + cost tracking
+    skills.py           #   Skill manager (agentskills.io)
+
+  llm/                  # ─── Provider-neutral LLM layer ───
+    core.py             #   Single conversation state, pluggable adapters
     providers/
-      anthropic.py      # Messages API adapter
-      openai.py         # Responses API adapter
-  tools/
-    core.py             # Filesystem + run_shell + run_background
-    subagent.py         # dispatch_agent / check_agent
-    web_fetch.py        # 5-tier anti-blocking fetch
-    web_search_tool.py  # DuckDuckGo HTML search
-    mcp_tool.py         # MCP bridge
-  registry.py           # Tool registry with parallel-safe / timeout metadata
+      anthropic.py      #   Messages API adapter
+      openai.py         #   Responses API adapter
+
+  tools/                # ─── Built-in tool implementations ───
+    core.py             #   Filesystem + run_shell + run_background
+    subagent.py         #   dispatch_agent / check_agent
+    web_fetch.py        #   5-tier anti-blocking fetch
+    web_search_tool.py  #   Multi-engine cascade (DDG → Brave → Mojeek)
+    mcp_tool.py         #   MCP bridge
+
+  memory/               # Conversation compaction, session save/load, extraction
+  mcp_client.py         # MCP protocol client
+  mcp_manager.py        # MCP connection lifecycle
+  terminal_ux.py        # CLI-side LoopCallbacks implementation
+  config.py             # Env-driven config (overridable by library users)
+
 data/
-  memory/               # MEMORY.md index + topics/
-skills/                 # Agent skills (loaded by jyagent/skills.py)
+  memory/               # MEMORY.md index + topics/ + journal/
+skills/                 # Agent skills (loaded by jyagent/runtime/skills.py)
 tests/                  # pytest suite (background, subagent, runtime, memory, …)
 .mcp.json               # Default MCP servers (Chrome DevTools)
 ```
+
+> **Note**: top-level modules like `jyagent.loop_engine`, `jyagent.registry`,
+> `jyagent.session_stats`, `jyagent.toolresult`, `jyagent.skills`, etc. are
+> backward-compat shims that re-export from `jyagent.runtime.*` and emit a
+> `DeprecationWarning`. New code should import from `jyagent.runtime` directly.
+
+## Using `jyagent.runtime` as a library
+
+The runtime is decoupled from the CLI / reference app and can be embedded:
+
+```python
+from jyagent.runtime import AgentLoop, LoopConfig, LoopCallbacks, get_registry
+from jyagent.llm import LLMOwner
+from jyagent.llm.types import ModelSpec
+import jyagent.tools  # noqa: F401 — triggers built-in tool registration
+
+# 1. Pick a provider/model.
+runtime_owner = LLMOwner(ModelSpec(provider="anthropic", model="claude-sonnet-4-6"))
+
+# 2. Build observer hooks.  `LoopCallbacks` is a dataclass — every field is an
+#    Optional[Callable]; pass only the hooks you care about.  None = silent.
+callbacks = LoopCallbacks(
+    on_text_delta=lambda t: print(t, end="", flush=True),
+    on_tool_start=lambda name, inp: print(f"\n[tool] {name}({inp})"),
+    on_tool_end=lambda name, content, is_error: print(f"[tool/{name} ok={not is_error}]"),
+)
+
+# 3. Tool source: a callable that returns (schemas, functions) on each iteration.
+#    `registry.snapshot()` returns (version, schemas, functions); slice off the
+#    version int.  Mutate the registry between turns and the loop will pick it up.
+registry = get_registry()
+tool_source = lambda: registry.snapshot()[1:]
+
+# 4. Run.  `messages` is mutated in-place; pass an empty list for a fresh turn,
+#    or a prior conversation to continue.
+loop = AgentLoop(
+    runtime_owner,
+    LoopConfig(streaming=True, max_working_tokens=120_000),
+    callbacks=callbacks,
+    tool_source=tool_source,
+)
+messages = [{"role": "user", "content": "Summarize all TODO comments in this repo."}]
+result = loop.run(system_prompt="You are a focused code-spelunking assistant.",
+                  messages=messages)
+print(f"\nstatus={result.status}  steps={result.steps_taken}  "
+      f"tokens={result.total_input_tokens}/{result.total_output_tokens}")
+```
+
+For a full-featured integration (slash commands, MCP, skills, persistence,
+session stats, cancellation, sub-agent attribution, …) see `jyagent/agent.py` —
+the reference application built on this exact API.
+
+Public API surface (everything else is internal):
+
+| Import | Purpose |
+|---|---|
+| `AgentLoop`, `LoopConfig`, `LoopResult` | Core loop |
+| `LoopCallbacks` | Observer dataclass — set the hooks you need, leave the rest `None` |
+| `get_registry`, `ToolResult` | Tool registration & return type |
+| `get_stats`, `SessionStats` | Per-session telemetry & cost tracking |
 
 ## Development
 
@@ -124,6 +214,25 @@ ruff check jyagent tests
 # Tests
 pytest -q
 ```
+
+### Refactor gotcha: shim asymmetry on module-level constants
+
+The backward-compat shims (`jyagent.verification`, `jyagent.tracing`, etc.)
+re-export the new module's namespace once at import time via
+`globals().update(__dict__)`. Classes and singletons are shared correctly
+(`old.Foo is new.Foo`), but **module-level mutable constants diverge** after
+that point:
+
+```python
+# This is a SILENT NO-OP — the shim only holds a value snapshot:
+monkeypatch.setattr("jyagent.verification.VERIFICATION_ENABLED", True)
+
+# Use the new path instead — functions read THIS module's globals:
+monkeypatch.setattr("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True)
+```
+
+Always target `jyagent.runtime.*` paths in new tests. Shims are scheduled for
+removal one release after the runtime-package refactor lands.
 
 ## Origin
 
