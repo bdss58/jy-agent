@@ -208,6 +208,51 @@ class TestShouldVerify:
             msgs = [{"role": "tool_result", "tool_name": "write_file", "content": "ok"}]
             assert should_verify(msgs, tool_calls_count=1) is True
 
+    def test_since_index_excludes_prior_turn_mutations(self):
+        """Replayed historical mutations must NOT re-arm verification on a
+        non-mutating turn.
+
+        Codex review 2026-04-25 Part 2 #5: ``_has_mutation`` previously
+        scanned the entire ``messages`` list, so a prior turn's
+        ``edit_file`` (still present in the persisted history) would
+        trigger verification on a follow-up turn that only did read-only
+        work.  Fix: the engine passes ``since_index = len(messages)`` at
+        turn start so the scan is bounded to this-turn appends.
+        """
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
+            # Prior turn left a write_file in history; current turn only
+            # called read_file.  Without since_index the gate would
+            # incorrectly fire.
+            history = [
+                {"role": "tool_result", "tool_name": "write_file", "content": "ok"},
+                {"role": "assistant", "content": "done"},
+            ]
+            turn_start = len(history)
+            this_turn = [
+                {"role": "tool_result", "tool_name": "read_file", "content": "data"},
+            ]
+            msgs = history + this_turn
+            assert should_verify(
+                msgs, tool_calls_count=1, since_index=turn_start
+            ) is False, "since_index must exclude prior-turn mutations"
+
+            # Sanity: without since_index the legacy behaviour DOES fire
+            # (proves the test is exercising the right boundary).
+            assert should_verify(msgs, tool_calls_count=1) is True
+
+    def test_since_index_includes_current_turn_mutations(self):
+        """When this-turn has a mutation past the boundary, verify fires."""
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
+            history = [{"role": "user", "content": "do thing"}]
+            turn_start = len(history)
+            this_turn = [
+                {"role": "tool_result", "tool_name": "edit_file", "content": "ok"},
+            ]
+            msgs = history + this_turn
+            assert should_verify(
+                msgs, tool_calls_count=1, since_index=turn_start
+            ) is True
+
 
 class TestBuildVerificationPrompt:
     """build_verification_prompt() output."""

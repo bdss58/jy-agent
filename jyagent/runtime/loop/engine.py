@@ -1016,6 +1016,11 @@ class AgentLoop:
         total_output_tokens = 0
         tool_calls_count = 0
         last_reflection_count = 0  # tool_calls_count at last reflection injection
+        # Boundary between prior-turn history and this-turn appends.
+        # Passed to ``should_verify`` so a replayed historical mutation
+        # cannot re-arm the verification gate on a non-mutating new turn
+        # (Codex review 2026-04-25 Part 2 #5).
+        turn_start_idx = len(messages)
         registry = get_registry()
         step = 0
         consecutive_truncations = 0  # cap truncation recovery retries
@@ -1294,7 +1299,7 @@ class AgentLoop:
                     # next turn.
                     if (
                         not verification_injected
-                        and should_verify(messages, tool_calls_count)
+                        and should_verify(messages, tool_calls_count, since_index=turn_start_idx)
                         and step + 1 < cfg.max_steps
                     ):
                         verification_injected = True

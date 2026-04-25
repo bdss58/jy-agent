@@ -34,6 +34,8 @@ _VERIFICATION_MARKER = "[VERIFICATION]"
 def should_verify(
     messages: list[dict[str, Any]],
     tool_calls_count: int,
+    *,
+    since_index: int = 0,
 ) -> bool:
     """Return True if a verification prompt should be injected.
 
@@ -42,6 +44,13 @@ def should_verify(
     2. At least one tool call was made this turn.
     3. The turn involved file-mutating tools (edit_file / write_file / run_shell).
     4. A verification prompt has not already been injected this turn.
+
+    ``since_index`` (default 0, i.e. scan everything) bounds the mutation
+    scan to messages appended during *this* turn — pass the value of
+    ``len(messages)`` captured at the start of ``_run_impl``.  Without
+    this, a replayed historical mutation in prior turns would re-arm the
+    verification gate on a non-mutating new turn (Codex review
+    2026-04-25 Part 2 #5).
     """
     if not VERIFICATION_ENABLED:
         return False
@@ -52,7 +61,7 @@ def should_verify(
     if _already_injected(messages):
         return False
 
-    if not _has_mutation(messages):
+    if not _has_mutation(messages, since_index=since_index):
         return False
 
     return True
@@ -108,9 +117,18 @@ def _already_injected(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _has_mutation(messages: list[dict[str, Any]]) -> bool:
-    """Return True if any tool-result message references a mutating tool."""
-    for msg in messages:
+def _has_mutation(
+    messages: list[dict[str, Any]],
+    *,
+    since_index: int = 0,
+) -> bool:
+    """Return True if any tool-result message references a mutating tool.
+
+    Bounded to ``messages[since_index:]`` so a replayed mutation from a
+    prior turn (still present in the persisted history) does not re-arm
+    the verification gate on a new, non-mutating turn.
+    """
+    for msg in messages[since_index:]:
         # Anthropic format: role "user" with tool_result content blocks
         if msg.get("role") == "user":
             content = msg.get("content", "")
