@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import logging
 import hashlib
 import json
 import random
@@ -41,6 +42,9 @@ from .tracing import get_tracer
 from .verification import should_verify, build_verification_prompt
 from .callbacks import LoopCallbacks  # re-exported for back-compat
 from .config import LoopConfig, LoopResult  # re-exported for back-compat
+
+
+_logger = logging.getLogger(__name__)
 
 
 # ─── Core types ──────────────────────────────────────────────────────────────
@@ -79,10 +83,60 @@ def _t_as_dict(t: Any) -> dict:
 # with the process.  Python futures aren't cancellable, so pooling bodies
 # would permanently leak workers every time a tool timed out.
 
-_tool_dispatch_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="jyagent-tool-dispatch",
-)
-atexit.register(_tool_dispatch_executor.shutdown, wait=False)
+_tool_dispatch_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_tool_dispatch_lock = threading.Lock()
+_tool_dispatch_cap = 0
+
+
+def _get_tool_dispatch_executor(
+    min_workers: int = 8,
+) -> concurrent.futures.ThreadPoolExecutor:
+    """Return the shared dispatch executor, growing it if needed.
+
+    A2 fix (codex review 2026-04-25): the eagerly-created executor was
+    hard-capped at 8 workers, so ``LoopConfig.max_tool_workers > 8`` was
+    silently honoured at the body-permit layer but starved at dispatch.
+    This helper lazy-creates and grows the pool to the largest
+    ``max_tool_workers`` ever requested across all live ``AgentLoop``
+    instances in the process.
+
+    Growth recreates the pool: the old one's ``shutdown(wait=False)`` lets
+    in-flight dispatches finish in their own threads (we never block on
+    them here), but no new tasks are accepted on it.  Concurrent callers
+    are serialised by ``_tool_dispatch_lock``.
+    """
+    global _tool_dispatch_executor, _tool_dispatch_cap
+    target = max(int(min_workers), 8)
+    # Fast path: existing executor already big enough.
+    if _tool_dispatch_executor is not None and _tool_dispatch_cap >= target:
+        return _tool_dispatch_executor
+    with _tool_dispatch_lock:
+        if _tool_dispatch_executor is not None and _tool_dispatch_cap >= target:
+            return _tool_dispatch_executor
+        if _tool_dispatch_executor is not None:
+            _logger.info(
+                "expanding tool dispatch pool: %d -> %d workers",
+                _tool_dispatch_cap, target,
+            )
+            old = _tool_dispatch_executor
+            try:
+                atexit.unregister(old.shutdown)
+            except Exception:  # noqa: BLE001 — atexit unregister is best-effort
+                pass
+            old.shutdown(wait=False)
+        _tool_dispatch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=target,
+            thread_name_prefix="jyagent-tool-dispatch",
+        )
+        _tool_dispatch_cap = target
+        atexit.register(_tool_dispatch_executor.shutdown, wait=False)
+        return _tool_dispatch_executor
+
+
+# Initialise at import for back-compat (older code reads the module global
+# directly).  Sized at the historical default; ``_get_tool_dispatch_executor``
+# grows it on demand.
+_tool_dispatch_executor = _get_tool_dispatch_executor(8)
 
 # Backwards-compat alias (callers that pass a pool explicitly).
 _tool_executor = _tool_dispatch_executor
@@ -336,8 +390,19 @@ def _finalize_run(
         }
         if trace_total_cost_usd is not None:
             finish_kwargs["total_cost_usd"] = trace_total_cost_usd
-        trace.finish(**finish_kwargs)
-        trace.flush()
+        # A3 (codex review 2026-04-25): tracing must never fail-close a
+        # successful run.  Disk-full / read-only fs / permission errors here
+        # used to bubble up and discard the entire LoopResult.  Log + swallow
+        # so observability stays non-fatal.
+        try:
+            trace.finish(**finish_kwargs)
+            trace.flush()
+        except Exception as trace_err:  # noqa: BLE001 — observability is best-effort
+            _logger.warning(
+                "trace finalize failed (non-fatal): %s: %s",
+                type(trace_err).__name__,
+                trace_err,
+            )
     return LoopResult(
         status=status,
         text=text,
@@ -871,8 +936,11 @@ class AgentLoop:
         self._cancel_event = cancel_event
         # Reuse the module-level shared executor to avoid accumulating
         # ThreadPoolExecutor objects and atexit handlers across turns and
-        # sub-agent dispatches.
-        self._executor = _tool_executor
+        # sub-agent dispatches.  A2 fix: ensure the pool is at least as
+        # wide as the configured ``max_tool_workers`` (the historical
+        # singleton was hard-capped at 8, silently throttling configs
+        # that asked for more dispatch parallelism).
+        self._executor = _get_tool_dispatch_executor(config.max_tool_workers)
         # Task-plan scratchpad (see jyagent/todos.py).  Populated via the
         # `write_todos` tool and seeded optionally via run(initial_todos=...)
         # so outer layers can carry the plan across turns.

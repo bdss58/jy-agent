@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -122,12 +123,28 @@ def iso_utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_RUN_ID_UNSAFE = re.compile(r"[^A-Za-z0-9._\-]")
+
+
+def _sanitize_run_id(run_id: str) -> str:
+    """Coerce a ``run_id`` into a path-safe directory name.
+
+    Replaces every char outside ``[A-Za-z0-9._-]`` with ``_``, then strips
+    leading dots so that values like ``".."`` or ``".hidden"`` cannot escape
+    or hide inside ``checkpoint_dir``.  Falls back to ``"_"`` on empty input.
+    """
+    cleaned = _RUN_ID_UNSAFE.sub("_", run_id or "")
+    cleaned = cleaned.lstrip(".")
+    return cleaned or "_"
+
+
 def checkpoint_path(dir_: str, run_id: str, step: int | str) -> str:
     """Canonical path for a given run / step.  ``step`` may be an int or
     the literal string ``"final"`` for the terminal checkpoint."""
-    safe_run = run_id.replace(os.sep, "_")
+    safe_run = _sanitize_run_id(run_id)
     filename = f"step_{step:04d}.json" if isinstance(step, int) else f"{step}.json"
     return os.path.join(dir_, safe_run, filename)
+
 
 
 __all__ = [
