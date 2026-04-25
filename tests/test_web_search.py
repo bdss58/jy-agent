@@ -64,11 +64,7 @@ class TestSearchDdgParsing:
         html = self._make_ddg_html(fake_results)
 
         # Mock the HTTP fetcher used by _search_ddg.
-        # Note: jyagent.tools.__init__ re-exports web_fetch (the function),
-        # which shadows the submodule attribute — fetch via sys.modules.
-        import sys
-        import jyagent.tools.web_fetch  # noqa: F401  (load into sys.modules)
-        web_fetch_mod = sys.modules["jyagent.tools.web_fetch"]
+        import jyagent.tools.web_fetch as web_fetch_mod
         monkeypatch.setattr(
             web_fetch_mod, "_fetch_cffi", lambda url, **kw: (200, html),
         )
@@ -88,9 +84,7 @@ class TestSearchDdgParsing:
         ]
         html = self._make_ddg_html(fake_results)
 
-        import sys
-        import jyagent.tools.web_fetch  # noqa: F401
-        web_fetch_mod = sys.modules["jyagent.tools.web_fetch"]
+        import jyagent.tools.web_fetch as web_fetch_mod
         monkeypatch.setattr(
             web_fetch_mod, "_fetch_cffi", lambda url, **kw: (200, html),
         )
@@ -99,9 +93,7 @@ class TestSearchDdgParsing:
         assert len(results) == 3
 
     def test_empty_html_returns_empty(self, monkeypatch):
-        import sys
-        import jyagent.tools.web_fetch  # noqa: F401
-        web_fetch_mod = sys.modules["jyagent.tools.web_fetch"]
+        import jyagent.tools.web_fetch as web_fetch_mod
         monkeypatch.setattr(
             web_fetch_mod, "_fetch_cffi", lambda url, **kw: (200, ""),
         )
