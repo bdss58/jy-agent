@@ -18,7 +18,7 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - Verify current date with `date` before time-sensitive research
 - Keep MEMORY.md concise (≤200 lines); move detail to topic files; chronological notes go to journal
 - For self-upgrades to jy-agent runtime/source, use `git worktree` to avoid disrupting the running agent
-- **Codex as second opinion** on significant tasks (code review, bug investigation, planning, research). `codex review` for code reviews, `codex exec --sandbox read-only` for analysis, `web_search(engine="codex")` for deep research. Skip for trivial tasks.
+- **Codex as second opinion** on significant tasks (code review, bug investigation, planning, research). `codex review` for code reviews, `codex exec --sandbox read-only` for analysis. Skip for trivial tasks.
 
 ## User Preferences
 - Dual output: keep raw streaming + rendered markdown panel (not a bug)
@@ -42,7 +42,7 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - **gfw-proxy-fallback.md** — SSH SOCKS5 tunnel workflow for GFW-blocked hosts (ghcr.io, raw.githubusercontent.com, huggingface.co, etc.). Read when a network call fails against a likely-blocked host.
 - **openclaw-offline-update.md** — OpenClaw offline bundle update process (preflight, docker-compose schema migration, build-artifact staleness). Read on any OpenClaw customer-deployment question.
 - **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read on any session mentioning nano-vLLM / learning / LLM study.
-
+- **jyagent-testing-quirks.md** — Test-writing gotchas for the `jyagent` package (e.g. `jyagent.tools.X` is shadowed by re-exported functions — monkeypatch via `sys.modules`). Read before writing or debugging tests under `tests/`.
 ## Repo Snapshot
 - Provider-neutral runtime: Anthropic Messages + OpenAI Responses adapters under `jyagent/runtime/`
 - `RuntimeOwner` owns the active `provider:model`; `/model <provider> <model>` switches future turns
