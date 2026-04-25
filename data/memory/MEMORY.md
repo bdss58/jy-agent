@@ -67,3 +67,4 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 [user_stated] OpenClaw architecture: ocaw-run pod runs openclaw supervisor + openclaw-gateway (Python WebSocket on port 18789); browser/OCR/LLM delegated to separate services (browser-service, processor-service, model-gateway)
 [user_stated] OpenClaw ocaw-run pods steady-state: ~510 MiB RSS+cache (max 652), 1-3 millicores CPU; 0 OOMs across 1600+ pod-hours observed
 [preference] For sizing recommendations, prefer empirical measurement (live pod inspection, cgroup memory.events) over guessing; recommend Burstable QoS over Gu
+[tip] web_search backend: cascade DDG → Brave → Mojeek; SearxNG (via SEARXNG_URL env) jumps to first if set. WEB_SEARCH_ENGINE forces single engine. Chrome-tier no longer scrapes SERPs (removed; was slow + bot-detected).
