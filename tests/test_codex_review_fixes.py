@@ -1117,3 +1117,196 @@ class TestC4Phase2ToolExecutorExtraction:
         from jyagent.runtime.loop import engine as _engine
         with pytest.raises(AttributeError, match="no attribute"):
             _ = _engine._definitely_does_not_exist  # noqa: SLF001
+
+
+# ─── C4 Phase 3: LLM call + retry extracted to runtime/loop/llm_runner.py ────
+
+
+class TestC4Phase3LLMRunnerExtraction:
+    """C4 Phase 3: the LLM call machinery (``call_complete`` /
+    ``call_streaming`` / ``call_with_retry``) plus its helpers
+    (``extract_text``, ``extract_tool_calls``, ``is_transient_error``,
+    ``build_runtime_options``) now lives in
+    ``jyagent.runtime.loop.llm_runner``.  Engine keeps four back-compat
+    aliases so tests and internal callers that import the
+    underscore-prefixed names continue to work.
+
+    Unlike Phase 2, there is no mutable module state to worry about — only
+    functions and a class — so a plain ``from X import Y`` snapshot is
+    fine and identity assertions suffice.  AgentLoop's ``_call_complete``
+    and ``_call_streaming`` methods are thin delegates onto
+    ``LLMRunner``; ``_call_llm_with_retry`` keeps its own retry loop in
+    AgentLoop so tests that override ``_call_*`` on a subclass to inject
+    failures still affect the retry behaviour.
+    """
+
+    def test_llm_runner_class_is_importable(self):
+        from jyagent.runtime.loop.llm_runner import LLMRunner
+        # Minimal surface contract.
+        for attr in ("call_complete", "call_streaming", "call_with_retry"):
+            assert callable(getattr(LLMRunner, attr)), attr
+
+    def test_helper_functions_exist_with_public_names(self):
+        """The four helper functions must exist under their public
+        (non-underscored) names in llm_runner."""
+        from jyagent.runtime.loop import llm_runner
+        for name in (
+            "extract_text",
+            "extract_tool_calls",
+            "is_transient_error",
+            "build_runtime_options",
+        ):
+            assert hasattr(llm_runner, name), name
+            assert callable(getattr(llm_runner, name)), name
+
+    def test_engine_aliases_point_at_llm_runner(self):
+        """engine._{extract_text,extract_tool_calls,is_transient_error,
+        build_runtime_options} must be identical objects to the
+        llm_runner public names.  Any divergence here means two copies of
+        the function live in the tree."""
+        from jyagent.runtime.loop import engine as _engine
+        from jyagent.runtime.loop import llm_runner as _lr
+        assert _engine._extract_text is _lr.extract_text
+        assert _engine._extract_tool_calls is _lr.extract_tool_calls
+        assert _engine._is_transient_error is _lr.is_transient_error
+        assert _engine._build_runtime_options is _lr.build_runtime_options
+
+    def test_agent_loop_get_llm_runner_caches(self):
+        """AgentLoop._get_llm_runner() must build once and cache — the
+        same instance is returned across multiple calls."""
+        from unittest.mock import MagicMock
+        from jyagent.runtime.loop.engine import AgentLoop, LoopConfig
+        from jyagent.runtime.loop.llm_runner import LLMRunner
+
+        owner = MagicMock()
+        owner.model_spec = MagicMock(provider="test", model="test-model")
+        loop = AgentLoop(
+            runtime_owner=owner,
+            config=LoopConfig(max_steps=1, streaming=False),
+        )
+        r1 = loop._get_llm_runner()
+        r2 = loop._get_llm_runner()
+        assert isinstance(r1, LLMRunner)
+        assert r1 is r2
+
+    def test_call_complete_delegates_to_runner(self):
+        """_call_complete is a thin delegate onto LLMRunner.call_complete —
+        patching the runner's method must be visible through the engine
+        entry point."""
+        from unittest.mock import MagicMock, patch
+        from jyagent.runtime.loop.engine import AgentLoop, LoopConfig
+
+        owner = MagicMock()
+        owner.model_spec = MagicMock(provider="test", model="test-model")
+        loop = AgentLoop(
+            runtime_owner=owner,
+            config=LoopConfig(max_steps=1, streaming=False),
+        )
+        runner = loop._get_llm_runner()
+        sentinel = ("text", [], "stop", {"role": "assistant"})
+        with patch.object(runner, "call_complete", return_value=sentinel) as mock_cc:
+            result = loop._call_complete({}, None)
+            mock_cc.assert_called_once_with({}, None)
+            assert result is sentinel
+
+    def test_call_streaming_delegates_to_runner(self):
+        """Same identity/forwarding check for the streaming path."""
+        from unittest.mock import MagicMock, patch
+        from jyagent.runtime.loop.engine import AgentLoop, LoopConfig
+
+        owner = MagicMock()
+        owner.model_spec = MagicMock(provider="test", model="test-model")
+        loop = AgentLoop(
+            runtime_owner=owner,
+            config=LoopConfig(max_steps=1, streaming=True),
+        )
+        runner = loop._get_llm_runner()
+        sentinel = ("text", [], "stop", {"role": "assistant"})
+        with patch.object(runner, "call_streaming", return_value=sentinel) as mock_cs:
+            result = loop._call_streaming({}, None)
+            mock_cs.assert_called_once_with({}, None)
+            assert result is sentinel
+
+    def test_retry_loop_dispatches_through_self_call_methods(self):
+        """The retry loop in AgentLoop._call_llm_with_retry MUST invoke
+        ``self._call_streaming`` / ``self._call_complete`` (not the
+        runner methods directly).  This preserves the long-standing
+        contract where subclasses / monkeypatches on those names inject
+        failures visible to the retry machinery.
+        """
+        from unittest.mock import MagicMock
+        from jyagent.runtime.loop.engine import AgentLoop, LoopConfig
+
+        class _Transient(Exception):
+            """Treated as transient by is_transient_error via duck-type."""
+            pass
+
+        # is_transient_error keys off APIConnectionError / APIStatusError /
+        # 5xx status — we need something it'll accept.  Easier route:
+        # patch is_transient_error to always return True for this test.
+        from jyagent.runtime.loop import llm_runner
+
+        owner = MagicMock()
+        owner.model_spec = MagicMock(provider="test", model="test-model")
+
+        streaming_calls = 0
+        complete_calls = 0
+        final = ("ok", [], "stop", {"role": "assistant"})
+
+        class _Loop(AgentLoop):
+            def _is_cancelled(self) -> bool:
+                return False
+
+            def _call_streaming(self, context, options):
+                nonlocal streaming_calls
+                streaming_calls += 1
+                if streaming_calls < 2:
+                    raise _Transient("boom")
+                return final
+
+            def _call_complete(self, context, options):
+                nonlocal complete_calls
+                complete_calls += 1
+                if complete_calls < 2:
+                    raise _Transient("boom")
+                return final
+
+        # Non-streaming path.
+        loop_c = _Loop(
+            runtime_owner=owner,
+            config=LoopConfig(max_steps=1, streaming=False, retry_attempts=2,
+                              retry_base_delay=0.0),
+        )
+        orig = llm_runner.is_transient_error
+        try:
+            llm_runner.is_transient_error = lambda e: isinstance(e, _Transient)
+            # Also patch the engine-side alias since the retry loop lives
+            # in engine.py and imports is_transient_error via a local
+            # alias at module-load time.
+            import jyagent.runtime.loop.engine as _engine
+            _engine._is_transient_error = llm_runner.is_transient_error
+            result = loop_c._call_llm_with_retry({}, None, step=0)
+        finally:
+            llm_runner.is_transient_error = orig
+            import jyagent.runtime.loop.engine as _engine
+            _engine._is_transient_error = orig
+        assert result == final
+        assert complete_calls == 2, "retry should invoke self._call_complete twice"
+
+        # Streaming path.
+        loop_s = _Loop(
+            runtime_owner=owner,
+            config=LoopConfig(max_steps=1, streaming=True, retry_attempts=2,
+                              retry_base_delay=0.0),
+        )
+        try:
+            llm_runner.is_transient_error = lambda e: isinstance(e, _Transient)
+            import jyagent.runtime.loop.engine as _engine
+            _engine._is_transient_error = llm_runner.is_transient_error
+            result = loop_s._call_llm_with_retry({}, None, step=0)
+        finally:
+            llm_runner.is_transient_error = orig
+            import jyagent.runtime.loop.engine as _engine
+            _engine._is_transient_error = orig
+        assert result == final
+        assert streaming_calls == 2, "retry should invoke self._call_streaming twice"

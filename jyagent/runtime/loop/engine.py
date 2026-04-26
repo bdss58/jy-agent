@@ -201,26 +201,19 @@ class _StuckLoopDetector:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_text(message: dict) -> str:
-    """Extract concatenated text blocks from an AssistantMessage."""
-    return "".join(
-        block.get("text", "")
-        for block in message.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _extract_tool_calls(message: dict) -> list[ToolCallRequest]:
-    """Extract tool_call blocks from an AssistantMessage."""
-    return [
-        ToolCallRequest(
-            id=block["id"],
-            name=block["name"],
-            input=block.get("arguments", {}),
-        )
-        for block in message.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "tool_call"
-    ]
+# C4 Phase 3 (codex review 2026-04-25): extraction helpers moved to
+# runtime/loop/llm_runner.py.  Engine keeps back-compat aliases with the
+# historical underscore-prefixed names so internal call sites (and tests
+# that monkeypatch them) continue to work unchanged.
+from .llm_runner import (
+    extract_text as _extract_text,
+    extract_tool_calls as _extract_tool_calls,
+    is_transient_error as _is_transient_error,
+    build_runtime_options as _build_runtime_options,
+)
 
 
 def _is_truncated(stop_reason: str, tool_calls: list[ToolCallRequest]) -> bool:
@@ -510,78 +503,6 @@ def _truncate_tool_call_blocks(blocks: list, batch: ToolBatch) -> list:
                     block["arguments"] = truncated_inp
         out.append(block)
     return out
-
-
-def _is_transient_error(error: BaseException) -> bool:
-    """Return True if the error is likely transient and worth retrying.
-
-    Checks concrete exception types first to avoid false positives from
-    keyword-matching against arbitrary error messages.
-    """
-    # --- Network / transport layer (always transient) ---
-    import httpx  # local import to avoid hard dependency at module level
-    if isinstance(error, (
-        httpx.ConnectError,
-        httpx.ReadTimeout,
-        httpx.WriteTimeout,
-        httpx.ConnectTimeout,
-        httpx.PoolTimeout,
-        httpx.RemoteProtocolError,
-        ConnectionResetError,
-        BrokenPipeError,
-        ConnectionAbortedError,
-    )):
-        return True
-
-    # --- Provider SDK errors (transient if server-side) ---
-    try:
-        import anthropic as _anth
-        if isinstance(error, _anth.APIStatusError) and error.status_code in (429, 500, 502, 503, 529):
-            return True
-        if isinstance(error, (_anth.APIConnectionError, _anth.APITimeoutError)):
-            return True
-    except ImportError:
-        pass
-    try:
-        import openai as _oai
-        if isinstance(error, _oai.APIStatusError) and error.status_code in (429, 500, 502, 503):
-            return True
-        if isinstance(error, (_oai.APIConnectionError, _oai.APITimeoutError)):
-            return True
-    except ImportError:
-        pass
-
-    # --- JSON decode failure (often a truncated stream response) ---
-    if isinstance(error, json.JSONDecodeError):
-        return True
-
-    # --- Fallback: keyword match, but only for generic / unknown types ---
-    msg = str(error).lower()
-    transient_keywords = [
-        "overloaded", "server_error", "peer closed",
-        "connection reset", "broken pipe",
-    ]
-    return any(kw in msg for kw in transient_keywords)
-
-
-def _build_runtime_options(
-    runtime_owner: LLMClient,
-    max_output_tokens: int,
-    model_spec: ModelSpec | None = None,
-    metadata: dict | None = None,
-) -> LLMOptions:
-    """Build LLMOptions with reasoning config for the active provider."""
-    spec = model_spec or runtime_owner.model_spec
-    return LLMOptions(
-        max_output_tokens=max_output_tokens,
-        timeout=STREAM_TIMEOUT,
-        reasoning=get_reasoning_config_for_provider(
-            spec.provider,
-            max_output_tokens=max_output_tokens,
-            model=spec.model,
-        ),
-        metadata=metadata,
-    )
 
 
 # ─── AgentLoop ───────────────────────────────────────────────────────────────
@@ -1511,7 +1432,36 @@ class AgentLoop:
                 trace=trace,
             )
 
-    # ── LLM call with retry ──────────────────────────────────────────────
+    # ── LLM call + retry/fallback (delegated to LLMRunner) ──────────────
+    #
+    # C4 Phase 3 (codex review 2026-04-25): the call machinery lives in
+    # ``llm_runner.LLMRunner``.  These methods are kept as thin delegates
+    # because internal code and tests call them by name (and tests
+    # monkeypatch them on the instance).  The runner is created lazily on
+    # first use so subclasses / tests that mutate ``self._runtime_owner``,
+    # ``self._config``, ``self._callbacks``, ``self._cancel_event``, or
+    # ``self._model_spec`` after ``__init__`` still see the new values —
+    # one-shot build, then cached for the remainder of the instance's life.
+
+    def _get_llm_runner(self):
+        """Return (and memoise) the per-instance ``LLMRunner``.
+
+        Built on first demand so post-__init__ swaps of runtime_owner /
+        callbacks / cancel_event / model_spec are visible.  Once built, the
+        runner is reused for the rest of the AgentLoop's lifetime.
+        """
+        from .llm_runner import LLMRunner
+        runner = getattr(self, "_llm_runner_cached", None)
+        if runner is None:
+            runner = LLMRunner(
+                runtime_owner=self._runtime_owner,
+                config=self._config,
+                callbacks=self._callbacks,
+                cancel_event=self._cancel_event,
+                model_spec=self._model_spec,
+            )
+            self._llm_runner_cached = runner
+        return runner
 
     def _call_llm_with_retry(
         self,
@@ -1520,6 +1470,13 @@ class AgentLoop:
         step: int,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
+
+        C4 Phase 3: we keep the retry loop in AgentLoop (rather than routing
+        straight to ``LLMRunner.call_with_retry``) so that it dispatches
+        through ``self._call_streaming`` / ``self._call_complete``.  Several
+        tests and internal diagnostics override those methods on a subclass
+        or monkeypatch them on the instance to inject transient failures —
+        that contract is preserved.
 
         Returns (step_text, tool_call_blocks, stop_reason, final_message).
         """
@@ -1539,19 +1496,20 @@ class AgentLoop:
                 if _is_transient_error(err) and attempt < cfg.retry_attempts:
                     if self._is_cancelled():
                         raise
-                    # Exponential backoff with "equal jitter" (AWS architecture
-                    # recommendation) to avoid thundering-herd when multiple
-                    # parallel sub-agents all retry a 529 at the same moment.
+                    # Exponential backoff with "equal jitter" (AWS
+                    # architecture recommendation) to avoid thundering-herd
+                    # when multiple parallel sub-agents all retry a 529 at
+                    # the same moment:
                     #   half the delay is deterministic exponential,
                     #   half is uniform random in [0, base * 2^attempt / 2].
                     base = cfg.retry_base_delay * (2 ** attempt)
                     delay = base / 2 + random.uniform(0, base / 2)
                     self._fire("on_retry", attempt + 1, err)
                     # Signal UI that any partial output from the failed
-                    # attempt will be replayed on retry (visual de-duplication
-                    # hook).  `partial_stream_text` is stashed by
-                    # `_call_streaming` on the exception; missing for
-                    # non-streaming path.
+                    # attempt will be replayed on retry (visual
+                    # de-duplication hook).  ``partial_stream_text`` is
+                    # stashed by ``_call_streaming`` on the exception;
+                    # missing for the non-streaming path.
                     partial_text = getattr(err, "partial_stream_text", "")
                     self._fire("on_stream_retry", "transient_error", partial_text)
                     # Cancel-aware backoff: wake immediately on Ctrl-C so we
@@ -1564,273 +1522,21 @@ class AgentLoop:
         # Should not reach here, but just in case:
         raise last_error  # type: ignore[misc]
 
-    # ── non-streaming call ───────────────────────────────────────────────
-
     def _call_complete(
         self,
         context: dict,
         options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Non-streaming: runtime_owner.complete() -> extract text/tool_calls.
-
-        C1 fix (codex review 2026-04-25): the sync SDK call is a single
-        blocking network operation with zero yield points, so cooperative
-        cancellation between yields (which the streaming path has) isn't
-        possible here.  Run the call in a daemon worker thread and poll
-        ``cancel_event`` from the main thread every 100 ms.  On cancel we
-        raise ``KeyboardInterrupt`` immediately; the worker thread keeps
-        running in the background (same trade-off as the mutating-tool
-        timeout path — Python threads aren't cancellable, so the network
-        request leaks until it completes).  Without this, a cancel during
-        a slow ``complete()`` call would wait up to the provider HTTP
-        timeout (60-300 s typical).
-
-        If no cancel_event is attached (the common non-CLI path), the
-        call runs synchronously in the current thread — no worker-thread
-        overhead.
-        """
-        # Pre-call check: no point issuing the request if already cancelled.
-        if self._is_cancelled():
-            raise KeyboardInterrupt("cancelled before complete()")
-
-        if self._cancel_event is None:
-            # Fast path: no cancel machinery needed.
-            final_message = self._runtime_owner.complete(
-                context, options=options, model_spec=self._model_spec,
-            )
-        else:
-            # Cancellable path: daemon worker + 100 ms poll.
-            final_holder: list[dict | None] = [None]
-            exc_holder: list[BaseException | None] = [None]
-            done = threading.Event()
-
-            def _worker() -> None:
-                try:
-                    final_holder[0] = self._runtime_owner.complete(
-                        context, options=options, model_spec=self._model_spec,
-                    )
-                except BaseException as e:  # noqa: BLE001
-                    exc_holder[0] = e
-                finally:
-                    done.set()
-
-            t = threading.Thread(
-                target=_worker,
-                name="jyagent-llm-complete",
-                daemon=True,
-            )
-            t.start()
-            while not done.wait(0.1):
-                if self._is_cancelled():
-                    _logger.info(
-                        "cancel signalled during complete(); "
-                        "worker thread will drain in background",
-                    )
-                    raise KeyboardInterrupt("cancelled during complete()")
-            if exc_holder[0] is not None:
-                raise exc_holder[0]
-            assert final_holder[0] is not None
-            final_message = final_holder[0]
-
-        stop_reason = final_message.get("stop_reason", "stop")
-
-        if stop_reason == "error":
-            error_msg = final_message.get("error_message", "Unknown error")
-            raise RuntimeError(error_msg)
-
-        step_text = _extract_text(final_message)
-        if step_text:
-            self._fire("on_text_delta", step_text)
-
-        tool_calls = _extract_tool_calls(final_message)
-        return step_text, tool_calls, stop_reason, final_message
-
-    # ── streaming call ───────────────────────────────────────────────────
+        """Thin delegate → ``LLMRunner.call_complete``."""
+        return self._get_llm_runner().call_complete(context, options)
 
     def _call_streaming(
         self,
         context: dict,
         options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Streaming: consume LLMStream events and fire callbacks.
-
-        Delta-emission policy is controlled by ``cfg.buffered_streaming``:
-
-        * ``False`` (default) — fire ``on_text_delta`` live as tokens arrive.
-          On transient error mid-stream, the user sees partial output and the
-          retry replays it, producing visible duplication.  The engine fires
-          ``on_stream_retry`` before the retry so UIs can mark/clear the
-          duplicated region.
-        * ``True`` — buffer deltas locally and only flush them to
-          ``on_text_delta`` after a clean ``done`` event.  A failed attempt
-          discards its buffer silently.  Eliminates duplication at the cost
-          of losing live-token UX.
-
-        The buffered partial text is stashed on the raised exception as
-        ``err.partial_stream_text`` so ``_call_llm_with_retry`` can pass it
-        to ``on_stream_retry``.
-        """
-        cfg = self._config
-        text_parts: list[str] = []
-        # Tracks how many characters have already been flushed to
-        # on_text_delta — used for buffered mode and for partial-text
-        # reporting on error.
-        emitted_len = 0
-        final_message: dict | None = None
-        thinking_active = False
-        stream = None
-
-        def _flush_pending() -> None:
-            """Emit un-flushed buffered deltas (buffered mode only)."""
-            nonlocal emitted_len
-            if emitted_len >= sum(len(p) for p in text_parts):
-                return
-            pending = "".join(text_parts)[emitted_len:]
-            if pending:
-                self._fire("on_text_delta", pending)
-                emitted_len += len(pending)
-
-        # C1: watcher-thread state.  Declared before the try so the finally
-        # block can always see them, even on exceptions raised mid-setup.
-        watcher_stop: threading.Event | None = None
-        watcher_thread: threading.Thread | None = None
-
-        try:
-            stream = self._runtime_owner.stream(
-                context, options=options, model_spec=self._model_spec,
-            )
-            # C1 fix (codex review 2026-04-25): the between-yields cancel
-            # check at the top of the loop only fires if the iterator is
-            # yielding.  When the provider hangs mid-chunk (network stuck
-            # waiting for bytes), the `for event in stream` call blocks
-            # indefinitely without ever returning to the Python level.
-            # Spawn a daemon watcher that waits on cancel_event and calls
-            # ``stream.close()`` when it fires — closing the underlying
-            # httpx response unblocks the SDK iterator with an exception
-            # the except-clause below catches and normalises.
-            #
-            # Returns early (no watcher spawned) when there's no
-            # cancel_event — avoids the tiny thread overhead on the common
-            # non-CLI path where cancellation isn't wired up.
-            if self._cancel_event is not None:
-                watcher_stop = threading.Event()
-                _cancel_ev = self._cancel_event  # local capture for closure
-
-                def _stream_cancel_watcher() -> None:
-                    # Wake on EITHER the cancel signal OR the stop signal
-                    # (which fires from the finally clause when the call
-                    # completes normally).  We poll both because
-                    # threading.Event doesn't support wait_for_any.
-                    while not watcher_stop.is_set():
-                        if _cancel_ev.wait(0.05):
-                            if watcher_stop.is_set():
-                                return
-                            try:
-                                stream.close()
-                            except Exception:  # noqa: BLE001 — best-effort
-                                pass
-                            return
-
-                watcher_thread = threading.Thread(
-                    target=_stream_cancel_watcher,
-                    name="jyagent-llm-stream-cancel-watcher",
-                    daemon=True,
-                )
-                watcher_thread.start()
-            for event in stream:
-                # Cancellation check inside the stream loop so Ctrl-C
-                # doesn't wait for the provider to close — latency-sensitive.
-                if self._is_cancelled():
-                    raise KeyboardInterrupt("cancelled during stream")
-                etype = event.get("type")
-
-                if etype == "text_delta":
-                    text = event.get("text", "")
-                    if thinking_active:
-                        thinking_active = False
-                        self._fire("on_thinking_stop")
-                    text_parts.append(text)
-                    if not cfg.buffered_streaming:
-                        # Live mode: emit now.
-                        self._fire("on_text_delta", text)
-                        emitted_len += len(text)
-                    # Buffered mode: accumulate, flush on `done`.
-
-                elif etype == "thinking_start":
-                    if not thinking_active:
-                        thinking_active = True
-                        self._fire("on_thinking_start")
-
-                elif etype == "thinking_delta":
-                    if not thinking_active:
-                        thinking_active = True
-                        self._fire("on_thinking_start")
-
-                elif etype in ("tool_call_start", "tool_call_delta"):
-                    if thinking_active:
-                        thinking_active = False
-                        self._fire("on_thinking_stop")
-
-                elif etype == "thinking_end":
-                    if thinking_active:
-                        thinking_active = False
-                        self._fire("on_thinking_stop")
-
-                elif etype == "done":
-                    final_message = event["message"]
-                    # Buffered mode: flush the accumulated text now that we
-                    # know the stream completed cleanly.
-                    if cfg.buffered_streaming:
-                        _flush_pending()
-
-                elif etype == "error":
-                    final_message = event["message"]
-
-            if final_message is None:
-                final_message = stream.get_final_message()
-
-            stop_reason = final_message.get("stop_reason", "stop")
-            if stop_reason == "error":
-                error_msg = final_message.get("error_message", "Unknown streaming error")
-                # Attach partial text so the retry layer can report it to
-                # on_stream_retry.  Accumulated even in buffered mode — the
-                # caller decides what (if anything) to do with it.
-                err = RuntimeError(error_msg)
-                err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
-                raise err
-
-            # Successful completion: in live mode emitted_len already equals
-            # the full text length; in buffered mode the done-handler above
-            # flushed it.  Nothing more to do.
-            tool_calls = _extract_tool_calls(final_message)
-            return "".join(text_parts), tool_calls, stop_reason, final_message
-
-        except BaseException as err:
-            # Stash partial text on every exception path (transient network
-            # errors, cancellations, etc.) so the retry layer can pass it to
-            # on_stream_retry.  Intentionally set on the raised exception
-            # rather than returned — the call site re-raises and catches it
-            # at a different layer.
-            if not hasattr(err, "partial_stream_text"):
-                err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
-            raise
-
-        finally:
-            # C1: signal the cancel watcher to exit BEFORE closing the
-            # stream ourselves, so it doesn't race with our own close().
-            if watcher_stop is not None:
-                watcher_stop.set()
-                # Nudge the watcher: it's waiting on either cancel_event
-                # or its own polling timeout.  Don't join — it's a daemon
-                # and will exit within its 50 ms poll cycle; joining would
-                # add needless latency to every stream call.
-            if thinking_active:
-                self._fire("on_thinking_stop")
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+        """Thin delegate → ``LLMRunner.call_streaming``."""
+        return self._get_llm_runner().call_streaming(context, options)
 
 
 # ─── PEP 562 back-compat shim for tool_executor module state ────────────────

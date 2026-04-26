@@ -409,13 +409,17 @@ class TestStreamLoopCancellationCheck:
 
     def test_stream_loop_has_cancel_check(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._call_streaming)
+        # C4 Phase 3 (2026-04-25): streaming machinery moved to
+        # ``runtime.loop.llm_runner.LLMRunner.call_streaming``.  The AgentLoop
+        # ``_call_streaming`` delegate is a one-liner — inspect the runner.
+        from jyagent.runtime.loop.llm_runner import LLMRunner
+        source = inspect.getsource(LLMRunner.call_streaming)
         # The check must appear before the `etype = event.get(...)` dispatch
         # so that an in-flight stream can be short-circuited on cancel.
         assert "for event in stream:" in source
         assert "self._is_cancelled()" in source, (
-            "_call_streaming must check self._is_cancelled() inside the "
-            "event loop to short-circuit on Ctrl-C."
+            "LLMRunner.call_streaming must check self._is_cancelled() inside "
+            "the event loop to short-circuit on Ctrl-C."
         )
         # Sanity: the cancel check lands before the event dispatch.
         iter_idx = source.find("for event in stream:")
