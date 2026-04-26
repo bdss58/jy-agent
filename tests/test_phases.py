@@ -113,17 +113,19 @@ class TestLoopCallbacksPhaseHook:
 class TestRunImplWiresPhasePolicy:
     def test_source_consults_policy_and_rebuilds_opts(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        from jyagent.runtime.loop import step
+        # Phase-policy wiring lives in step.run_step after C4 Phase 5.
+        source = inspect.getsource(step.run_step)
         # Policy must be consulted each step after opts is built.
         assert "cfg.phase_policy(" in source, (
-            "phase policy is not invoked inside _run_impl"
+            "phase policy is not invoked inside run_step"
         )
         # Override must rebuild LLMOptions with the directive's tool_choice.
         assert "tool_choice=directive.tool_choice" in source, (
             "policy's tool_choice override is not propagated into opts"
         )
-        # Observational callback must fire.
-        assert 'self._fire("on_phase_enter"' in source, (
+        # Observational callback must fire (loop._fire after the C4 split).
+        assert '_fire("on_phase_enter"' in source, (
             "on_phase_enter callback is not wired"
         )
         # Exceptions from user code must not crash the loop.
@@ -139,7 +141,8 @@ class TestRunImplWiresPhasePolicy:
         instead we assert the source-level defensive pattern is in place.
         """
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        from jyagent.runtime.loop import step
+        source = inspect.getsource(step.run_step)
         assert "directive = None" in source, (
             "policy-exception path must set directive=None and continue"
         )
