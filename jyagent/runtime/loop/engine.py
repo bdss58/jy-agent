@@ -1964,10 +1964,67 @@ class AgentLoop:
         context: dict,
         options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Non-streaming: runtime_owner.complete() -> extract text/tool_calls."""
-        final_message = self._runtime_owner.complete(
-            context, options=options, model_spec=self._model_spec,
-        )
+        """Non-streaming: runtime_owner.complete() -> extract text/tool_calls.
+
+        C1 fix (codex review 2026-04-25): the sync SDK call is a single
+        blocking network operation with zero yield points, so cooperative
+        cancellation between yields (which the streaming path has) isn't
+        possible here.  Run the call in a daemon worker thread and poll
+        ``cancel_event`` from the main thread every 100 ms.  On cancel we
+        raise ``KeyboardInterrupt`` immediately; the worker thread keeps
+        running in the background (same trade-off as the mutating-tool
+        timeout path — Python threads aren't cancellable, so the network
+        request leaks until it completes).  Without this, a cancel during
+        a slow ``complete()`` call would wait up to the provider HTTP
+        timeout (60-300 s typical).
+
+        If no cancel_event is attached (the common non-CLI path), the
+        call runs synchronously in the current thread — no worker-thread
+        overhead.
+        """
+        # Pre-call check: no point issuing the request if already cancelled.
+        if self._is_cancelled():
+            raise KeyboardInterrupt("cancelled before complete()")
+
+        if self._cancel_event is None:
+            # Fast path: no cancel machinery needed.
+            final_message = self._runtime_owner.complete(
+                context, options=options, model_spec=self._model_spec,
+            )
+        else:
+            # Cancellable path: daemon worker + 100 ms poll.
+            final_holder: list[dict | None] = [None]
+            exc_holder: list[BaseException | None] = [None]
+            done = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    final_holder[0] = self._runtime_owner.complete(
+                        context, options=options, model_spec=self._model_spec,
+                    )
+                except BaseException as e:  # noqa: BLE001
+                    exc_holder[0] = e
+                finally:
+                    done.set()
+
+            t = threading.Thread(
+                target=_worker,
+                name="jyagent-llm-complete",
+                daemon=True,
+            )
+            t.start()
+            while not done.wait(0.1):
+                if self._is_cancelled():
+                    _logger.info(
+                        "cancel signalled during complete(); "
+                        "worker thread will drain in background",
+                    )
+                    raise KeyboardInterrupt("cancelled during complete()")
+            if exc_holder[0] is not None:
+                raise exc_holder[0]
+            assert final_holder[0] is not None
+            final_message = final_holder[0]
+
         stop_reason = final_message.get("stop_reason", "stop")
 
         if stop_reason == "error":
@@ -2026,10 +2083,53 @@ class AgentLoop:
                 self._fire("on_text_delta", pending)
                 emitted_len += len(pending)
 
+        # C1: watcher-thread state.  Declared before the try so the finally
+        # block can always see them, even on exceptions raised mid-setup.
+        watcher_stop: threading.Event | None = None
+        watcher_thread: threading.Thread | None = None
+
         try:
             stream = self._runtime_owner.stream(
                 context, options=options, model_spec=self._model_spec,
             )
+            # C1 fix (codex review 2026-04-25): the between-yields cancel
+            # check at the top of the loop only fires if the iterator is
+            # yielding.  When the provider hangs mid-chunk (network stuck
+            # waiting for bytes), the `for event in stream` call blocks
+            # indefinitely without ever returning to the Python level.
+            # Spawn a daemon watcher that waits on cancel_event and calls
+            # ``stream.close()`` when it fires — closing the underlying
+            # httpx response unblocks the SDK iterator with an exception
+            # the except-clause below catches and normalises.
+            #
+            # Returns early (no watcher spawned) when there's no
+            # cancel_event — avoids the tiny thread overhead on the common
+            # non-CLI path where cancellation isn't wired up.
+            if self._cancel_event is not None:
+                watcher_stop = threading.Event()
+                _cancel_ev = self._cancel_event  # local capture for closure
+
+                def _stream_cancel_watcher() -> None:
+                    # Wake on EITHER the cancel signal OR the stop signal
+                    # (which fires from the finally clause when the call
+                    # completes normally).  We poll both because
+                    # threading.Event doesn't support wait_for_any.
+                    while not watcher_stop.is_set():
+                        if _cancel_ev.wait(0.05):
+                            if watcher_stop.is_set():
+                                return
+                            try:
+                                stream.close()
+                            except Exception:  # noqa: BLE001 — best-effort
+                                pass
+                            return
+
+                watcher_thread = threading.Thread(
+                    target=_stream_cancel_watcher,
+                    name="jyagent-llm-stream-cancel-watcher",
+                    daemon=True,
+                )
+                watcher_thread.start()
             for event in stream:
                 # Cancellation check inside the stream loop so Ctrl-C
                 # doesn't wait for the provider to close — latency-sensitive.
@@ -2109,6 +2209,14 @@ class AgentLoop:
             raise
 
         finally:
+            # C1: signal the cancel watcher to exit BEFORE closing the
+            # stream ourselves, so it doesn't race with our own close().
+            if watcher_stop is not None:
+                watcher_stop.set()
+                # Nudge the watcher: it's waiting on either cancel_event
+                # or its own polling timeout.  Don't join — it's a daemon
+                # and will exit within its 50 ms poll cycle; joining would
+                # add needless latency to every stream call.
             if thinking_active:
                 self._fire("on_thinking_stop")
             if stream is not None:

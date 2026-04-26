@@ -793,3 +793,189 @@ class TestSessionStatsLockedReaders:
         assert not torn, (
             f"observed torn provider/model pairs (read without lock): {torn[:5]}"
         )
+
+
+# ─── C1: cancellation latency in LLM calls ──────────────────────────────────
+
+
+class TestC1CancellationLatency:
+    """C1: a cancel_event set during a slow LLM complete() or stream()
+    call must unblock the call within ~200 ms instead of waiting for
+    the provider timeout.
+    """
+
+    def _make_loop_with_owner(self, owner, cancel_event):
+        """Build an AgentLoop via __new__ just like the todos fixture,
+        but wire the owner + cancel_event so _call_streaming /
+        _call_complete are the only thing under test."""
+        loop = loop_engine.AgentLoop.__new__(loop_engine.AgentLoop)
+        loop._runtime_owner = owner
+        loop._config = LoopConfig(max_steps=1, streaming=False)
+        loop._callbacks = loop_engine.LoopCallbacks()
+        loop._tool_source = None
+        loop._model_spec = None
+        loop._cancel_event = cancel_event
+        loop._executor = loop_engine._tool_dispatch_executor
+        loop._todos = []
+        loop._partial_side_effects = []
+        return loop
+
+    def test_complete_cancels_within_200ms(self):
+        """_call_complete must raise KeyboardInterrupt within ~200 ms
+        of cancel_event.set() instead of waiting for the 10 s fake
+        provider call to finish.
+        """
+        class _SlowOwner:
+            model_spec = _FakeModelSpec()
+            entered = threading.Event()
+
+            def complete(self, *args, **kwargs):
+                self.entered.set()
+                time.sleep(10.0)  # simulates a stuck provider
+                return _final_text_message("should never return")
+
+            def stream(self, *args, **kwargs):
+                raise AssertionError("stream should not be called")
+
+        owner = _SlowOwner()
+        cancel_event = threading.Event()
+        loop = self._make_loop_with_owner(owner, cancel_event)
+
+        # Kick off the call in a worker; trigger cancel from main.
+        result_holder: dict = {}
+
+        def _call_target():
+            try:
+                loop._call_complete({}, loop_engine.LLMOptions())
+                result_holder["outcome"] = "returned"
+            except KeyboardInterrupt as e:
+                result_holder["outcome"] = "cancelled"
+                result_holder["exc"] = e
+            except BaseException as e:  # noqa: BLE001
+                result_holder["outcome"] = "other_error"
+                result_holder["exc"] = e
+
+        t = threading.Thread(target=_call_target, daemon=True)
+        t0 = time.monotonic()
+        t.start()
+        # Wait until the worker has actually entered the fake provider call,
+        # so the cancel fires DURING the sleep not before it.
+        assert owner.entered.wait(2.0), "slow owner never entered complete()"
+        cancel_event.set()
+        t.join(timeout=2.0)
+        elapsed = time.monotonic() - t0
+
+        assert not t.is_alive(), "call thread did not unblock after cancel"
+        assert result_holder.get("outcome") == "cancelled", (
+            f"expected KeyboardInterrupt, got {result_holder!r}"
+        )
+        # Must unblock quickly — 1 s is generous (poll is 100 ms).
+        assert elapsed < 1.5, (
+            f"cancel latency too high: {elapsed:.2f}s (poll is 100ms)"
+        )
+
+    def test_complete_no_cancel_event_uses_fast_path(self):
+        """When cancel_event is None, _call_complete must run in the
+        current thread (no daemon worker), so the call returns its
+        result directly.
+        """
+        class _FastOwner:
+            model_spec = _FakeModelSpec()
+
+            def complete(self, *args, **kwargs):
+                msg = _final_text_message("fast answer")
+                msg["usage"] = {"input_tokens": 5, "output_tokens": 3}
+                return msg
+
+            def stream(self, *args, **kwargs):
+                raise AssertionError("stream should not be called")
+
+        owner = _FastOwner()
+        loop = self._make_loop_with_owner(owner, cancel_event=None)
+        step_text, tool_calls, stop, msg = loop._call_complete({}, loop_engine.LLMOptions())
+        assert step_text == "fast answer"
+        assert stop == "stop"
+        assert tool_calls == []
+
+    def test_complete_precheck_fires_before_call(self):
+        """If cancel_event is already set when _call_complete is invoked,
+        the provider call must NOT be issued."""
+        class _WouldBeCalledOwner:
+            model_spec = _FakeModelSpec()
+            was_called = False
+
+            def complete(self, *args, **kwargs):
+                self.was_called = True
+                return _final_text_message("x")
+
+            def stream(self, *args, **kwargs):
+                raise AssertionError("stream should not be called")
+
+        owner = _WouldBeCalledOwner()
+        cancel_event = threading.Event()
+        cancel_event.set()  # pre-set
+        loop = self._make_loop_with_owner(owner, cancel_event)
+
+        with pytest.raises(KeyboardInterrupt, match="before complete"):
+            loop._call_complete({}, loop_engine.LLMOptions())
+        assert not owner.was_called, "complete() was issued despite pre-set cancel"
+
+    def test_streaming_watcher_closes_stream_on_cancel(self):
+        """_call_streaming must spawn a watcher that calls stream.close()
+        when cancel_event fires.  We verify the close() call, not the
+        end-to-end stream path (that's exercised by existing streaming
+        tests in the suite)."""
+
+        close_called = threading.Event()
+        entered = threading.Event()
+
+        class _StuckStream:
+            """Stream whose __iter__ blocks until close() is called
+            (simulating a network-stuck provider)."""
+            _stopped = threading.Event()
+
+            def __iter__(self):
+                entered.set()
+                # Block until close() unblocks us.
+                self._stopped.wait(timeout=5.0)
+                # Iterator exits cleanly — loop sees no events.
+                return iter([])
+
+            def close(self):
+                close_called.set()
+                self._stopped.set()
+
+            def get_final_message(self):
+                return _final_text_message("partial")
+
+        class _StreamOwner:
+            model_spec = _FakeModelSpec()
+
+            def complete(self, *args, **kwargs):
+                raise AssertionError("complete should not be called")
+
+            def stream(self, *args, **kwargs):
+                return _StuckStream()
+
+        cancel_event = threading.Event()
+        owner = _StreamOwner()
+        loop = self._make_loop_with_owner(owner, cancel_event)
+        loop._config = LoopConfig(max_steps=1, streaming=True)
+
+        def _call_target():
+            try:
+                loop._call_streaming({}, loop_engine.LLMOptions())
+            except BaseException:  # noqa: BLE001 — any exit is fine for this test
+                pass
+
+        t = threading.Thread(target=_call_target, daemon=True)
+        t.start()
+        assert entered.wait(2.0), "streaming never entered __iter__"
+        t0 = time.monotonic()
+        cancel_event.set()
+        assert close_called.wait(1.0), "watcher never called stream.close()"
+        elapsed = time.monotonic() - t0
+        # Watcher poll is 50 ms; close should fire within ~200 ms.
+        assert elapsed < 0.5, f"watcher close latency too high: {elapsed:.2f}s"
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "streaming call did not unblock after close"
