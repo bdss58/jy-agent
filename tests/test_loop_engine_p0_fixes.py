@@ -28,6 +28,22 @@ from jyagent.runtime.tools.result import ToolResult
 from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
 
 
+# Combined-source helper for structural tests that grep the loop body.
+# After the C4 Phase 5 split, the per-step body lives in
+# ``runtime.loop.step.run_step``; the engine's ``AgentLoop._run_impl``
+# now contains only setup + the for-loop dispatcher + post-loop terminal
+# handlers + the outer try/except. Tests that grep for patterns must
+# therefore consult both sources.
+def _loop_combined_source():
+    import inspect
+    from jyagent.runtime.loop import engine as _le, step as _step
+    return (
+        inspect.getsource(_le.AgentLoop._run_impl)
+        + "\n# ─── step.run_step ───\n"
+        + inspect.getsource(_step.run_step)
+    )
+
+
 # ─── Shared fake registry ────────────────────────────────────────────────────
 
 
@@ -178,22 +194,38 @@ class TestCostTrackerUsesEffectiveSpec:
 
     def test_cost_record_uses_effective_spec_variable(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
-        # The run() body must hoist the effective spec before the loop.
-        assert "effective_spec = self._model_spec or self._runtime_owner.model_spec" in source, (
-            "AgentLoop.run must resolve effective_spec once at the top of run()."
+        from jyagent.runtime.loop import step
+        # After C4 Phase 5, effective_spec is hoisted in RunState.from_loop()
+        # (the run-state factory called at the top of _run_impl). The
+        # cost_tracker.record(...) call lives in step.run_step.
+        from_loop_src = inspect.getsource(step.RunState.from_loop)
+        run_step_src = inspect.getsource(step.run_step)
+
+        assert "effective_spec = loop._model_spec or loop._runtime_owner.model_spec" in from_loop_src, (
+            "RunState.from_loop must resolve effective_spec once at the top of "
+            "the run-state factory (formerly at the top of _run_impl)."
         )
-        # And cost_tracker.record must consume it.
-        # Locate the cost_tracker.record(...) call and check its args.
-        idx = source.find("cost_tracker.record(")
-        assert idx != -1, "cost_tracker.record(...) call is missing"
-        snippet = source[idx : idx + 400]
+        # cost_tracker.record(...) must consume effective_spec.
+        idx = run_step_src.find("cost_tracker.record(")
+        assert idx != -1, "cost_tracker.record(...) call is missing in run_step"
+        snippet = run_step_src[idx : idx + 400]
         assert "effective_spec.provider" in snippet
         assert "effective_spec.model" in snippet
-        assert "self._runtime_owner.model_spec.provider" not in snippet, (
+        assert "loop._runtime_owner.model_spec.provider" not in snippet, (
             "cost_tracker.record must NOT hardcode the owner spec — that loses "
             "sub-agent model overrides."
         )
+        # Also confirm the engine's max_steps fallback path records cost
+        # against effective_spec (B1 fix from codex review 2026-04-25).
+        engine_src = inspect.getsource(le.AgentLoop._run_impl)
+        fallback_idx = engine_src.find("fallback_on_max_steps")
+        assert fallback_idx != -1, "max_steps fallback block missing"
+        fallback_snippet = engine_src[fallback_idx : fallback_idx + 3000]
+        assert "cost_tracker.record(" in fallback_snippet, (
+            "max_steps fallback must record cost against effective_spec "
+            "(B1 fix)."
+        )
+        assert "effective_spec.provider" in fallback_snippet
 
 
 # ─── P0 #4 — Max-steps fallback always fires when enabled ────────────────────
@@ -316,7 +348,7 @@ class TestStuckDetectorRawContent:
 
     def test_source_passes_raw_result_content_to_detector(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        source = _loop_combined_source()
         # Locate the stuck-detector.record call.
         idx = source.find("stuck_detector.record(")
         assert idx != -1, "stuck_detector.record(...) call is missing"
@@ -391,8 +423,7 @@ class TestStuckDetectorBatchDedup:
 
     def test_source_has_batch_dedup_set(self):
         """Source-level check: the loop must allocate a per-batch seen-set."""
-        import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        source = _loop_combined_source()
         # Anchor on the dedup comment and look for a seen-set just below.
         assert "seen_batch_keys" in source, (
             "AgentLoop.run must dedup (name, args) keys within a single tool "
@@ -447,7 +478,7 @@ class TestVerificationGateBoundary:
 
     def test_gate_has_boundary_guard(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        source = _loop_combined_source()
         # The gate must include the boundary guard.
         assert "step + 1 < cfg.max_steps" in source, (
             "Verification gate is missing the `step + 1 < cfg.max_steps` "
@@ -758,15 +789,15 @@ class TestTruncationRecoveryEmitsStreamRetry:
 
     def test_source_fires_on_stream_retry_on_truncation(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        source = _loop_combined_source()
         # Anchor on the truncation block.
         idx = source.find("_is_truncated(stop_reason, tool_call_blocks)")
         assert idx != -1, "truncation-recovery block not found"
         snippet = source[idx : idx + 1500]
-        assert 'self._fire("on_truncation")' in snippet, (
+        assert '_fire("on_truncation")' in snippet, (
             "existing on_truncation callback missing"
         )
-        assert 'self._fire("on_stream_retry", "truncation"' in snippet, (
+        assert '_fire("on_stream_retry", "truncation"' in snippet, (
             "truncation-recovery must also fire on_stream_retry so UIs can "
             "dedupe the replayed text"
         )
@@ -1188,7 +1219,7 @@ class TestVerificationCleanupParity:
         """
         import inspect
         import re as _re
-        source = inspect.getsource(le.AgentLoop._run_impl)
+        source = _loop_combined_source()
         # Look for `return LoopResult(` — the pre-funnel pattern.  The
         # only acceptable return shape is `return _finalize_run(...)`.
         bare_returns = _re.findall(r"return\s+LoopResult\s*\(", source)

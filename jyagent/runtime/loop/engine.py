@@ -543,574 +543,47 @@ class AgentLoop:
         initial_todos: list | None = None,
     ) -> LoopResult:
         """Core run loop.  Public entry point is ``run()`` which also
-        snapshots the final todos onto the result."""
+        snapshots the final todos onto the result.
+
+        After C4 Phase 5, this method is a thin orchestrator: setup is in
+        ``RunState.from_loop()``, the per-step body is in
+        ``runtime/loop/step.py::run_step``, and only the for-step counter,
+        post-loop terminal handlers (cancelled-exit / max_steps fallback /
+        max_steps exit), and the outer try/except live here.
+        """
+        from .step import RunState, run_step, StepContinue, StepTerminate, StepBreak
+
         cfg = self._config
-        all_text = ""
-        final_text = ""
-        current_max_tokens = cfg.initial_max_tokens
-        total_input_tokens = 0
-        total_output_tokens = 0
-        tool_calls_count = 0
-        last_reflection_count = 0  # tool_calls_count at last reflection injection
-        # A1 (codex review 2026-04-25): reset the mutating-timeout
-        # accumulator at the top of every run so back-to-back turns on the
-        # same AgentLoop instance don't carry stale names forward.
-        self._partial_side_effects = []
-        # Boundary between prior-turn history and this-turn appends.
-        # Passed to ``should_verify`` so a replayed historical mutation
-        # cannot re-arm the verification gate on a non-mutating new turn
-        # (Codex review 2026-04-25 Part 2 #5).
-        turn_start_idx = len(messages)
-        registry = get_registry()
-        step = 0
-        consecutive_truncations = 0  # cap truncation recovery retries
-        max_truncation_retries = 3
-        verification_injected = False  # only verify once per run
-
-        # Lazy import of the reflection module so test imports of
-        # loop_engine stay cheap and reflection is opt-in by config.
-        if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
-            from . import reflection  # noqa: F401 — referenced below
-        else:
-            reflection = None  # type: ignore[assignment]
-
-        # Ensure a run id is set when checkpointing is enabled (outer
-        # layers may have preset one via set_run_id).
-        if cfg.checkpoint_dir and not self._run_id:
-            from .checkpoint import new_run_id
-            self._run_id = new_run_id()
-
-        # ── Seed todos scratchpad ─────────────────────────────────────
-        # Lazy import to keep the dependency optional.
-        if cfg.todos_enabled:
-            from .todos import (
-                WRITE_TODOS_SCHEMA,
-                build_write_todos_tool,
-                inject_todos_into_messages,
-                normalize_todo,
-            )
-            if initial_todos:
-                try:
-                    self._todos = [normalize_todo(t) for t in initial_todos]
-                except TypeError as e:
-                    self._fire("on_warning", f"ignoring invalid initial_todos: {e}")
-                    self._todos = []
-            else:
-                self._todos = []
-
-            # Per-loop write_todos tool closing over self._todos.
-            def _get_store() -> list:
-                return self._todos
-
-            def _set_store(new_list: list) -> None:
-                self._todos = new_list
-
-            _write_todos_fn = build_write_todos_tool(_get_store, _set_store)
-
-        # ── Harness trackers ──────────────────────────────────────────
-        # Effective model spec — sub-agent override wins over owner default.
-        # Used for tracing and cost accounting so sub-agents on a different
-        # tier are billed against the correct pricing.
-        effective_spec = self._model_spec or self._runtime_owner.model_spec
-
-        trace = get_tracer()
-        if trace:
-            trace.start(effective_spec.provider, effective_spec.model)
-        cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
-        unpriced_warned = False  # one-shot flag for cost_tracker.has_unpriced_usage
-        stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
-
-        # Resolve tools.  ``tools_batch`` is the immutable per-step snapshot
-        # consumed by every dispatch/compaction helper.  Built once per step
-        # via ``ToolRegistry.freeze()`` (or from ``_tool_source()`` when
-        # provided), so concurrent registry mutations cannot race against
-        # in-flight metadata reads (Codex Part 1 #4, #11, #12).
-        tools_batch: ToolBatch = ToolBatch.empty()
+        state = RunState.from_loop(self, system_prompt, messages, initial_todos)
+        # Aliases for the post-loop terminal handlers below — keeps the
+        # diff minimal vs. pre-Phase-5 while still routing through state.
+        trace = state.trace
+        cost_tracker = state.cost_tracker
+        effective_spec = state.effective_spec
 
         try:
             for step in range(cfg.max_steps):
-                self._fire("on_step_progress", step, cfg.max_steps)
-
-                # ── Cooperative cancellation check (top of loop) ─────
-                if self._is_cancelled():
+                state.step = step
+                outcome = run_step(self, state)
+                if isinstance(outcome, StepTerminate):
+                    return outcome.result
+                if isinstance(outcome, StepBreak):
+                    # Cooperative cancellation requested by ``run_step``
+                    # (cancel checked at top of step or before/after tools).
+                    # Fall through to the cancelled-exit handler below.
                     break
-
-                # Refresh tool batch each step.
-                #
-                # When ``_tool_source`` is provided (e.g. MCP integration that
-                # builds tool sets dynamically per turn), its (schemas,
-                # functions) supersede the registry's, but we still freeze
-                # the registry to inherit metadata (parallel_safe, timeout
-                # hints, large_input_keys, compaction_priority) for any
-                # tool whose name happens to be registered too.  This
-                # preserves the historical "tool_source funcs + registry
-                # metadata" behaviour but now atomically.
-                if self._tool_source is not None:
-                    src_schemas, src_functions = self._tool_source()
-                    reg_batch = registry.freeze()
-                    src_schema_map = {
-                        s.get("name"): s for s in src_schemas if s.get("name")
-                    }
-                    tools_batch = ToolBatch(
-                        version=reg_batch.version,
-                        schemas=tuple(src_schemas),
-                        schema_map=src_schema_map,
-                        functions=dict(src_functions),
-                        parallel_safe=reg_batch.parallel_safe,
-                        timeout_hints=reg_batch.timeout_hints,
-                        large_input_keys=reg_batch.large_input_keys,
-                        compaction_priority=reg_batch.compaction_priority,
-                        # Inherit mutating classification from the registry
-                        # freeze — tool_source functions that happen to share
-                        # a registered name pick up the registered metadata;
-                        # purely dynamic names (e.g. MCP tools that
-                        # auto-registered via the real register() path)
-                        # bring their own.  A1 fix (codex review 2026-04-25).
-                        mutating=reg_batch.mutating,
-                    )
-                elif step == 0 or registry.version != tools_batch.version:
-                    # Re-freeze only when the registry has changed.  The
-                    # version read is locked (defense-in-depth), and even
-                    # if a stale-by-one read causes us to skip a freeze,
-                    # the next step will catch up — at most one step uses
-                    # slightly-stale metadata, never inconsistent metadata.
-                    tools_batch = registry.freeze()
-
-                # Overlay the per-loop write_todos tool on top of the
-                # registry snapshot when todos are enabled.  This is the
-                # closure-scoped injection point recommended by the design
-                # review (avoids ContextVar propagation issues with our
-                # daemon-thread tool executor).
-                if cfg.todos_enabled:
-                    step_batch = tools_batch.with_overlay(
-                        functions={"write_todos": _write_todos_fn},
-                        schemas=[WRITE_TODOS_SCHEMA],
-                        # write_todos must NOT be parallel-safe — it would
-                        # then run concurrently with itself in a batch and
-                        # the replace-all semantics would silently drop
-                        # one of the writes (Codex Part 2 #4).
-                    )
-                else:
-                    step_batch = tools_batch
-
-                tool_schemas = list(step_batch.schemas)
-                tool_functions = step_batch.functions
-
-                # Context compaction
-                if cfg.compact_messages:
-                    before_len = len(messages)
-                    messages_maybe = _compact_messages(
-                        messages, cfg.max_working_tokens, cfg.compact_tool_result_chars,
-                        step_batch,
-                    )
-                    if messages_maybe is not messages:
-                        after_len = len(messages_maybe)
-                        messages[:] = messages_maybe
-                        self._fire("on_compaction", before_len, after_len)
-
-                # Build context dict.  Todos are injected as a
-                # <system-reminder> text block appended to the tail user
-                # message — NOT persisted into `messages`, so compaction
-                # never touches them.  The base system_prompt stays
-                # untouched to preserve Anthropic prefix caching.
-                if cfg.todos_enabled and self._todos:
-                    context_messages = inject_todos_into_messages(messages, self._todos)
-                else:
-                    context_messages = messages
-
-                context: dict[str, Any] = {
-                    "system_prompt": system_prompt,
-                    "messages": context_messages,
-                }
-                if tool_schemas:
-                    context["tools"] = tool_schemas
-
-                # LLM call with retry
-                opts = _build_runtime_options(
-                    self._runtime_owner,
-                    current_max_tokens,
-                    model_spec=self._model_spec,
-                    metadata={"component": "loop_engine", "step": step + 1},
-                )
-
-                # Phase-aware tool_choice shaping (see jyagent/phases.py).
-                # The policy is consulted once per step.  Returning a
-                # PhaseDirective with `tool_choice=None` is informational
-                # only (engine fires on_phase_enter for observability but
-                # leaves tool_choice unchanged).  A non-None tool_choice
-                # rebuilds `opts` so the runtime adapter sees the override.
-                if cfg.phase_policy is not None:
-                    try:
-                        directive = cfg.phase_policy(step, cfg.max_steps, tool_calls_count)
-                    except Exception as e:
-                        directive = None
-                        self._fire("on_warning", f"phase_policy raised: {e}")
-                    if directive is not None:
-                        self._fire("on_phase_enter", directive.phase)
-                        if trace:
-                            trace.add_span(
-                                step=step, event_type="phase",
-                                tool_name=directive.phase,
-                            )
-                        if directive.tool_choice is not None:
-                            opts = LLMOptions(
-                                max_output_tokens=opts.max_output_tokens,
-                                timeout=opts.timeout,
-                                reasoning=opts.reasoning,
-                                metadata={**(opts.metadata or {}), "phase": directive.phase},
-                                tool_choice=directive.tool_choice,
-                            )
-
-                llm_t0 = time.perf_counter()
-                step_text, tool_call_blocks, stop_reason, final_message = self._call_llm_with_retry(
-                    context, opts, step,
-                )
-                llm_dur_ms = (time.perf_counter() - llm_t0) * 1000
-
-                # Fire runtime warnings
-                for warning in final_message.get("llm_warnings", []):
-                    self._fire("on_warning", warning)
-
-                # Accumulate usage
-                usage = final_message.get("usage", {})
-                total_input_tokens += usage.get("input_tokens", 0)
-                total_output_tokens += usage.get("output_tokens", 0)
-                self._fire("on_usage", usage)
-
-                # ── Trace LLM call ────────────────────────────────────
-                if trace:
-                    trace.add_span(
-                        step=step,
-                        event_type="llm_call",
-                        duration_ms=llm_dur_ms,
-                        tokens_in=usage.get("input_tokens"),
-                        tokens_out=usage.get("output_tokens"),
-                    )
-
-                # ── Cost budget check ─────────────────────────────────
-                if cost_tracker is not None:
-                    # Use the effective spec so sub-agent model overrides are
-                    # billed at the right rate (P0 fix).
-                    cost_tracker.record(
-                        usage,
-                        effective_spec.provider,
-                        effective_spec.model,
-                    )
-                    # One-shot warning if any call lacked pricing data.  The
-                    # budget still enforces on the priced subtotal (lower
-                    # bound) — silent "None ⇒ skip" would disable the gate.
-                    if cost_tracker.has_unpriced_usage and not unpriced_warned:
-                        unpriced_warned = True
-                        self._fire(
-                            "on_warning",
-                            f"Cost budget using lower bound: "
-                            f"{cost_tracker.unpriced_calls} call(s) had no pricing data "
-                            f"({effective_spec.provider}/{effective_spec.model}).",
-                        )
-                    current_cost = cost_tracker.cost
-                    if current_cost >= cfg.max_cost_usd:
-                        self._fire(
-                            "on_warning",
-                            f"Cost budget exceeded: ${current_cost:.4f} >= ${cfg.max_cost_usd:.4f}",
-                        )
-                        if trace:
-                            trace.add_span(step=step, event_type="cost_check", success=False,
-                                           error=f"budget ${cfg.max_cost_usd} exceeded")
-                        return _finalize_run(
-                            status="cost_limit",
-                            text=all_text or "",
-                            final_text=final_text,
-                            messages=messages,
-                            steps=step + 1,
-                            total_input_tokens=total_input_tokens,
-                            total_output_tokens=total_output_tokens,
-                            tool_calls_count=tool_calls_count,
-                            error=f"Cost budget exceeded: ${current_cost:.4f} >= ${cfg.max_cost_usd:.4f}",
-                            trace=trace,
-                            trace_total_cost_usd=current_cost,
-                        )
-
-                all_text += step_text
-                final_text = step_text
-
-                # No tool calls → done (or verification gate)
-                if not tool_call_blocks:
-                    # ── Pre-completion verification gate ───────────────
-                    # If we mutated files and haven't verified yet, inject a
-                    # self-check prompt and loop once more instead of returning.
-                    #
-                    # Boundary guard (P0 fix): never inject on the final allowed
-                    # step — the follow-up model reply has no iteration left to
-                    # run, and the dangling `[VERIFICATION]` user message would
-                    # otherwise leak into the persisted session and poison the
-                    # next turn.
-                    if (
-                        not verification_injected
-                        and should_verify(messages, tool_calls_count, since_index=turn_start_idx)
-                        and step + 1 < cfg.max_steps
-                    ):
-                        verification_injected = True
-                        if trace:
-                            trace.add_span(step=step, event_type="verification")
-                        # Append the assistant's response, then inject verification
-                        messages.append(final_message)
-                        messages.append({
-                            "role": "user",
-                            "content": build_verification_prompt(messages),
-                        })
-                        continue
-
-                    if not step_text:
-                        final_text = _extract_text(final_message)
-                        all_text = final_text or all_text
-
-                    # Apply truncation if enabled
-                    if cfg.truncate_large_inputs:
-                        content = final_message.get("content", [])
-                        final_message = dict(final_message)
-                        final_message["content"] = _truncate_tool_call_blocks(content, step_batch)
-
-                    # Allow caller to transform before append
-                    cb_am = self._callbacks.on_assistant_message
-                    if cb_am is not None:
-                        final_message = cb_am(final_message) or final_message
-                    messages.append(final_message)
-                    result_text = all_text if all_text else "I processed your request but had no text response to return."
-
-                    cost = cost_tracker.cost if cost_tracker else 0.0
-                    return _finalize_run(
-                        status="completed",
-                        text=result_text,
-                        final_text=final_text,
-                        messages=messages,
-                        steps=step + 1,
-                        total_input_tokens=total_input_tokens,
-                        total_output_tokens=total_output_tokens,
-                        tool_calls_count=tool_calls_count,
-                        trace=trace,
-                        trace_total_cost_usd=cost or 0.0,
-                    )
-
-                # Truncation detection → scale up and retry step
-                if cfg.auto_scale_on_truncation and _is_truncated(stop_reason, tool_call_blocks):
-                    consecutive_truncations += 1
-                    if consecutive_truncations > max_truncation_retries:
-                        cost = cost_tracker.cost if cost_tracker else 0.0
-                        return _finalize_run(
-                            status="error",
-                            text=all_text or "",
-                            final_text="",
-                            messages=messages,
-                            steps=step + 1,
-                            total_input_tokens=total_input_tokens,
-                            total_output_tokens=total_output_tokens,
-                            tool_calls_count=tool_calls_count,
-                            error=f"Repeated truncation ({consecutive_truncations}x) — model output exceeds capacity",
-                            trace=trace,
-                            trace_total_cost_usd=cost or 0.0,
-                        )
-                    self._fire("on_truncation")
-                    # Also fire the unified stream-retry hook so UIs that
-                    # already handle transient-error duplication can use the
-                    # same visual treatment for truncation-recovery replays.
-                    self._fire("on_stream_retry", "truncation", step_text or "")
-                    current_max_tokens = min(
-                        current_max_tokens * cfg.token_scale_factor,
-                        cfg.max_tokens_cap,
-                    )
-                    # Remove the partial step text
-                    all_text = all_text[: -len(step_text)] if step_text else all_text
-                    continue
-
-                # Successful step — reset truncation counter
-                consecutive_truncations = 0
-
-                # Append assistant message (allow caller to transform)
-                if cfg.truncate_large_inputs:
-                    content = final_message.get("content", [])
-                    final_message = dict(final_message)
-                    final_message["content"] = _truncate_tool_call_blocks(content, step_batch)
-
-                cb_am = self._callbacks.on_assistant_message
-                if cb_am is not None:
-                    transformed = cb_am(final_message)
-                    if transformed is not None:
-                        final_message = transformed
-                messages.append(final_message)
-
-                # Fire on_tool_batch for multi-tool batches
-                if len(tool_call_blocks) > 1:
-                    self._fire("on_tool_batch", len(tool_call_blocks))
-
-                # Fire on_tool_start for all tool calls BEFORE execution
-                for block in tool_call_blocks:
-                    self._fire("on_tool_start", block.name, block.input)
-
-                # Execute tools
-                # ── Cooperative cancellation check (before tools) ────
-                if self._is_cancelled():
-                    # Return error results for all pending tool calls.
-                    # Fire on_tool_end for each so callbacks see the matching
-                    # close event for the on_tool_start fired above
-                    # (without this, UIs that count starts vs. ends — e.g.
-                    # spinners, progress bars — leak resources on cancel).
-                    for block in tool_call_blocks:
-                        messages.append({
-                            "role": "tool_result",
-                            "tool_call_id": block.id,
-                            "tool_name": block.name,
-                            "content": "Cancelled",
-                            "is_error": True,
-                        })
-                        self._fire("on_tool_end", block.name, "Cancelled", True)
-                    break
-
-                tools_t0 = time.perf_counter()
-                tool_results_tuples = _execute_tools(
-                    tool_call_blocks,
-                    step_batch,
-                    cfg.concurrent_tools,
-                    cfg.max_tool_workers,
-                    cfg.tool_timeout,
-                    executor=self._executor,
-                    partial_side_effects=self._partial_side_effects,
-                )
-                tools_dur_ms = (time.perf_counter() - tools_t0) * 1000
-
-                for block, result in tool_results_tuples:
-                    tool_calls_count += 1
-                    content_str = _truncate_result(result.content, cfg.max_tool_result_chars, result.is_error)
-                    self._fire("on_tool_end", block.name, content_str, result.is_error)
-
-                    # ── Trace tool call ────────────────────────────────
-                    if trace:
-                        trace.add_span(
-                            step=step,
-                            event_type="tool_call",
-                            tool_name=block.name,
-                            tool_args=block.input,
-                            success=not result.is_error,
-                            error=content_str[:200] if result.is_error else None,
-                        )
-
-                    messages.append({
-                        "role": "tool_result",
-                        "tool_call_id": block.id,
-                        "tool_name": block.name,
-                        "content": content_str,
-                        "is_error": result.is_error,
-                    })
-
-                # ── Response-aware stuck-loop detection ────────────────
-                # Check AFTER execution so we can compare responses.  A tool
-                # is only "stuck" when the same (tool, args) returns the same
-                # response repeatedly — polling tools like check_background
-                # naturally return different responses (elapsed_seconds etc.)
-                # and are never flagged.
-                #
-                # Two correctness rules (P0 fixes, 2026-04):
-                #   1. Hash the RAW tool output, not the UI-truncated string.
-                #      Two different long outputs that happen to share a
-                #      common prefix up to max_tool_result_chars would
-                #      collide on the truncated string and look "stuck".
-                #   2. Deduplicate (name, args) keys *within a single batch*.
-                #      A legitimate parallel fanout of e.g. 3 identical
-                #      read_file calls in one step is not a stuck loop — it's
-                #      the model doing simultaneous reads.  Without this, such
-                #      a batch alone can hit threshold=3 in a single step.
-                stuck_feedback = None
-                seen_batch_keys: set[str] = set()
-                for block, result in tool_results_tuples:
-                    batch_key = _StuckLoopDetector._make_key(
-                        block.name, block.input if isinstance(block.input, dict) else {},
-                    )
-                    if batch_key in seen_batch_keys:
-                        continue
-                    seen_batch_keys.add(batch_key)
-                    feedback = stuck_detector.record(
-                        block.name,
-                        block.input,
-                        result.content,  # raw content — not the truncated display string
-                    )
-                    if feedback and not stuck_feedback:
-                        stuck_feedback = feedback
-                if stuck_feedback:
-                    self._fire("on_warning", stuck_feedback)
-                    cost = cost_tracker.cost if cost_tracker else 0.0
-                    if trace:
-                        trace.add_span(step=step, event_type="dedup_break", success=False, error=stuck_feedback)
-                    return _finalize_run(
-                        status="dedup_break",
-                        text=all_text or "",
-                        final_text=final_text,
-                        messages=messages,
-                        steps=step + 1,
-                        total_input_tokens=total_input_tokens,
-                        total_output_tokens=total_output_tokens,
-                        tool_calls_count=tool_calls_count,
-                        error=stuck_feedback,
-                        trace=trace,
-                        trace_total_cost_usd=cost or 0.0,
-                    )
-
-                # ── Cooperative cancellation check (after tools) ─────
-                if self._is_cancelled():
-                    break
-
-                # ── Mid-loop reflection / critic step ─────────────────
-                # After meaningful work boundaries (every-N cadence or
-                # sub-agent return), append a short progress-check user
-                # message so the next LLM call re-grounds on the task.
-                # Avoids drift on long-horizon rollouts.
-                if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
-                    batch_names = [b.name for b, _ in tool_results_tuples]
-                    inject, reason = reflection.should_reflect(
-                        reflect_every_n=cfg.reflect_every_n_tool_calls,
-                        reflect_after_subagent=cfg.reflect_after_subagent,
-                        tool_calls_total=tool_calls_count,
-                        tool_calls_at_last_reflection=last_reflection_count,
-                        batch_tool_names=batch_names,
-                        messages=messages,
-                    )
-                    if inject:
-                        prompt = reflection.build_reflection_prompt(
-                            reason, tool_calls_count,
-                        )
-                        messages.append({"role": "user", "content": prompt})
-                        last_reflection_count = tool_calls_count
-                        self._fire("on_reflection", reason)
-                        if trace:
-                            trace.add_span(step=step, event_type="reflection")
-
-                # ── Periodic checkpoint ──────────────────────────────
-                # At the end of each step, if a cadence is configured and
-                # we're on the boundary, persist state so crashes can
-                # resume from here.  No-op when checkpoint_dir is None.
-                if (
-                    cfg.checkpoint_every_n_steps > 0
-                    and cfg.checkpoint_dir
-                    and (step + 1) % cfg.checkpoint_every_n_steps == 0
-                ):
-                    self._write_checkpoint(
-                        step=step,
-                        messages=messages,
-                        total_input_tokens=total_input_tokens,
-                        total_output_tokens=total_output_tokens,
-                        tool_calls_count=tool_calls_count,
-                        status="in_progress",
-                    )
 
             # ── Cooperative cancellation — early exit ────────────────
             if self._is_cancelled():
                 return _finalize_run(
                     status="interrupted",
-                    text=all_text or "",
-                    final_text=final_text,
+                    text=state.all_text or "",
+                    final_text=state.final_text,
                     messages=messages,
-                    steps=step + 1,
-                    total_input_tokens=total_input_tokens,
-                    total_output_tokens=total_output_tokens,
-                    tool_calls_count=tool_calls_count,
+                    steps=state.step + 1,
+                    total_input_tokens=state.total_input_tokens,
+                    total_output_tokens=state.total_output_tokens,
+                    tool_calls_count=state.tool_calls_count,
                     trace=trace,
                 )
 
@@ -1131,9 +604,10 @@ class AgentLoop:
             if cfg.fallback_on_max_steps:
                 # Try one more streaming call with system instruction to avoid tools
                 try:
-                    fallback_context = dict(context)
-                    fallback_system = context["system_prompt"] + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]"
-                    fallback_context["system_prompt"] = fallback_system
+                    fallback_context = {
+                        "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
+                        "messages": messages,
+                    }
 
                     # Create fallback options with tool_choice=none
                     _base = _build_runtime_options(
@@ -1150,10 +624,6 @@ class AgentLoop:
                         tool_choice={"type": "none"},
                     )
 
-                    # Remove tools from fallback context to ensure no tool use
-                    if "tools" in fallback_context:
-                        del fallback_context["tools"]
-
                     if cfg.streaming:
                         fallback_text, _, _, fallback_message = self._call_streaming(fallback_context, fallback_opts)
                     else:
@@ -1161,8 +631,8 @@ class AgentLoop:
 
                     # Accumulate usage
                     usage = fallback_message.get("usage", {})
-                    total_input_tokens += usage.get("input_tokens", 0)
-                    total_output_tokens += usage.get("output_tokens", 0)
+                    state.total_input_tokens += usage.get("input_tokens", 0)
+                    state.total_output_tokens += usage.get("output_tokens", 0)
                     self._fire("on_usage", usage)
                     # B1 fix (codex review 2026-04-25): the fallback call's
                     # tokens were being added to the totals reported on
@@ -1178,19 +648,20 @@ class AgentLoop:
                             effective_spec.provider,
                             effective_spec.model,
                         )
-                        if cost_tracker.has_unpriced_usage and not unpriced_warned:
-                            unpriced_warned = True
+                        if cost_tracker.has_unpriced_usage and not state.unpriced_warned:
+                            state.unpriced_warned = True
                             self._fire(
                                 "on_warning",
                                 "cost_tracker: at least one call lacked pricing data; "
                                 "budget enforcement uses the priced subtotal only",
                             )
 
-                    # Apply truncation if enabled
+                    # Apply truncation if enabled — uses the last step_batch
+                    # built by run_step (threaded via state.last_step_batch).
                     if cfg.truncate_large_inputs:
                         content = fallback_message.get("content", [])
                         fallback_message = dict(fallback_message)
-                        fallback_message["content"] = _truncate_tool_call_blocks(content, step_batch)
+                        fallback_message["content"] = _truncate_tool_call_blocks(content, state.last_step_batch)
 
                     # Append fallback response
                     messages.append(fallback_message)
@@ -1201,13 +672,13 @@ class AgentLoop:
                     cost = cost_tracker.cost if cost_tracker else 0.0
                     return _finalize_run(
                         status="completed",
-                        text=fallback_text or all_text,
+                        text=fallback_text or state.all_text,
                         final_text=fallback_text,
                         messages=messages,
                         steps=cfg.max_steps,
-                        total_input_tokens=total_input_tokens,
-                        total_output_tokens=total_output_tokens,
-                        tool_calls_count=tool_calls_count,
+                        total_input_tokens=state.total_input_tokens,
+                        total_output_tokens=state.total_output_tokens,
+                        tool_calls_count=state.tool_calls_count,
                         trace=trace,
                         trace_total_cost_usd=cost or 0.0,
                     )
@@ -1221,13 +692,13 @@ class AgentLoop:
             cost = cost_tracker.cost if cost_tracker else 0.0
             return _finalize_run(
                 status="max_steps",
-                text=all_text or "",
-                final_text=final_text,
+                text=state.all_text or "",
+                final_text=state.final_text,
                 messages=messages,
                 steps=cfg.max_steps,
-                total_input_tokens=total_input_tokens,
-                total_output_tokens=total_output_tokens,
-                tool_calls_count=tool_calls_count,
+                total_input_tokens=state.total_input_tokens,
+                total_output_tokens=state.total_output_tokens,
+                tool_calls_count=state.tool_calls_count,
                 trace=trace,
                 trace_total_cost_usd=cost or 0.0,
             )
@@ -1235,28 +706,29 @@ class AgentLoop:
         except KeyboardInterrupt:
             return _finalize_run(
                 status="interrupted",
-                text=all_text + "\n\n[Interrupted by user]" if all_text else "[Interrupted by user]",
+                text=state.all_text + "\n\n[Interrupted by user]" if state.all_text else "[Interrupted by user]",
                 final_text="",
                 messages=messages,
-                steps=step + 1,
-                total_input_tokens=total_input_tokens,
-                total_output_tokens=total_output_tokens,
-                tool_calls_count=tool_calls_count,
+                steps=state.step + 1,
+                total_input_tokens=state.total_input_tokens,
+                total_output_tokens=state.total_output_tokens,
+                tool_calls_count=state.tool_calls_count,
                 trace=trace,
             )
         except Exception as e:
             return _finalize_run(
                 status="error",
-                text=all_text or "",
+                text=state.all_text or "",
                 final_text="",
                 messages=messages,
-                steps=step + 1,
-                total_input_tokens=total_input_tokens,
-                total_output_tokens=total_output_tokens,
-                tool_calls_count=tool_calls_count,
+                steps=state.step + 1,
+                total_input_tokens=state.total_input_tokens,
+                total_output_tokens=state.total_output_tokens,
+                tool_calls_count=state.tool_calls_count,
                 error=str(e),
                 trace=trace,
             )
+
 
     # ── LLM call + retry/fallback (delegated to LLMRunner) ──────────────
     #

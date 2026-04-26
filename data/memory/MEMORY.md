@@ -75,4 +75,4 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 [tip] SearxNG settings.yml supports `use_default_settings: true` — write only your overrides; everything else (incl. 281 engines) inherits from the default in the searxng/searxng image. Must still override `server.secret_key` (default placeholder `ultrasecretkey` makes the app refuse to start).
 [tip] SearxNG only honors a few env overrides (SEARXNG_PORT, BIND_ADDRESS, SECRET_KEY, LIMITER, PUBLIC_INSTANCE); search.formats must come from settings.yml
 [tip] Docker Compose v2.23+ supports inline `configs.content:` to embed file contents in docker-compose.yml, avoiding companion files
-[tip] web_search backend cascade (2026-04-25 onward): SearxNG → Brave → Mojeek → DDG (DDG moved to last; was flakiest). SEARXNG_URL env activates SearxNG. WEB_SEARCH_ENGINE=name forces single engine.
+[tip] web_search cascade order: SearxNG → Brave → Mojeek → DDG (DDG last due to flakiness). SEARXNG_URL activates SearxNG. WEB_SEARCH_ENGINE=name forces single engine. Tests in test_web_search.py must reflect this order.
