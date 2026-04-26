@@ -125,8 +125,15 @@ class TestDispatchExecutorGrowsWithConfig:
     def test_get_executor_grows_on_demand(self, monkeypatch):
         """Requesting more workers than current cap grows the pool."""
         # Snapshot + reset module state so the test is independent.
-        original_executor = loop_engine._tool_dispatch_executor
-        original_cap = loop_engine._tool_dispatch_cap
+        # C4 Phase 2: the canonical home for this state is now
+        # runtime/loop/tool_executor.py.  Restoring by writing through
+        # ``loop_engine._tool_dispatch_executor`` would create a STATIC
+        # attribute that shadows the PEP-562 ``__getattr__`` passthrough,
+        # breaking later tests (e.g. test_backcompat_alias_points_to_dispatch)
+        # that expect the back-compat names to mirror the live pool.
+        from jyagent.runtime.loop import tool_executor as _te
+        original_executor = _te.tool_dispatch_executor
+        original_cap = _te.tool_dispatch_cap
         try:
             exe_small = loop_engine._get_tool_dispatch_executor(8)
             cap_small = loop_engine._tool_dispatch_cap
@@ -140,8 +147,8 @@ class TestDispatchExecutorGrowsWithConfig:
             # Growth must have replaced the executor.
             assert exe_big is not exe_small
         finally:
-            loop_engine._tool_dispatch_executor = original_executor
-            loop_engine._tool_dispatch_cap = original_cap
+            _te.tool_dispatch_executor = original_executor
+            _te.tool_dispatch_cap = original_cap
 
     def test_get_executor_reuses_when_already_big_enough(self):
         """Asking for a smaller size than current cap returns the same pool."""
@@ -1027,3 +1034,86 @@ class TestC4Phase1CostExtraction:
         )
         assert ct.has_unpriced_usage is True
         assert ct.cost == 0.0  # lower bound
+
+
+# ─── C4 Phase 2: tool executor extracted to runtime/loop/tool_executor.py ────
+
+
+class TestC4Phase2ToolExecutorExtraction:
+    """C4 Phase 2: the tool-execution stack (execute_tool, execute_tool_with_timeout,
+    execute_tools, dispatch-pool state) now lives in runtime/loop/tool_executor.py.
+    Engine aliases the functions with underscore-prefixed names for internal
+    callers and exposes the mutable pool state via a PEP-562 ``__getattr__``
+    passthrough so existing tests that read the old names keep working
+    against the LIVE pool (not a stale snapshot).
+    """
+
+    def test_execute_tool_importable_from_new_home(self):
+        from jyagent.runtime.loop.tool_executor import (
+            execute_tool,
+            execute_tool_with_timeout,
+            execute_tools,
+            get_tool_dispatch_executor,
+        )
+        # All must be callables (smoke check).
+        assert callable(execute_tool)
+        assert callable(execute_tool_with_timeout)
+        assert callable(execute_tools)
+        assert callable(get_tool_dispatch_executor)
+
+    def test_engine_reexport_still_works(self):
+        """Engine's underscore-prefixed aliases must be the same objects
+        as the tool_executor public names (identity, not equality)."""
+        from jyagent.runtime.loop import engine as _engine
+        from jyagent.runtime.loop import tool_executor as _te
+        assert _engine._execute_tool is _te.execute_tool
+        assert _engine._execute_tool_with_timeout is _te.execute_tool_with_timeout
+        assert _engine._execute_tools is _te.execute_tools
+        assert _engine._get_tool_dispatch_executor is _te.get_tool_dispatch_executor
+
+    def test_module_globals_track_live_value(self):
+        """Critical: engine._tool_dispatch_executor must mirror the LIVE pool
+        in tool_executor.py, even after a grow.  This is the PEP-562 passthrough
+        test — a naive ``from .tool_executor import _tool_dispatch_executor``
+        would snapshot at import time and go stale on the first grow."""
+        from jyagent.runtime.loop import engine as _engine
+        from jyagent.runtime.loop import tool_executor as _te
+        # Grow to a large size, then confirm engine's back-compat name
+        # returns the NEW pool object (not a stale snapshot).
+        pre_grow = _engine._tool_dispatch_executor
+        _engine._get_tool_dispatch_executor(256)
+        post_grow_engine = _engine._tool_dispatch_executor
+        post_grow_te = _te.tool_dispatch_executor
+        assert post_grow_engine is post_grow_te, (
+            f"engine view ({id(post_grow_engine)}) diverged from "
+            f"tool_executor view ({id(post_grow_te)}) after grow — "
+            "PEP-562 passthrough broken"
+        )
+        # The post-grow object MUST differ from pre-grow (otherwise the
+        # test isn't actually exercising the rebind case).
+        assert post_grow_engine is not pre_grow, (
+            "grow didn't rebind — pool already >= 256 before the call? "
+            "retry the test in isolation"
+        )
+
+    def test_tool_dispatch_cap_tracks_live_value(self):
+        """Same PEP-562 check but for the integer cap (a non-object type)."""
+        from jyagent.runtime.loop import engine as _engine
+        from jyagent.runtime.loop import tool_executor as _te
+        _engine._get_tool_dispatch_executor(300)
+        assert _engine._tool_dispatch_cap == _te.tool_dispatch_cap
+        assert _engine._tool_dispatch_cap >= 300
+
+    def test_tool_executor_alias_points_at_dispatch(self):
+        """engine._tool_executor (historical shorthand) must equal
+        engine._tool_dispatch_executor — both names forward to the same
+        live object in tool_executor.py."""
+        from jyagent.runtime.loop import engine as _engine
+        assert _engine._tool_executor is _engine._tool_dispatch_executor
+
+    def test_engine_getattr_raises_on_unknown(self):
+        """The __getattr__ shim must still raise AttributeError for names
+        it doesn't own — no silent fallback."""
+        from jyagent.runtime.loop import engine as _engine
+        with pytest.raises(AttributeError, match="no attribute"):
+            _ = _engine._definitely_does_not_exist  # noqa: SLF001
