@@ -127,6 +127,122 @@ class RunState:
     # Latest per-step artefact — read by engine's max_steps fallback path
     last_step_batch: ToolBatch = field(default_factory=ToolBatch.empty)
 
+    # ── Constructor ────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_loop(
+        cls,
+        loop: "AgentLoop",
+        system_prompt: str,
+        messages: list,
+        initial_todos: list | None = None,
+    ) -> "RunState":
+        """Run-setup factory: prepares the AgentLoop instance for a fresh
+        run and constructs the per-run mutable state.
+
+        Side effects on ``loop`` (intentional, not just construction):
+          - ``loop._partial_side_effects = []`` — reset mutating-timeout
+            accumulator so back-to-back turns on the same instance don't
+            carry stale names forward (A1 from codex review 2026-04-25).
+          - ``loop._run_id`` set when checkpointing is enabled and not
+            already preset.
+          - ``loop._todos`` seeded from ``initial_todos`` (validated via
+            ``normalize_todo``); falls back to ``[]`` on TypeError with
+            a warning.
+
+        Side-effect-free construction:
+          - tracer started against the effective model spec (provider/
+            model picked from ``loop._model_spec`` if set, else
+            ``loop._runtime_owner.model_spec``).
+          - cost_tracker built only when ``cfg.max_cost_usd`` is set.
+          - stuck_detector built unconditionally (cheap; the dedup
+            threshold gates its actual blocking).
+          - write_todos closure bound when todos are enabled — the
+            closure reads/writes ``loop._todos`` via accessor functions
+            so later mutation by the engine remains visible. (Codex Part 2 #4.)
+          - reflection module lazily imported only when at least one
+            reflection knob is on.
+
+        Why these mutations live here and not on the loop's __init__:
+        ``run()`` is reentrant within a single instance (turn-by-turn or
+        sub-agent re-use) but ``__init__`` only fires once. Per-run reset
+        must happen at the top of every run, and the cleanest place is
+        the run-state constructor.
+        """
+        cfg = loop._config
+
+        # A1: reset accumulator. MUST happen at every run, not just init.
+        loop._partial_side_effects = []
+
+        turn_start_idx = len(messages)
+
+        # Lazy reflection import — opt-in by config.
+        if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
+            from . import reflection as _reflection
+            reflection_module = _reflection
+        else:
+            reflection_module = None
+
+        # Ensure a run id when checkpointing is enabled (CLI may have
+        # preset one via set_run_id() — preserve that).
+        if cfg.checkpoint_dir and not loop._run_id:
+            from .checkpoint import new_run_id
+            loop._run_id = new_run_id()
+
+        # Seed todos + bind write_todos closure if enabled.
+        write_todos_fn = None
+        if cfg.todos_enabled:
+            from .todos import build_write_todos_tool, normalize_todo
+            if initial_todos:
+                try:
+                    loop._todos = [normalize_todo(t) for t in initial_todos]
+                except TypeError as e:
+                    loop._fire("on_warning", f"ignoring invalid initial_todos: {e}")
+                    loop._todos = []
+            else:
+                loop._todos = []
+
+            # Closure reads/writes loop._todos via accessors so engine
+            # mutations remain visible to the write_todos tool.
+            def _get_store() -> list:
+                return loop._todos
+
+            def _set_store(new_list: list) -> None:
+                loop._todos = new_list
+
+            write_todos_fn = build_write_todos_tool(_get_store, _set_store)
+
+        # Effective model spec for tracing + cost accounting (sub-agent
+        # tier override wins over owner default).
+        effective_spec = loop._model_spec or loop._runtime_owner.model_spec
+
+        # Tracer + cost tracker + stuck detector. Late imports kept local
+        # to avoid pulling these modules during ``import engine`` when a
+        # caller never runs the loop (e.g. test collection).
+        from .tracing import get_tracer
+        from .cost import CostTracker
+        from .engine import _StuckLoopDetector
+
+        trace = get_tracer()
+        if trace:
+            trace.start(effective_spec.provider, effective_spec.model)
+        cost_tracker = CostTracker() if cfg.max_cost_usd is not None else None
+        stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
+
+        return cls(
+            system_prompt=system_prompt,
+            messages=messages,
+            turn_start_idx=turn_start_idx,
+            current_max_tokens=cfg.initial_max_tokens,
+            cost_tracker=cost_tracker,
+            stuck_detector=stuck_detector,
+            tools_batch=ToolBatch.empty(),
+            trace=trace,
+            effective_spec=effective_spec,
+            write_todos_fn=write_todos_fn,
+            reflection_module=reflection_module,
+        )
+
 
 # ─── Tagged-union step outcome ───────────────────────────────────────────────
 

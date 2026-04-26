@@ -545,92 +545,21 @@ class AgentLoop:
         """Core run loop.  Public entry point is ``run()`` which also
         snapshots the final todos onto the result.
 
-        C4 Phase 5 (codex review 2026-04-25, follow-up): the per-step body
-        lives in ``runtime/loop/step.py::run_step``.  The setup phase below
-        will move to ``RunState.from_loop()`` in a follow-up commit; for
-        this commit (Phase-5 C1) it stays inline so the diff is reviewable
-        as "extract one method, no other behavioural change."
+        After C4 Phase 5, this method is a thin orchestrator: setup is in
+        ``RunState.from_loop()``, the per-step body is in
+        ``runtime/loop/step.py::run_step``, and only the for-step counter,
+        post-loop terminal handlers (cancelled-exit / max_steps fallback /
+        max_steps exit), and the outer try/except live here.
         """
         from .step import RunState, run_step, StepContinue, StepTerminate, StepBreak
 
         cfg = self._config
-        # A1 (codex review 2026-04-25): reset the mutating-timeout
-        # accumulator at the top of every run so back-to-back turns on the
-        # same AgentLoop instance don't carry stale names forward.
-        self._partial_side_effects = []
-        # Boundary between prior-turn history and this-turn appends.
-        # Passed to ``should_verify`` so a replayed historical mutation
-        # cannot re-arm the verification gate on a non-mutating new turn
-        # (Codex review 2026-04-25 Part 2 #5).
-        turn_start_idx = len(messages)
-
-        # Lazy import of the reflection module so test imports of
-        # loop_engine stay cheap and reflection is opt-in by config.
-        if cfg.reflect_every_n_tool_calls > 0 or cfg.reflect_after_subagent:
-            from . import reflection
-            reflection_module = reflection
-        else:
-            reflection_module = None
-
-        # Ensure a run id is set when checkpointing is enabled (outer
-        # layers may have preset one via set_run_id).
-        if cfg.checkpoint_dir and not self._run_id:
-            from .checkpoint import new_run_id
-            self._run_id = new_run_id()
-
-        # ── Seed todos scratchpad ─────────────────────────────────────
-        # Lazy import to keep the dependency optional.
-        write_todos_fn = None
-        if cfg.todos_enabled:
-            from .todos import (
-                build_write_todos_tool,
-                normalize_todo,
-            )
-            if initial_todos:
-                try:
-                    self._todos = [normalize_todo(t) for t in initial_todos]
-                except TypeError as e:
-                    self._fire("on_warning", f"ignoring invalid initial_todos: {e}")
-                    self._todos = []
-            else:
-                self._todos = []
-
-            # Per-loop write_todos tool closing over self._todos.
-            def _get_store() -> list:
-                return self._todos
-
-            def _set_store(new_list: list) -> None:
-                self._todos = new_list
-
-            write_todos_fn = build_write_todos_tool(_get_store, _set_store)
-
-        # ── Harness trackers ──────────────────────────────────────────
-        # Effective model spec — sub-agent override wins over owner default.
-        # Used for tracing and cost accounting so sub-agents on a different
-        # tier are billed against the correct pricing.
-        effective_spec = self._model_spec or self._runtime_owner.model_spec
-
-        trace = get_tracer()
-        if trace:
-            trace.start(effective_spec.provider, effective_spec.model)
-        cost_tracker = _CostTracker() if cfg.max_cost_usd is not None else None
-        stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
-
-        # Build mutable run state. Threaded by reference into every
-        # ``run_step`` call; no copying.
-        state = RunState(
-            system_prompt=system_prompt,
-            messages=messages,
-            turn_start_idx=turn_start_idx,
-            current_max_tokens=cfg.initial_max_tokens,
-            cost_tracker=cost_tracker,
-            stuck_detector=stuck_detector,
-            tools_batch=ToolBatch.empty(),
-            trace=trace,
-            effective_spec=effective_spec,
-            write_todos_fn=write_todos_fn,
-            reflection_module=reflection_module,
-        )
+        state = RunState.from_loop(self, system_prompt, messages, initial_todos)
+        # Aliases for the post-loop terminal handlers below — keeps the
+        # diff minimal vs. pre-Phase-5 while still routing through state.
+        trace = state.trace
+        cost_tracker = state.cost_tracker
+        effective_spec = state.effective_spec
 
         try:
             for step in range(cfg.max_steps):

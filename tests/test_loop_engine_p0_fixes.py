@@ -194,22 +194,38 @@ class TestCostTrackerUsesEffectiveSpec:
 
     def test_cost_record_uses_effective_spec_variable(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._run_impl)
-        # The run() body must hoist the effective spec before the loop.
-        assert "effective_spec = self._model_spec or self._runtime_owner.model_spec" in source, (
-            "AgentLoop.run must resolve effective_spec once at the top of run()."
+        from jyagent.runtime.loop import step
+        # After C4 Phase 5, effective_spec is hoisted in RunState.from_loop()
+        # (the run-state factory called at the top of _run_impl). The
+        # cost_tracker.record(...) call lives in step.run_step.
+        from_loop_src = inspect.getsource(step.RunState.from_loop)
+        run_step_src = inspect.getsource(step.run_step)
+
+        assert "effective_spec = loop._model_spec or loop._runtime_owner.model_spec" in from_loop_src, (
+            "RunState.from_loop must resolve effective_spec once at the top of "
+            "the run-state factory (formerly at the top of _run_impl)."
         )
-        # And cost_tracker.record must consume it.
-        # Locate the cost_tracker.record(...) call and check its args.
-        idx = source.find("cost_tracker.record(")
-        assert idx != -1, "cost_tracker.record(...) call is missing"
-        snippet = source[idx : idx + 400]
+        # cost_tracker.record(...) must consume effective_spec.
+        idx = run_step_src.find("cost_tracker.record(")
+        assert idx != -1, "cost_tracker.record(...) call is missing in run_step"
+        snippet = run_step_src[idx : idx + 400]
         assert "effective_spec.provider" in snippet
         assert "effective_spec.model" in snippet
-        assert "self._runtime_owner.model_spec.provider" not in snippet, (
+        assert "loop._runtime_owner.model_spec.provider" not in snippet, (
             "cost_tracker.record must NOT hardcode the owner spec — that loses "
             "sub-agent model overrides."
         )
+        # Also confirm the engine's max_steps fallback path records cost
+        # against effective_spec (B1 fix from codex review 2026-04-25).
+        engine_src = inspect.getsource(le.AgentLoop._run_impl)
+        fallback_idx = engine_src.find("fallback_on_max_steps")
+        assert fallback_idx != -1, "max_steps fallback block missing"
+        fallback_snippet = engine_src[fallback_idx : fallback_idx + 3000]
+        assert "cost_tracker.record(" in fallback_snippet, (
+            "max_steps fallback must record cost against effective_spec "
+            "(B1 fix)."
+        )
+        assert "effective_spec.provider" in fallback_snippet
 
 
 # ─── P0 #4 — Max-steps fallback always fires when enabled ────────────────────
