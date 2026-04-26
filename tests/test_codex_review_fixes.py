@@ -1310,3 +1310,90 @@ class TestC4Phase3LLMRunnerExtraction:
             _engine._is_transient_error = orig
         assert result == final
         assert streaming_calls == 2, "retry should invoke self._call_streaming twice"
+
+
+# ─── C4 Phase 4: compaction helpers extracted to runtime/loop/compaction.py ──
+
+
+class TestC4Phase4CompactionExtraction:
+    """C4 Phase 4: the three compaction helpers (``truncate_result``,
+    ``compact_messages``, ``truncate_tool_call_blocks``) moved to
+    ``jyagent.runtime.loop.compaction``.  Engine keeps three
+    underscore-prefixed back-compat aliases so the many existing test
+    imports and internal call sites continue to work unchanged.
+
+    All three are **pure functions** — no closure state, no mutable
+    module attributes — so identity checks are sufficient proof that
+    the engine alias and the compaction-module original are the same
+    object.  (Phase 2's PEP-562 shim is not needed here because there
+    is nothing to rebind.)
+    """
+
+    def test_compaction_module_exposes_public_names(self):
+        from jyagent.runtime.loop import compaction
+        for name in ("truncate_result", "compact_messages", "truncate_tool_call_blocks"):
+            assert hasattr(compaction, name), name
+            assert callable(getattr(compaction, name)), name
+
+    def test_engine_aliases_point_at_compaction(self):
+        """engine._{truncate_result,compact_messages,truncate_tool_call_blocks}
+        must be the same object as the compaction-module original.
+        Any divergence means two copies of the function exist in the
+        tree."""
+        from jyagent.runtime.loop import engine as _engine
+        from jyagent.runtime.loop import compaction as _c
+        assert _engine._truncate_result is _c.truncate_result
+        assert _engine._compact_messages is _c.compact_messages
+        assert _engine._truncate_tool_call_blocks is _c.truncate_tool_call_blocks
+
+    def test_truncate_result_head_tail_split(self):
+        """truncate_result keeps first 85% + last 10% of max_chars when
+        over budget; returns unchanged when under budget or on error."""
+        from jyagent.runtime.loop.compaction import truncate_result
+
+        # Under budget — pass through.
+        assert truncate_result("short", 100) == "short"
+
+        # Error results are NEVER truncated — users need the full trace.
+        big_error = "x" * 10_000
+        assert truncate_result(big_error, 100, is_error=True) == big_error
+
+        # Over budget + non-error — truncated with marker.
+        big = "A" * 1000 + "B" * 1000  # 2000 chars, max 100
+        out = truncate_result(big, 100, is_error=False)
+        assert len(out) < len(big)
+        assert "truncated" in out
+        assert "total: 2000 chars" in out
+        # Head preserved, tail preserved.
+        assert out.startswith("A")
+        assert out.endswith("B")
+
+    def test_compact_messages_passthrough_when_under_budget(self):
+        """When estimated tokens <= max_tokens, compact_messages returns
+        the ORIGINAL list (identity) — no deep copy, no mutation."""
+        from jyagent.runtime.loop.compaction import compact_messages
+        from jyagent.runtime.tools.registry import ToolBatch
+
+        msgs = [{"role": "user", "content": "hi"}]
+        # Very large max_tokens so we're certainly under budget.
+        out = compact_messages(msgs, max_tokens=10**9, compact_chars=1000, batch=ToolBatch.empty())
+        assert out is msgs  # identity, not equality — proves the fast path
+
+    def test_truncate_tool_call_blocks_leaves_unrelated_blocks_alone(self):
+        """truncate_tool_call_blocks only touches ``tool_call`` blocks
+        whose tool has ``large_input_keys`` — text blocks pass through
+        unchanged (identity preserved)."""
+        from jyagent.runtime.loop.compaction import truncate_tool_call_blocks
+        from jyagent.runtime.tools.registry import ToolBatch
+
+        text_block = {"type": "text", "text": "hello"}
+        tool_block = {
+            "type": "tool_call",
+            "id": "call_1",
+            "name": "unknown_tool",  # not in empty batch → no large_keys
+            "arguments": {"code": "x" * 100_000},
+        }
+        out = truncate_tool_call_blocks([text_block, tool_block], ToolBatch.empty())
+        # Empty batch → no known large_input_keys → no truncation.
+        assert out[0] is text_block
+        assert out[1] is tool_block  # same object reference
