@@ -29,7 +29,25 @@ from __future__ import annotations
 import copy
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, Optional
+
+
+def _readonly(d: Mapping) -> Mapping:
+    """Wrap ``d`` in a ``MappingProxyType`` for ToolBatch fields.
+
+    B2 fix (codex review 2026-04-25): ``@dataclass(frozen=True)`` only
+    freezes the *field references* on a ToolBatch instance — the dicts
+    they point to are still mutable.  We deep-copy at freeze() time, so
+    cross-batch mutation is already blocked, but a single batch's
+    schema_map / functions / timeout_hints / etc. used to be writeable
+    by any caller that held the batch reference.  ``MappingProxyType``
+    is a zero-cost read-only view that raises ``TypeError`` on every
+    mutating method (``__setitem__``, ``pop``, ``update``, ``clear``).
+
+    Re-wrapping an existing ``MappingProxyType`` is fine and still O(1).
+    """
+    return MappingProxyType(d) if not isinstance(d, MappingProxyType) else d
 
 
 @dataclass(frozen=True)
@@ -51,18 +69,45 @@ class ToolBatch:
 
     version: int  # registry version when frozen; -1 for ad-hoc batches (e.g. tool_source)
     schemas: tuple[dict, ...]  # deep-copied; safe to share across threads
-    schema_map: dict[str, dict]  # name → schema (also deep-copied)
-    functions: dict[str, Callable]  # name → callable
+    schema_map: Mapping[str, dict]  # name → schema (read-only view via MappingProxyType)
+    functions: Mapping[str, Callable]  # name → callable (read-only view)
     parallel_safe: frozenset[str]  # tool names with parallel_safe=True
-    timeout_hints: dict[str, int]  # name → timeout (seconds)
-    large_input_keys: dict[str, frozenset[str]]  # name → keys whose values to truncate
-    compaction_priority: dict[str, str]  # name → "ephemeral" | "standard" | "persistent"
+    timeout_hints: Mapping[str, int]  # name → timeout (seconds) — read-only view
+    large_input_keys: Mapping[str, frozenset[str]]  # name → keys to truncate — read-only
+    compaction_priority: Mapping[str, str]  # read-only: "ephemeral" | "standard" | "persistent"
+    # Names of tools that perform externally-observable side effects (filesystem
+    # writes, shell commands, sub-process spawns, sub-agent dispatches, MCP
+    # calls).  Surfaced by ``is_mutating(name)`` so the dispatch loop can
+    # classify timeouts: a mutating-tool timeout leaks a daemon thread whose
+    # partial side effect is now invisible to the model, and the loop records
+    # the name in ``LoopResult.partial_side_effects`` for outer layers to
+    # reconcile.  A1 fix (codex review 2026-04-25): before this, every timeout
+    # returned the same "consider smaller steps" error regardless of whether
+    # the tool was read-only or mutating, so the model would happily retry a
+    # half-completed edit / shell script.
+    mutating: frozenset[str]  # tool names with mutating=True
 
     # ─── Convenience accessors (mirror the legacy ToolRegistry shape so
     #     callers can swap registry → batch with no method changes) ────────
 
     def is_parallel_safe(self, name: str) -> bool:
         return name in self.parallel_safe
+
+    def is_mutating(self, name: str) -> bool:
+        """Return True if the tool is flagged as having side effects.
+
+        Used by the dispatch loop's timeout path: a mutating-tool timeout is
+        treated as a potential-partial-effect event (warning logged, name
+        appended to ``LoopResult.partial_side_effects``) because the daemon
+        thread running the tool body keeps running in the background after
+        we report the timeout — the operation may complete invisibly.
+
+        Unknown names default to False: an overlaid or sub-source tool that
+        was not registered through the canonical metadata pipeline is
+        treated as read-only (safer to under-warn than to spam warnings on
+        benign tools that happened to slip past metadata registration).
+        """
+        return name in self.mutating
 
     def get_timeout_hint(self, name: str) -> int | None:
         return self.timeout_hints.get(name)
@@ -88,12 +133,13 @@ class ToolBatch:
         return cls(
             version=-1,
             schemas=(),
-            schema_map={},
-            functions={},
+            schema_map=_readonly({}),
+            functions=_readonly({}),
             parallel_safe=frozenset(),
-            timeout_hints={},
-            large_input_keys={},
-            compaction_priority={},
+            timeout_hints=_readonly({}),
+            large_input_keys=_readonly({}),
+            compaction_priority=_readonly({}),
+            mutating=frozenset(),
         )
 
     def with_overlay(
@@ -131,12 +177,19 @@ class ToolBatch:
         return ToolBatch(
             version=self.version,
             schemas=new_schemas,
-            schema_map=new_schema_map,
-            functions=new_functions,
+            schema_map=_readonly(new_schema_map),
+            functions=_readonly(new_functions),
             parallel_safe=new_parallel,
             timeout_hints=self.timeout_hints,
             large_input_keys=self.large_input_keys,
             compaction_priority=self.compaction_priority,
+            # Overlaid tools default to non-mutating.  The two in-tree
+            # overlays (``write_todos``, verification-context injections)
+            # are local scratchpad ops with no externally-observable side
+            # effects, so this default is correct for every current
+            # caller.  If a future overlay adds a side-effecting tool, it
+            # must register mutating=True via the canonical registry path.
+            mutating=self.mutating,
         )
 
 
@@ -166,7 +219,8 @@ class ToolRegistry:
                  parallel_safe: bool = False,
                  timeout_hint: int | None = None,
                  large_input_keys: set[str] | None = None,
-                 compaction_priority: str | None = None) -> None:
+                 compaction_priority: str | None = None,
+                 mutating: bool = False) -> None:
         with self._lock:
             self._functions[name] = fn
             self._schema_map[name] = schema
@@ -178,6 +232,12 @@ class ToolRegistry:
                 meta["large_input_keys"] = large_input_keys
             if compaction_priority:
                 meta["compaction_priority"] = compaction_priority
+            # ``mutating`` is stored only when True: keeps the metadata
+            # dict compact (most tools are read-only) and matches the
+            # "present means yes" convention used by the freeze() path
+            # for every other boolean-like flag.
+            if mutating:
+                meta["mutating"] = True
             self._metadata[name] = meta
             self._version += 1
 
@@ -228,15 +288,20 @@ class ToolRegistry:
                 for name, meta in self._metadata.items()
                 if "compaction_priority" in meta
             }
+            mutating = frozenset(
+                name for name, meta in self._metadata.items()
+                if meta.get("mutating", False)
+            )
             return ToolBatch(
                 version=self._version,
                 schemas=schemas,
-                schema_map=schema_map,
-                functions=dict(self._functions),
+                schema_map=_readonly(schema_map),
+                functions=_readonly(dict(self._functions)),
                 parallel_safe=parallel_safe,
-                timeout_hints=timeout_hints,
-                large_input_keys=large_input_keys,
-                compaction_priority=compaction_priority,
+                timeout_hints=_readonly(timeout_hints),
+                large_input_keys=_readonly(large_input_keys),
+                compaction_priority=_readonly(compaction_priority),
+                mutating=mutating,
             )
 
     def snapshot(self) -> tuple[int, list[dict], dict[str, Callable]]:
@@ -265,6 +330,17 @@ class ToolRegistry:
     def is_parallel_safe(self, name: str) -> bool:
         with self._lock:
             return self._metadata.get(name, {}).get("parallel_safe", False)
+
+    def is_mutating(self, name: str) -> bool:
+        """Return True if the tool was registered with ``mutating=True``.
+
+        Defense-in-depth mirror of ``ToolBatch.is_mutating``: callers that
+        legitimately need a live lookup (e.g. ad-hoc diagnostics) can use
+        this, but the dispatch loop reads the flag off the per-step
+        ``ToolBatch`` snapshot instead.  Unknown names default to False.
+        """
+        with self._lock:
+            return self._metadata.get(name, {}).get("mutating", False)
 
     def get_timeout_hint(self, name: str) -> int | None:
         """Return the tool's preferred timeout in seconds, or None for default."""

@@ -50,19 +50,33 @@ _TOOL_METADATA = {
     "list_directory":  {"parallel_safe": True, "compaction_priority": "ephemeral"},
     "glob_files":      {"parallel_safe": True, "compaction_priority": "ephemeral"},
     "grep_files":      {"parallel_safe": True, "compaction_priority": "ephemeral"},
-    "run_shell":       {"parallel_safe": False, "timeout_hint": "from_input", "compaction_priority": "ephemeral"},
-    "write_file":      {"parallel_safe": False, "large_input_keys": {"content"}},
-    "edit_file":       {"parallel_safe": False, "large_input_keys": {"new_text", "old_text"}},
+    "run_shell":       {"parallel_safe": False, "timeout_hint": "from_input", "compaction_priority": "ephemeral", "mutating": True},
+    "write_file":      {"parallel_safe": False, "large_input_keys": {"content"}, "mutating": True},
+    "edit_file":       {"parallel_safe": False, "large_input_keys": {"new_text", "old_text"}, "mutating": True},
     "manage_memory":   {"parallel_safe": False},
     "manage_skills":   {"parallel_safe": False},
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180, "compaction_priority": "persistent"},
-    "mcp":             {"parallel_safe": False, "timeout_hint": 180},
-    "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}},
+    "mcp":             {"parallel_safe": False, "timeout_hint": 180, "mutating": True},
+    "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}, "mutating": True},
     "check_agent":     {"parallel_safe": True, "compaction_priority": "ephemeral"},
-    "run_background":  {"parallel_safe": False},
+    "run_background":  {"parallel_safe": False, "mutating": True},
     "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral"},
     "web_search":      {"parallel_safe": True, "timeout_hint": 180, "compaction_priority": "persistent"},
 }
+
+# NOTE on the ``mutating`` flag (A1 fix, codex review 2026-04-25):
+#   Flagged tools have externally-observable side effects (filesystem writes,
+#   shell commands, sub-process spawns, sub-agent dispatches, MCP calls) that
+#   the dispatch loop cannot cancel when the tool times out — the daemon
+#   thread carrying the side effect keeps running past the timeout report.
+#   The loop engine uses this flag to (a) log a loud WARNING, (b) rewrite the
+#   ToolResult error text so the model knows to re-verify state before
+#   retrying, and (c) accumulate the tool name in
+#   ``LoopResult.partial_side_effects`` for outer layers to reconcile.
+#   Read-only / query tools (read_file, list_directory, grep_files, glob_files,
+#   web_search, web_fetch, check_background, check_agent, manage_memory,
+#   manage_skills) default to mutating=False because a timed-out read is
+#   idempotent — retrying is always safe.
 
 _registry = get_registry()
 for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA, SUBAGENT_SCHEMA, CHECK_AGENT_SCHEMA, WEB_SEARCH_SCHEMA]:
@@ -80,4 +94,5 @@ for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA, SUBAGENT_SCHEMA, CHE
             timeout_hint=timeout_hint,
             large_input_keys=large_keys,
             compaction_priority=compaction_priority,
+            mutating=meta.get("mutating", False),
         )

@@ -255,11 +255,18 @@ class SessionStats:
 
     @property
     def provider(self) -> str:
-        return self._provider
+        # C3 (codex review 2026-04-25): lock the read so it's correct under
+        # free-threaded CPython (3.13t+) where attribute reads are not
+        # guaranteed atomic without the GIL.  On GIL'd CPython the lock is
+        # cheap and documents the intent — the set_active_model writer at
+        # L251-254 takes self._lock, so readers must too for consistency.
+        with self._lock:
+            return self._provider
 
     @property
     def model(self) -> str:
-        return self._model
+        with self._lock:
+            return self._model
 
     def _usage_value(self, usage, key: str) -> int:
         if usage is None:

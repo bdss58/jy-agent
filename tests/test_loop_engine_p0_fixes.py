@@ -89,7 +89,17 @@ class TestNoNestedPoolDeadlock:
     """
 
     def test_backcompat_alias_points_to_dispatch(self):
-        assert le._tool_executor is _tool_dispatch_executor
+        # Read both names via the live module attribute path.
+        # C4 Phase 2 (2026-04-25): the pool is now canonical in
+        # runtime/loop/tool_executor.py and engine.py forwards via PEP-562
+        # ``__getattr__``.  The earlier-imported ``_tool_dispatch_executor``
+        # at the top of this file is an import-time snapshot that goes stale
+        # once any test grows the pool (previous tests in TestDispatchExecutorGrowsWithConfig
+        # do exactly that).  Do a fresh read so this back-compat invariant
+        # check tests the POST-MOVE semantics (both names surface the
+        # current live pool) instead of the pre-move invariant (both names
+        # were module-load aliases to the same frozen object).
+        assert le._tool_executor is le._tool_dispatch_executor
 
     def test_parallel_batch_larger_than_dispatch_pool_completes(self):
         """A parallel batch of tools equal to the dispatch-pool width must
@@ -399,13 +409,17 @@ class TestStreamLoopCancellationCheck:
 
     def test_stream_loop_has_cancel_check(self):
         import inspect
-        source = inspect.getsource(le.AgentLoop._call_streaming)
+        # C4 Phase 3 (2026-04-25): streaming machinery moved to
+        # ``runtime.loop.llm_runner.LLMRunner.call_streaming``.  The AgentLoop
+        # ``_call_streaming`` delegate is a one-liner — inspect the runner.
+        from jyagent.runtime.loop.llm_runner import LLMRunner
+        source = inspect.getsource(LLMRunner.call_streaming)
         # The check must appear before the `etype = event.get(...)` dispatch
         # so that an in-flight stream can be short-circuited on cancel.
         assert "for event in stream:" in source
         assert "self._is_cancelled()" in source, (
-            "_call_streaming must check self._is_cancelled() inside the "
-            "event loop to short-circuit on Ctrl-C."
+            "LLMRunner.call_streaming must check self._is_cancelled() inside "
+            "the event loop to short-circuit on Ctrl-C."
         )
         # Sanity: the cancel check lands before the event dispatch.
         iter_idx = source.find("for event in stream:")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import logging
 import hashlib
 import json
 import random
@@ -43,6 +44,9 @@ from .callbacks import LoopCallbacks  # re-exported for back-compat
 from .config import LoopConfig, LoopResult  # re-exported for back-compat
 
 
+_logger = logging.getLogger(__name__)
+
+
 # ─── Core types ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -68,24 +72,25 @@ def _t_as_dict(t: Any) -> dict:
 
 
 # ─── Shared dispatch executor ────────────────────────────────────────────────
-# `_execute_tools()` fans out a parallel-safe batch onto this shared pool.
-# Order is preserved via index-keyed result slots, so out-of-order completion
-# (`as_completed`) doesn't scramble results.  Per-call concurrency is capped
-# by a BoundedSemaphore sized from LoopConfig.max_tool_workers — the shared
-# pool stays hot while each batch still honours its configured width.
-#
-# Tool *bodies* (inside `_execute_tool_with_timeout`) do NOT use a pool —
-# they run in daemon threads so a timed-out body holds no pool slot and dies
-# with the process.  Python futures aren't cancellable, so pooling bodies
-# would permanently leak workers every time a tool timed out.
-
-_tool_dispatch_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=8, thread_name_prefix="jyagent-tool-dispatch",
+# C4 Phase 2 (codex review 2026-04-25): the shared tool-dispatch pool, its
+# lazy-grow helper, and the ``_execute_tool*`` helpers moved to
+# ``runtime/loop/tool_executor.py``.  Internal call sites still use the
+# underscore-prefixed names via these aliases; tests that poke module
+# globals (``_tool_dispatch_executor``, ``_tool_dispatch_cap``, etc.) also
+# see them here via the PEP-562 ``__getattr__`` at the bottom of the file.
+from .tool_executor import (  # noqa: E402
+    execute_tool as _execute_tool,
+    execute_tool_with_timeout as _execute_tool_with_timeout,
+    execute_tools as _execute_tools,
+    get_tool_dispatch_executor as _get_tool_dispatch_executor,
 )
-atexit.register(_tool_dispatch_executor.shutdown, wait=False)
-
-# Backwards-compat alias (callers that pass a pool explicitly).
-_tool_executor = _tool_dispatch_executor
+# The pool + lock + cap are MODULE STATE that ``get_tool_dispatch_executor``
+# REBINDS when the pool grows.  A plain ``from .tool_executor import
+# _tool_dispatch_executor`` would snapshot the pre-grow object and go stale.
+# The engine-level back-compat names (``_tool_dispatch_executor``,
+# ``_tool_dispatch_cap``, ``_tool_dispatch_lock``, ``_tool_executor``) are
+# served by a module-level ``__getattr__`` (PEP 562) at the bottom of this
+# file, which delegates to the live attribute on ``tool_executor``.
 
 
 # ─── Private helpers ─────────────────────────────────────────────────────────
@@ -93,51 +98,11 @@ _tool_executor = _tool_dispatch_executor
 
 # ─── Harness helpers ─────────────────────────────────────────────────────────
 
-class _CostTracker:
-    """Track estimated cost within a single run() for budget enforcement.
-
-    Delegates pricing math to ``stats.compute_call_cost`` so the engine
-    and ``SessionStats`` cannot drift on Anthropic 1M-context tier
-    multipliers, the ``input_tokens_include_cache_reads`` credit, or
-    cache-creation pricing.  Codex review 2026-04-25 Part 1 #9/#10:
-    the previous implementation reimplemented a simplified pricing
-    formula and quietly under-counted cost on long-context calls.
-
-    When a call's (provider, model) has no pricing entry the call's
-    tokens are NOT included in the running total and ``unpriced_calls``
-    is bumped.  The budget check still runs on the partial total — i.e.
-    the accounted cost is a lower bound.  An earlier design returned
-    ``None`` from ``known_cost`` in that case, which silently disabled
-    the budget entirely; the current design reports a lower-bound cost
-    and exposes ``has_unpriced_usage`` so the caller can warn once.
-    """
-
-    def __init__(self):
-        self.total_cost: float = 0.0
-        self.unpriced_calls: int = 0
-
-    def record(self, usage: dict, provider: str, model: str) -> None:
-        from ..stats import compute_call_cost
-        breakdown = compute_call_cost(usage, provider, model)
-        if not breakdown.is_priced:
-            # Only count it as unpriced if there was actual token activity.
-            # ``compute_call_cost`` already reports ``is_priced=True`` for
-            # zero-token calls, so reaching this branch with no tokens is
-            # impossible — but be explicit.
-            if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
-                self.unpriced_calls += 1
-            return
-        self.total_cost += breakdown.cost_usd
-
-    @property
-    def has_unpriced_usage(self) -> bool:
-        return self.unpriced_calls > 0
-
-    @property
-    def cost(self) -> float:
-        """Best-effort running total in USD.  When ``has_unpriced_usage`` is
-        True, this is a lower bound — unpriced calls are not included."""
-        return self.total_cost
+# C4 Phase 1 (codex review 2026-04-25): extracted to runtime/loop/cost.py.
+# Kept as a private alias so internal imports (`_CostTracker()`) continue
+# to work without churn; phases 2-5 will similarly extract tool executor,
+# LLM runner, compaction, and leave engine.py as just the LoopController.
+from .cost import CostTracker as _CostTracker  # noqa: E402
 
 
 class _StuckLoopDetector:
@@ -236,26 +201,19 @@ class _StuckLoopDetector:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_text(message: dict) -> str:
-    """Extract concatenated text blocks from an AssistantMessage."""
-    return "".join(
-        block.get("text", "")
-        for block in message.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def _extract_tool_calls(message: dict) -> list[ToolCallRequest]:
-    """Extract tool_call blocks from an AssistantMessage."""
-    return [
-        ToolCallRequest(
-            id=block["id"],
-            name=block["name"],
-            input=block.get("arguments", {}),
-        )
-        for block in message.get("content", [])
-        if isinstance(block, dict) and block.get("type") == "tool_call"
-    ]
+# C4 Phase 3 (codex review 2026-04-25): extraction helpers moved to
+# runtime/loop/llm_runner.py.  Engine keeps back-compat aliases with the
+# historical underscore-prefixed names so internal call sites (and tests
+# that monkeypatch them) continue to work unchanged.
+from .llm_runner import (
+    extract_text as _extract_text,
+    extract_tool_calls as _extract_tool_calls,
+    is_transient_error as _is_transient_error,
+    build_runtime_options as _build_runtime_options,
+)
 
 
 def _is_truncated(stop_reason: str, tool_calls: list[ToolCallRequest]) -> bool:
@@ -336,8 +294,19 @@ def _finalize_run(
         }
         if trace_total_cost_usd is not None:
             finish_kwargs["total_cost_usd"] = trace_total_cost_usd
-        trace.finish(**finish_kwargs)
-        trace.flush()
+        # A3 (codex review 2026-04-25): tracing must never fail-close a
+        # successful run.  Disk-full / read-only fs / permission errors here
+        # used to bubble up and discard the entire LoopResult.  Log + swallow
+        # so observability stays non-fatal.
+        try:
+            trace.finish(**finish_kwargs)
+            trace.flush()
+        except Exception as trace_err:  # noqa: BLE001 — observability is best-effort
+            _logger.warning(
+                "trace finalize failed (non-fatal): %s: %s",
+                type(trace_err).__name__,
+                trace_err,
+            )
     return LoopResult(
         status=status,
         text=text,
@@ -351,498 +320,15 @@ def _finalize_run(
     )
 
 
-def _truncate_result(content: str, max_chars: int, is_error: bool = False) -> str:
-    """Truncate a tool result string.  Error results are never truncated."""
-    if len(content) <= max_chars or is_error:
-        return content
-    head = int(max_chars * 0.85)
-    tail = int(max_chars * 0.10)
-    return (
-        content[:head]
-        + f"\n\n[... truncated {len(content) - head - tail} chars "
-        + f"(total: {len(content)} chars) ...]\n\n"
-        + content[-tail:]
-    )
-
-
-def _compact_messages(
-    messages: list,
-    max_tokens: int,
-    compact_chars: int,
-    batch: ToolBatch,
-) -> list:
-    """Multi-tier context compaction for messages sent to the LLM.
-
-    Applied in order of aggressiveness:
-      Tier 0 — Thinking block pruning: strip ``thinking`` blocks from old messages.
-      Tier 1 — Observation masking: beyond ``mask_distance`` messages from the end,
-               tool results are fully cleared (replaced with a short placeholder).
-               Within the mask distance but outside the keep-recent zone, results
-               are truncated to ``compact_chars``.
-      Tier 2 — Compaction-priority awareness: "ephemeral" tool results are cleared
-               more aggressively (zero chars) even within the mask distance.
-
-    Keeps the last 2 messages fully intact (the LLM needs them for reasoning).
-    Returns the original list unchanged if no modification was performed.
-
-    ``batch`` is the per-step tool snapshot used for compaction-priority
-    lookups.  Tools that have been unregistered between the step that called
-    them and now degrade gracefully to ``"standard"`` priority — the
-    optimisation is lost but no behaviour is incorrect.
-    """
-    from ...config import OBSERVATION_MASK_DISTANCE
-
-    estimated = estimate_conversation_tokens(messages)
-    if estimated <= max_tokens:
-        return messages
-
-    n = len(messages)
-    keep_intact = 2  # always preserve last 2 messages verbatim
-
-    # Deep-copy to avoid mutating originals
-    compacted = []
-    for m in messages:
-        mc = dict(m)
-        c = mc.get("content")
-        if isinstance(c, list):
-            mc["content"] = [dict(b) if isinstance(b, dict) else b for b in c]
-        compacted.append(mc)
-    did_compact = False
-
-    for i in range(n - keep_intact):
-        msg = compacted[i]
-        distance_from_end = n - 1 - i  # how far this message is from the newest
-        far_away = distance_from_end > OBSERVATION_MASK_DISTANCE
-
-        # ── Tier 0: Thinking block pruning ──────────────────────────
-        # Strip thinking blocks from all but the last few messages.
-        #
-        # Provider-aware rule (P0 fix): Anthropic extended-thinking emits
-        # cryptographically-signed `thinking` blocks that are bound to a
-        # following tool-invocation block in the same assistant message.
-        # If we strip the thinking block but keep the tool block, the
-        # signature becomes invalid and the provider rejects the next turn.
-        # So: preserve all `thinking` blocks in any message that also
-        # contains at least one tool-invocation block.  We check BOTH type
-        # names because the engine sees assistant messages in their
-        # normalized form (`tool_call`, per runtime.types.ToolCallBlock),
-        # while raw Anthropic-SDK payloads sometimes reach compaction with
-        # the provider-native `tool_use` name.  Safe across providers —
-        # non-Anthropic responses simply won't have the adjacency in the
-        # first place.
-        _TOOL_BLOCK_TYPES = ("tool_call", "tool_use")
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            has_tool_block = any(
-                isinstance(b, dict) and b.get("type") in _TOOL_BLOCK_TYPES
-                for b in content
-            )
-            filtered_blocks = []
-            for block in content:
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") == "thinking"
-                    and not has_tool_block
-                ):
-                    did_compact = True
-                    continue  # safe to drop
-                filtered_blocks.append(block)
-            if len(filtered_blocks) != len(content):
-                compacted[i]["content"] = filtered_blocks
-                content = filtered_blocks  # use filtered for subsequent tiers
-
-        # ── Tier 1 & 2: Observation masking + priority-aware compaction ──
-        # Process tool_result messages (top-level role)
-        if msg.get("role") == "tool_result":
-            result_text = str(msg.get("content", ""))
-            tool_name = msg.get("tool_name", "")
-            priority = batch.get_compaction_priority(tool_name) if tool_name else "standard"
-
-            if far_away or priority == "ephemeral":
-                # Full clear — observation masking
-                if result_text:
-                    compacted[i]["content"] = "[Tool result cleared]"
-                    did_compact = True
-            elif len(result_text) > compact_chars and priority != "persistent":
-                # Truncate to compact_chars
-                compacted[i]["content"] = (
-                    result_text[:compact_chars]
-                    + f"\n[... compacted from {len(result_text)} chars ...]"
-                )
-                did_compact = True
-            continue
-
-        # Process tool_result blocks inside list content (e.g., after normalization)
-        if isinstance(content, list):
-            new_blocks = []
-            block_changed = False
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    result_text = str(block.get("content", ""))
-                    tool_name = block.get("tool_name", "")
-                    priority = batch.get_compaction_priority(tool_name) if tool_name else "standard"
-
-                    if far_away or priority == "ephemeral":
-                        block = dict(block)
-                        block["content"] = "[Tool result cleared]"
-                        block_changed = True
-                    elif len(result_text) > compact_chars and priority != "persistent":
-                        block = dict(block)
-                        block["content"] = (
-                            result_text[:compact_chars]
-                            + f"\n[... compacted from {len(result_text)} chars ...]"
-                        )
-                        block_changed = True
-                new_blocks.append(block)
-            if block_changed:
-                compacted[i]["content"] = new_blocks
-                did_compact = True
-
-    if not did_compact:
-        return messages
-
-    return compacted
-
-
-def _truncate_tool_call_blocks(blocks: list, batch: ToolBatch) -> list:
-    """Truncate large tool_call argument fields in normalized assistant content.
-
-    ``batch`` is the per-step tool snapshot used for ``large_input_keys``
-    metadata.  Tools not in the batch (e.g. unregistered between dispatch
-    and the next assistant transformation) degrade to no-truncation —
-    safer than mid-step live registry reads (Codex Part 1 #4).
-    """
-    out = []
-    for block in blocks:
-        if isinstance(block, dict) and block.get("type") == "tool_call":
-            large_keys = batch.get_large_input_keys(block.get("name", ""))
-            if large_keys:
-                inp = block.get("arguments", {})
-                truncated_inp = {}
-                did_truncate = False
-                for k, v in inp.items():
-                    if k in large_keys and isinstance(v, str) and len(v) > MAX_TOOL_USE_INPUT_CHARS:
-                        truncated_inp[k] = (
-                            v[:MAX_TOOL_USE_INPUT_CHARS]
-                            + f"\n[... truncated, {len(v)} chars total ...]"
-                        )
-                        did_truncate = True
-                    else:
-                        truncated_inp[k] = v
-                if did_truncate:
-                    block = dict(block)
-                    block["arguments"] = truncated_inp
-        out.append(block)
-    return out
-
-
-def _execute_tool(
-    name: str,
-    tool_input: dict,
-    batch: ToolBatch,
-) -> ToolResult:
-    """Execute a single tool call with validation.  Always returns ToolResult.
-
-    All tool resolution (function lookup, schema for validation) goes
-    through the per-step ``batch`` snapshot — no live registry reads
-    here, so a concurrent ``register()``/``unregister()`` cannot pair
-    a function with a different schema mid-batch (Codex Part 1 #4).
-    """
-    fn = batch.get_function(name)
-    if fn is None:
-        return enrich_error(ToolResult(
-            f"Error: Unknown tool '{name}'. Available: {batch.list_tools()[:20]}",
-            is_error=True,
-        ), name)
-
-    tool_schema = batch.get_schema(name)
-    validation_error = validate_tool_input(name, tool_input, fn, tool_schema)
-    if validation_error:
-        return enrich_error(ToolResult(validation_error, is_error=True), name)
-
-    try:
-        if tool_input is None:
-            tool_input = {}
-        raw = fn(**tool_input)
-        if isinstance(raw, ToolResult):
-            return enrich_error(raw, name)
-        return ToolResult(str(raw))
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        return enrich_error(ToolResult(
-            f"Error calling tool {name}: {e}\n{error_detail}",
-            is_error=True,
-        ), name)
-
-
-def _execute_tools(
-    blocks: list[ToolCallRequest],
-    batch: ToolBatch,
-    concurrent_mode: bool,
-    max_workers: int,
-    timeout: int,
-    executor: concurrent.futures.ThreadPoolExecutor | None = None,
-) -> list[tuple[ToolCallRequest, ToolResult]]:
-    """Execute tool calls with selective parallelisation.
-
-    Parallel-safe tools run concurrently; state-mutating tools run sequentially
-    as barriers between parallel batches.  Results are always in original order.
-
-    ``max_workers`` caps how many tool bodies may execute concurrently across
-    a parallel sub-batch.  A per-call ``BoundedSemaphore`` enforces this cap
-    on top of the shared dispatch pool so the shared pool can stay hot (with
-    a larger worker count) without violating per-loop concurrency preferences.
-    Sequential paths don't acquire permits — they're serial by construction.
-
-    All ``parallel_safe`` decisions read from the immutable ``batch`` — a
-    concurrent registry mutation cannot flip a tool's flag mid-partition
-    (Codex Part 1 #11).
-    """
-    if not blocks:
-        return []
-
-    # Fast path: single tool or concurrency disabled
-    if len(blocks) <= 1 or not concurrent_mode:
-        results = []
-        for block in blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
-            results.append((block, result))
-        return results
-
-    # Check if any tool is parallel-safe
-    if not any(batch.is_parallel_safe(b.name) for b in blocks):
-        results = []
-        for block in blocks:
-            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
-            results.append((block, result))
-        return results
-
-    # Per-batch concurrency cap (honours cfg.max_tool_workers).  Only applied
-    # on the parallel path — sequential calls are already serialised.
-    body_permits = threading.BoundedSemaphore(max(1, max_workers))
-
-    # Partition into contiguous groups
-    results_arr: list[tuple[ToolCallRequest, ToolResult] | None] = [None] * len(blocks)
-    i = 0
-    while i < len(blocks):
-        if batch.is_parallel_safe(blocks[i].name):
-            parallel_batch = []
-            while i < len(blocks) and batch.is_parallel_safe(blocks[i].name):
-                parallel_batch.append((i, blocks[i]))
-                i += 1
-
-            pool = executor or _tool_dispatch_executor
-            futures = {
-                pool.submit(
-                    _execute_tool_with_timeout,
-                    block.name, block.input, batch, timeout,
-                    body_permits=body_permits,
-                ): (idx, block)
-                for idx, block in parallel_batch
-            }
-            for future in concurrent.futures.as_completed(futures):
-                idx, block = futures[future]
-                try:
-                    results_arr[idx] = (block, future.result())
-                except Exception as exc:
-                    error_detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                    results_arr[idx] = (block, ToolResult(
-                        f"Error calling tool {block.name}: {exc}\n{error_detail}",
-                        is_error=True,
-                    ))
-        else:
-            block = blocks[i]
-            result = _execute_tool_with_timeout(block.name, block.input, batch, timeout)
-            results_arr[i] = (block, result)
-            i += 1
-
-    # Guard: fill any slots that are still None (e.g. executor.submit() itself failed)
-    return [
-        r if r is not None else (blocks[i], ToolResult("Internal dispatch error", is_error=True))
-        for i, r in enumerate(results_arr)
-    ]
-
-
-def _execute_tool_with_timeout(
-    name: str,
-    tool_input: dict,
-    batch: ToolBatch,
-    default_timeout: int,
-    executor: concurrent.futures.ThreadPoolExecutor | None = None,
-    body_permits: threading.BoundedSemaphore | None = None,
-) -> ToolResult:
-    """Execute a tool body with a timeout.
-
-    Uses a daemon thread per invocation rather than a shared pool.  Rationale
-    (P0 fix, 2026-04): Python threads are not cancellable — `future.cancel()`
-    on a running thread is a no-op, so a timed-out tool running in a shared
-    pool permanently consumes a worker slot.  Under enough timeouts the pool
-    starves and every subsequent tool call blocks waiting for a slot that
-    never frees.
-
-    Daemon threads sidestep this:
-      * A timed-out thread keeps running but holds no pool slot.
-      * Daemon status guarantees it cannot block process exit.
-      * Thread creation overhead is ~0.1 ms — negligible next to any LLM call.
-
-    The ``executor`` parameter is kept for backwards compatibility (callers
-    that passed an explicit pool) but is now ignored.  Dispatch-level
-    parallelism still uses ``_tool_dispatch_executor``; only the inner
-    timeout wrapper changed.
-
-    ``body_permits`` (optional) caps concurrent live tool bodies to honour
-    ``LoopConfig.max_tool_workers`` independent of the dispatch-pool width.
-    Released as soon as ``done.wait(timeout)`` returns, so a tool that
-    times out does not hold a permit while its daemon thread continues in
-    the background.
-
-    The per-step ``batch`` snapshot supplies the timeout hint, function,
-    and schema — no live registry reads, so a concurrent registration
-    cannot change the effective timeout mid-call.
-    """
-    timeout = default_timeout
-    hint = batch.get_timeout_hint(name)
-    if hint is not None:
-        timeout = max(timeout, hint)
-
-    # run_shell manages its own timeout — give extra slack
-    if name == "run_shell":
-        user_timeout = (tool_input or {}).get("timeout", 60)
-        timeout = max(timeout, int(user_timeout) + 10)
-
-    result_holder: list[ToolResult | None] = [None]
-    exc_holder: list[BaseException | None] = [None]
-    done = threading.Event()
-
-    def _run_body() -> None:
-        try:
-            result_holder[0] = _execute_tool(name, tool_input, batch)
-        except BaseException as e:  # noqa: BLE001 — we need to propagate everything
-            exc_holder[0] = e
-        finally:
-            done.set()
-
-    if body_permits is not None:
-        body_permits.acquire()
-    try:
-        t = threading.Thread(
-            target=_run_body,
-            name=f"jyagent-tool-body:{name}",
-            daemon=True,
-        )
-        t.start()
-        timed_out = not done.wait(timeout)
-    finally:
-        if body_permits is not None:
-            body_permits.release()
-
-    if timed_out:
-        # Timeout — the daemon thread continues running but holds no pool
-        # slot, so there's nothing to leak.  We just report the timeout.
-        return ToolResult(
-            f"Error: Tool '{name}' timed out after {timeout}s. "
-            f"Consider breaking the operation into smaller steps.",
-            is_error=True,
-        )
-
-    if exc_holder[0] is not None:
-        # KeyboardInterrupt in the worker is rare (main thread gets SIGINT)
-        # but propagate anyway.  _execute_tool normally catches exceptions
-        # and returns an error ToolResult, so reaching this branch implies
-        # something pathological.
-        if isinstance(exc_holder[0], KeyboardInterrupt):
-            raise exc_holder[0]
-        return enrich_error(
-            ToolResult(
-                f"Error: Tool '{name}' raised an uncaught exception: "
-                f"{type(exc_holder[0]).__name__}: {exc_holder[0]}",
-                is_error=True,
-            ),
-            name,
-        )
-
-    result = result_holder[0]
-    if result is None:
-        return ToolResult(
-            f"Error: Tool '{name}' returned no result (worker finished "
-            f"without producing output)",
-            is_error=True,
-        )
-    return result
-
-
-def _is_transient_error(error: BaseException) -> bool:
-    """Return True if the error is likely transient and worth retrying.
-
-    Checks concrete exception types first to avoid false positives from
-    keyword-matching against arbitrary error messages.
-    """
-    # --- Network / transport layer (always transient) ---
-    import httpx  # local import to avoid hard dependency at module level
-    if isinstance(error, (
-        httpx.ConnectError,
-        httpx.ReadTimeout,
-        httpx.WriteTimeout,
-        httpx.ConnectTimeout,
-        httpx.PoolTimeout,
-        httpx.RemoteProtocolError,
-        ConnectionResetError,
-        BrokenPipeError,
-        ConnectionAbortedError,
-    )):
-        return True
-
-    # --- Provider SDK errors (transient if server-side) ---
-    try:
-        import anthropic as _anth
-        if isinstance(error, _anth.APIStatusError) and error.status_code in (429, 500, 502, 503, 529):
-            return True
-        if isinstance(error, (_anth.APIConnectionError, _anth.APITimeoutError)):
-            return True
-    except ImportError:
-        pass
-    try:
-        import openai as _oai
-        if isinstance(error, _oai.APIStatusError) and error.status_code in (429, 500, 502, 503):
-            return True
-        if isinstance(error, (_oai.APIConnectionError, _oai.APITimeoutError)):
-            return True
-    except ImportError:
-        pass
-
-    # --- JSON decode failure (often a truncated stream response) ---
-    if isinstance(error, json.JSONDecodeError):
-        return True
-
-    # --- Fallback: keyword match, but only for generic / unknown types ---
-    msg = str(error).lower()
-    transient_keywords = [
-        "overloaded", "server_error", "peer closed",
-        "connection reset", "broken pipe",
-    ]
-    return any(kw in msg for kw in transient_keywords)
-
-
-def _build_runtime_options(
-    runtime_owner: LLMClient,
-    max_output_tokens: int,
-    model_spec: ModelSpec | None = None,
-    metadata: dict | None = None,
-) -> LLMOptions:
-    """Build LLMOptions with reasoning config for the active provider."""
-    spec = model_spec or runtime_owner.model_spec
-    return LLMOptions(
-        max_output_tokens=max_output_tokens,
-        timeout=STREAM_TIMEOUT,
-        reasoning=get_reasoning_config_for_provider(
-            spec.provider,
-            max_output_tokens=max_output_tokens,
-            model=spec.model,
-        ),
-        metadata=metadata,
-    )
+# C4 Phase 4 (codex-review 2026-04-25): compaction helpers moved to
+# runtime/loop/compaction.py.  Engine keeps underscore-prefixed back-compat
+# aliases so tests and internal callers that import the historical names
+# continue to work unchanged.
+from .compaction import (  # noqa: E402
+    compact_messages as _compact_messages,
+    truncate_result as _truncate_result,
+    truncate_tool_call_blocks as _truncate_tool_call_blocks,
+)
 
 
 # ─── AgentLoop ───────────────────────────────────────────────────────────────
@@ -871,12 +357,34 @@ class AgentLoop:
         self._cancel_event = cancel_event
         # Reuse the module-level shared executor to avoid accumulating
         # ThreadPoolExecutor objects and atexit handlers across turns and
-        # sub-agent dispatches.
-        self._executor = _tool_executor
+        # sub-agent dispatches.  A2 fix: ensure the pool is at least as
+        # wide as the configured ``max_tool_workers`` (the historical
+        # singleton was hard-capped at 8, silently throttling configs
+        # that asked for more dispatch parallelism).
+        self._executor = _get_tool_dispatch_executor(config.max_tool_workers)
         # Task-plan scratchpad (see jyagent/todos.py).  Populated via the
         # `write_todos` tool and seeded optionally via run(initial_todos=...)
         # so outer layers can carry the plan across turns.
         self._todos: list = []
+        # A1 fix (codex review 2026-04-25): accumulator for mutating-tool
+        # timeouts.  Populated by ``_execute_tool_with_timeout`` via the
+        # ``partial_side_effects=`` kwarg threaded through ``_execute_tools``;
+        # snapshotted onto ``LoopResult.partial_side_effects`` in ``run()``.
+        # Reset at the top of ``_run_impl`` so back-to-back .run() calls on
+        # the same AgentLoop instance don't bleed state across turns.
+        self._partial_side_effects: list[str] = []
+        # C2 (codex review 2026-04-25): AgentLoop holds substantial per-run
+        # state on the instance (_todos, _run_id, _partial_side_effects,
+        # closures, etc).  Concurrent .run() calls on a single instance
+        # would silently corrupt that state — they'd share the todo list,
+        # the same checkpoint identity, and the same mutating-timeout
+        # accumulator.  Enforce single-run ownership with an exclusive
+        # threading.Lock acquired non-blockingly at the top of run() so the
+        # second caller sees a clear RuntimeError instead of a silent race.
+        # ``threading.Lock`` (not RLock) by design: even nested .run() from
+        # the same thread is wrong (the inner call would clobber the outer
+        # call's _partial_side_effects on entry).
+        self._run_lock = threading.Lock()
         # Run id for checkpointing.  Fresh per AgentLoop; outer layers can
         # override via `set_run_id()` before calling run() to correlate
         # checkpoints with an external request/session.
@@ -977,24 +485,56 @@ class AgentLoop:
         Thin wrapper around ``_run_impl`` that attaches the final todos
         scratchpad and writes a terminal checkpoint (if enabled),
         regardless of which exit path fired.
+
+        Raises ``RuntimeError`` if a previous ``run()`` on this instance
+        is still in flight (C2 fix, codex review 2026-04-25): AgentLoop
+        owns per-run mutable state (_todos, _run_id, _partial_side_effects,
+        closures over _todos) that concurrent or re-entrant runs would
+        silently corrupt.
         """
-        result = self._run_impl(system_prompt, messages, initial_todos)
-        if self._config.todos_enabled:
-            # Serialize to dict-form for easy JSON persistence by outer layers.
-            from .todos import todo_to_dict
-            result.todos = [todo_to_dict(t) for t in self._todos]
-        if self._config.checkpoint_dir:
-            # Terminal ("final") checkpoint — includes status + error.
-            self._write_checkpoint(
-                step="final",
-                messages=result.messages,
-                total_input_tokens=result.total_input_tokens,
-                total_output_tokens=result.total_output_tokens,
-                tool_calls_count=result.tool_calls_count,
-                status=result.status,
-                error=result.error,
+        # Lazy-init: test utilities that build AgentLoop via __new__ to
+        # skip __init__ don't set _run_lock.  Installing it on first call
+        # is safe because the very first .run() caller has exclusive
+        # access by construction.
+        if not hasattr(self, "_run_lock"):
+            self._run_lock = threading.Lock()
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "AgentLoop.run() is already in progress on this instance. "
+                "AgentLoop is not reentrant; construct a new AgentLoop "
+                "(or wait for the previous run to return) before calling "
+                "run() again."
             )
-        return result
+        try:
+            result = self._run_impl(system_prompt, messages, initial_todos)
+            if self._config.todos_enabled:
+                # Serialize to dict-form for easy JSON persistence by outer layers.
+                from .todos import todo_to_dict
+                result.todos = [todo_to_dict(t) for t in self._todos]
+            # A1 (codex review 2026-04-25): mirror the todos pattern — snapshot
+            # the mutating-timeout accumulator onto the result so every exit
+            # path benefits without having to thread the list through every
+            # _finalize_run() call site.  Copy defensively so a caller that
+            # retains the returned list can't mutate the AgentLoop's internal
+            # state on the next run.
+            result.partial_side_effects = list(self._partial_side_effects)
+            if self._config.checkpoint_dir:
+                # Terminal ("final") checkpoint — includes status + error.
+                self._write_checkpoint(
+                    step="final",
+                    messages=result.messages,
+                    total_input_tokens=result.total_input_tokens,
+                    total_output_tokens=result.total_output_tokens,
+                    tool_calls_count=result.tool_calls_count,
+                    status=result.status,
+                    error=result.error,
+                )
+            return result
+        finally:
+            # C2: release the reentrance guard regardless of how _run_impl
+            # exited (return, raise, KeyboardInterrupt) so a subsequent
+            # run() on the same instance is not deadlocked.
+            self._run_lock.release()
 
     def _run_impl(
         self,
@@ -1012,6 +552,10 @@ class AgentLoop:
         total_output_tokens = 0
         tool_calls_count = 0
         last_reflection_count = 0  # tool_calls_count at last reflection injection
+        # A1 (codex review 2026-04-25): reset the mutating-timeout
+        # accumulator at the top of every run so back-to-back turns on the
+        # same AgentLoop instance don't carry stale names forward.
+        self._partial_side_effects = []
         # Boundary between prior-turn history and this-turn appends.
         # Passed to ``should_verify`` so a replayed historical mutation
         # cannot re-arm the verification gate on a non-mutating new turn
@@ -1116,6 +660,13 @@ class AgentLoop:
                         timeout_hints=reg_batch.timeout_hints,
                         large_input_keys=reg_batch.large_input_keys,
                         compaction_priority=reg_batch.compaction_priority,
+                        # Inherit mutating classification from the registry
+                        # freeze — tool_source functions that happen to share
+                        # a registered name pick up the registered metadata;
+                        # purely dynamic names (e.g. MCP tools that
+                        # auto-registered via the real register() path)
+                        # bring their own.  A1 fix (codex review 2026-04-25).
+                        mutating=reg_batch.mutating,
                     )
                 elif step == 0 or registry.version != tools_batch.version:
                     # Re-freeze only when the registry has changed.  The
@@ -1422,6 +973,7 @@ class AgentLoop:
                     cfg.max_tool_workers,
                     cfg.tool_timeout,
                     executor=self._executor,
+                    partial_side_effects=self._partial_side_effects,
                 )
                 tools_dur_ms = (time.perf_counter() - tools_t0) * 1000
 
@@ -1612,6 +1164,27 @@ class AgentLoop:
                     total_input_tokens += usage.get("input_tokens", 0)
                     total_output_tokens += usage.get("output_tokens", 0)
                     self._fire("on_usage", usage)
+                    # B1 fix (codex review 2026-04-25): the fallback call's
+                    # tokens were being added to the totals reported on
+                    # LoopResult, but ``cost_tracker`` was never updated —
+                    # so ``trace_total_cost_usd`` (read three lines below
+                    # from ``cost_tracker.cost``) silently under-counted by
+                    # whatever the fallback turn cost.  Record here using
+                    # the same effective_spec the rest of the loop uses, so
+                    # sub-agent tier overrides bill at the right rate.
+                    if cost_tracker is not None:
+                        cost_tracker.record(
+                            usage,
+                            effective_spec.provider,
+                            effective_spec.model,
+                        )
+                        if cost_tracker.has_unpriced_usage and not unpriced_warned:
+                            unpriced_warned = True
+                            self._fire(
+                                "on_warning",
+                                "cost_tracker: at least one call lacked pricing data; "
+                                "budget enforcement uses the priced subtotal only",
+                            )
 
                     # Apply truncation if enabled
                     if cfg.truncate_large_inputs:
@@ -1685,7 +1258,36 @@ class AgentLoop:
                 trace=trace,
             )
 
-    # ── LLM call with retry ──────────────────────────────────────────────
+    # ── LLM call + retry/fallback (delegated to LLMRunner) ──────────────
+    #
+    # C4 Phase 3 (codex review 2026-04-25): the call machinery lives in
+    # ``llm_runner.LLMRunner``.  These methods are kept as thin delegates
+    # because internal code and tests call them by name (and tests
+    # monkeypatch them on the instance).  The runner is created lazily on
+    # first use so subclasses / tests that mutate ``self._runtime_owner``,
+    # ``self._config``, ``self._callbacks``, ``self._cancel_event``, or
+    # ``self._model_spec`` after ``__init__`` still see the new values —
+    # one-shot build, then cached for the remainder of the instance's life.
+
+    def _get_llm_runner(self):
+        """Return (and memoise) the per-instance ``LLMRunner``.
+
+        Built on first demand so post-__init__ swaps of runtime_owner /
+        callbacks / cancel_event / model_spec are visible.  Once built, the
+        runner is reused for the rest of the AgentLoop's lifetime.
+        """
+        from .llm_runner import LLMRunner
+        runner = getattr(self, "_llm_runner_cached", None)
+        if runner is None:
+            runner = LLMRunner(
+                runtime_owner=self._runtime_owner,
+                config=self._config,
+                callbacks=self._callbacks,
+                cancel_event=self._cancel_event,
+                model_spec=self._model_spec,
+            )
+            self._llm_runner_cached = runner
+        return runner
 
     def _call_llm_with_retry(
         self,
@@ -1694,6 +1296,13 @@ class AgentLoop:
         step: int,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
+
+        C4 Phase 3: we keep the retry loop in AgentLoop (rather than routing
+        straight to ``LLMRunner.call_with_retry``) so that it dispatches
+        through ``self._call_streaming`` / ``self._call_complete``.  Several
+        tests and internal diagnostics override those methods on a subclass
+        or monkeypatch them on the instance to inject transient failures —
+        that contract is preserved.
 
         Returns (step_text, tool_call_blocks, stop_reason, final_message).
         """
@@ -1713,19 +1322,20 @@ class AgentLoop:
                 if _is_transient_error(err) and attempt < cfg.retry_attempts:
                     if self._is_cancelled():
                         raise
-                    # Exponential backoff with "equal jitter" (AWS architecture
-                    # recommendation) to avoid thundering-herd when multiple
-                    # parallel sub-agents all retry a 529 at the same moment.
+                    # Exponential backoff with "equal jitter" (AWS
+                    # architecture recommendation) to avoid thundering-herd
+                    # when multiple parallel sub-agents all retry a 529 at
+                    # the same moment:
                     #   half the delay is deterministic exponential,
                     #   half is uniform random in [0, base * 2^attempt / 2].
                     base = cfg.retry_base_delay * (2 ** attempt)
                     delay = base / 2 + random.uniform(0, base / 2)
                     self._fire("on_retry", attempt + 1, err)
                     # Signal UI that any partial output from the failed
-                    # attempt will be replayed on retry (visual de-duplication
-                    # hook).  `partial_stream_text` is stashed by
-                    # `_call_streaming` on the exception; missing for
-                    # non-streaming path.
+                    # attempt will be replayed on retry (visual
+                    # de-duplication hook).  ``partial_stream_text`` is
+                    # stashed by ``_call_streaming`` on the exception;
+                    # missing for the non-streaming path.
                     partial_text = getattr(err, "partial_stream_text", "")
                     self._fire("on_stream_retry", "transient_error", partial_text)
                     # Cancel-aware backoff: wake immediately on Ctrl-C so we
@@ -1738,162 +1348,47 @@ class AgentLoop:
         # Should not reach here, but just in case:
         raise last_error  # type: ignore[misc]
 
-    # ── non-streaming call ───────────────────────────────────────────────
-
     def _call_complete(
         self,
         context: dict,
         options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Non-streaming: runtime_owner.complete() -> extract text/tool_calls."""
-        final_message = self._runtime_owner.complete(
-            context, options=options, model_spec=self._model_spec,
-        )
-        stop_reason = final_message.get("stop_reason", "stop")
-
-        if stop_reason == "error":
-            error_msg = final_message.get("error_message", "Unknown error")
-            raise RuntimeError(error_msg)
-
-        step_text = _extract_text(final_message)
-        if step_text:
-            self._fire("on_text_delta", step_text)
-
-        tool_calls = _extract_tool_calls(final_message)
-        return step_text, tool_calls, stop_reason, final_message
-
-    # ── streaming call ───────────────────────────────────────────────────
+        """Thin delegate → ``LLMRunner.call_complete``."""
+        return self._get_llm_runner().call_complete(context, options)
 
     def _call_streaming(
         self,
         context: dict,
         options: LLMOptions,
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
-        """Streaming: consume LLMStream events and fire callbacks.
+        """Thin delegate → ``LLMRunner.call_streaming``."""
+        return self._get_llm_runner().call_streaming(context, options)
 
-        Delta-emission policy is controlled by ``cfg.buffered_streaming``:
 
-        * ``False`` (default) — fire ``on_text_delta`` live as tokens arrive.
-          On transient error mid-stream, the user sees partial output and the
-          retry replays it, producing visible duplication.  The engine fires
-          ``on_stream_retry`` before the retry so UIs can mark/clear the
-          duplicated region.
-        * ``True`` — buffer deltas locally and only flush them to
-          ``on_text_delta`` after a clean ``done`` event.  A failed attempt
-          discards its buffer silently.  Eliminates duplication at the cost
-          of losing live-token UX.
+# ─── PEP 562 back-compat shim for tool_executor module state ────────────────
+#
+# C4 Phase 2: the pool + lock + cap are MUTABLE module state that
+# ``get_tool_dispatch_executor()`` rebinds inside ``tool_executor.py`` when
+# the pool grows.  If engine.py imported them as values at module-import
+# time, every post-grow read from ``loop_engine._tool_dispatch_executor``
+# would see the pre-grow snapshot.  47 test references across 4 files
+# read those names through the engine module path.
+#
+# PEP 562 (Python 3.7+) lets a module define ``__getattr__`` for lazy /
+# forwarding attribute access.  Each lookup takes one import (cheap) plus
+# one ``getattr`` and returns the live object from tool_executor.py.
 
-        The buffered partial text is stashed on the raised exception as
-        ``err.partial_stream_text`` so ``_call_llm_with_retry`` can pass it
-        to ``on_stream_retry``.
-        """
-        cfg = self._config
-        text_parts: list[str] = []
-        # Tracks how many characters have already been flushed to
-        # on_text_delta — used for buffered mode and for partial-text
-        # reporting on error.
-        emitted_len = 0
-        final_message: dict | None = None
-        thinking_active = False
-        stream = None
+_TOOL_EXECUTOR_PASSTHROUGH = {
+    "_tool_dispatch_executor": "tool_dispatch_executor",
+    "_tool_dispatch_cap":      "tool_dispatch_cap",
+    "_tool_dispatch_lock":     "tool_dispatch_lock",
+    "_tool_executor":          "tool_dispatch_executor",
+}
 
-        def _flush_pending() -> None:
-            """Emit un-flushed buffered deltas (buffered mode only)."""
-            nonlocal emitted_len
-            if emitted_len >= sum(len(p) for p in text_parts):
-                return
-            pending = "".join(text_parts)[emitted_len:]
-            if pending:
-                self._fire("on_text_delta", pending)
-                emitted_len += len(pending)
 
-        try:
-            stream = self._runtime_owner.stream(
-                context, options=options, model_spec=self._model_spec,
-            )
-            for event in stream:
-                # Cancellation check inside the stream loop so Ctrl-C
-                # doesn't wait for the provider to close — latency-sensitive.
-                if self._is_cancelled():
-                    raise KeyboardInterrupt("cancelled during stream")
-                etype = event.get("type")
-
-                if etype == "text_delta":
-                    text = event.get("text", "")
-                    if thinking_active:
-                        thinking_active = False
-                        self._fire("on_thinking_stop")
-                    text_parts.append(text)
-                    if not cfg.buffered_streaming:
-                        # Live mode: emit now.
-                        self._fire("on_text_delta", text)
-                        emitted_len += len(text)
-                    # Buffered mode: accumulate, flush on `done`.
-
-                elif etype == "thinking_start":
-                    if not thinking_active:
-                        thinking_active = True
-                        self._fire("on_thinking_start")
-
-                elif etype == "thinking_delta":
-                    if not thinking_active:
-                        thinking_active = True
-                        self._fire("on_thinking_start")
-
-                elif etype in ("tool_call_start", "tool_call_delta"):
-                    if thinking_active:
-                        thinking_active = False
-                        self._fire("on_thinking_stop")
-
-                elif etype == "thinking_end":
-                    if thinking_active:
-                        thinking_active = False
-                        self._fire("on_thinking_stop")
-
-                elif etype == "done":
-                    final_message = event["message"]
-                    # Buffered mode: flush the accumulated text now that we
-                    # know the stream completed cleanly.
-                    if cfg.buffered_streaming:
-                        _flush_pending()
-
-                elif etype == "error":
-                    final_message = event["message"]
-
-            if final_message is None:
-                final_message = stream.get_final_message()
-
-            stop_reason = final_message.get("stop_reason", "stop")
-            if stop_reason == "error":
-                error_msg = final_message.get("error_message", "Unknown streaming error")
-                # Attach partial text so the retry layer can report it to
-                # on_stream_retry.  Accumulated even in buffered mode — the
-                # caller decides what (if anything) to do with it.
-                err = RuntimeError(error_msg)
-                err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
-                raise err
-
-            # Successful completion: in live mode emitted_len already equals
-            # the full text length; in buffered mode the done-handler above
-            # flushed it.  Nothing more to do.
-            tool_calls = _extract_tool_calls(final_message)
-            return "".join(text_parts), tool_calls, stop_reason, final_message
-
-        except BaseException as err:
-            # Stash partial text on every exception path (transient network
-            # errors, cancellations, etc.) so the retry layer can pass it to
-            # on_stream_retry.  Intentionally set on the raised exception
-            # rather than returned — the call site re-raises and catches it
-            # at a different layer.
-            if not hasattr(err, "partial_stream_text"):
-                err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
-            raise
-
-        finally:
-            if thinking_active:
-                self._fire("on_thinking_stop")
-            if stream is not None:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+def __getattr__(name: str):
+    target = _TOOL_EXECUTOR_PASSTHROUGH.get(name)
+    if target is not None:
+        from . import tool_executor as _te
+        return getattr(_te, target)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
