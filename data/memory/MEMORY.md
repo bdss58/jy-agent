@@ -44,6 +44,7 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read on any session mentioning nano-vLLM / learning / LLM study.
 - **runtime-refactor.md** — Runtime Package Refactor
 - **runtime-review-2026-04-25.md** — Runtime Design + Implementation Review (Codex)
+- **runtime-c1-c4-deferrals.md** — Tier C deferrals — C1 (cancellation latency) and C4 (engine.py split)
 ## Repo Snapshot
 - Provider-neutral LLM layer: Anthropic Messages + OpenAI Responses adapters under `jyagent/llm/`
 - `LLMOwner` owns the active `provider:model`; `/model <provider> <model>` switches future turns
