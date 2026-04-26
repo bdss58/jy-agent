@@ -147,51 +147,11 @@ _tool_executor = _tool_dispatch_executor
 
 # ─── Harness helpers ─────────────────────────────────────────────────────────
 
-class _CostTracker:
-    """Track estimated cost within a single run() for budget enforcement.
-
-    Delegates pricing math to ``stats.compute_call_cost`` so the engine
-    and ``SessionStats`` cannot drift on Anthropic 1M-context tier
-    multipliers, the ``input_tokens_include_cache_reads`` credit, or
-    cache-creation pricing.  Codex review 2026-04-25 Part 1 #9/#10:
-    the previous implementation reimplemented a simplified pricing
-    formula and quietly under-counted cost on long-context calls.
-
-    When a call's (provider, model) has no pricing entry the call's
-    tokens are NOT included in the running total and ``unpriced_calls``
-    is bumped.  The budget check still runs on the partial total — i.e.
-    the accounted cost is a lower bound.  An earlier design returned
-    ``None`` from ``known_cost`` in that case, which silently disabled
-    the budget entirely; the current design reports a lower-bound cost
-    and exposes ``has_unpriced_usage`` so the caller can warn once.
-    """
-
-    def __init__(self):
-        self.total_cost: float = 0.0
-        self.unpriced_calls: int = 0
-
-    def record(self, usage: dict, provider: str, model: str) -> None:
-        from ..stats import compute_call_cost
-        breakdown = compute_call_cost(usage, provider, model)
-        if not breakdown.is_priced:
-            # Only count it as unpriced if there was actual token activity.
-            # ``compute_call_cost`` already reports ``is_priced=True`` for
-            # zero-token calls, so reaching this branch with no tokens is
-            # impossible — but be explicit.
-            if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
-                self.unpriced_calls += 1
-            return
-        self.total_cost += breakdown.cost_usd
-
-    @property
-    def has_unpriced_usage(self) -> bool:
-        return self.unpriced_calls > 0
-
-    @property
-    def cost(self) -> float:
-        """Best-effort running total in USD.  When ``has_unpriced_usage`` is
-        True, this is a lower bound — unpriced calls are not included."""
-        return self.total_cost
+# C4 Phase 1 (codex review 2026-04-25): extracted to runtime/loop/cost.py.
+# Kept as a private alias so internal imports (`_CostTracker()`) continue
+# to work without churn; phases 2-5 will similarly extract tool executor,
+# LLM runner, compaction, and leave engine.py as just the LoopController.
+from .cost import CostTracker as _CostTracker  # noqa: E402
 
 
 class _StuckLoopDetector:

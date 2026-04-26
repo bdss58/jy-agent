@@ -979,3 +979,51 @@ class TestC1CancellationLatency:
         assert elapsed < 0.5, f"watcher close latency too high: {elapsed:.2f}s"
         t.join(timeout=2.0)
         assert not t.is_alive(), "streaming call did not unblock after close"
+
+
+# ─── C4 Phase 1: CostTracker extracted to runtime/loop/cost.py ──────────────
+
+
+class TestC4Phase1CostExtraction:
+    """C4 Phase 1 proof-of-pattern: _CostTracker moved to runtime/loop/cost.py
+    under the name CostTracker.  Engine re-exports as _CostTracker for
+    internal back-compat.  Both import paths must work.
+    """
+
+    def test_cost_tracker_importable_from_new_home(self):
+        from jyagent.runtime.loop.cost import CostTracker
+        ct = CostTracker()
+        assert ct.total_cost == 0.0
+        assert ct.unpriced_calls == 0
+        assert ct.cost == 0.0
+        assert ct.has_unpriced_usage is False
+
+    def test_engine_reexport_still_works(self):
+        """Engine's private `_CostTracker` alias must still point at the
+        same class for any internal call site that didn't migrate."""
+        from jyagent.runtime.loop import engine as _engine
+        from jyagent.runtime.loop.cost import CostTracker
+        assert _engine._CostTracker is CostTracker
+
+    def test_cost_tracker_records_priced_call(self):
+        from jyagent.runtime.loop.cost import CostTracker
+        ct = CostTracker()
+        # Anthropic pricing entry exists; cost_usd > 0 for nonzero usage.
+        ct.record(
+            {"input_tokens": 1000, "output_tokens": 500},
+            "anthropic",
+            "claude-opus-4-6",
+        )
+        assert ct.cost > 0.0
+        assert ct.unpriced_calls == 0
+
+    def test_cost_tracker_flags_unpriced(self):
+        from jyagent.runtime.loop.cost import CostTracker
+        ct = CostTracker()
+        ct.record(
+            {"input_tokens": 1000, "output_tokens": 500},
+            "nonexistent-provider",
+            "nonexistent-model",
+        )
+        assert ct.has_unpriced_usage is True
+        assert ct.cost == 0.0  # lower bound
