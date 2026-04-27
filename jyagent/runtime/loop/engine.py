@@ -546,7 +546,7 @@ class AgentLoop:
         snapshots the final todos onto the result.
 
         After C4 Phase 5, this method is a thin orchestrator: setup is in
-        ``RunState.from_loop()``, the per-step body is in
+        ``RunState.prepare_for_run()``, the per-step body is in
         ``runtime/loop/step.py::run_step``, and only the for-step counter,
         post-loop terminal handlers (cancelled-exit / max_steps fallback /
         max_steps exit), and the outer try/except live here.
@@ -554,12 +554,14 @@ class AgentLoop:
         from .step import RunState, run_step, StepContinue, StepTerminate, StepBreak
 
         cfg = self._config
-        state = RunState.from_loop(self, system_prompt, messages, initial_todos)
-        # Aliases for the post-loop terminal handlers below — keeps the
-        # diff minimal vs. pre-Phase-5 while still routing through state.
+        state = RunState.prepare_for_run(self, system_prompt, messages, initial_todos)
+        # Aliases for the post-loop terminal handlers below.  ``trace`` is
+        # threaded into 5 ``_finalize_run`` calls and ``cost_tracker`` into
+        # 7 lexical sites, so the locals earn their keep on readability.
+        # ``effective_spec`` is read inline from ``state`` at its single
+        # use site (Codex review of Phase 5, 2026-04-27).
         trace = state.trace
         cost_tracker = state.cost_tracker
-        effective_spec = state.effective_spec
 
         try:
             for step in range(cfg.max_steps):
@@ -572,6 +574,13 @@ class AgentLoop:
                     # (cancel checked at top of step or before/after tools).
                     # Fall through to the cancelled-exit handler below.
                     break
+                # Defense-in-depth: every other ``run_step`` return must be
+                # ``StepContinue``.  Any future tagged-union member would
+                # silently fall through to the next iteration without this
+                # check (Codex review of Phase 5, 2026-04-27).
+                assert isinstance(outcome, StepContinue), (
+                    f"run_step returned unknown outcome type: {type(outcome).__name__}"
+                )
 
             # ── Cooperative cancellation — early exit ────────────────
             if self._is_cancelled():
@@ -645,8 +654,8 @@ class AgentLoop:
                     if cost_tracker is not None:
                         cost_tracker.record(
                             usage,
-                            effective_spec.provider,
-                            effective_spec.model,
+                            state.effective_spec.provider,
+                            state.effective_spec.model,
                         )
                         if cost_tracker.has_unpriced_usage and not state.unpriced_warned:
                             state.unpriced_warned = True

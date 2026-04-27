@@ -32,7 +32,7 @@ from jyagent.runtime.tools.registry import ToolBatch
 @dataclass
 class _FakeOwner:
     """Minimal stand-in for LLMOwner — only `model_spec` is read by run_step
-    (via ``effective_spec`` resolution in RunState.from_loop)."""
+    (via ``effective_spec`` resolution in RunState.prepare_for_run)."""
     model_spec: ModelSpec = field(
         default_factory=lambda: ModelSpec(provider="anthropic", model="claude-sonnet-4-6")
     )
@@ -101,8 +101,8 @@ class FakeLoop:
 
 def _build_state(loop: FakeLoop, *, messages: list | None = None) -> RunState:
     """Construct a RunState the same way _run_impl does, without engine
-    instance-state mutation surprises (we use the from_loop classmethod)."""
-    state = RunState.from_loop(
+    instance-state mutation surprises (we use the prepare_for_run classmethod)."""
+    state = RunState.prepare_for_run(
         loop,
         system_prompt="you are a helpful assistant",
         messages=messages or [],
@@ -295,14 +295,14 @@ class TestSubclassOverrideContract:
         assert len(called_with) == 1
 
 
-# ─── T6: from_loop side effects ──────────────────────────────────────────────
+# ─── T6: prepare_for_run side effects ──────────────────────────────────────────────
 
 
 class TestRunStateFromLoop:
     def test_resets_partial_side_effects(self):
         loop = FakeLoop()
         loop._partial_side_effects = ["stale1", "stale2"]
-        state = RunState.from_loop(loop, "sys", [], None)
+        state = RunState.prepare_for_run(loop, "sys", [], None)
         assert loop._partial_side_effects == []
         # state doesn't shadow the loop's list
         assert "_partial_side_effects" not in state.__dict__
@@ -314,7 +314,7 @@ class TestRunStateFromLoop:
         )
         loop = FakeLoop(config=cfg)
         initial = [{"content": "step 1", "status": "pending"}]
-        RunState.from_loop(loop, "sys", [], initial)
+        RunState.prepare_for_run(loop, "sys", [], initial)
         assert len(loop._todos) == 1
         # normalize_todo turns dicts into TodoItem dataclass instances.
         assert loop._todos[0].content == "step 1"
@@ -328,7 +328,7 @@ class TestRunStateFromLoop:
         # Pass a value normalize_todo will reject (TypeError on dict access)
         bad = [{"no_content_field": True}]  # missing required "content"
         try:
-            RunState.from_loop(loop, "sys", [], bad)
+            RunState.prepare_for_run(loop, "sys", [], bad)
         except (TypeError, ValueError, KeyError):
             # If normalize_todo raises something other than TypeError, the
             # impl still falls back to []. That's fine — the contract is
@@ -340,19 +340,19 @@ class TestRunStateFromLoop:
 
     def test_effective_spec_resolves_to_owner_when_no_override(self):
         loop = FakeLoop()
-        state = RunState.from_loop(loop, "sys", [], None)
+        state = RunState.prepare_for_run(loop, "sys", [], None)
         assert state.effective_spec is loop._runtime_owner.model_spec
 
     def test_effective_spec_resolves_to_override_when_set(self):
         loop = FakeLoop()
         loop._model_spec = ModelSpec(provider="openai", model="gpt-test")
-        state = RunState.from_loop(loop, "sys", [], None)
+        state = RunState.prepare_for_run(loop, "sys", [], None)
         assert state.effective_spec.provider == "openai"
         assert state.effective_spec.model == "gpt-test"
 
     def test_cost_tracker_only_built_when_budget_set(self):
         loop = FakeLoop()
-        state = RunState.from_loop(loop, "sys", [], None)
+        state = RunState.prepare_for_run(loop, "sys", [], None)
         assert state.cost_tracker is None
 
         cfg = LoopConfig(
@@ -360,12 +360,12 @@ class TestRunStateFromLoop:
             todos_enabled=False, max_cost_usd=1.0,
         )
         loop2 = FakeLoop(config=cfg)
-        state2 = RunState.from_loop(loop2, "sys", [], None)
+        state2 = RunState.prepare_for_run(loop2, "sys", [], None)
         assert state2.cost_tracker is not None
 
     def test_reflection_module_only_loaded_when_enabled(self):
         loop = FakeLoop()
-        state = RunState.from_loop(loop, "sys", [], None)
+        state = RunState.prepare_for_run(loop, "sys", [], None)
         assert state.reflection_module is None
 
         cfg = LoopConfig(
@@ -373,6 +373,6 @@ class TestRunStateFromLoop:
             todos_enabled=False, reflect_every_n_tool_calls=3,
         )
         loop2 = FakeLoop(config=cfg)
-        state2 = RunState.from_loop(loop2, "sys", [], None)
+        state2 = RunState.prepare_for_run(loop2, "sys", [], None)
         assert state2.reflection_module is not None
         assert hasattr(state2.reflection_module, "should_reflect")

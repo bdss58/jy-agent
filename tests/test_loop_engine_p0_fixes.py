@@ -195,14 +195,14 @@ class TestCostTrackerUsesEffectiveSpec:
     def test_cost_record_uses_effective_spec_variable(self):
         import inspect
         from jyagent.runtime.loop import step
-        # After C4 Phase 5, effective_spec is hoisted in RunState.from_loop()
+        # After C4 Phase 5, effective_spec is hoisted in RunState.prepare_for_run()
         # (the run-state factory called at the top of _run_impl). The
         # cost_tracker.record(...) call lives in step.run_step.
-        from_loop_src = inspect.getsource(step.RunState.from_loop)
+        prepare_src = inspect.getsource(step.RunState.prepare_for_run)
         run_step_src = inspect.getsource(step.run_step)
 
-        assert "effective_spec = loop._model_spec or loop._runtime_owner.model_spec" in from_loop_src, (
-            "RunState.from_loop must resolve effective_spec once at the top of "
+        assert "effective_spec = loop._model_spec or loop._runtime_owner.model_spec" in prepare_src, (
+            "RunState.prepare_for_run must resolve effective_spec once at the top of "
             "the run-state factory (formerly at the top of _run_impl)."
         )
         # cost_tracker.record(...) must consume effective_spec.
