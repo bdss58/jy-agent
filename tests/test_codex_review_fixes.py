@@ -1397,3 +1397,143 @@ class TestC4Phase4CompactionExtraction:
         # Empty batch → no known large_input_keys → no truncation.
         assert out[0] is text_block
         assert out[1] is tool_block  # same object reference
+
+
+# ─── P3-1 + P3-2: import-time cleanup ───────────────────────────────────────
+#
+# Codex review 2026-04-25 Part 3 #1 (eager engine load on `import runtime`)
+# and Part 3 #2 (module-level pool + atexit at import).  These tests run in
+# subprocess so they get a fresh `sys.modules` — the in-process pytest run
+# has already imported the engine for hundreds of other tests.
+
+class TestC4ImportTimeCleanup:
+    """Verify `import jyagent.runtime` is cheap and side-effect-free.
+
+    All checks run in subprocess so the pytest-process module cache doesn't
+    mask the laziness.
+    """
+
+    def _run_in_subprocess(self, code: str, timeout: int = 15) -> str:
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"subprocess exited {result.returncode}\n"
+                f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+            )
+        return result.stdout
+
+    def test_runtime_import_does_not_load_engine(self):
+        """P3-1: `import jyagent.runtime` must NOT load engine.py.
+
+        Engine pulls in tool_executor/llm_runner/compaction/step — a hard
+        regression if it loads on plain `import jyagent.runtime`.
+        """
+        out = self._run_in_subprocess("""
+import sys
+import jyagent.runtime
+heavy = [
+    'jyagent.runtime.loop.engine',
+    'jyagent.runtime.loop.tool_executor',
+    'jyagent.runtime.loop.llm_runner',
+    'jyagent.runtime.loop.compaction',
+    'jyagent.runtime.loop.step',
+]
+loaded = [m for m in heavy if m in sys.modules]
+assert not loaded, f'unexpectedly eager: {loaded}'
+print('OK')
+""")
+        assert "OK" in out
+
+    def test_runtime_loop_import_does_not_load_engine(self):
+        """P3-1: `import jyagent.runtime.loop` must NOT load engine.py either."""
+        out = self._run_in_subprocess("""
+import sys
+import jyagent.runtime.loop
+assert 'jyagent.runtime.loop.engine' not in sys.modules, 'engine eagerly loaded'
+# But cheap leaves SHOULD be loaded — they're explicit eager imports.
+assert 'jyagent.runtime.loop.callbacks' in sys.modules
+assert 'jyagent.runtime.loop.config' in sys.modules
+print('OK')
+""")
+        assert "OK" in out
+
+    def test_runtime_import_creates_no_thread_pool(self):
+        """P3-2: `import jyagent.runtime` must NOT create the dispatch pool.
+
+        Pool creation registers an atexit hook and spins a daemon thread —
+        unwanted for callers that never construct an `AgentLoop`.
+        """
+        out = self._run_in_subprocess("""
+import jyagent.runtime
+# tool_executor itself isn't loaded yet (P3-1 makes it lazy via engine);
+# import it explicitly and check the pool is None.
+from jyagent.runtime.loop import tool_executor as te
+assert te.tool_dispatch_executor is None, 'pool eagerly initialised at import'
+assert te.tool_dispatch_cap == 0, f'expected cap=0 got {te.tool_dispatch_cap}'
+print('OK')
+""")
+        assert "OK" in out
+
+    def test_lazy_agentloop_attribute_works(self):
+        """P3-1: `from jyagent.runtime import AgentLoop` lazy-loads engine."""
+        out = self._run_in_subprocess("""
+import sys
+import jyagent.runtime
+assert 'jyagent.runtime.loop.engine' not in sys.modules
+# Lazy load via attribute access:
+AL = jyagent.runtime.AgentLoop
+assert 'jyagent.runtime.loop.engine' in sys.modules, 'lazy load did not fire'
+# Cached on the module dict for future O(1) lookups:
+assert 'AgentLoop' in vars(jyagent.runtime)
+# Same object on second access:
+assert jyagent.runtime.AgentLoop is AL
+print('OK')
+""")
+        assert "OK" in out
+
+    def test_lazy_from_import_pattern_works(self):
+        """P3-1: `from jyagent.runtime import AgentLoop` (statement form)
+        triggers __getattr__ exactly like attribute access."""
+        out = self._run_in_subprocess("""
+import sys
+# Engine not loaded yet by trick: import the package WITHOUT touching AgentLoop.
+import jyagent.runtime
+assert 'jyagent.runtime.loop.engine' not in sys.modules
+# Now do the from-import — Python falls back to __getattr__ for missing names.
+from jyagent.runtime import AgentLoop
+assert AgentLoop.__name__ == 'AgentLoop'
+assert 'jyagent.runtime.loop.engine' in sys.modules
+print('OK')
+""")
+        assert "OK" in out
+
+    def test_unknown_attribute_raises_attribute_error(self):
+        """PEP-562 contract: unknown attributes still raise AttributeError."""
+        out = self._run_in_subprocess("""
+import jyagent.runtime
+try:
+    _ = jyagent.runtime.DefinitelyNotARealClass
+    raise SystemExit('FAIL: should have raised AttributeError')
+except AttributeError as e:
+    assert 'DefinitelyNotARealClass' in str(e)
+print('OK')
+""")
+        assert "OK" in out
+
+    def test_loop_phase_submodules_lazy_accessible(self):
+        """Phase modules (phases, reflection, ...) remain accessible via the
+        `from jyagent.runtime.loop import phases` pattern even though they
+        are no longer eagerly imported at package init."""
+        out = self._run_in_subprocess("""
+from jyagent.runtime.loop import phases, reflection, checkpoint, todos, verification, remediation, tracing
+# All should be modules:
+import types
+for m in (phases, reflection, checkpoint, todos, verification, remediation, tracing):
+    assert isinstance(m, types.ModuleType), f'{m} is not a module'
+print('OK')
+""")
+        assert "OK" in out

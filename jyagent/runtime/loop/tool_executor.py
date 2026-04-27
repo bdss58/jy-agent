@@ -125,10 +125,24 @@ def get_tool_dispatch_executor(
         return tool_dispatch_executor
 
 
-# Initialise at import for back-compat (older code reads the module global
-# directly).  Sized at the historical default; ``get_tool_dispatch_executor``
-# grows it on demand.
-tool_dispatch_executor = get_tool_dispatch_executor(8)
+# P3-2 (Codex review 2026-04-25 Part 3 #2): the pool is now LAZY.
+# It used to be eagerly initialised here at module import — but that meant
+# `import jyagent.runtime` (which transitively imports this module) spun up
+# a background thread pool and registered an `atexit.shutdown` hook even
+# for callers that never run an `AgentLoop` (CLI subcommands, unit tests
+# that only touch tool registration, doc generation, etc.).
+#
+# All in-process callers go through `get_tool_dispatch_executor(...)`:
+#   * `AgentLoop.__init__` (engine.py) — calls `_get_tool_dispatch_executor(
+#     config.max_tool_workers)` so the pool is sized correctly on first use.
+#   * `execute_tools(executor=...)` — called from step.py with `loop._executor`
+#     pre-set, so the fallback `pool = executor or tool_dispatch_executor`
+#     branch never reaches a None pool in production.
+#
+# Tests that previously did `from .engine import _tool_dispatch_executor` at
+# module-import (snapshotting the eagerly-created pool) MUST switch to live
+# attribute access (`engine._tool_dispatch_executor`) — the engine PEP-562
+# `__getattr__` shim already returns the live value.
 
 
 # ─── Tool invocation ─────────────────────────────────────────────────────────

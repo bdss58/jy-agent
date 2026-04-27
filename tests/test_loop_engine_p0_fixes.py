@@ -21,7 +21,6 @@ from jyagent.runtime.loop import engine as le
 from jyagent.runtime.loop.engine import (
     _execute_tool_with_timeout,
     _execute_tools,
-    _tool_dispatch_executor,
     ToolCallRequest,
 )
 from jyagent.runtime.tools.result import ToolResult
@@ -123,7 +122,11 @@ class TestNoNestedPoolDeadlock:
         pools it completes in roughly sleep_ms (not sleep_ms × N).
         """
         # Match dispatch width — this is the failure mode of the old design.
-        n = _tool_dispatch_executor._max_workers  # type: ignore[attr-defined]
+        # P3-2 (2026-04-27): pool is lazy-init; trigger it before reading
+        # `_max_workers` so we don't get None.  `le._tool_dispatch_executor`
+        # routes through the PEP-562 __getattr__ to the LIVE value.
+        le._get_tool_dispatch_executor(8)
+        n = le._tool_dispatch_executor._max_workers  # type: ignore[attr-defined]
         sleep_ms = 150
         functions = {f"t{i}": _sleep_tool(sleep_ms) for i in range(n)}
         batch = _make_batch(functions=functions, parallel_safe=True)
