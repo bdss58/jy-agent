@@ -28,10 +28,18 @@ from __future__ import annotations
 
 import copy
 import threading
-import warnings
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
+
+# `typing_extensions.deprecated` is the PEP 702 backport.  Python 3.13+
+# has the same decorator at `warnings.deprecated` / `typing.deprecated`,
+# but pyproject still advertises requires-python = ">=3.12", and on 3.12
+# `warnings.deprecated` does not exist (Codex review of P1-11 commit
+# 493a34d caught this — the import would AttributeError at class-def
+# time on 3.12).  The backport works on 3.12 and forwards to the stdlib
+# implementation on 3.13+.
+from typing_extensions import deprecated
 
 
 def _readonly(d: Mapping) -> Mapping:
@@ -325,7 +333,7 @@ class ToolRegistry:
                 mutating=mutating,
             )
 
-    @warnings.deprecated(
+    @deprecated(
         "ToolRegistry.snapshot() is a footgun — it returns the raw schema "
         "list (mutable, no defensive copy of the dicts) and is per-call "
         "atomic but NOT batch-atomic.  Use ToolRegistry.freeze() to obtain "
@@ -366,7 +374,7 @@ class ToolRegistry:
         with self._lock:
             return self._version
 
-    @warnings.deprecated(
+    @deprecated(
         "Use ToolRegistry.freeze().is_parallel_safe(name) for batch-atomic "
         "reads.  The registry-level method races with concurrent register()/"
         "unregister() across consecutive calls.  (P1-11, 2026-04-27.)"
@@ -375,7 +383,7 @@ class ToolRegistry:
         with self._lock:
             return self._metadata.get(name, {}).get("parallel_safe", False)
 
-    @warnings.deprecated(
+    @deprecated(
         "Use ToolRegistry.freeze().is_mutating(name) for batch-atomic reads. "
         "(P1-11, 2026-04-27.)"
     )
@@ -388,7 +396,7 @@ class ToolRegistry:
         with self._lock:
             return self._metadata.get(name, {}).get("mutating", False)
 
-    @warnings.deprecated(
+    @deprecated(
         "Use ToolRegistry.freeze().get_timeout_hint(name) for batch-atomic "
         "reads.  (P1-11, 2026-04-27.)"
     )
@@ -401,7 +409,7 @@ class ToolRegistry:
         with self._lock:
             return self._metadata.get(name, {}).get("timeout_hint")
 
-    @warnings.deprecated(
+    @deprecated(
         "Use ToolRegistry.freeze().get_large_input_keys(name) for "
         "batch-atomic reads.  (P1-11, 2026-04-27.)"
     )
@@ -414,7 +422,7 @@ class ToolRegistry:
         with self._lock:
             return self._metadata.get(name, {}).get("large_input_keys")
 
-    @warnings.deprecated(
+    @deprecated(
         "Use ToolRegistry.freeze().get_compaction_priority(name) for "
         "batch-atomic reads.  (P1-11, 2026-04-27.)"
     )

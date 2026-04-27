@@ -25,6 +25,10 @@ dependencies = [
     "readability-lxml>=0.8",
     "curl_cffi>=0.7",
     "python-dotenv>=1.0",
+    # typing-extensions: needed for `deprecated` (PEP 702) on Python 3.12.
+    # In 3.13+ stdlib `warnings.deprecated` works, but pyproject still
+    # advertises requires-python = ">=3.12", so use the backport for safety.
+    "typing-extensions>=4.5",
 ]
 
 [project.optional-dependencies]
