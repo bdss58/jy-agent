@@ -78,6 +78,17 @@ def _t_as_dict(t: Any) -> dict:
 # underscore-prefixed names via these aliases; tests that poke module
 # globals (``_tool_dispatch_executor``, ``_tool_dispatch_cap``, etc.) also
 # see them here via the PEP-562 ``__getattr__`` at the bottom of the file.
+#
+# ⚠️ IMPORTANT — back-compat scope (C4 Phase 5 follow-up, 2026-04-27):
+# The per-step body in ``runtime/loop/step.py::run_step`` calls
+# ``tool_executor.execute_tools`` DIRECTLY, NOT through this engine-level
+# alias.  Consequently, any downstream test or extension that patches
+# ``jyagent.runtime.loop.engine._execute_tools`` (or the other names
+# aliased below) will NOT intercept tool calls made during the normal
+# loop step.  The engine alias now only covers callers that imported
+# ``_execute_tools`` from ``engine`` directly (pre-Phase-2 compat only).
+# New code and tests should patch ``jyagent.runtime.loop.tool_executor``
+# instead.
 from .tool_executor import (  # noqa: E402
     execute_tool as _execute_tool,
     execute_tool_with_timeout as _execute_tool_with_timeout,

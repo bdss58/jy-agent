@@ -376,3 +376,357 @@ class TestRunStateFromLoop:
         state2 = RunState.prepare_for_run(loop2, "sys", [], None)
         assert state2.reflection_module is not None
         assert hasattr(state2.reflection_module, "should_reflect")
+
+
+# ─── T7-T13: tool execution + cancellation + dedup + checkpoint + todos ─────
+#
+# These tests fill the largest coverage gaps identified by the Codex review
+# of Phase 5 (2026-04-27).  They exercise code paths in step.run_step that
+# depend on `tool_executor.execute_tools`, so the tests monkeypatch that
+# module-level function rather than touching the registry.
+#
+# NOTE: step.py calls ``from .tool_executor import execute_tools`` inside
+# run_step (lazy, on every call), so patching the attribute on the
+# ``tool_executor`` module is sufficient — no engine alias involved.
+
+from unittest import mock
+
+
+def _tool_call_block(name: str = "fake_tool", call_id: str = "call_1", tool_input: dict | None = None):
+    """Return a tool_use-shaped LLM response tuple for a single tool call."""
+    from jyagent.runtime.loop.engine import ToolCallRequest
+    block = ToolCallRequest(id=call_id, name=name, input=tool_input or {"x": 1})
+    msg = {
+        "content": [
+            {"type": "text", "text": ""},
+            {"type": "tool_use", "id": call_id, "name": name, "input": tool_input or {"x": 1}},
+        ],
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+    }
+    return ("", [block], "tool_use", msg)
+
+
+def _tool_result(content: str, is_error: bool = False):
+    """Build a ToolResult the way tool_executor.execute_tools returns."""
+    from jyagent.runtime.tools.result import ToolResult
+    return ToolResult(content=content, is_error=is_error)
+
+
+class TestNormalToolExecution:
+    """The largest uncovered path: model requests tool, executor runs it,
+    tool_result message is appended, loop continues."""
+
+    def test_single_tool_call_round_trip(self):
+        loop = FakeLoop(llm_response=_tool_call_block("read_file", "c1", {"path": "/tmp/x"}))
+        state = _build_state(loop)
+
+        # Mock the executor to return a deterministic result.
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("contents: hi"))],
+        ) as mock_exec:
+            outcome = run_step(loop, state)
+
+        # run_step returns StepContinue (tool path does NOT terminate)
+        assert isinstance(outcome, StepContinue)
+        # Executor was called exactly once
+        assert mock_exec.call_count == 1
+        # The assistant message (with tool_use block) was appended, plus
+        # the tool_result message → 2 messages total.
+        assert len(state.messages) == 2
+        assert state.messages[0]["content"][1]["type"] == "tool_use"
+        assert state.messages[1]["role"] == "tool_result"
+        assert state.messages[1]["tool_call_id"] == "c1"
+        assert state.messages[1]["tool_name"] == "read_file"
+        assert "contents: hi" in state.messages[1]["content"]
+        assert state.messages[1]["is_error"] is False
+        # Counter incremented
+        assert state.tool_calls_count == 1
+
+    def test_on_tool_start_fires_before_end_and_in_pairs(self):
+        """UI contract: every on_tool_start MUST be matched by exactly one
+        on_tool_end (Codex spinner-leak prevention)."""
+        loop = FakeLoop(llm_response=_tool_call_block("write_file", "c1", {"path": "/tmp/y"}))
+        state = _build_state(loop)
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("ok"))],
+        ):
+            run_step(loop, state)
+
+        names = [name for (name, _) in loop.fired]
+        # on_tool_start precedes on_tool_end, and both happen exactly once.
+        assert names.count("on_tool_start") == 1
+        assert names.count("on_tool_end") == 1
+        assert names.index("on_tool_start") < names.index("on_tool_end")
+
+    def test_tool_error_result_carries_is_error_flag(self):
+        loop = FakeLoop(llm_response=_tool_call_block("run_shell", "c1", {"command": "false"}))
+        state = _build_state(loop)
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("exit 1", is_error=True))],
+        ):
+            run_step(loop, state)
+
+        assert state.messages[1]["is_error"] is True
+        assert "exit 1" in state.messages[1]["content"]
+
+
+class TestCancellationBeforeTools:
+    """Top-of-step cancel is covered; this covers the SECOND cancel check
+    (L648 of step.py — between on_tool_start firing and execute_tools).
+    Required invariant: on_tool_end must still fire for every on_tool_start
+    (Codex review of P0 fixes: UI spinner leak prevention)."""
+
+    def test_cancel_after_tool_start_fires_matching_on_tool_ends(self):
+        loop = FakeLoop(llm_response=_tool_call_block("read_file", "c1"))
+        state = _build_state(loop)
+
+        # Stage: first _is_cancelled() call (top of step) returns False;
+        # second call (before tools) returns True.
+        call_count = {"n": 0}
+        def _staged_cancel():
+            call_count["n"] += 1
+            return call_count["n"] >= 2
+        loop._is_cancelled = _staged_cancel  # type: ignore[method-assign]
+
+        # Even though execute_tools should NOT be called, patch to
+        # detect a regression.
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("should-not-run"))],
+        ) as mock_exec:
+            outcome = run_step(loop, state)
+
+        # Outcome: StepBreak, NOT a tool-result append with the mocked content.
+        assert isinstance(outcome, StepBreak)
+        assert outcome.reason == "cancelled"
+        # Executor was NOT called.
+        assert mock_exec.call_count == 0
+        # But the tool_result SHIM (Cancelled) was still appended, AND
+        # on_tool_end fired to match on_tool_start.
+        names = [name for (name, _) in loop.fired]
+        assert names.count("on_tool_start") == 1
+        assert names.count("on_tool_end") == 1
+        # The shim message marks it as an error.
+        tool_results = [m for m in state.messages if m.get("role") == "tool_result"]
+        assert len(tool_results) == 1
+        assert tool_results[0]["content"] == "Cancelled"
+        assert tool_results[0]["is_error"] is True
+
+
+class TestCancellationAfterTools:
+    """Covers the THIRD cancel check at L754 of step.py — between tool
+    execution and reflection/checkpoint.  Tools ran normally but the user
+    hit Ctrl+C while results were being appended."""
+
+    def test_cancel_after_execution_returns_break(self):
+        loop = FakeLoop(llm_response=_tool_call_block("fast_tool", "c1"))
+        state = _build_state(loop)
+
+        # Staged: top-of-step=False, before-tools=False, after-tools=True.
+        call_count = {"n": 0}
+        def _staged_cancel():
+            call_count["n"] += 1
+            return call_count["n"] >= 3
+        loop._is_cancelled = _staged_cancel  # type: ignore[method-assign]
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("done"))],
+        ):
+            outcome = run_step(loop, state)
+
+        assert isinstance(outcome, StepBreak)
+        # Tools DID run — tool_result message was appended normally
+        tool_results = [m for m in state.messages if m.get("role") == "tool_result"]
+        assert len(tool_results) == 1
+        assert "done" in tool_results[0]["content"]
+        assert tool_results[0]["is_error"] is False
+
+
+class TestStuckLoopDedupBreak:
+    """Same (tool, args, result) returning N times in a row → StepTerminate
+    with status='dedup_break'.  Covers L713-L751 of step.py."""
+
+    def test_three_identical_calls_trigger_dedup_break(self):
+        cfg = LoopConfig(
+            max_steps=10, streaming=False, compact_messages=False,
+            todos_enabled=False, dedup_threshold=3,
+        )
+        loop = FakeLoop(
+            config=cfg,
+            llm_response=_tool_call_block("spin_tool", "c1", {"q": "same"}),
+        )
+        state = _build_state(loop)
+
+        # Run the same tool/args/result three times in a row.  Each call
+        # advances state.step and state.all_text independently.
+        outcomes = []
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("identical-output"))],
+        ):
+            for i in range(3):
+                state.step = i
+                outcomes.append(run_step(loop, state))
+
+        # First two steps: StepContinue.  Third: dedup break.
+        assert isinstance(outcomes[0], StepContinue)
+        assert isinstance(outcomes[1], StepContinue)
+        assert isinstance(outcomes[2], StepTerminate)
+        assert outcomes[2].result.status == "dedup_break"
+        # tool_calls_count rolled up correctly
+        assert state.tool_calls_count == 3
+
+
+class TestDuplicateToolCallsInSingleBatch:
+    """Covers L724-L726: within a single batch, duplicate (name, args)
+    keys are deduped before passing to stuck_detector.record.  This
+    prevents a legitimate parallel fanout of 3 identical read_file calls
+    in ONE step from tripping threshold=3."""
+
+    def test_duplicates_in_batch_count_as_one(self):
+        cfg = LoopConfig(
+            max_steps=10, streaming=False, compact_messages=False,
+            todos_enabled=False, dedup_threshold=3,
+        )
+        # Build an LLM response with 3 identical tool calls in ONE batch.
+        from jyagent.runtime.loop.engine import ToolCallRequest
+        blocks = [
+            ToolCallRequest(id=f"c{i}", name="read_file", input={"path": "/tmp/z"})
+            for i in range(3)
+        ]
+        msg = {
+            "content": [
+                *[
+                    {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+                    for b in blocks
+                ],
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+        loop = FakeLoop(config=cfg, llm_response=("", blocks, "tool_use", msg))
+        state = _build_state(loop)
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(b, _tool_result("contents")) for b in blocks],
+        ):
+            outcome = run_step(loop, state)
+
+        # One batch of three duplicates is NOT a stuck loop.
+        assert isinstance(outcome, StepContinue)
+        # The stuck_detector only saw ONE record, not three (dedup worked).
+        # We verify this by checking the internal counter.  Exact name
+        # depends on the detector's internals; we verify through behavior:
+        # another identical batch would still NOT trigger dedup if the
+        # first batch was properly counted as one.
+        state.step = 1
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(b, _tool_result("contents")) for b in blocks],
+        ):
+            outcome2 = run_step(loop, state)
+        assert isinstance(outcome2, StepContinue)  # count is 2, still under threshold
+
+
+class TestCheckpointWrite:
+    """Covers L787-L799: when checkpoint_dir is set and we're on the
+    cadence boundary, loop._write_checkpoint fires with the current state."""
+
+    def test_checkpoint_fires_on_cadence_boundary(self, tmp_path):
+        cfg = LoopConfig(
+            max_steps=5, streaming=False, compact_messages=False,
+            todos_enabled=False,
+            checkpoint_dir=str(tmp_path),
+            checkpoint_every_n_steps=1,  # every step
+        )
+        loop = FakeLoop(config=cfg, llm_response=_tool_call_block("noop_tool", "c1"))
+        state = _build_state(loop)
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("done"))],
+        ):
+            outcome = run_step(loop, state)
+
+        assert isinstance(outcome, StepContinue)
+        assert len(loop.checkpoints) == 1
+        cp = loop.checkpoints[0]
+        assert cp["step"] == 0
+        assert cp["status"] == "in_progress"
+        assert cp["tool_calls_count"] == 1
+
+    def test_checkpoint_skipped_when_dir_unset(self):
+        cfg = LoopConfig(
+            max_steps=5, streaming=False, compact_messages=False,
+            todos_enabled=False,
+            checkpoint_dir=None,  # no checkpointing
+            checkpoint_every_n_steps=1,
+        )
+        loop = FakeLoop(config=cfg, llm_response=_tool_call_block("noop", "c1"))
+        state = _build_state(loop)
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("done"))],
+        ):
+            run_step(loop, state)
+
+        assert loop.checkpoints == []
+
+    def test_checkpoint_skipped_off_cadence(self):
+        cfg = LoopConfig(
+            max_steps=10, streaming=False, compact_messages=False,
+            todos_enabled=False,
+            checkpoint_dir="/tmp/cp",
+            checkpoint_every_n_steps=5,  # only every 5 steps
+        )
+        loop = FakeLoop(config=cfg, llm_response=_tool_call_block("noop", "c1"))
+        state = _build_state(loop)
+        state.step = 2  # step 2 → (step+1) % 5 == 3, no checkpoint
+
+        with mock.patch(
+            "jyagent.runtime.loop.tool_executor.execute_tools",
+            return_value=[(loop.llm_response[1][0], _tool_result("done"))],
+        ):
+            run_step(loop, state)
+
+        assert loop.checkpoints == []
+
+
+class TestTodosOverlayInStepBatch:
+    """Covers L379-L391: when todos_enabled, step_batch has the
+    write_todos function overlaid; state.last_step_batch reflects that."""
+
+    def test_todos_enabled_overlays_write_todos_into_step_batch(self):
+        cfg = LoopConfig(
+            max_steps=5, streaming=False, compact_messages=False,
+            todos_enabled=True,
+        )
+        loop = FakeLoop(config=cfg, llm_response=_llm_text_only("done"))
+        state = _build_state(loop)
+
+        run_step(loop, state)
+
+        # The last step_batch has write_todos in its functions map
+        assert "write_todos" in state.last_step_batch.functions
+        # And the schema is present
+        schema_names = [s.get("name") for s in state.last_step_batch.schemas]
+        assert "write_todos" in schema_names
+
+    def test_todos_disabled_step_batch_has_no_write_todos(self):
+        cfg = LoopConfig(
+            max_steps=5, streaming=False, compact_messages=False,
+            todos_enabled=False,
+        )
+        loop = FakeLoop(config=cfg, llm_response=_llm_text_only("done"))
+        state = _build_state(loop)
+
+        run_step(loop, state)
+
+        assert "write_todos" not in state.last_step_batch.functions
