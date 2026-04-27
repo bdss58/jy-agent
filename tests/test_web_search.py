@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from jyagent.tools.web_search_tool import (
+from jyagent.tools.web_search import (
     TOOL_SCHEMA,
     _cascade,
     _search_ddg,
@@ -125,7 +125,7 @@ class TestSearchSearxng:
 class TestCascade:
     def test_first_engine_wins_searxng(self, monkeypatch):
         # Cascade order: searxng → ddg. With SEARXNG_URL set, searxng wins.
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         fake = [{"title": "T", "url": "https://a/", "snippet": ""} for _ in range(5)]
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")
@@ -139,7 +139,7 @@ class TestCascade:
 
     def test_falls_through_to_ddg_when_searxng_underfills(self, monkeypatch):
         # searxng underfills → ddg wins.
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")
         monkeypatch.setitem(m._ENGINES, "searxng", lambda q, n: [])
@@ -153,7 +153,7 @@ class TestCascade:
 
     def test_searxng_skipped_when_env_unset(self, monkeypatch):
         # No SEARXNG_URL → searxng is silently skipped, ddg is the only hop.
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         monkeypatch.setitem(m._ENGINES, "searxng", lambda q, n: pytest.fail("searxng called"))
@@ -165,7 +165,7 @@ class TestCascade:
         assert name == "ddg"
 
     def test_force_override_via_env(self, monkeypatch):
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         monkeypatch.setenv("WEB_SEARCH_ENGINE", "ddg")
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")  # would normally win
@@ -179,7 +179,7 @@ class TestCascade:
 
     def test_engine_exception_recorded_and_continues(self, monkeypatch):
         # searxng throws → cascade records error and continues to ddg.
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")
 
@@ -205,7 +205,7 @@ class TestWebSearch:
         assert web_search(query="   ").is_error
 
     def test_returns_formatted_results(self, monkeypatch):
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         # Patch ddg so it wins outright with ≥ _MIN_RESULTS_TO_STOP;
         # otherwise cascade would fall through to live network.
@@ -224,7 +224,7 @@ class TestWebSearch:
         assert "Engine: ddg" in text
 
     def test_all_engines_empty_returns_error(self, monkeypatch):
-        from jyagent.tools import web_search_tool as m
+        from jyagent.tools import web_search as m
 
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         for eng in ("searxng", "ddg"):

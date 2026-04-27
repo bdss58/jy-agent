@@ -19,7 +19,7 @@ from .subagent import (
     TOOL_SCHEMA as SUBAGENT_SCHEMA,
     CHECK_AGENT_SCHEMA,
 )
-from .web_search_tool import web_search as web_search_fn, TOOL_SCHEMA as WEB_SEARCH_SCHEMA
+from .web_search import web_search as web_search_fn, TOOL_SCHEMA as WEB_SEARCH_SCHEMA
 
 # Re-export constants from config (backward compat)
 from ..config import SKIP_DIRS, BINARY_EXTS

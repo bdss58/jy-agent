@@ -129,7 +129,7 @@ jyagent/
     core.py             #   Filesystem + run_shell + run_background
     subagent.py         #   dispatch_agent / check_agent
     web_fetch.py        #   5-tier anti-blocking fetch
-    web_search_tool.py  #   Multi-engine cascade (DDG → Brave → Mojeek)
+    web_search.py       #   SearxNG → DDG cascade
     mcp_tool.py         #   MCP bridge
 
   memory/               # Conversation compaction, session save/load, extraction
