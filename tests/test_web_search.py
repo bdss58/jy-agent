@@ -1,5 +1,4 @@
-"""Tests for web_search tool — multi-engine cascade (DDG → Brave → Mojeek)
-plus opt-in SearxNG via env."""
+"""Tests for web_search tool — SearxNG → DDG cascade."""
 
 import os
 
@@ -8,9 +7,7 @@ import pytest
 from jyagent.tools.web_search_tool import (
     TOOL_SCHEMA,
     _cascade,
-    _search_brave,
     _search_ddg,
-    _search_mojeek,
     _search_searxng,
     web_search,
 )
@@ -87,83 +84,6 @@ class TestSearchDdgParsing:
         assert _search_ddg("q", max_results=10) == []
 
 
-# ─── Brave parser tests (unit, mocked HTML) ──────────────────────────────────
-
-
-class TestSearchBraveParsing:
-    def test_parses_a_l1_anchor(self, monkeypatch):
-        # Synthetic HTML matching the observed Brave structure (a.l1 + .snippet)
-        html = """<html><body><div id="results">
-          <div class="snippet svelte-xyz">
-            <div class="result-wrapper">
-              <a class="l1 svelte-abc" href="https://example.com/page1">Example Page One</a>
-              <p class="desc">A snippet describing example page one with more than forty characters of useful content.</p>
-            </div>
-          </div>
-          <div class="snippet">
-            <div class="result-wrapper">
-              <a class="l1" href="https://other.com/page2">Other Page Two</a>
-            </div>
-          </div>
-        </div></body></html>""" + ("x" * 2500)  # pad to clear min_len
-        import jyagent.tools.web_fetch as wf
-        monkeypatch.setattr(wf, "_fetch_cffi", lambda url, **kw: (200, html))
-
-        results = _search_brave("anything", max_results=10)
-        assert len(results) == 2
-        assert results[0]["url"] == "https://example.com/page1"
-        assert results[0]["title"] == "Example Page One"
-        assert "example page one" in results[0]["snippet"].lower()
-        assert results[1]["url"] == "https://other.com/page2"
-
-    def test_skips_non_http_anchors(self, monkeypatch):
-        html = """<html><body>
-          <div class="snippet"><a class="l1" href="#fragment">Skip me</a></div>
-          <div class="snippet"><a class="l1" href="https://ok.com/">Keep me</a></div>
-        </body></html>""" + ("x" * 2500)
-        import jyagent.tools.web_fetch as wf
-        monkeypatch.setattr(wf, "_fetch_cffi", lambda url, **kw: (200, html))
-
-        results = _search_brave("q", max_results=10)
-        assert len(results) == 1
-        assert results[0]["url"] == "https://ok.com/"
-
-    def test_empty_returns_empty(self, monkeypatch):
-        import jyagent.tools.web_fetch as wf
-        monkeypatch.setattr(wf, "_fetch_cffi", lambda url, **kw: (200, ""))
-        monkeypatch.setattr(wf, "_fetch_httpx", lambda url, **kw: (200, ""))
-        assert _search_brave("q", max_results=10) == []
-
-
-# ─── Mojeek parser tests (unit, mocked HTML) ─────────────────────────────────
-
-
-class TestSearchMojeekParsing:
-    def test_parses_results_standard(self, monkeypatch):
-        html = """<html><body>
-          <ul class="results-standard">
-            <li class="r1">
-              <h2><a class="title" href="https://docs.python.org/3/">Python 3 Docs</a></h2>
-              <a class="ob" href="https://docs.python.org/3/">https://docs.python.org/3/</a>
-              <p class="s">Python is an easy to learn, powerful programming language.</p>
-            </li>
-            <li class="r2 clu-result">
-              <h2><a class="title" href="https://realpython.com/">Real Python</a></h2>
-              <p class="s">Tutorials.</p>
-            </li>
-          </ul>
-        </body></html>""" + ("x" * 1600)
-        import jyagent.tools.web_fetch as wf
-        monkeypatch.setattr(wf, "_fetch_cffi", lambda url, **kw: (200, html))
-
-        results = _search_mojeek("anything", max_results=10)
-        assert len(results) == 2
-        assert results[0]["title"] == "Python 3 Docs"
-        assert results[0]["url"] == "https://docs.python.org/3/"
-        assert "powerful programming" in results[0]["snippet"]
-        assert results[1]["title"] == "Real Python"
-
-
 # ─── SearxNG tests (env-gated) ────────────────────────────────────────────────
 
 
@@ -203,68 +123,75 @@ class TestSearchSearxng:
 
 
 class TestCascade:
-    def test_first_engine_wins(self, monkeypatch):
-        # Cascade order: searxng → brave → mojeek → ddg.
-        # With SEARXNG_URL unset, brave is the first engine tried.
+    def test_first_engine_wins_searxng(self, monkeypatch):
+        # Cascade order: searxng → ddg. With SEARXNG_URL set, searxng wins.
         from jyagent.tools import web_search_tool as m
 
-        fake_brave = [{"title": "T", "url": "https://a/", "snippet": ""} for _ in range(5)]
-        monkeypatch.delenv("SEARXNG_URL", raising=False)  # ensure searxng skipped
-        monkeypatch.setitem(m._ENGINES, "brave", lambda q, n: fake_brave)
-        # Downstream engines MUST NOT be called once brave wins
-        monkeypatch.setitem(m._ENGINES, "mojeek", lambda q, n: pytest.fail("mojeek called"))
+        fake = [{"title": "T", "url": "https://a/", "snippet": ""} for _ in range(5)]
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")
+        monkeypatch.setitem(m._ENGINES, "searxng", lambda q, n: fake)
+        # Downstream engines MUST NOT be called once searxng wins
         monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: pytest.fail("ddg called"))
 
         name, results, errs = _cascade("q", 5)
-        assert name == "brave"
+        assert name == "searxng"
         assert len(results) == 5
 
-    def test_falls_through_to_next_when_underfilled(self, monkeypatch):
-        # Cascade order: searxng → brave → mojeek → ddg.
-        # brave underfills → mojeek wins → ddg never called.
+    def test_falls_through_to_ddg_when_searxng_underfills(self, monkeypatch):
+        # searxng underfills → ddg wins.
+        from jyagent.tools import web_search_tool as m
+
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")
+        monkeypatch.setitem(m._ENGINES, "searxng", lambda q, n: [])
+        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: [
+            {"title": "T", "url": "https://d/", "snippet": ""} for _ in range(5)
+        ])
+
+        name, results, errs = _cascade("q", 5)
+        assert name == "ddg"
+        assert len(results) == 5
+
+    def test_searxng_skipped_when_env_unset(self, monkeypatch):
+        # No SEARXNG_URL → searxng is silently skipped, ddg is the only hop.
         from jyagent.tools import web_search_tool as m
 
         monkeypatch.delenv("SEARXNG_URL", raising=False)
-        monkeypatch.setitem(m._ENGINES, "brave", lambda q, n: [])  # rate-limited
-        monkeypatch.setitem(m._ENGINES, "mojeek", lambda q, n: [
-            {"title": "T", "url": "https://m/", "snippet": ""} for _ in range(5)
+        monkeypatch.setitem(m._ENGINES, "searxng", lambda q, n: pytest.fail("searxng called"))
+        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: [
+            {"title": "D", "url": "https://d/", "snippet": ""} for _ in range(5)
         ])
-        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: pytest.fail("should not reach"))
 
         name, results, errs = _cascade("q", 5)
-        assert name == "mojeek"
-        assert len(results) == 5
-        assert any("brave" in e for e in errs)
+        assert name == "ddg"
 
     def test_force_override_via_env(self, monkeypatch):
         from jyagent.tools import web_search_tool as m
 
-        monkeypatch.setenv("WEB_SEARCH_ENGINE", "mojeek")
-        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: pytest.fail("ddg called"))
-        monkeypatch.setitem(m._ENGINES, "brave", lambda q, n: pytest.fail("brave called"))
-        monkeypatch.setitem(m._ENGINES, "mojeek", lambda q, n: [
-            {"title": "M", "url": "https://m/", "snippet": ""} for _ in range(5)
+        monkeypatch.setenv("WEB_SEARCH_ENGINE", "ddg")
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")  # would normally win
+        monkeypatch.setitem(m._ENGINES, "searxng", lambda q, n: pytest.fail("searxng called"))
+        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: [
+            {"title": "D", "url": "https://d/", "snippet": ""} for _ in range(5)
         ])
 
         name, results, errs = _cascade("q", 5)
-        assert name == "mojeek"
+        assert name == "ddg"
 
     def test_engine_exception_recorded_and_continues(self, monkeypatch):
-        # Cascade order: searxng → brave → mojeek → ddg.
-        # brave throws → cascade records error and continues to mojeek.
+        # searxng throws → cascade records error and continues to ddg.
         from jyagent.tools import web_search_tool as m
 
-        monkeypatch.delenv("SEARXNG_URL", raising=False)
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:9999")
 
         def boom(q, n): raise RuntimeError("kaboom")
-        monkeypatch.setitem(m._ENGINES, "brave", boom)
-        monkeypatch.setitem(m._ENGINES, "mojeek", lambda q, n: [
-            {"title": "M", "url": "https://m/", "snippet": ""} for _ in range(5)
+        monkeypatch.setitem(m._ENGINES, "searxng", boom)
+        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: [
+            {"title": "D", "url": "https://d/", "snippet": ""} for _ in range(5)
         ])
 
         name, results, errs = _cascade("q", 5)
-        assert name == "mojeek"
-        assert any("brave" in e and "kaboom" in e for e in errs)
+        assert name == "ddg"
+        assert any("searxng" in e and "kaboom" in e for e in errs)
 
 
 # ─── web_search() integration ─────────────────────────────────────────────────
@@ -280,28 +207,27 @@ class TestWebSearch:
     def test_returns_formatted_results(self, monkeypatch):
         from jyagent.tools import web_search_tool as m
 
-        # Cascade order: searxng → brave → mojeek → ddg. Patch brave (the
-        # first non-searxng engine) so it wins outright with ≥ _MIN_RESULTS_TO_STOP;
-        # otherwise cascade would fall through to live mojeek/ddg.
+        # Patch ddg so it wins outright with ≥ _MIN_RESULTS_TO_STOP;
+        # otherwise cascade would fall through to live network.
         fake = [
             {"title": f"Result {i}", "url": f"https://example.com/{i}", "snippet": f"S{i}"}
             for i in range(1, 5)
         ]
         monkeypatch.delenv("SEARXNG_URL", raising=False)
-        monkeypatch.setitem(m._ENGINES, "brave", lambda q, n: fake)
+        monkeypatch.setitem(m._ENGINES, "ddg", lambda q, n: fake)
 
         result = web_search(query="test query")
         assert not result.is_error
         text = str(result)
         assert "Result 1" in text
         assert "https://example.com/1" in text
-        assert "Engine: brave" in text
+        assert "Engine: ddg" in text
 
     def test_all_engines_empty_returns_error(self, monkeypatch):
         from jyagent.tools import web_search_tool as m
 
         monkeypatch.delenv("SEARXNG_URL", raising=False)
-        for eng in ("ddg", "brave", "mojeek"):
+        for eng in ("searxng", "ddg"):
             monkeypatch.setitem(m._ENGINES, eng, lambda q, n: [])
 
         result = web_search(query="anything")

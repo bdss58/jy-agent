@@ -7,22 +7,29 @@ iteration / synthesis: run web_search → pick URLs → web_fetch each.
 
 Engine cascade (first non-empty wins):
 
-  1. SearxNG      — if SEARXNG_URL env is set. Aggregates Google+Bing+Brave+
-                    DDG+70 others via one self-hosted JSON endpoint.
-                    No API key, best quality.
-  2. Brave Search — HTML endpoint. Independent index of ~8B docs.
-  3. Mojeek       — HTML endpoint. Independent crawler, tiny but unique.
-  4. DuckDuckGo   — HTML endpoint. Last-resort fallback (most rate-limited).
+  1. SearxNG    — if SEARXNG_URL env is set. Aggregates Google + Bing +
+                  Brave + DDG + ~70 others via one self-hosted JSON
+                  endpoint. No API key, best quality.
+  2. DuckDuckGo — HTML endpoint. Default fallback, no auth.
+
+Brave (HTML scrape) and Mojeek were removed 2026-04-26. Brave now serves
+a PoW captcha to scrapers; even curl_cffi Chrome impersonation returns
+CURLE_WRITE_ERROR. Mojeek aggressively IP-blocks all available exit
+ranges (datacenter + Cloudflare WARP), serving a 340-byte
+"403 / automated queries" page regardless of TLS impersonation. Run a
+SearxNG instance for richer aggregation — it queries Brave/Mojeek/etc.
+on your behalf from a residential-style request flow.
 
 Each engine has its own parser, but they all return the same
 {title, url, snippet} dict shape so the caller never needs to care
 which engine served the result.
 
 Environment variables:
-  SEARXNG_URL       Base URL of a SearxNG instance, e.g. http://localhost:8888
-                    (no trailing slash). When set, SearxNG goes first.
-  WEB_SEARCH_ENGINE Force a single engine: "searxng" | "ddg" | "brave" |
-                    "mojeek". Default: cascade.
+  SEARXNG_URL       Base URL of a SearxNG instance, e.g.
+                    http://localhost:8888 (no trailing slash).
+                    When set, SearxNG goes first.
+  WEB_SEARCH_ENGINE Force a single engine: "searxng" | "ddg".
+                    Default: cascade.
 """
 
 import logging
@@ -133,112 +140,12 @@ def _search_ddg(query: str, max_results: int) -> list[dict]:
     return results
 
 
-# ─── Engine 3: Brave Search (HTML, independent ~8B-doc index) ────────────────
-
-
-def _search_brave(query: str, max_results: int) -> list[dict]:
-    """Scrape Brave Search HTML SERPs.
-
-    Brave runs an independent crawler, so results complement DDG/Bing.
-    No API key needed for the HTML endpoint, but Brave rate-limits
-    aggressively (HTTP 429) — expect this engine to miss on sustained use,
-    which is why it sits behind DDG in the cascade.
-
-    Selectors observed 2026-04 (Svelte-based SPA): `a.l1` is the stable
-    title anchor inside `div.snippet > div.result-wrapper`. Class names
-    like `svelte-<hash>` rotate and must NOT be relied on.
-    """
-    url = f"https://search.brave.com/search?q={quote_plus(query)}&source=web"
-    html = _http_get(url, min_len=2000)
-    if not html:
-        return []
-
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, "html.parser")
-    results: list[dict] = []
-    seen_urls: set[str] = set()
-
-    for a in soup.select("a.l1"):
-        href = (a.get("href") or "").strip()
-        if not href.startswith("http") or href in seen_urls:
-            continue
-
-        # Title is mixed with the display-URL chip; split on the first
-        # occurrence of the actual page title heuristically, or just take
-        # the whole text — DDG does the same and agents handle it fine.
-        title = a.get_text(" ", strip=True)
-
-        # Snippet: look inside the enclosing result-wrapper / snippet block
-        wrap = a.find_parent("div", class_="snippet") or a.find_parent("div", class_="result-wrapper")
-        snippet = ""
-        if wrap:
-            # Any <div> / <p> with medium-length non-title text is likely the description
-            for el in wrap.find_all(["p", "div"]):
-                txt = el.get_text(" ", strip=True)
-                if 40 <= len(txt) <= 400 and not txt.startswith(title[:20]):
-                    snippet = txt
-                    break
-
-        seen_urls.add(href)
-        results.append({"title": title, "url": href, "snippet": snippet})
-        if len(results) >= max_results:
-            break
-
-    return results
-
-
-# ─── Engine 4: Mojeek (HTML, independent crawler, minimal JS) ────────────────
-
-
-def _search_mojeek(query: str, max_results: int) -> list[dict]:
-    """Scrape Mojeek — independent UK-based crawler. Small index but unique.
-
-    Mojeek's HTML is static, parser-friendly, and not rate-limited the way
-    Brave is — making it the most reliable third fallback.
-
-    Selectors observed 2026-04: `ul.results-standard > li` with
-    `h2 a.title` for the title (real anchor), `a.ob` for the URL chip,
-    `p.s` for the snippet.
-    """
-    url = f"https://www.mojeek.com/search?q={quote_plus(query)}"
-    html = _http_get(url, min_len=1500)
-    if not html:
-        return []
-
-    from bs4 import BeautifulSoup
-
-    soup = BeautifulSoup(html, "html.parser")
-    results: list[dict] = []
-
-    for li in soup.select("ul.results-standard > li"):
-        # Title anchor — h2 a.title is the real titled link
-        title_a = li.select_one("h2 a.title") or li.select_one("h2 a")
-        if not title_a:
-            continue
-        href = (title_a.get("href") or "").strip()
-        title = title_a.get_text(" ", strip=True)
-        if not (title and href.startswith("http")):
-            continue
-
-        snip_el = li.select_one("p.s")
-        snippet = snip_el.get_text(" ", strip=True) if snip_el else ""
-
-        results.append({"title": title, "url": href, "snippet": snippet})
-        if len(results) >= max_results:
-            break
-
-    return results
-
-
 # ─── Cascade orchestrator ───────────────────────────────────────────────────
 
 # Registry: name → callable. Order matters when no override is set.
 _ENGINES: dict[str, Callable[[str, int], list[dict]]] = {
     "searxng": _search_searxng,
     "ddg": _search_ddg,
-    "brave": _search_brave,
-    "mojeek": _search_mojeek,
 }
 
 # Minimum results an engine must return before we stop cascading.
@@ -257,12 +164,9 @@ def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
         engines = [(forced, _ENGINES[forced])]
     else:
         # SearxNG first (only active if SEARXNG_URL is set; otherwise returns []).
-        # DDG is intentionally LAST: it has been the flakiest engine in practice
-        # (rate limiting, intermittent empty HTML, redirect-wrapped URLs).
+        # DDG is the universal fallback — no auth, no env required.
         engines = [
             ("searxng", _ENGINES["searxng"]),
-            ("brave", _ENGINES["brave"]),
-            ("mojeek", _ENGINES["mojeek"]),
             ("ddg", _ENGINES["ddg"]),
         ]
 
@@ -270,7 +174,7 @@ def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
     best_name, best_results = "", []
 
     for name, fn in engines:
-        # Skip SearxNG silently when not configured
+        # Skip SearxNG silently when not configured.
         if name == "searxng" and not os.environ.get("SEARXNG_URL"):
             continue
         try:
@@ -296,8 +200,8 @@ def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
 def web_search(query: str, max_results: int = 10) -> ToolResult:
     """Search the web and return structured results.
 
-    Cascade: SearxNG (if SEARXNG_URL set) → DuckDuckGo → Brave → Mojeek.
-    First engine returning ≥3 results wins.
+    Cascade: SearxNG (if SEARXNG_URL set) → DuckDuckGo. First engine
+    returning ≥3 results wins.
 
     Args:
         query: Search query string
@@ -345,9 +249,9 @@ TOOL_SCHEMA = {
     "name": "web_search",
     "description": (
         "Search the web and return structured results (title, URL, snippet). "
-        "Cascades through SearxNG (if SEARXNG_URL env set) → DuckDuckGo → "
-        "Brave Search → Mojeek until one returns enough results. No API key "
-        "required. Use this for finding information, news, comparisons, "
+        "Cascades through SearxNG (if SEARXNG_URL set) → DuckDuckGo until "
+        "one returns enough results. No API key required for the DDG "
+        "fallback. Use this for finding information, news, comparisons, "
         "fact-checking. For fetching a known URL, use web_fetch instead. "
         "For comprehensive multi-source research, iterate: web_search → "
         "pick top URLs → web_fetch each."
