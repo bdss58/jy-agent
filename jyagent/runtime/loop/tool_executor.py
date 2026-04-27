@@ -259,7 +259,14 @@ def execute_tools(
                 parallel_batch.append((i, blocks[i]))
                 i += 1
 
-            pool = executor or tool_dispatch_executor
+            # P3-2 (2026-04-27): the module-level `tool_dispatch_executor`
+            # is now lazy.  In production, `executor` is always set
+            # (`AgentLoop.__init__` passes `loop._executor`), but direct
+            # callers (`tool_executor.execute_tools()` with `executor=None`,
+            # or the back-compat `engine._execute_tools()` shim) need us to
+            # materialise the pool here.  `get_tool_dispatch_executor` is
+            # idempotent and grows in place, so this is cheap.
+            pool = executor or get_tool_dispatch_executor(max_workers)
             futures = {
                 pool.submit(
                     execute_tool_with_timeout,

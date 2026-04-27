@@ -1537,3 +1537,55 @@ for m in (phases, reflection, checkpoint, todos, verification, remediation, trac
 print('OK')
 """)
         assert "OK" in out
+    def test_execute_tools_with_executor_none_lazy_inits_pool(self):
+        """P3-2 regression (Codex follow-up): direct callers of
+        `tool_executor.execute_tools(...)` with `executor=None` MUST work
+        even when no AgentLoop has been constructed yet.
+
+        Before the lazy-init fallback (`pool = executor or
+        get_tool_dispatch_executor(max_workers)`), the module global was
+        None at import time so `pool.submit(...)` would raise
+        AttributeError on a parallel batch.
+
+        Subprocess-isolated so we get a fresh sys.modules with no other
+        test having already grown the pool.
+        """
+        out = self._run_in_subprocess('''
+from jyagent.runtime.loop import tool_executor as te
+from jyagent.runtime.tools.registry import ToolRegistry
+
+# Verify the pool is None at this point (no AgentLoop ever constructed)
+assert te.tool_dispatch_executor is None
+
+# Build a parallel-safe batch with two tools
+def _t(label="x"):
+    return f"{label}-done"
+
+reg = ToolRegistry()
+reg.register("a", _t, {"name": "a", "input_schema": {"type": "object"}}, parallel_safe=True)
+reg.register("b", _t, {"name": "b", "input_schema": {"type": "object"}}, parallel_safe=True)
+batch = reg.freeze()
+
+from jyagent.runtime.loop.engine import ToolCallRequest
+blocks = [
+    ToolCallRequest(id="1", name="a", input={"label": "a"}),
+    ToolCallRequest(id="2", name="b", input={"label": "b"}),
+]
+
+# Critical path: executor=None forces the fallback that used to read None
+results = te.execute_tools(
+    blocks, batch,
+    concurrent_mode=True, max_workers=4, timeout=10,
+    executor=None,
+)
+
+assert len(results) == 2
+for block, r in results:
+    assert not r.is_error, f"{block.name} errored: {r.content}"
+    assert "done" in r.content
+
+# And the pool was lazily materialised
+assert te.tool_dispatch_executor is not None
+print("OK")
+''', timeout=20)
+        assert "OK" in out
