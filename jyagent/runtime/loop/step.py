@@ -51,9 +51,9 @@ if TYPE_CHECKING:
 class RunState:
     """Mutable per-run state threaded through every ``run_step`` call.
 
-    Built once at the top of ``AgentLoop._run_impl`` (currently inline,
-    target ``RunState.from_loop()`` in a follow-up commit), mutated in
-    place by ``run_step`` on every iteration.
+    Built once at the top of ``AgentLoop._run_impl`` via
+    ``RunState.prepare_for_run()``, mutated in place by ``run_step`` on
+    every iteration.
 
     Field categories:
       - **Conversation**: ``system_prompt``, ``messages``, ``turn_start_idx``.
@@ -130,7 +130,7 @@ class RunState:
     # ── Constructor ────────────────────────────────────────────────────────
 
     @classmethod
-    def from_loop(
+    def prepare_for_run(
         cls,
         loop: "AgentLoop",
         system_prompt: str,
@@ -139,6 +139,11 @@ class RunState:
     ) -> "RunState":
         """Run-setup factory: prepares the AgentLoop instance for a fresh
         run and constructs the per-run mutable state.
+
+        Renamed from ``from_loop`` (Codex review of Phase 5, 2026-04-27):
+        the old name read like a pure factory but the method intentionally
+        mutates ``loop._partial_side_effects``, ``loop._run_id``, and
+        ``loop._todos``. The new name signals the side-effect contract.
 
         Side effects on ``loop`` (intentional, not just construction):
           - ``loop._partial_side_effects = []`` — reset mutating-timeout
