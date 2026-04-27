@@ -32,6 +32,15 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
+# `typing_extensions.deprecated` is the PEP 702 backport.  Python 3.13+
+# has the same decorator at `warnings.deprecated` / `typing.deprecated`,
+# but pyproject still advertises requires-python = ">=3.12", and on 3.12
+# `warnings.deprecated` does not exist (Codex review of P1-11 commit
+# 493a34d caught this — the import would AttributeError at class-def
+# time on 3.12).  The backport works on 3.12 and forwards to the stdlib
+# implementation on 3.13+.
+from typing_extensions import deprecated
+
 
 def _readonly(d: Mapping) -> Mapping:
     """Wrap ``d`` in a ``MappingProxyType`` for ToolBatch fields.
@@ -205,6 +214,26 @@ class ToolRegistry:
     For per-step dispatch, prefer ``freeze()`` over per-call lookups —
     ``freeze()`` produces an immutable ``ToolBatch`` consumed by the entire
     step, eliminating mid-step races on metadata (Codex review 2026-04-25).
+
+    .. deprecated:: 2026-04-27 (Codex review 2026-04-25 Part 1 #11)
+        The following per-call live-read methods are deprecated and will
+        emit ``DeprecationWarning`` on use; they are footguns because
+        consecutive calls are NOT batch-atomic:
+
+        - :meth:`snapshot`
+        - :meth:`is_parallel_safe`
+        - :meth:`is_mutating`
+        - :meth:`get_timeout_hint`
+        - :meth:`get_large_input_keys`
+        - :meth:`get_compaction_priority`
+
+        Migrate to ``registry.freeze()`` once at the top of any cross-call
+        operation, then read from the resulting :class:`ToolBatch`.
+
+        The single-lookup methods :meth:`get_function`, :meth:`get_schema`,
+        :meth:`get_schemas`, :meth:`get_functions`, :meth:`list_tools`, and
+        :attr:`version` remain undeprecated — they are fine for one-off
+        live reads where cross-call atomicity does not matter.
     """
 
     def __init__(self):
@@ -304,56 +333,105 @@ class ToolRegistry:
                 mutating=mutating,
             )
 
+    @deprecated(
+        "ToolRegistry.snapshot() is a footgun — it returns the raw schema "
+        "list (mutable, no defensive copy of the dicts) and is per-call "
+        "atomic but NOT batch-atomic.  Use ToolRegistry.freeze() to obtain "
+        "a deep-copied immutable ToolBatch, then read from the batch.  "
+        "(Codex review 2026-04-25 Part 1 #11/#12; deprecated 2026-04-27.)"
+    )
     def snapshot(self) -> tuple[int, list[dict], dict[str, Callable]]:
         """Legacy shallow snapshot — kept for callers that haven't migrated.
 
-        Returns ``(version, schemas_copy, functions_copy)``.  Prefer
-        ``freeze()`` which also captures metadata atomically and deep-copies
-        schemas to prevent post-freeze mutation.
+        .. deprecated:: 2026-04-27
+            Use :meth:`freeze` which also captures metadata atomically and
+            deep-copies schemas to prevent post-freeze mutation.
+
+        Returns ``(version, schemas_copy, functions_copy)``.
         """
         with self._lock:
             return (self._version, list(self._schemas), dict(self._functions))
 
-    # ─── Locked metadata getters (defense-in-depth) ─────────────────────
+    # ─── Locked metadata getters (DEPRECATED — use ToolBatch instead) ────
     #
-    # These remain for callers that legitimately need a single live
-    # lookup (e.g. ``mcp_manager`` reflection).  All take ``self._lock``
-    # so a concurrent ``register()``/``unregister()`` cannot expose a
-    # half-updated metadata dict.  The dispatch loop must NOT use these
-    # — it uses ``freeze()`` once per step.
+    # These methods are per-call locked but NOT batch-atomic: two
+    # consecutive calls on the same registry can return values from
+    # different registry versions if a register()/unregister() fires
+    # between them.  That was the original Codex Part 1 #4/#11 bug —
+    # the dispatch loop saw a tool as parallel-safe in one read and
+    # serial in another, accidentally racing a mutating tool.
+    #
+    # The fix was ``ToolBatch`` (per-step immutable snapshot via
+    # ``freeze()``).  All in-tree dispatch code now uses ToolBatch.
+    # The methods below remain ONLY for back-compat with external
+    # callers; they will be removed in a future major version.
+    #
+    # Use ``registry.freeze()`` once at the top of any cross-call
+    # operation, then read from the resulting ToolBatch.
 
     @property
     def version(self) -> int:
         with self._lock:
             return self._version
 
+    @deprecated(
+        "Use ToolRegistry.freeze().is_parallel_safe(name) for batch-atomic "
+        "reads.  The registry-level method races with concurrent register()/"
+        "unregister() across consecutive calls.  (P1-11, 2026-04-27.)"
+    )
     def is_parallel_safe(self, name: str) -> bool:
         with self._lock:
             return self._metadata.get(name, {}).get("parallel_safe", False)
 
+    @deprecated(
+        "Use ToolRegistry.freeze().is_mutating(name) for batch-atomic reads. "
+        "(P1-11, 2026-04-27.)"
+    )
     def is_mutating(self, name: str) -> bool:
         """Return True if the tool was registered with ``mutating=True``.
 
-        Defense-in-depth mirror of ``ToolBatch.is_mutating``: callers that
-        legitimately need a live lookup (e.g. ad-hoc diagnostics) can use
-        this, but the dispatch loop reads the flag off the per-step
-        ``ToolBatch`` snapshot instead.  Unknown names default to False.
+        .. deprecated:: 2026-04-27
+            Use ``ToolRegistry.freeze().is_mutating(name)`` instead.
         """
         with self._lock:
             return self._metadata.get(name, {}).get("mutating", False)
 
+    @deprecated(
+        "Use ToolRegistry.freeze().get_timeout_hint(name) for batch-atomic "
+        "reads.  (P1-11, 2026-04-27.)"
+    )
     def get_timeout_hint(self, name: str) -> int | None:
-        """Return the tool's preferred timeout in seconds, or None for default."""
+        """Return the tool's preferred timeout in seconds, or None for default.
+
+        .. deprecated:: 2026-04-27
+            Use ``ToolRegistry.freeze().get_timeout_hint(name)`` instead.
+        """
         with self._lock:
             return self._metadata.get(name, {}).get("timeout_hint")
 
+    @deprecated(
+        "Use ToolRegistry.freeze().get_large_input_keys(name) for "
+        "batch-atomic reads.  (P1-11, 2026-04-27.)"
+    )
     def get_large_input_keys(self, name: str) -> set[str] | None:
-        """Return keys whose values should be truncated in working messages, or None."""
+        """Return keys whose values should be truncated in working messages, or None.
+
+        .. deprecated:: 2026-04-27
+            Use ``ToolRegistry.freeze().get_large_input_keys(name)`` instead.
+        """
         with self._lock:
             return self._metadata.get(name, {}).get("large_input_keys")
 
+    @deprecated(
+        "Use ToolRegistry.freeze().get_compaction_priority(name) for "
+        "batch-atomic reads.  (P1-11, 2026-04-27.)"
+    )
     def get_compaction_priority(self, name: str) -> str:
-        """Return tool's compaction priority: 'ephemeral', 'standard', or 'persistent'."""
+        """Return tool's compaction priority: 'ephemeral', 'standard', or 'persistent'.
+
+        .. deprecated:: 2026-04-27
+            Use ``ToolRegistry.freeze().get_compaction_priority(name)`` instead.
+        """
         with self._lock:
             return self._metadata.get(name, {}).get("compaction_priority", "standard")
 

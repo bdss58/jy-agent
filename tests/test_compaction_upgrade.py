@@ -272,21 +272,27 @@ def test_compaction_priority_in_registry():
     reg = ToolRegistry()
     reg.register("test_tool", lambda: None, {"name": "test_tool"},
                  compaction_priority="ephemeral")
-    assert reg.get_compaction_priority("test_tool") == "ephemeral"
-    assert reg.get_compaction_priority("unknown_tool") == "standard"  # default
+    # Use ``freeze()`` rather than the deprecated live-read accessor
+    # (P1-11 / Codex review 2026-04-25): the per-step ToolBatch is the
+    # canonical metadata API; the registry-level method is a footgun.
+    batch = reg.freeze()
+    assert batch.get_compaction_priority("test_tool") == "ephemeral"
+    assert batch.get_compaction_priority("unknown_tool") == "standard"  # default
 
 
 def test_builtin_tools_have_correct_priorities():
     """Built-in tools registered with expected compaction priorities."""
     import jyagent.tools  # noqa
     from jyagent.runtime.tools.registry import get_registry
-    r = get_registry()
+    # P1-11 (2026-04-27): use freeze() rather than the deprecated
+    # registry-level live-read accessor.
+    batch = get_registry().freeze()
 
-    assert r.get_compaction_priority("run_shell") == "ephemeral"
-    assert r.get_compaction_priority("list_directory") == "ephemeral"
-    assert r.get_compaction_priority("read_file") == "persistent"
-    assert r.get_compaction_priority("web_fetch") == "persistent"
-    assert r.get_compaction_priority("write_file") == "standard"
+    assert batch.get_compaction_priority("run_shell") == "ephemeral"
+    assert batch.get_compaction_priority("list_directory") == "ephemeral"
+    assert batch.get_compaction_priority("read_file") == "persistent"
+    assert batch.get_compaction_priority("web_fetch") == "persistent"
+    assert batch.get_compaction_priority("write_file") == "standard"
 
 
 # ─── Phase 2: P1.6 — Enhanced 9-section summary prompt ───────────────────────

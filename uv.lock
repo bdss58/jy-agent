@@ -615,6 +615,7 @@ dependencies = [
     { name = "readability-lxml" },
     { name = "rich" },
     { name = "trafilatura" },
+    { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
@@ -643,6 +644,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "trafilatura", specifier = ">=1.8" },
+    { name = "typing-extensions", specifier = ">=4.5" },
 ]
 provides-extras = ["dev"]
 
