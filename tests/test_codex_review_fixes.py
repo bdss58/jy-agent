@@ -1589,3 +1589,145 @@ assert te.tool_dispatch_executor is not None
 print("OK")
 ''', timeout=20)
         assert "OK" in out
+
+
+
+# ─── P1-11: ToolRegistry live-read accessors deprecation ────────────────────
+#
+# Codex review 2026-04-25 Part 1 #11.  The 6 per-call live-read methods on
+# ``ToolRegistry`` are footguns: they're per-call locked but NOT batch-atomic,
+# so two consecutive reads can see different registry versions if a
+# register()/unregister() fires between them.  All in-tree dispatch code now
+# goes through ``freeze()`` → ToolBatch (Codex Part 1 #4 fix from earlier
+# this month).  These tests pin the deprecation contract.
+
+class TestC4ToolRegistryLiveReadDeprecation:
+    """Verify each footgun method emits DeprecationWarning and still works.
+
+    Backward compatibility: deprecated methods MUST still return correct
+    values — the deprecation is a soft, runtime-warning-only signal so
+    external callers have a migration window.
+    """
+
+    def _registry_with_one_tool(self):
+        """Build a fresh ToolRegistry with a single fully-attributed tool."""
+        from jyagent.runtime.tools.registry import ToolRegistry
+        reg = ToolRegistry()
+        reg.register(
+            "demo", lambda: None,
+            {"name": "demo", "input_schema": {"type": "object"}},
+            parallel_safe=True,
+            timeout_hint=42,
+            large_input_keys={"big_field"},
+            compaction_priority="ephemeral",
+            mutating=True,
+        )
+        return reg
+
+    def test_snapshot_warns_and_works(self):
+        import pytest
+        reg = self._registry_with_one_tool()
+        with pytest.warns(DeprecationWarning, match="snapshot"):
+            version, schemas, functions = reg.snapshot()
+        assert version >= 1
+        assert len(schemas) == 1 and schemas[0]["name"] == "demo"
+        assert "demo" in functions
+
+    def test_is_parallel_safe_warns_and_works(self):
+        import pytest
+        reg = self._registry_with_one_tool()
+        with pytest.warns(DeprecationWarning, match="is_parallel_safe"):
+            assert reg.is_parallel_safe("demo") is True
+        with pytest.warns(DeprecationWarning):
+            assert reg.is_parallel_safe("unknown") is False
+
+    def test_is_mutating_warns_and_works(self):
+        import pytest
+        reg = self._registry_with_one_tool()
+        with pytest.warns(DeprecationWarning, match="is_mutating"):
+            assert reg.is_mutating("demo") is True
+
+    def test_get_timeout_hint_warns_and_works(self):
+        import pytest
+        reg = self._registry_with_one_tool()
+        with pytest.warns(DeprecationWarning, match="get_timeout_hint"):
+            assert reg.get_timeout_hint("demo") == 42
+
+    def test_get_large_input_keys_warns_and_works(self):
+        import pytest
+        reg = self._registry_with_one_tool()
+        with pytest.warns(DeprecationWarning, match="get_large_input_keys"):
+            keys = reg.get_large_input_keys("demo")
+        assert keys == {"big_field"}
+
+    def test_get_compaction_priority_warns_and_works(self):
+        import pytest
+        reg = self._registry_with_one_tool()
+        with pytest.warns(DeprecationWarning, match="get_compaction_priority"):
+            assert reg.get_compaction_priority("demo") == "ephemeral"
+
+    def test_undeprecated_lookups_do_not_warn(self):
+        """Single-lookup methods that are fine for one-off live reads —
+        ``get_function``, ``get_schema``, ``list_tools``, ``version`` — must
+        NOT emit DeprecationWarning.  They are legitimate when batch-atomicity
+        does not matter.
+        """
+        import warnings
+        reg = self._registry_with_one_tool()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning becomes a test failure
+            assert reg.get_function("demo") is not None
+            assert reg.get_schema("demo")["name"] == "demo"
+            assert reg.get_schemas()[0]["name"] == "demo"
+            assert reg.get_functions()["demo"] is not None
+            assert "demo" in reg.list_tools()
+            assert reg.version >= 1
+
+    def test_freeze_path_does_not_warn(self):
+        """The recommended migration target — ``freeze() → ToolBatch.is_*``
+        — must be warning-free.  This is what callers should use instead."""
+        import warnings
+        reg = self._registry_with_one_tool()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            batch = reg.freeze()
+            assert batch.is_parallel_safe("demo") is True
+            assert batch.is_mutating("demo") is True
+            assert batch.get_timeout_hint("demo") == 42
+            assert batch.get_large_input_keys("demo") == frozenset({"big_field"})
+            assert batch.get_compaction_priority("demo") == "ephemeral"
+
+    def test_no_in_tree_callers_remain(self):
+        """Production code must not call the deprecated methods.
+
+        Static check: grep the package source for ``registry.<deprecated>(``
+        patterns.  Catches accidental re-introduction during refactors.
+        """
+        import pathlib
+        import re
+        # Match `<ident>.<method>(` where <method> is one of the deprecated 6.
+        # Filter to in-package source files only.
+        deprecated = [
+            "snapshot", "is_parallel_safe", "is_mutating",
+            "get_timeout_hint", "get_large_input_keys",
+            "get_compaction_priority",
+        ]
+        pattern = re.compile(
+            r"\b(?:registry|reg|self\._registry|_registry)\."
+            r"(?:" + "|".join(deprecated) + r")\("
+        )
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        pkg_root = repo_root / "jyagent"
+        offenders = []
+        for src in pkg_root.rglob("*.py"):
+            # Skip the registry module itself (defines + tests the methods)
+            if src.name == "registry.py":
+                continue
+            text = src.read_text()
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append(f"{src.relative_to(repo_root)}:{line_no}: {line.strip()}")
+        assert not offenders, (
+            "Deprecated ToolRegistry methods called from production code:\n"
+            + "\n".join(offenders)
+        )

@@ -464,9 +464,17 @@ def run(runtime_owner: LLMOwner) -> None:
                     stats.new_turn()
                     callbacks, spinner = build_streaming_callbacks(stats, runtime_owner)
 
-                    # Create tool source factory
+                    # Create tool source factory.
+                    # P1-11 (Codex review 2026-04-25): use ``freeze()`` (the
+                    # batch-atomic deep-copy snapshot) rather than the legacy
+                    # ``snapshot()`` shallow tuple.  The engine builds its own
+                    # per-step ToolBatch from this output anyway; freeze gives
+                    # us cross-call atomicity for free.
                     registry = get_registry()
-                    tool_source = lambda: registry.snapshot()[1:]  # (schemas, functions) — skip version
+                    def _tool_source():
+                        batch = registry.freeze()
+                        return (list(batch.schemas), dict(batch.functions))
+                    tool_source = _tool_source
 
                     # Create AgentLoop and run
                     loop = AgentLoop(runtime_owner, config, callbacks=callbacks, tool_source=tool_source)
