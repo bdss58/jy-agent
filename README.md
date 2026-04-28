@@ -167,10 +167,13 @@ callbacks = LoopCallbacks(
 )
 
 # 3. Tool source: a callable that returns (schemas, functions) on each iteration.
-#    `registry.snapshot()` returns (version, schemas, functions); slice off the
-#    version int.  Mutate the registry between turns and the loop will pick it up.
+#    `registry.freeze()` returns an immutable ToolBatch with `.schemas` and
+#    `.functions` attributes.  Mutate the registry between turns and the loop
+#    will pick it up.
 registry = get_registry()
-tool_source = lambda: registry.snapshot()[1:]
+def tool_source():
+    batch = registry.freeze()
+    return batch.schemas, batch.functions
 
 # 4. Run.  `messages` is mutated in-place; pass an empty list for a fresh turn,
 #    or a prior conversation to continue.
