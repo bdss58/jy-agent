@@ -37,14 +37,9 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 
 ## Topic Files Index
 - **memory-design.md** — Three-tier memory architecture (this file's design rationale + routing rules). Read this if asked to refactor or extend the memory system.
-- **agent-loop-changelog.md** — Loop engine internals (TODO scratchpad, reflection, phases, checkpoints, sub-agent envelope) + `run_background` hardening detail. Read on questions about loop_engine, todos, reflection, phases, checkpoint, or background tooling.
-- **skill-router-fix.md** — Why the skill LLM router was silently broken and the `complete_text(reasoning=...)` fix. Read on questions about skill routing, `_route_llm`, or the `validate_anthropic_reasoning` ValueError.
 - **gfw-proxy-fallback.md** — SSH SOCKS5 tunnel workflow for GFW-blocked hosts (ghcr.io, raw.githubusercontent.com, huggingface.co, etc.). Read when a network call fails against a likely-blocked host.
 - **openclaw-offline-update.md** — OpenClaw offline bundle update process (preflight, docker-compose schema migration, build-artifact staleness). Read on any OpenClaw customer-deployment question.
 - **nano-vllm-learning.md** — Long-term plan to master LLM inference via nano-vLLM. Tracks current phase, session log, checkpoints, questions. Read on any session mentioning nano-vLLM / learning / LLM study.
-- **runtime-refactor.md** — Runtime Package Refactor
-- **runtime-review-2026-04-25.md** — Runtime Design + Implementation Review (Codex)
-- **runtime-c1-c4-deferrals.md** — Tier C deferrals — C1 (cancellation latency) and C4 (engine.py split)
 ## Repo Snapshot
 - Provider-neutral LLM layer: Anthropic Messages + OpenAI Responses adapters under `jyagent/llm/`
 - `LLMOwner` owns the active `provider:model`; `/model <provider> <model>` switches future turns
