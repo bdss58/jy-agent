@@ -16,13 +16,17 @@ from ..types import (
     Message,
     ModelSpec,
     LLMOptions,
-    TextBlock,
-    ThinkingBlock,
-    ToolCallBlock,
     ToolResultMessage,
     Usage,
     compute_total_tokens,
 )
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read a field from SDK objects or dict-like responses."""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
 
 
 # ─── Model capability detection ─────────────────────────────────────────────
@@ -95,13 +99,13 @@ def usage_from_response(usage: Any) -> Usage:
     if usage is None:
         return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-    input_tokens = getattr(usage, "input_tokens", 0) or 0
-    output_tokens = getattr(usage, "output_tokens", 0) or 0
+    input_tokens = _field(usage, "input_tokens", 0) or 0
+    output_tokens = _field(usage, "output_tokens", 0) or 0
 
     cache_read = 0
-    input_details = getattr(usage, "input_tokens_details", None)
+    input_details = _field(usage, "input_tokens_details", None)
     if input_details is not None:
-        cache_read = getattr(input_details, "cached_tokens", 0) or 0
+        cache_read = _field(input_details, "cached_tokens", 0) or 0
 
     raw: Usage = {
         "input_tokens": input_tokens,
@@ -138,43 +142,43 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
     content: list[dict[str, Any]] = []
     has_tool_calls = False
 
-    for item in getattr(response, "output", []):
-        item_type = getattr(item, "type", None)
+    for item in _field(response, "output", []) or []:
+        item_type = _field(item, "type")
 
         if item_type == "message":
             # Extract text from message content parts
-            for part in getattr(item, "content", []):
-                part_type = getattr(part, "type", None)
-                if part_type == "output_text":
-                    text = getattr(part, "text", "")
+            for part in _field(item, "content", []) or []:
+                part_type = _field(part, "type")
+                if part_type in ("output_text", "text"):
+                    text = _field(part, "text", "")
                     if text:
                         content.append({"type": "text", "text": text})
 
         elif item_type == "function_call":
             has_tool_calls = True
-            arguments_str = getattr(item, "arguments", "") or "{}"
+            arguments_str = _field(item, "arguments", "") or "{}"
             try:
                 parsed_args = json.loads(arguments_str)
             except (json.JSONDecodeError, TypeError) as exc:
                 import logging
                 logging.getLogger("jyagent.llm").warning(
                     "Malformed tool-call arguments from OpenAI (call_id=%s, name=%s): %s",
-                    getattr(item, "call_id", "?"), getattr(item, "name", "?"), exc,
+                    _field(item, "call_id", "?"), _field(item, "name", "?"), exc,
                 )
                 parsed_args = {"_parse_error": str(exc)}
             content.append({
                 "type": "tool_call",
-                "id": getattr(item, "call_id", ""),
-                "name": getattr(item, "name", ""),
+                "id": _field(item, "call_id", ""),
+                "name": _field(item, "name", ""),
                 "arguments": parsed_args,
             })
 
         elif item_type == "reasoning":
             # Preserve reasoning/thinking output if available
-            summary_parts = getattr(item, "summary", None) or []
+            summary_parts = _field(item, "summary") or []
             summary_texts: list[str] = []
             for sp in summary_parts:
-                text = getattr(sp, "text", "") if not isinstance(sp, str) else sp
+                text = _field(sp, "text", "") if not isinstance(sp, str) else sp
                 if text:
                     summary_texts.append(text)
             if summary_texts:
@@ -184,9 +188,14 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
                     "summary": summary_texts,
                 })
 
-    usage = usage_from_response(getattr(response, "usage", None))
-    response_id = getattr(response, "id", "")
-    status = getattr(response, "status", None)
+    if not any(block.get("type") == "text" for block in content):
+        output_text = _field(response, "output_text", "")
+        if output_text:
+            content.append({"type": "text", "text": output_text})
+
+    usage = usage_from_response(_field(response, "usage"))
+    response_id = _field(response, "id", "")
+    status = _field(response, "status")
 
     return {
         "role": "assistant",
@@ -287,7 +296,7 @@ def convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dic
 def _add_additional_properties_false(schema: dict[str, Any]) -> dict[str, Any]:
     """Recursively add "additionalProperties": false to schemas that have "properties".
 
-    This is required for OpenAI strict mode / structured outputs.
+    This keeps tool arguments constrained without requiring strict-mode schemas.
     """
     schema = dict(schema)  # shallow copy
     if "properties" in schema:
@@ -310,7 +319,7 @@ def convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Convert normalized tool definitions to OpenAI Responses API function tool format.
 
     In the Responses API, tools are flat objects (not nested under ``function``):
-    ``{"type": "function", "name": ..., "description": ..., "parameters": ..., "strict": ...}``
+    ``{"type": "function", "name": ..., "description": ..., "parameters": ...}``
     """
     if not tools:
         return []
@@ -323,7 +332,6 @@ def convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
             "name": tool["name"],
             "description": tool.get("description", ""),
             "parameters": parameters,
-            "strict": True,
         })
     return result
 
@@ -359,7 +367,6 @@ def build_request_kwargs(
     ``instructions`` instead of a system message, and
     ``max_output_tokens`` for all models.
     """
-    is_o_series = uses_openai_legacy_reasoning_transport(model_spec.model)
     supports_reasoning = supports_openai_reasoning_effort(model_spec.model)
 
     input_items = convert_messages(model_spec, context.get("messages", []))

@@ -717,6 +717,24 @@ class TestBufferedStreaming:
             f"Buffered mode should emit a single flush; got {call_order}"
         )
 
+    def test_uses_final_message_text_when_stream_has_no_text_deltas(self):
+        done_msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "stop_reason": "stop",
+            "usage": {},
+        }
+        owner = _FakeRuntimeOwner([[{"type": "done", "message": done_msg}]])
+        emitted = []
+        cbs = le.LoopCallbacks(on_text_delta=lambda t: emitted.append(t))
+        loop = _make_loop_for_streaming(owner, buffered=False, callbacks=cbs)
+
+        text, tools, stop, msg = loop._call_streaming(context={}, options=None)
+        assert text == "Hello!"
+        assert emitted == ["Hello!"]
+        assert stop == "stop"
+        assert msg is done_msg
+
 
 class TestStreamRetryCallbacks:
     """on_stream_retry must fire with partial text on transient-error retry."""

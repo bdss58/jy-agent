@@ -470,8 +470,16 @@ class LLMRunner:
             # Successful completion: in live mode emitted_len already equals
             # the full text length; in buffered mode the done-handler above
             # flushed it.  Nothing more to do.
+            final_text = extract_text(final_message)
+            if final_text and not text_parts:
+                text_parts.append(final_text)
+                self._fire("on_text_delta", final_text)
+            elif final_text and final_text != "".join(text_parts):
+                _logger.debug(
+                    "Stream delta text differed from final message text; using final message text for loop result."
+                )
             tool_calls = extract_tool_calls(final_message)
-            return "".join(text_parts), tool_calls, stop_reason, final_message
+            return final_text or "".join(text_parts), tool_calls, stop_reason, final_message
 
         except BaseException as err:
             # Stash partial text on every exception path (transient network

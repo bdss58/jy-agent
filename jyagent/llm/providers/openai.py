@@ -25,14 +25,10 @@ from ..types import (
     ModelSpec,
     LLMOptions,
     LLMStream,
-    Usage,
-    compute_total_tokens,
 )
 from ._openai_helpers import (
     assistant_from_response,
     build_request_kwargs,
-    map_stop_reason,
-    usage_from_response,
 )
 
 # Register "openai" as a known provider in the config layer too.
@@ -81,6 +77,7 @@ class _OpenAIStream(BaseStream):
 
         # Accumulated state for building the final message from events
         text_parts: list[str] = []
+        text_by_output_index: dict[int, str] = {}
         tool_calls_acc: dict[int, dict[str, str]] = {}  # output_index → {call_id, name, arguments}
         thinking_parts: dict[int, list[str]] = {}  # output_index → summary text parts
         final_response: Any = None
@@ -139,7 +136,20 @@ class _OpenAIStream(BaseStream):
                     delta = getattr(event, "delta", "")
                     ci = output_index_to_content_index.get(output_index, 0)
                     text_parts.append(delta)
+                    text_by_output_index[output_index] = text_by_output_index.get(output_index, "") + delta
                     yield {"type": "text_delta", "text": delta, "content_index": ci}
+
+                # ── Text done (some transports may emit final text without deltas) ──
+                elif etype == "response.output_text.done":
+                    output_index = getattr(event, "output_index", 0)
+                    text = getattr(event, "text", "") or ""
+                    seen = text_by_output_index.get(output_index, "")
+                    if text and text != seen:
+                        missing = text[len(seen):] if text.startswith(seen) else text
+                        ci = output_index_to_content_index.get(output_index, 0)
+                        text_parts.append(missing)
+                        text_by_output_index[output_index] = text
+                        yield {"type": "text_delta", "text": missing, "content_index": ci}
 
                 # ── Content part done ──
                 elif etype == "response.content_part.done":
@@ -147,6 +157,14 @@ class _OpenAIStream(BaseStream):
                     part = getattr(event, "part", None)
                     part_type = getattr(part, "type", None)
                     if part_type in ("output_text", "text"):
+                        text = getattr(part, "text", "") or ""
+                        seen = text_by_output_index.get(output_index, "")
+                        if text and text != seen:
+                            missing = text[len(seen):] if text.startswith(seen) else text
+                            text_parts.append(missing)
+                            text_by_output_index[output_index] = text
+                            ci = output_index_to_content_index.get(output_index, 0)
+                            yield {"type": "text_delta", "text": missing, "content_index": ci}
                         ci = output_index_to_content_index.get(output_index, 0)
                         yield {"type": "text_end", "content_index": ci}
 

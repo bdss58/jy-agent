@@ -510,6 +510,7 @@ from jyagent.llm.providers._openai_helpers import (
     map_stop_reason as openai_map_stop_reason,
     usage_from_response as openai_usage_from_response,
     assistant_from_response as openai_assistant_from_response,
+    convert_tools as openai_convert_tools,
     supports_openai_reasoning_effort,
 )
 
@@ -590,6 +591,30 @@ class TestOpenAIUsageFromResponse:
         assert result["cache_read_input_tokens"] == 0
 
 
+class TestOpenAIConvertTools:
+    def test_optional_properties_do_not_force_strict_mode(self):
+        tools = [
+            {
+                "name": "run_shell",
+                "description": "Run a command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            }
+        ]
+        result = openai_convert_tools(tools)
+        assert result[0]["type"] == "function"
+        assert result[0]["name"] == "run_shell"
+        assert "strict" not in result[0]
+        assert result[0]["parameters"]["required"] == ["command"]
+        assert result[0]["parameters"]["additionalProperties"] is False
+
+
 class TestOpenAIAssistantFromResponse:
     def _spec(self):
         return ModelSpec(provider="openai", model="gpt-5.4")
@@ -616,6 +641,38 @@ class TestOpenAIAssistantFromResponse:
         text_blocks = [b for b in msg["content"] if b["type"] == "text"]
         assert len(text_blocks) == 1
         assert text_blocks[0]["text"] == "Hello!"
+
+    def test_text_response_from_dict_shape(self):
+        response = {
+            "id": "resp_dict",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "text", "text": "Hello from dict!"}],
+                },
+            ],
+            "usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 1},
+            },
+        }
+        msg = openai_assistant_from_response(self._spec(), response)
+        assert msg["content"] == [{"type": "text", "text": "Hello from dict!"}]
+        assert msg["usage"]["total_tokens"] == 7
+        assert msg["usage"]["cache_read_input_tokens"] == 1
+
+    def test_top_level_output_text_fallback(self):
+        response = SimpleNamespace(
+            id="resp_output_text",
+            status="completed",
+            output=[],
+            output_text="Hello from output_text",
+            usage=None,
+        )
+        msg = openai_assistant_from_response(self._spec(), response)
+        assert msg["content"] == [{"type": "text", "text": "Hello from output_text"}]
 
     def test_tool_call_with_valid_json(self):
         response = SimpleNamespace(
