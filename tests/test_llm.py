@@ -1332,6 +1332,18 @@ class TestSupportsOpenAIReasoningEffort:
     def test_gpt_5_4_variant_supported(self):
         assert supports_openai_reasoning_effort("gpt-5.4-turbo") is True
 
+    def test_gpt_5_5_supported(self):
+        assert supports_openai_reasoning_effort("gpt-5.5") is True
+
+    def test_gpt_5_5_variant_supported(self):
+        assert supports_openai_reasoning_effort("gpt-5.5-mini") is True
+
+    def test_gpt_5_higher_minor_supported(self):
+        assert supports_openai_reasoning_effort("gpt-5.10") is True
+
+    def test_gpt_5_3_not_supported(self):
+        assert supports_openai_reasoning_effort("gpt-5.3") is False
+
     def test_gpt_4o_not_supported(self):
         assert supports_openai_reasoning_effort("gpt-4o") is False
 
@@ -1340,3 +1352,7 @@ class TestSupportsOpenAIReasoningEffort:
 
     def test_whitespace_stripped(self):
         assert supports_openai_reasoning_effort("  gpt-5.4  ") is True
+
+    def test_malformed_no_minor_not_supported(self):
+        assert supports_openai_reasoning_effort("gpt-5.") is False
+        assert supports_openai_reasoning_effort("gpt-5.4x") is False

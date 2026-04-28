@@ -28,7 +28,7 @@ from ..types import (
 # ─── Model capability detection ─────────────────────────────────────────────
 
 _OPENAI_LEGACY_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
-_OPENAI_REASONING_EFFORT_MODEL_PREFIX = "gpt-5.4"
+_OPENAI_REASONING_MIN_MINOR_VERSION = 4  # gpt-5.4 is the first version to accept reasoning_effort
 
 _OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
 
@@ -50,11 +50,26 @@ def validate_openai_reasoning(reasoning: Any, *, model: str | None = None) -> di
 
 
 def supports_openai_reasoning_effort(model: str) -> bool:
-    """Return True for GPT-5.4 models that accept reasoning_effort."""
+    """Return True for GPT-5.4+ models that accept reasoning_effort.
+
+    Matches ``gpt-5.<minor>[-<suffix>]`` where minor >= 4
+    (e.g. ``gpt-5.4``, ``gpt-5.4-mini``, ``gpt-5.5``, ``gpt-5.6-turbo``).
+    """
     normalized = model.strip().lower()
-    return normalized == _OPENAI_REASONING_EFFORT_MODEL_PREFIX or normalized.startswith(
-        f"{_OPENAI_REASONING_EFFORT_MODEL_PREFIX}-"
-    )
+    if not normalized.startswith("gpt-5."):
+        return False
+    rest = normalized[len("gpt-5."):]
+    digits = ""
+    for c in rest:
+        if c.isdigit():
+            digits += c
+        else:
+            break
+    if not digits:
+        return False
+    if rest != digits and not rest.startswith(f"{digits}-"):
+        return False
+    return int(digits) >= _OPENAI_REASONING_MIN_MINOR_VERSION
 
 
 def uses_openai_legacy_reasoning_transport(model: str) -> bool:

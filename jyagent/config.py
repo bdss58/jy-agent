@@ -160,21 +160,17 @@ def get_reasoning_config_for_provider(
         return validate_anthropic_reasoning(config, model=resolved_model)
 
     elif provider == "openai":
+        from .llm.providers._openai_helpers import supports_openai_reasoning_effort
+
         effort = (os.environ.get("OPENAI_REASONING_EFFORT") or "").strip().lower()
         if not effort:
             return None
         resolved_model = (model or "").strip()
         if not resolved_model and AGENT_PROVIDER == "openai":
             resolved_model = AGENT_MODEL
-        normalized_model = resolved_model.lower()
-        if not (
-            normalized_model == "gpt-5.4"
-            or normalized_model.startswith("gpt-5.4-")
-        ):
-            raise ValueError(
-                "OPENAI_REASONING_EFFORT is only supported for OpenAI model "
-                f"'gpt-5.4' and its variants, not '{resolved_model or '<unset>'}'."
-            )
+        if not supports_openai_reasoning_effort(resolved_model):
+            # Globally-set env var should not block runs with other models.
+            return None
         valid_efforts = {"none", "low", "medium", "high", "xhigh"}
         if effort not in valid_efforts:
             raise ValueError(
