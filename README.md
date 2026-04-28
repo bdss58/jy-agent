@@ -9,7 +9,8 @@ orchestration, MCP integration, durable cross-session memory, and a skills syste
 - **Provider-neutral core**: single conversation state, pluggable adapters for
   Anthropic Messages (`claude-*`) and — optionally — OpenAI Responses (`gpt-*`, `o*`).
   The Anthropic SDK is a hard dependency; the `openai` SDK is optional and only
-  required when `AGENT_PROVIDER=openai` (install with `pip install openai`).
+  required when `AGENT_PROVIDER=openai` (install with `uv sync --extra openai`
+  or `pip install -e ".[openai]"`).
 - **Live provider/model switching**: `/model <provider> <model>` swaps the active
   runtime for subsequent turns without restarting.
 - **Streaming tool-use loop** with parallel-safe tool execution, cooperative

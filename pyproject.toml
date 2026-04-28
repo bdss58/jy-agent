@@ -36,6 +36,9 @@ dev = [
     "pytest",
     "ruff",
 ]
+openai = [
+    "openai>=1.0",
+]
 
 [project.scripts]
 jy-agent = "jyagent.__main__:main"
