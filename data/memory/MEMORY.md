@@ -57,21 +57,23 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 
 ## Durable Tips
 - **Mutating Anthropic `system_prompt` breaks prompt caching** — inject dynamic context as a non-persisted tail message block instead. (This is also why MEMORY.md must stay stable across a session.)
-- AWS Bedrock account lacks access to `claude-opus-4-7` (`permission_error` on `InvokeModelWithResponseStream`).
-- Warp.dev deprecated `warp-cli` in favor of `oz` CLI (auto-updates). Cloudflare WARP's `warp-cli` is unrelated and still active.
 
 ## Goals
 - Long-term: guide user through nano-vLLM to master LLM inference. Progress in `topics/nano-vllm-learning.md`. On any session mentioning nano-vLLM / learning / LLM study, read that file first.
 [user_stated] OpenClaw architecture: ocaw-run pod runs openclaw supervisor + openclaw-gateway (Python WebSocket on port 18789); browser/OCR/LLM delegated to separate services (browser-service, processor-service, model-gateway)
 [user_stated] OpenClaw ocaw-run pods steady-state: ~510 MiB RSS+cache (max 652), 1-3 millicores CPU; 0 OOMs across 1600+ pod-hours observed
-[preference] For sizing recommendations, prefer empirical measurement (live pod inspection, cgroup memory.events) over guessing; recommend Burstable QoS over Gu
+[preference] For sizing recommendations, prefer empirical measurement (live pod inspection, cgroup memory.events) over guessing; recommend Burstable QoS over Guaranteed for bursty workloads.
 [gotcha] git worktree shares the parent repo's editable-install `.venv` — `uv run` from the worktree imports the package from the MAIN worktree's path (per `__editable___*_finder.py` MAPPING), NOT the worktree's source. Tests run in a worktree may silently exercise the WRONG code. Fix: install a local editable venv in the worktree (`uv sync` inside it) before testing, OR run tests on main after merge.
 [gotcha] When moving a Python module deeper in a package tree, audit every `os.path.dirname(__file__)` chain and `Path(__file__).parents[N]` — depth count is coupled to file location and silently resolves to the wrong path (no ImportError). Check skills.py-style "no items found" symptoms first.
 [tip] SearxNG settings.yml supports `use_default_settings: true` — write only your overrides; everything else (incl. 281 engines) inherits from the default in the searxng/searxng image. Must still override `server.secret_key` (default placeholder `ultrasecretkey` makes the app refuse to start).
 [tip] SearxNG only honors a few env overrides (SEARXNG_PORT, BIND_ADDRESS, SECRET_KEY, LIMITER, PUBLIC_INSTANCE); search.formats must come from settings.yml
 [tip] Docker Compose v2.23+ supports inline `configs.content:` to embed file contents in docker-compose.yml, avoiding companion files
-~~[tip] web_search cascade order: SearxNG → Brave → Mojeek → DDG (DDG last due to flakiness). SEARXNG_URL activates SearxNG. WEB_SEARCH_ENGINE=name forces single engine. Tests in test_web_search.py must reflect this order.~~  (superseded 2026-04-27: web_search cascade order: SearxNG (SEARXNG_URL) → Brave API …)
-~~[tip] web_search cascade order: SearxNG (SEARXNG_URL) → Brave API (BRAVE_SEARCH_API_KEY, official JSON) → Mojeek (HTML, often IP-blocked) → DDG (HTML, last). Brave HTML scraper retired 2026-04 due to PoW captcha. WEB_SEARCH_ENGINE=name forces single engine.~~  (superseded 2026-04-27: web_search cascade order: SearxNG (SEARXNG_URL) → DDG. Brave…)
 [tip] web_search cascade order: SearxNG (SEARXNG_URL) → DDG. Brave + Mojeek removed 2026-04-26: Brave serves PoW captcha to scrapers, Mojeek IP-blocks all datacenter+WARP exits. Run SearxNG for richer aggregation. WEB_SEARCH_ENGINE=name forces single engine.
 [gotcha] Before `git commit`, always `git status --short` — `git mv` stages the rename but later edits to OTHER files via edit_file/sed remain unstaged and will be silently dropped from the commit. Use `git add -A` or stage explicitly.
 [gotcha] After C4 Phase 5, `runtime/loop/step.py::run_step` calls `tool_executor.execute_tools` directly (not via `engine._execute_tools` alias). Patches against `jyagent.runtime.loop.engine._execute_tools` DO NOT intercept per-step tool calls. Patch `jyagent.runtime.loop.tool_executor` instead.
+[gotcha] containerd 2.x renamed CRI config keys: `sandbox_image` → `sandbox`, and `config_path` defaults to empty `''` (not `/etc/containerd/certs.d`). Old sed patterns silently no-op; mirror dirs are silently ignored. After `containerd config default`, must explicitly set both, then `systemctl restart containerd`.
+[gotcha] `pgrep -af <name>` matches its own wrapper bash command line when invoked via `bash -c "while pgrep -af X; do ..."` (X appears in the wrapper's argv) → infinite loop. Use `pgrep -x <exact_binary>` or `fuser /var/lib/dpkg/lock-frontend` for apt locks instead.
+[tip] `ctr image pull` does NOT honor `/etc/containerd/certs.d/` mirror config — that's CRI-plugin-only. To test containerd registry mirrors, deploy a pod via kubectl, not `ctr`.
+[gotcha] `warnings.deprecated` (PEP 702) requires Python 3.13+; use `typing_extensions.deprecated` for 3.12 compat
+[tip] For generic build pipelines that need both build-host and customer-host validation: bake the validator INTO the image (e.g. /app/preflight.sh + /app/preflight.d/*.sh). Both sides run `docker exec <ct> /app/preflight.sh` — eliminates the dual-list drift bug.
+[tip] Dockerfile build-arg cache: declare `ARG FOO_VERSION` JUST BEFORE the RUN that uses it, not at the top of the stage. Adding/changing an ARG invalidates the cache for every downstream RUN, even ones that don't reference it.
