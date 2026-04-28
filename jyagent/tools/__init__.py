@@ -15,7 +15,6 @@ from .web_fetch import web_fetch as web_fetch_fn, TOOL_SCHEMA as WEB_FETCH_SCHEM
 from .mcp_tool import mcp, TOOL_SCHEMA as MCP_SCHEMA
 from .subagent import (
     dispatch_agent, check_agent,
-    set_client as set_subagent_client,
     TOOL_SCHEMA as SUBAGENT_SCHEMA,
     CHECK_AGENT_SCHEMA,
 )

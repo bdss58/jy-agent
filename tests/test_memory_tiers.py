@@ -212,21 +212,6 @@ def test_manage_memory_journal_action():
     assert "did some research today" in body
 
 
-def test_manage_memory_note_now_routes_to_journal():
-    """Backward compat: 'note' was previously an alias appending to MEMORY.md.
-    The new behavior MUST route to the journal tier, with a deprecation hint."""
-    setup()
-    write_memory_md("# Agent Memory\n\n[gotcha] existing rule\n")
-    before = read_memory_md()
-    res = manage_memory("note", "today's session work")
-    assert not res.is_error
-    assert "journal" in res.content.lower()
-    assert "alias" in res.content.lower()  # caller informed of the redirect
-    after = read_memory_md()
-    assert before == after, "note alias still leaks into MEMORY.md"
-    assert "today's session work" in read_journal()
-
-
 def test_manage_memory_consolidate_action():
     setup()
     write_memory_md("# Agent Memory\n\n[note] 2026-04-18 — some dated cruft\n")

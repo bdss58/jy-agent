@@ -5,7 +5,7 @@ from ..runtime.tools.result import ToolResult
 
 
 def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult:
-    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'supersede' (mark stale entries with strikethrough and append a corrected one — non-destructive update), 'show' (display all memories), 'search' (BM25 over topic+journal bodies), 'topic' (manage curated topic files: list/read/write/delete/sections), 'goal' (add/complete a goal), 'note' (DEPRECATED alias for journal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/)."""
+    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'supersede' (mark stale entries with strikethrough and append a corrected one — non-destructive update), 'show' (display all memories), 'search' (BM25 over topic+journal bodies), 'topic' (manage curated topic files: list/read/write/delete/sections), 'goal' (add/complete a goal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/)."""
     from ..memory.operations import (
         remember, forget, supersede, show_memory,
         list_topics, read_topic, write_topic, delete_topic,
@@ -142,23 +142,8 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
                 return ToolResult(f"🧠 {forget(text[5:].strip())}")
             return ToolResult(f"🧠 {remember(text, 'goal')}")
 
-        elif action == "note":
-            # 'note' used to mean "append [note] to MEMORY.md" — that was an
-            # anti-pattern (chronological cruft in the always-loaded index, with
-            # prompt-cache invalidation cost). Redirect to the journal tier and
-            # tell the caller. Old call sites still work.
-            if not text:
-                return ToolResult("Error: 'text' parameter required", is_error=True)
-            cat = category or "note"
-            path = append_journal(text, cat)
-            return ToolResult(
-                f"📓 Note routed to journal: {path} [{cat}] "
-                "(action='note' is now an alias for action='journal'; "
-                "use action='remember' only for durable rules in MEMORY.md)"
-            )
-
         else:
-            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, supersede, show, search, topic, goal, note, journal, consolidate", is_error=True)
+            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, supersede, show, search, topic, goal, journal, consolidate", is_error=True)
 
     except Exception as e:
         return ToolResult(f"Error managing memory: {e}", is_error=True)

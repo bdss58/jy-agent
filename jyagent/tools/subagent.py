@@ -57,88 +57,17 @@ _MAX_NESTING = 2  # sub-agent can spawn sub-sub-agent, but no deeper
 # ─── Runtime owner access ─────────────────────────────────────────────────────
 
 _runtime_owner = None
-_client = None
 
 
 def set_runtime_owner(runtime_owner):
     """Called during agent startup to share the active runtime owner."""
-    global _runtime_owner, _client
+    global _runtime_owner
     _runtime_owner = runtime_owner
-    _client = None
-
-
-def set_client(runtime_owner):
-    """Backward-compatible alias for older call sites/tests."""
-    global _runtime_owner, _client
-    if isinstance(runtime_owner, LLMOwner):
-        set_runtime_owner(runtime_owner)
-        return
-    _runtime_owner = None
-    _client = runtime_owner
-
-
-def _get_client():
-    """Backward-compatible helper for tests that monkeypatch the raw client."""
-    return _client
-
-
-class _LegacyClientRuntimeOwner:
-    """Compatibility shim for tests that still provide a fake Anthropic client.
-
-    DEPRECATED: Tests should use LLMOwner with mock adapters instead
-    of injecting raw Anthropic SDK clients. This shim exists only to keep
-    existing tests working during the migration.
-    """
-
-    def __init__(self, client):
-        self._client = client
-        self.model_spec = get_active_model_spec()
-
-    def complete(self, context, options=None, model_spec=None):
-        # Lazy imports: only needed when running through the legacy shim
-        from ..llm.reasoning import build_anthropic_request_reasoning
-        from ..llm.providers._anthropic_helpers import (
-            assistant_from_response, convert_messages,
-        )
-
-        model_spec = model_spec or self.model_spec
-        max_tokens = _DEFAULT_MAX_TOKENS_PER_RESPONSE
-        timeout = STREAM_TIMEOUT
-        if options is not None:
-            max_tokens = options.max_output_tokens or max_tokens
-            timeout = options.timeout or timeout
-
-        kwargs = {
-            "model": model_spec.model,
-            "max_tokens": max_tokens,
-            "system": context.get("system_prompt", ""),
-            "messages": convert_messages(model_spec, context.get("messages", [])),
-        }
-        if options is not None and options.reasoning is not None:
-            thinking, output_config = build_anthropic_request_reasoning(options.reasoning, model=model_spec.model)
-            if thinking is not None:
-                kwargs["thinking"] = thinking
-            if output_config is not None:
-                kwargs["output_config"] = output_config
-        if context.get("tools"):
-            kwargs["tools"] = context["tools"]
-        stream_fn = getattr(self._client.messages, "stream", None)
-        if callable(stream_fn):
-            with stream_fn(**kwargs, timeout=timeout) as stream:
-                for _event in stream:
-                    pass
-                response = stream.get_final_message()
-        else:
-            response = self._client.messages.create(**kwargs, timeout=timeout)
-        return assistant_from_response(model_spec, response)
 
 
 def _get_runtime_owner():
     """Get the shared runtime owner, creating a default one if needed."""
     global _runtime_owner
-    client = _get_client()
-    if client is not None:
-        return _LegacyClientRuntimeOwner(client)
     if _runtime_owner is None:
         _runtime_owner = LLMOwner(get_active_model_spec())
     return _runtime_owner
