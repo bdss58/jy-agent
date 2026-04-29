@@ -142,12 +142,60 @@ class ToolBatch:
             mutating=frozenset(),
         )
 
+    @classmethod
+    def from_source(
+        cls,
+        src_schemas: list[dict],
+        src_functions: dict[str, Callable],
+        *,
+        base: "ToolBatch",
+    ) -> "ToolBatch":
+        """Build a batch from an external tool source (e.g. sub-agent) while
+        inheriting metadata classification (parallel_safe, mutating, timeout
+        hints, large_input_keys, compaction_priority) from ``base``.
+
+        Schemas are deep-copied; all maps are wrapped in MappingProxyType.
+        Mirrors the safety properties of ``ToolRegistry.freeze()`` for the
+        non-registry source path: callers that retain a reference to the
+        passed-in ``src_schemas`` list element cannot mutate the snapshot
+        through shared reference, and the resulting ``functions`` /
+        ``schema_map`` views raise ``TypeError`` on assignment.
+
+        ``base`` supplies the metadata maps verbatim — they are already
+        ``MappingProxyType`` views (from ``freeze()``) so re-using them
+        is O(1) and safe.  ``version=base.version`` so the engine's
+        per-step ``registry.version != state.tools_batch.version`` cache
+        check still semantically tracks "registry has changed since last
+        freeze" (B-2 fix from 2026-04-29 review).
+        """
+        schema_map = {
+            s.get("name"): copy.deepcopy(s)
+            for s in src_schemas
+            if s.get("name")
+        }
+        # Schemas tuple uses the deep-copied map values so mutating an
+        # entry in src_schemas after this call has no effect on the
+        # snapshot.
+        schemas = tuple(schema_map[name] for name in schema_map)
+        return cls(
+            version=base.version,
+            schemas=schemas,
+            schema_map=_readonly(schema_map),
+            functions=_readonly(dict(src_functions)),
+            parallel_safe=base.parallel_safe,
+            timeout_hints=base.timeout_hints,
+            large_input_keys=base.large_input_keys,
+            compaction_priority=base.compaction_priority,
+            mutating=base.mutating,
+        )
+
     def with_overlay(
         self,
         *,
         functions: dict[str, Callable] | None = None,
         schemas: list[dict] | None = None,
         parallel_safe: set[str] | None = None,
+        mutating: set[str] | None = None,
     ) -> "ToolBatch":
         """Return a new batch with extra tools layered on top.
 
@@ -156,6 +204,12 @@ class ToolBatch:
         with the daemon-thread tool executor).  Overlaid tools are added
         with empty metadata unless explicitly specified — they default to
         non-parallel-safe, no timeout hint, standard compaction priority.
+
+        ``mutating`` (M-5, codex review 2026-04-29): explicit set of tool
+        names to flag as mutating in the new batch.  Used by tests and
+        by future MCP integrations that need to surface a freshly-added
+        side-effecting tool to the verification gate / partial-side-effects
+        accumulator without going through the canonical registry path.
         """
         new_functions = dict(self.functions)
         if functions:
@@ -174,6 +228,13 @@ class ToolBatch:
         if parallel_safe:
             new_parallel = frozenset(self.parallel_safe | parallel_safe)
 
+        new_mutating = self.mutating
+        if mutating:
+            # Union into the existing mutating set rather than replacing
+            # it so a caller adding a new mutator doesn't accidentally
+            # drop pre-existing mutating classifications.
+            new_mutating = frozenset(self.mutating | mutating)
+
         return ToolBatch(
             version=self.version,
             schemas=new_schemas,
@@ -183,13 +244,13 @@ class ToolBatch:
             timeout_hints=self.timeout_hints,
             large_input_keys=self.large_input_keys,
             compaction_priority=self.compaction_priority,
-            # Overlaid tools default to non-mutating.  The two in-tree
-            # overlays (``write_todos``, verification-context injections)
-            # are local scratchpad ops with no externally-observable side
-            # effects, so this default is correct for every current
-            # caller.  If a future overlay adds a side-effecting tool, it
-            # must register mutating=True via the canonical registry path.
-            mutating=self.mutating,
+            # Overlaid tools default to non-mutating unless ``mutating=``
+            # is supplied (M-5).  The two in-tree overlays
+            # (``write_todos``, verification-context injections) are
+            # local scratchpad ops with no externally-observable side
+            # effects, so the default is correct for every current
+            # caller that doesn't pass ``mutating``.
+            mutating=new_mutating,
         )
 
 

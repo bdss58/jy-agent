@@ -6,16 +6,10 @@
 
 from __future__ import annotations
 
-import atexit
-import concurrent.futures
+import collections
 import logging
-import hashlib
-import json
 import random
-import sys
 import threading
-import time
-import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -42,6 +36,7 @@ from .tracing import get_tracer
 from .verification import should_verify, build_verification_prompt
 from .callbacks import LoopCallbacks  # re-exported for back-compat
 from .config import LoopConfig, LoopResult  # re-exported for back-compat
+from ._thread_helpers import LoopThreadHelper  # L-2 mixin (cancel/_fire helpers)
 
 
 _logger = logging.getLogger(__name__)
@@ -116,98 +111,12 @@ from .tool_executor import (  # noqa: E402
 from .cost import CostTracker as _CostTracker  # noqa: E402
 
 
-class _StuckLoopDetector:
-    """Detect stuck loops by tracking whether repeated calls yield new responses.
-
-    Key insight: a loop is "stuck" only when the same tool call returns the
-    same response **consecutively**.  Polling tools (``check_background``,
-    ``take_snapshot``) naturally return changing responses (e.g. different
-    ``elapsed_seconds``) — they are never flagged without any exemption metadata.
-
-    Interleaved calls are also safe: if the agent alternates
-    ``run_shell(A) → check_background → run_shell(A) → check_background``
-    that's a polling pattern, not a stuck loop — even if ``run_shell(A)``
-    returns the same result each time.  Only **truly consecutive** identical
-    calls (``A → A → A``) trigger the detector.
-
-    This replaces the old ``_DedupTracker`` which required a whitelist of
-    ``dedup_exempt`` tools and a regex hack for ``sleep`` commands.
-
-    Design:
-        Track ``(tool_name, args_key) → (consecutive_identical_count, last_response_hash)``
-
-        * If a **different** key was recorded since the last call to *this* key,
-          the pattern is interleaved — reset the counter (not a stuck loop).
-        * If the response hash differs from the last recorded one for the same
-          ``(tool, args)`` key, the world is making progress — reset the counter.
-        * If the response hash is identical, increment the counter.
-        * At ``threshold``: return a feedback message so the engine can break.
-    """
-
-    def __init__(self, threshold: int = 3):
-        # key → (consecutive_identical_count, last_response_hash)
-        self._state: dict[str, tuple[int, str]] = {}
-        self._threshold = threshold
-        self._last_key: str | None = None
-
-    @staticmethod
-    def _make_key(name: str, args: dict) -> str:
-        """Stable string key for a tool call."""
-        try:
-            args_str = json.dumps(args, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            args_str = str(args)
-        return f"{name}::{args_str}"
-
-    @staticmethod
-    def _hash_response(content: str) -> str:
-        # Non-cryptographic: MD5 is fine for collision-detection here, and
-        # `usedforsecurity=False` silences security-linter false positives.
-        return hashlib.md5(
-            content.encode(errors="replace"), usedforsecurity=False,
-        ).hexdigest()
-
-    def record(self, name: str, args: dict, response: str) -> str | None:
-        """Record a single (tool, args, response) observation.
-
-        Returns a feedback message when a stuck loop is detected (same tool
-        called with identical arguments AND identical response ``threshold``
-        times **truly consecutively**), or ``None`` if everything is fine.
-
-        "Truly consecutive" means no other ``(tool, args)`` key was recorded
-        in between.  Interleaved patterns like ``A → B → A → B → A`` never
-        trigger — they represent polling, not a stuck loop.
-        """
-        key = self._make_key(name, args if isinstance(args, dict) else {})
-        resp_hash = self._hash_response(response)
-
-        prev_count, prev_hash = self._state.get(key, (0, ""))
-
-        # If a different tool/args was called since our last record() call,
-        # this is an interleaved pattern (e.g. polling).  Reset the counter
-        # for this key so it starts fresh.
-        if self._last_key is not None and self._last_key != key:
-            prev_count, prev_hash = 0, ""
-
-        self._last_key = key
-
-        if prev_hash and resp_hash != prev_hash:
-            # Response changed — progress is being made, reset.
-            self._state[key] = (1, resp_hash)
-            return None
-
-        # Response identical (or first observation) — increment.
-        new_count = prev_count + 1
-        self._state[key] = (new_count, resp_hash)
-
-        if new_count >= self._threshold:
-            return (
-                f"STUCK LOOP: Tool '{name}' was called {new_count} times with "
-                f"identical arguments AND identical response.  The external "
-                f"state is not changing.  Stop repeating this call and try a "
-                f"different approach, or explain to the user why you're stuck."
-            )
-        return None
+# L-1 (codex review 2026-04-29): the stuck-loop detector moved to its own
+# module (``runtime/loop/stuck_loop.py``) so this file can shrink toward its
+# post-Phase-5 thin-orchestrator role.  The underscore-prefixed back-compat
+# alias is preserved because ``runtime/loop/step.py`` and any out-of-tree
+# consumers reference ``engine._StuckLoopDetector`` directly.
+from .stuck_loop import StuckLoopDetector as _StuckLoopDetector  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,11 +253,16 @@ from .compaction import (  # noqa: E402
 
 # ─── AgentLoop ───────────────────────────────────────────────────────────────
 
-class AgentLoop:
+class AgentLoop(LoopThreadHelper):
     """Reusable agentic tool-use loop engine.
 
     Supports both streaming and non-streaming modes, concurrent tool execution,
     context compaction, truncation recovery, and transient-error retry.
+
+    Inherits ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` from
+    ``LoopThreadHelper`` (L-2, codex review 2026-04-29).  Default helper
+    attribute names (``_cancel_event`` / ``_callbacks``) match the
+    instance attributes set in ``__init__``, so no override is needed.
     """
 
     def __init__(
@@ -383,7 +297,18 @@ class AgentLoop:
         # snapshotted onto ``LoopResult.partial_side_effects`` in ``run()``.
         # Reset at the top of ``_run_impl`` so back-to-back .run() calls on
         # the same AgentLoop instance don't bleed state across turns.
-        self._partial_side_effects: list[str] = []
+        #
+        # H-2 (codex review 2026-04-29): backed by ``collections.deque``
+        # because parallel-safe tool batches can fan out across multiple
+        # daemon threads, each of which may hit a timeout simultaneously
+        # and call ``.append(name)`` from its own worker.  Under PEP 703
+        # free-threaded CPython (3.13t / 3.14t) ``list.append`` is no
+        # longer atomic w.r.t. concurrent mutation; ``deque.append`` IS
+        # documented thread-safe for single-element ops in the stdlib
+        # (see CPython Issue #117 and the collections module docs).
+        # ``list(deque(...))`` is a normal iteration — the snapshot
+        # in ``run()`` still works unchanged.
+        self._partial_side_effects: collections.deque[str] = collections.deque()
         # C2 (codex review 2026-04-25): AgentLoop holds substantial per-run
         # state on the instance (_todos, _run_id, _partial_side_effects,
         # closures, etc).  Concurrent .run() calls on a single instance
@@ -403,24 +328,13 @@ class AgentLoop:
 
     def set_run_id(self, run_id: str) -> None:
         """Override the run id used by checkpoint paths.  Must be called
-        before ``run()``.  Empty string / None restores default."""
+        before ``run()``.  Empty string clears the run id (resets to ``''``)."""
         self._run_id = run_id or ""
 
-    def _is_cancelled(self) -> bool:
-        """Check if external cancellation has been requested."""
-        return self._cancel_event is not None and self._cancel_event.is_set()
-
-    def _cancellable_sleep(self, seconds: float) -> bool:
-        """Sleep that returns early if cancellation is signalled.
-
-        Returns True if cancelled during the wait, False otherwise.  When no
-        cancel_event is attached, falls back to a plain blocking sleep.
-        """
-        if self._cancel_event is None:
-            time.sleep(seconds)
-            return False
-        # Event.wait returns True when set, False on timeout.
-        return self._cancel_event.wait(seconds)
+    # ``_is_cancelled``, ``_cancellable_sleep``, and ``_fire`` are inherited
+    # from ``LoopThreadHelper`` (see ``_thread_helpers.py``).  L-2 (codex
+    # review 2026-04-29) extracted these from AgentLoop and LLMRunner where
+    # they were duplicated verbatim.
 
     def _write_checkpoint(
         self,
@@ -472,16 +386,8 @@ class AgentLoop:
         except Exception as e:
             self._fire("on_warning", f"checkpoint write failed: {e}")
 
-    # ── callback helpers (no-op when callback is None) ────────────────────
-
-    def _fire(self, name: str, *args: Any) -> None:
-        cb = getattr(self._callbacks, name, None)
-        if cb is not None:
-            try:
-                cb(*args)
-            except Exception:
-                # Callbacks are for presentation — never abort the engine loop.
-                print(f"[warning] callback {name!r} raised:", traceback.format_exc(), file=sys.stderr)
+    # ── callback helpers ──────────────────────────────────────────────────
+    # ``_fire`` is provided by ``LoopThreadHelper`` (L-2 mixin).
 
     # ── public entry point ────────────────────────────────────────────────
 

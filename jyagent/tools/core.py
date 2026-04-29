@@ -1,4 +1,11 @@
 # Core file/shell tools and shared path/file helpers.
+#
+# TODO (L-6, codex review 2026-04-29): split this module into ``core`` and
+# ``background`` (the run_background / check_background / _bg_* helpers
+# stack accounts for ~half the file and could live in ``tools/background.py``
+# alongside their schemas).  Deferred from the 2026-04-29 PR because it's
+# a large move and the rest of the review's findings were higher leverage;
+# pick this up when next touching either group.
 
 import os
 import json

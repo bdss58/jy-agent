@@ -10,7 +10,14 @@ Disabled by default. Opt-in via AGENT_VERIFICATION_ENABLED=1.
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # Imported lazily to avoid a circular import: verification.py is
+    # imported from runtime.loop modules, and ToolBatch lives under
+    # runtime.tools — pulling it eagerly would couple the verification
+    # gate to the tools package at module load.
+    from ..tools.registry import ToolBatch
 
 # ---------------------------------------------------------------------------
 # Config
@@ -19,8 +26,6 @@ from typing import Any
 VERIFICATION_ENABLED: bool = os.environ.get(
     "AGENT_VERIFICATION_ENABLED", ""
 ).lower() in ("1", "true", "yes")
-
-VERIFY_TOOL_NAMES: set[str] = {"edit_file", "write_file", "run_shell"}
 
 # Sentinel content prefix used to detect an already-injected verification
 # prompt so we never inject twice in the same turn.
@@ -36,13 +41,19 @@ def should_verify(
     tool_calls_count: int,
     *,
     since_index: int = 0,
+    batch: "ToolBatch",
 ) -> bool:
     """Return True if a verification prompt should be injected.
 
     Criteria – **all** must be true:
     1. ``VERIFICATION_ENABLED`` is set.
     2. At least one tool call was made this turn.
-    3. The turn involved file-mutating tools (edit_file / write_file / run_shell).
+    3. The turn involved tools with the registry's ``mutating=True`` flag
+       (run_shell, edit_file, write_file, mcp, dispatch_agent,
+       run_background, plus any dynamic MCP tool that registers as
+       mutating).  Classification is done via ``batch.is_mutating(name)``
+       so a freshly-registered MCP mutator surfaces the gate without a
+       static keyword change here (B-1 fix, codex review 2026-04-29).
     4. A verification prompt has not already been injected this turn.
 
     ``since_index`` (default 0, i.e. scan everything) bounds the mutation
@@ -51,6 +62,11 @@ def should_verify(
     this, a replayed historical mutation in prior turns would re-arm the
     verification gate on a non-mutating new turn (Codex review
     2026-04-25 Part 2 #5).
+
+    ``batch`` is the immutable per-step ``ToolBatch`` snapshot the engine
+    already builds for dispatch — re-using it keeps the mutating-set
+    classification consistent with the dispatch loop's other ``mutating``
+    consumers (timeout warning, partial-side-effects accumulator).
     """
     if not VERIFICATION_ENABLED:
         return False
@@ -61,7 +77,7 @@ def should_verify(
     if _already_injected(messages):
         return False
 
-    if not _has_mutation(messages, since_index=since_index):
+    if not _has_mutation(messages, since_index=since_index, batch=batch):
         return False
 
     return True
@@ -121,12 +137,22 @@ def _has_mutation(
     messages: list[dict[str, Any]],
     *,
     since_index: int = 0,
+    batch: "ToolBatch",
 ) -> bool:
     """Return True if any tool-result message references a mutating tool.
 
     Bounded to ``messages[since_index:]`` so a replayed mutation from a
     prior turn (still present in the persisted history) does not re-arm
     the verification gate on a new, non-mutating turn.
+
+    Mutating-classification is done via ``batch.is_mutating(name)`` —
+    the per-step ToolBatch snapshot built by the engine.  This is the
+    same source of truth the dispatch loop uses for timeout-warning and
+    partial-side-effects accumulation, so a tool that's flagged
+    mutating in one place is flagged mutating everywhere.  Unknown names
+    (e.g. tools unregistered between the call and the verification scan)
+    default to False — the historical default for the gate (B-1 fix,
+    codex review 2026-04-29).
     """
     for msg in messages[since_index:]:
         # Anthropic format: role "user" with tool_result content blocks
@@ -137,17 +163,17 @@ def _has_mutation(
                     if (
                         isinstance(block, dict)
                         and block.get("type") == "tool_result"
-                        and block.get("tool_name", "") in VERIFY_TOOL_NAMES
+                        and batch.is_mutating(block.get("tool_name", ""))
                     ):
                         return True
 
         # OpenAI / normalized format: role "tool" with a name field
         if msg.get("role") == "tool":
-            if msg.get("name", "") in VERIFY_TOOL_NAMES:
+            if batch.is_mutating(msg.get("name", "")):
                 return True
 
         # Also support an explicit "tool_name" key used by some adapters
-        if msg.get("tool_name", "") in VERIFY_TOOL_NAMES:
+        if batch.is_mutating(msg.get("tool_name", "")):
             return True
 
     return False

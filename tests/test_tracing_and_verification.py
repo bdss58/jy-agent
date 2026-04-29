@@ -154,11 +154,37 @@ class TestGetTracer:
 from jyagent.runtime.loop.verification import (
     should_verify,
     build_verification_prompt,
-    VERIFY_TOOL_NAMES,
     _VERIFICATION_MARKER,
     _has_mutation,
     _already_injected,
 )
+from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
+
+
+# A frozen ToolBatch that flags edit_file/write_file/run_shell as mutating
+# (matching the historical VERIFY_TOOL_NAMES set the gate used to consult
+# directly).  Built once per test via the helper below — cheap, immutable,
+# and identical to what the production registry would produce after
+# ``jyagent.tools`` registers its core tools with mutating=True.
+def _mutating_batch() -> ToolBatch:
+    reg = ToolRegistry()
+    for name in ("edit_file", "write_file", "run_shell"):
+        reg.register(
+            name,
+            lambda **_kw: "ok",
+            {"name": name, "input_schema": {"type": "object"}},
+            mutating=True,
+        )
+    # Also register a non-mutating reader so tests that assert "no
+    # mutation" against read_file have a registered tool (the gate's
+    # unknown-name default is False anyway, but being explicit catches
+    # accidental classification flips).
+    reg.register(
+        "read_file",
+        lambda **_kw: "data",
+        {"name": "read_file", "input_schema": {"type": "object"}},
+    )
+    return reg.freeze()
 
 
 class TestShouldVerify:
@@ -168,24 +194,24 @@ class TestShouldVerify:
         """When VERIFICATION_ENABLED is False, always returns False."""
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", False):
             msgs = [{"role": "tool_result", "tool_name": "edit_file", "content": "ok"}]
-            assert should_verify(msgs, tool_calls_count=1) is False
+            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is False
 
     def test_no_tool_calls_returns_false(self):
         """Zero tool calls → no verification."""
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
-            assert should_verify([], tool_calls_count=0) is False
+            assert should_verify([], tool_calls_count=0, batch=_mutating_batch()) is False
 
     def test_no_mutation_returns_false(self):
         """Tool calls but no file mutations → no verification."""
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "read_file", "content": "data"}]
-            assert should_verify(msgs, tool_calls_count=1) is False
+            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is False
 
     def test_mutation_triggers_verification(self):
         """edit_file tool result + enabled → should verify."""
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "edit_file", "content": "ok"}]
-            assert should_verify(msgs, tool_calls_count=1) is True
+            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is True
 
     def test_already_injected_returns_false(self):
         """If verification prompt already in messages, don't inject again."""
@@ -194,19 +220,44 @@ class TestShouldVerify:
                 {"role": "tool_result", "tool_name": "edit_file", "content": "ok"},
                 {"role": "user", "content": f"{_VERIFICATION_MARKER} Before you finish..."},
             ]
-            assert should_verify(msgs, tool_calls_count=1) is False
+            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is False
 
     def test_run_shell_counts_as_mutation(self):
-        """run_shell is in VERIFY_TOOL_NAMES."""
+        """run_shell is registered with mutating=True."""
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "run_shell", "content": "ok"}]
-            assert should_verify(msgs, tool_calls_count=1) is True
+            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is True
 
     def test_write_file_counts_as_mutation(self):
-        """write_file is in VERIFY_TOOL_NAMES."""
+        """write_file is registered with mutating=True."""
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [{"role": "tool_result", "tool_name": "write_file", "content": "ok"}]
-            assert should_verify(msgs, tool_calls_count=1) is True
+            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is True
+
+    def test_dynamic_mcp_mutating_tool_triggers_verification(self):
+        """B-1 (codex review 2026-04-29): a dynamic MCP-flagged-mutating
+        tool — one not in the historical hard-coded VERIFY_TOOL_NAMES set
+        — must arm the verification gate as soon as it's used.
+
+        This test injects the mutating flag via ``with_overlay(mutating=...)``
+        — the same code path an MCP integration uses to add a freshly
+        registered tool to the per-step ToolBatch — and asserts the gate
+        fires for a tool result with that name.
+        """
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
+            batch = ToolBatch.empty().with_overlay(mutating={"mcp_dyn_writer"})
+            msgs = [{"role": "tool_result", "tool_name": "mcp_dyn_writer", "content": "ok"}]
+            assert should_verify(msgs, tool_calls_count=1, batch=batch) is True
+
+    def test_only_nonmutating_tools_skips_verification(self):
+        """B-1 (codex review 2026-04-29): a turn that only used read-only
+        tools (e.g. read_file) must NOT arm the verification gate, even
+        when VERIFICATION_ENABLED=1 and at least one tool was called.
+        """
+        with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
+            batch = _mutating_batch()
+            msgs = [{"role": "tool_result", "tool_name": "read_file", "content": "data"}]
+            assert should_verify(msgs, tool_calls_count=1, batch=batch) is False
 
     def test_since_index_excludes_prior_turn_mutations(self):
         """Replayed historical mutations must NOT re-arm verification on a
@@ -232,13 +283,14 @@ class TestShouldVerify:
                 {"role": "tool_result", "tool_name": "read_file", "content": "data"},
             ]
             msgs = history + this_turn
+            batch = _mutating_batch()
             assert should_verify(
-                msgs, tool_calls_count=1, since_index=turn_start
+                msgs, tool_calls_count=1, since_index=turn_start, batch=batch,
             ) is False, "since_index must exclude prior-turn mutations"
 
             # Sanity: without since_index the legacy behaviour DOES fire
             # (proves the test is exercising the right boundary).
-            assert should_verify(msgs, tool_calls_count=1) is True
+            assert should_verify(msgs, tool_calls_count=1, batch=batch) is True
 
     def test_since_index_includes_current_turn_mutations(self):
         """When this-turn has a mutation past the boundary, verify fires."""
@@ -250,7 +302,7 @@ class TestShouldVerify:
             ]
             msgs = history + this_turn
             assert should_verify(
-                msgs, tool_calls_count=1, since_index=turn_start
+                msgs, tool_calls_count=1, since_index=turn_start, batch=_mutating_batch(),
             ) is True
 
 
@@ -278,16 +330,16 @@ class TestHasMutation:
     """_has_mutation internal helper."""
 
     def test_empty_messages(self):
-        assert _has_mutation([]) is False
+        assert _has_mutation([], batch=_mutating_batch()) is False
 
     def test_tool_result_with_mutation_tool(self):
         """Detects tool_name at message level."""
         msgs = [{"role": "tool_result", "tool_name": "edit_file", "content": "ok"}]
-        assert _has_mutation(msgs) is True
+        assert _has_mutation(msgs, batch=_mutating_batch()) is True
 
     def test_tool_result_without_mutation(self):
         msgs = [{"role": "tool_result", "tool_name": "read_file", "content": "data"}]
-        assert _has_mutation(msgs) is False
+        assert _has_mutation(msgs, batch=_mutating_batch()) is False
 
     def test_anthropic_format_content_blocks(self):
         """Detects tool_result inside content blocks (Anthropic format)."""
@@ -297,12 +349,12 @@ class TestHasMutation:
                 {"type": "tool_result", "tool_name": "write_file", "content": "ok"},
             ],
         }]
-        assert _has_mutation(msgs) is True
+        assert _has_mutation(msgs, batch=_mutating_batch()) is True
 
     def test_openai_format_role_tool(self):
         """Detects role=tool with name field (OpenAI format)."""
         msgs = [{"role": "tool", "name": "edit_file", "content": "ok"}]
-        assert _has_mutation(msgs) is True
+        assert _has_mutation(msgs, batch=_mutating_batch()) is True
 
 
 class TestAlreadyInjected:
@@ -338,12 +390,9 @@ class TestAlreadyInjected:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Integration: verify tools are listed correctly
+# Integration: VERIFY_TOOL_NAMES has been removed (B-1, codex review
+# 2026-04-29).  Mutating-classification now lives on the registry's
+# ``mutating=True`` flag and is consulted via ``ToolBatch.is_mutating(...)``;
+# see TestShouldVerify.test_dynamic_mcp_mutating_tool_triggers_verification
+# for the regression test that pins the new behaviour.
 # ═══════════════════════════════════════════════════════════════════════════
-
-class TestVerifyToolNames:
-    def test_expected_tools(self):
-        assert "edit_file" in VERIFY_TOOL_NAMES
-        assert "write_file" in VERIFY_TOOL_NAMES
-        assert "run_shell" in VERIFY_TOOL_NAMES
-        assert "read_file" not in VERIFY_TOOL_NAMES

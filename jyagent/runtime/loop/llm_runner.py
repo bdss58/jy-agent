@@ -34,12 +34,13 @@ translation to be clean.  ``AgentLoop`` constructs one per instance and
 keeps thin delegation methods for back-compat with callers (and tests
 that mock ``_call_complete`` etc.).
 
-The ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` helpers are
-INTENTIONALLY DUPLICATED from ``AgentLoop`` here — AgentLoop uses the
-same three for non-LLM code paths (loop orchestration, reflection, tool
-dispatch), and coupling the two classes through inheritance or a shared
-context object would be premature abstraction.  ~15 lines of duplication
-total; acceptable.
+The ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` helpers live on
+the ``LoopThreadHelper`` mixin (``_thread_helpers.py``) — both ``LLMRunner``
+and ``AgentLoop`` inherit them and override the helper's two class-level
+attribute-name strings to point at their respective instance attributes.
+This was previously ~30 lines of cut-and-paste between the two classes;
+extracted in L-2 (codex review 2026-04-29) once it was clear neither class
+was going to evolve the helpers in divergent ways.
 """
 
 from __future__ import annotations
@@ -47,16 +48,14 @@ from __future__ import annotations
 import json
 import logging
 import random
-import sys
 import threading
-import time
-import traceback
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from .callbacks import LoopCallbacks
 from .config import LoopConfig
 from .llm_client import LLMClient
 from .llm_types import LLMOptions, ModelSpec
+from ._thread_helpers import LoopThreadHelper
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT
 
 if TYPE_CHECKING:
@@ -173,7 +172,7 @@ def build_runtime_options(
 # ─── LLMRunner ──────────────────────────────────────────────────────────────
 
 
-class LLMRunner:
+class LLMRunner(LoopThreadHelper):
     """Per-AgentLoop LLM I/O orchestrator.
 
     Owns the three entry points (``call_complete``, ``call_streaming``,
@@ -190,7 +189,18 @@ class LLMRunner:
         on_retry, on_stream_retry, on_usage
       * cancel_event — optional threading.Event for cooperative cancel
       * model_spec — optional override (sub-agent tier)
+
+    Inherits ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` from
+    ``LoopThreadHelper`` (L-2, codex review 2026-04-29).  Overrides the
+    helper's two attribute-name class-vars because LLMRunner uses
+    un-prefixed instance attribute names (``cancel_event`` / ``callbacks``)
+    while AgentLoop uses underscore-prefixed names.
     """
+
+    # L-2: tell the LoopThreadHelper mixin which instance attributes hold
+    # the cancel event and callbacks dataclass.
+    _helper_cancel_event_attr = "cancel_event"
+    _helper_callbacks_attr = "callbacks"
 
     def __init__(
         self,
@@ -206,31 +216,12 @@ class LLMRunner:
         self.cancel_event = cancel_event
         self.model_spec = model_spec
 
-    # ── cancellation + callback helpers (intentional duplication with AgentLoop) ──
-
-    def _is_cancelled(self) -> bool:
-        """Check if external cancellation has been requested."""
-        return self.cancel_event is not None and self.cancel_event.is_set()
-
-    def _cancellable_sleep(self, seconds: float) -> bool:
-        """Sleep that returns early if cancellation is signalled.
-
-        Returns True if cancelled during the wait, False otherwise.  When
-        no cancel_event is attached, falls back to a plain blocking sleep.
-        """
-        if self.cancel_event is None:
-            time.sleep(seconds)
-            return False
-        return self.cancel_event.wait(seconds)
-
-    def _fire(self, name: str, *args: Any) -> None:
-        cb = getattr(self.callbacks, name, None)
-        if cb is not None:
-            try:
-                cb(*args)
-            except Exception:
-                # Callbacks are for presentation — never abort the engine loop.
-                print(f"[warning] callback {name!r} raised:", traceback.format_exc(), file=sys.stderr)
+    # ── cancellation + callback helpers (L-2: mixin from LoopThreadHelper) ──
+    # ``_is_cancelled``, ``_cancellable_sleep``, ``_fire`` live on the
+    # ``LoopThreadHelper`` mixin (see ``_thread_helpers.py``).  Class-var
+    # overrides at the top of this class point the helper's attribute
+    # lookups at LLMRunner's un-prefixed ``cancel_event`` / ``callbacks``
+    # instance attributes.
 
     # ── non-streaming call ───────────────────────────────────────────────
 

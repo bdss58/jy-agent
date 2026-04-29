@@ -300,6 +300,14 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
 
     callbacks = LoopCallbacks(on_step_progress=_on_step_progress)
 
+    # TODO (L-4, codex review 2026-04-29): parent run-id propagation for
+    # cross-process checkpoint correlation is not yet implemented.  Sub-
+    # agents get a fresh run id from ``new_run_id()`` (assigned inside
+    # ``RunState.prepare_for_run``) when checkpointing is enabled at
+    # the sub-agent level, with no link back to the parent run id that
+    # spawned them.  Future work: thread an explicit ``parent_run_id``
+    # kwarg through ``_run_subagent`` and call ``loop.set_run_id(...)``
+    # before ``loop.run(...)`` so checkpoint files form a navigable tree.
     loop = AgentLoop(
         runtime_owner=runtime_owner,
         config=config,
@@ -509,12 +517,32 @@ _subagent_tracker = _SubagentTracker()
 
 # ─── Background Agent Registry ──────────────────────────────────────────────
 
-_bg_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=5, thread_name_prefix="bg-subagent",
-)
+# N-3 (codex review 2026-04-29): lazy pool initialisation, mirroring
+# ``tool_executor.get_tool_dispatch_executor``.  Eager creation here used
+# to spin up a 5-worker daemon thread pool and register an ``atexit``
+# shutdown hook on every ``import jyagent.tools.subagent``, even for
+# callers that never dispatch a sub-agent (CLI subcommands, unit tests
+# that only touch other tools, etc.).  The double-checked-locking pattern
+# keeps the fast path lock-free after the first dispatch.
 
-import atexit as _subagent_atexit
-_subagent_atexit.register(_bg_executor.shutdown, wait=False)
+_bg_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_bg_executor_lock = threading.Lock()
+
+
+def _get_bg_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the background sub-agent thread pool, creating it on first use."""
+    global _bg_executor
+    if _bg_executor is not None:
+        return _bg_executor
+    with _bg_executor_lock:
+        if _bg_executor is not None:
+            return _bg_executor
+        _bg_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=5, thread_name_prefix="bg-subagent",
+        )
+        import atexit as _subagent_atexit
+        _subagent_atexit.register(_bg_executor.shutdown, wait=False)
+        return _bg_executor
 
 
 @dataclass
@@ -853,7 +881,7 @@ def dispatch_agent(
         progress_ids = {"spinner_id": spinner_id, "bg_id": None}
 
         try:
-            future = _bg_executor.submit(
+            future = _get_bg_executor().submit(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 spinner_id, custom_system_prompt, cancel_event,
@@ -914,7 +942,7 @@ def dispatch_agent(
             # Submit to the shared executor (NOT a per-call `with ThreadPoolExecutor`
             # which blocks on __exit__ with shutdown(wait=True), making timeout
             # handoff impossible).
-            future = _bg_executor.submit(
+            future = _get_bg_executor().submit(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 agent_id, custom_system_prompt, cancel_event,

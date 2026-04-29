@@ -42,11 +42,12 @@ when the pool grows, so back-compat readers MUST see the live value.
 from __future__ import annotations
 
 import atexit
+import collections
 import concurrent.futures
 import logging
 import threading
 import traceback
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, MutableSequence
 
 from ..tools.registry import ToolBatch
 from ..tools.result import ToolResult
@@ -196,7 +197,7 @@ def execute_tools(
     max_workers: int,
     timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
-    partial_side_effects: list[str] | None = None,
+    partial_side_effects: "MutableSequence[str] | collections.deque[str] | None" = None,
 ) -> list[tuple["ToolCallRequest", ToolResult]]:
     """Execute tool calls with selective parallelisation.
 
@@ -213,12 +214,18 @@ def execute_tools(
     concurrent registry mutation cannot flip a tool's flag mid-partition
     (Codex Part 1 #11).
 
-    ``partial_side_effects`` (optional) is an accumulator list the caller owns
-    — every mutating-tool timeout appends its name to this list so
-    ``AgentLoop`` can surface it on ``LoopResult.partial_side_effects`` (A1
-    fix, codex review 2026-04-25).  Non-mutating timeouts and successful
-    calls never touch it.  ``None`` disables the accumulator (for ad-hoc
-    callers that don't care).
+    ``partial_side_effects`` (optional) is an accumulator the caller owns —
+    every mutating-tool timeout appends its name so ``AgentLoop`` can surface
+    it on ``LoopResult.partial_side_effects`` (A1 fix, codex review
+    2026-04-25).  Non-mutating timeouts and successful calls never touch it.
+    ``None`` disables the accumulator (for ad-hoc callers that don't care).
+
+    H-2 (codex review 2026-04-29): the accumulator must accept both
+    ``list[str]`` (legacy callers) and ``collections.deque[str]`` (the
+    AgentLoop default — chosen for free-threaded-Python forward-compat
+    where ``list.append`` is no longer atomic but ``deque.append`` is).
+    Both share the ``.append(...)`` interface; that's all the timeout
+    branch in ``execute_tool_with_timeout`` calls.
     """
     if not blocks:
         return []
@@ -309,7 +316,7 @@ def execute_tool_with_timeout(
     default_timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     body_permits: threading.BoundedSemaphore | None = None,
-    partial_side_effects: list[str] | None = None,
+    partial_side_effects: "MutableSequence[str] | collections.deque[str] | None" = None,
 ) -> ToolResult:
     """Execute a tool body with a timeout.
 
@@ -395,6 +402,25 @@ def execute_tool_with_timeout(
         t.start()
         timed_out = not done.wait(timeout)
     finally:
+        # H-3 (codex review 2026-04-29): the permit is released as soon as
+        # ``done.wait(timeout)`` returns, which on timeout is BEFORE the
+        # daemon body thread has actually finished.  This is intentional —
+        # alternative #1 (hold the permit until the daemon completes) would
+        # leak a slot permanently for any infinite-loop tool body, draining
+        # ``LoopConfig.max_tool_workers`` after enough timeouts and
+        # eventually starving the dispatch loop.  Alternative #2 (kill the
+        # daemon) is impossible — Python threads are not cancellable.
+        # The trade-off we accept here:
+        #   - A leaked-thread-from-timeout no longer counts against
+        #     ``max_tool_workers`` (good — the dispatch loop stays healthy).
+        #   - The leaked daemon's CPU / memory keeps running in the
+        #     background until it finishes naturally or the process exits
+        #     (acceptable — daemon=True guarantees no clean-up will block).
+        # If a future contributor "fixes" this by holding the permit longer,
+        # the LoopConfig.max_tool_workers semantic becomes "max EVER-LIVE
+        # tool bodies" instead of "max CURRENTLY-RUNNING bodies that the
+        # dispatch loop is aware of", which is the wrong invariant.
+        # Document loudly here so the trade-off is visible at the call site.
         if body_permits is not None:
             body_permits.release()
 

@@ -300,11 +300,25 @@ class TestSubclassOverrideContract:
 
 class TestRunStateFromLoop:
     def test_resets_partial_side_effects(self):
+        """``prepare_for_run`` resets the partial-side-effects accumulator
+        on the loop instance.
+
+        H-2 (codex review 2026-04-29): the accumulator is now a
+        ``collections.deque`` (free-threaded-Python forward-compat —
+        ``list.append`` is no longer atomic on PEP 703 builds; ``deque
+        .append`` is documented thread-safe).  ``list(deque(...)) == []``
+        still works for the empty-state assertion.
+        """
+        import collections as _c
         loop = FakeLoop()
-        loop._partial_side_effects = ["stale1", "stale2"]
+        loop._partial_side_effects = ["stale1", "stale2"]  # legacy list — reset must overwrite
         state = RunState.prepare_for_run(loop, "sys", [], None)
-        assert loop._partial_side_effects == []
-        # state doesn't shadow the loop's list
+        # Reset to an empty accumulator (now backed by deque, but list-equivalent
+        # on iteration).
+        assert list(loop._partial_side_effects) == []
+        # And the new container is actually a deque post-reset.
+        assert isinstance(loop._partial_side_effects, _c.deque)
+        # state doesn't shadow the loop's accumulator
         assert "_partial_side_effects" not in state.__dict__
 
     def test_seeds_todos_from_initial_when_enabled(self):

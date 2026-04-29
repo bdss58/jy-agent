@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -60,7 +61,14 @@ class LoopCheckpoint:
     @classmethod
     def from_json(cls, text: str) -> "LoopCheckpoint":
         obj = json.loads(text)
-        return cls(**obj)
+        # L-3 (codex review 2026-04-29): filter unknown fields so a
+        # checkpoint authored by a NEWER agent version (with extra
+        # fields the older code doesn't know about) loads cleanly in an
+        # OLDER agent.  Missing-field tolerance comes for free via
+        # dataclass defaults — every field on ``LoopCheckpoint`` either
+        # has a default value or is supplied by the caller.
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in obj.items() if k in known})
 
     # ── File I/O ─────────────────────────────────────────────────────────
 

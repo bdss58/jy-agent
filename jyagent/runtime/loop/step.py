@@ -34,6 +34,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING, Union
+import collections
 
 from .llm_types import LLMOptions
 from ..tools.registry import get_registry, ToolBatch
@@ -177,7 +178,13 @@ class RunState:
         cfg = loop._config
 
         # A1: reset accumulator. MUST happen at every run, not just init.
-        loop._partial_side_effects = []
+        # H-2 (codex review 2026-04-29): use ``deque`` (not list) for free-
+        # threaded-Python forward-compat — ``deque.append`` is documented
+        # thread-safe for single-element ops, while ``list.append`` is
+        # only atomic on the stock GIL build (PEP 703 / 3.13t / 3.14t
+        # remove that guarantee).  ``list(deque(...))`` later in run()
+        # converts to the historical list type for the LoopResult.
+        loop._partial_side_effects = collections.deque()
 
         turn_start_idx = len(messages)
 
@@ -204,7 +211,14 @@ class RunState:
                 except TypeError as e:
                     loop._fire("on_warning", f"ignoring invalid initial_todos: {e}")
                     loop._todos = []
-            else:
+            elif initial_todos is None:
+                # M-4 (codex review 2026-04-29): preserve any cross-turn todos
+                # the caller already set on the loop instance — e.g. an outer
+                # session that wants to chain multiple ``run()`` calls without
+                # restating the plan each time.  Callers that want a fresh
+                # start can pass ``initial_todos=[]`` explicitly.
+                pass
+            else:  # explicit empty list → caller wants the store cleared
                 loop._todos = []
 
             # Closure reads/writes loop._todos via accessors so engine
@@ -345,23 +359,15 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     # metadata" behaviour but now atomically.
     if loop._tool_source is not None:
         src_schemas, src_functions = loop._tool_source()
-        reg_batch = registry.freeze()
-        src_schema_map = {
-            s.get("name"): s for s in src_schemas if s.get("name")
-        }
-        state.tools_batch = ToolBatch(
-            version=reg_batch.version,
-            schemas=tuple(src_schemas),
-            schema_map=src_schema_map,
-            functions=dict(src_functions),
-            parallel_safe=reg_batch.parallel_safe,
-            timeout_hints=reg_batch.timeout_hints,
-            large_input_keys=reg_batch.large_input_keys,
-            compaction_priority=reg_batch.compaction_priority,
-            # Inherit mutating classification from the registry
-            # frozen above — used by the verification gate to decide
-            # whether to inject a self-check before completion.
-            mutating=reg_batch.mutating,
+        # B-2 fix (codex review 2026-04-29): deep-copy schemas + wrap
+        # all maps in MappingProxyType views, so the tool_source path
+        # has the same immutability guarantees as ToolRegistry.freeze().
+        # Metadata classification (parallel_safe, mutating, timeout
+        # hints, large_input_keys, compaction_priority) is inherited
+        # from the registry freeze for any tool whose name happens to
+        # be registered too.
+        state.tools_batch = ToolBatch.from_source(
+            src_schemas, src_functions, base=registry.freeze(),
         )
     elif step == 0 or registry.version != state.tools_batch.version:
         # Re-freeze only when the registry has changed.  The
@@ -543,7 +549,12 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
         # next turn.
         if (
             not state.verification_injected
-            and should_verify(messages, state.tool_calls_count, since_index=state.turn_start_idx)
+            and should_verify(
+                messages,
+                state.tool_calls_count,
+                since_index=state.turn_start_idx,
+                batch=step_batch,
+            )
             and step + 1 < cfg.max_steps
         ):
             state.verification_injected = True

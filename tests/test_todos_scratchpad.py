@@ -306,6 +306,46 @@ class TestAgentLoopTodosWiring:
         assert any("initial_todos" in w for w in warnings)
         assert result.todos == []
 
+    def test_initial_todos_none_preserves_cross_turn_state(self):
+        """M-4 (codex review 2026-04-29): when ``initial_todos=None`` is
+        passed (the default), any todos already on ``loop._todos`` from a
+        prior ``run()`` MUST be preserved.  This lets an outer session
+        chain multiple turns on the same AgentLoop instance without
+        restating the plan.
+        """
+        loop = self._make_loop(enabled=True)
+        # First run seeds the todo store.
+        loop.run("system", [], initial_todos=[{"content": "Step 1", "status": "pending"}])
+        assert len(loop._todos) == 1
+        first_snapshot = list(loop._todos)
+
+        # Second run with initial_todos=None must NOT clear the store.
+        result = loop.run("system", [], initial_todos=None)
+        assert loop._todos == first_snapshot, (
+            "M-4: initial_todos=None must preserve loop._todos across runs; "
+            f"got {loop._todos!r} (was {first_snapshot!r})"
+        )
+        # And the result snapshot reflects the preserved store.
+        assert result.todos == [
+            {"content": "Step 1", "status": "pending", "active_form": ""}
+        ]
+
+    def test_initial_todos_empty_list_clears_store(self):
+        """M-4: an explicit empty list (``initial_todos=[]``) MUST clear
+        the store — that's the caller's escape hatch for "fresh start"
+        when ``None`` would otherwise preserve state.
+        """
+        loop = self._make_loop(enabled=True)
+        loop.run("system", [], initial_todos=[{"content": "Step 1", "status": "pending"}])
+        assert len(loop._todos) == 1
+
+        result = loop.run("system", [], initial_todos=[])
+        assert loop._todos == [], (
+            "M-4: initial_todos=[] must clear loop._todos; "
+            f"got {loop._todos!r}"
+        )
+        assert result.todos == []
+
 
 # ─── Schema ──────────────────────────────────────────────────────────────────
 

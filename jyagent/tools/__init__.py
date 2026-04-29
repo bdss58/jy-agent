@@ -56,10 +56,17 @@ _TOOL_METADATA = {
     "manage_skills":   {"parallel_safe": False},
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180, "compaction_priority": "persistent"},
     "mcp":             {"parallel_safe": False, "timeout_hint": 180, "mutating": True},
-    "dispatch_agent":  {"parallel_safe": True, "timeout_hint": 300, "large_input_keys": {"context"}, "mutating": True},
+    # M-2 (codex review 2026-04-29): dispatch_agent is now serial.  Sub-agents
+    # are coarse-grained (each one runs an entire AgentLoop on the shared
+    # tool-dispatch pool); serialising at the top level avoids cross-pool
+    # reentrancy under high parallel-tool-call fan-outs.  The bg path still
+    # works fine because dispatch_agent returns immediately after the grace
+    # period for ``background=True`` — it doesn't rely on the parent batch's
+    # parallel_safe flag for liveness.
+    "dispatch_agent":  {"parallel_safe": False, "timeout_hint": 300, "large_input_keys": {"context"}, "mutating": True},
     "check_agent":     {"parallel_safe": True, "compaction_priority": "ephemeral"},
     "run_background":  {"parallel_safe": False, "mutating": True},
-    "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral"},
+    "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral", "timeout_hint": 360, "mutating": True},
     "web_search":      {"parallel_safe": True, "timeout_hint": 180, "compaction_priority": "persistent"},
 }
 
@@ -73,9 +80,15 @@ _TOOL_METADATA = {
 #   retrying, and (c) accumulate the tool name in
 #   ``LoopResult.partial_side_effects`` for outer layers to reconcile.
 #   Read-only / query tools (read_file, list_directory, grep_files, glob_files,
-#   web_search, web_fetch, check_background, check_agent, manage_memory,
-#   manage_skills) default to mutating=False because a timed-out read is
-#   idempotent — retrying is always safe.
+#   web_search, web_fetch, check_agent, manage_memory, manage_skills) default
+#   to mutating=False because a timed-out read is idempotent — retrying is
+#   always safe.
+#
+#   ``check_background`` is FLAGGED mutating (H-1, codex review 2026-04-29)
+#   because the ``action="kill"`` branch SIGTERM/SIGKILLs the target
+#   process group — that side effect cannot be undone if the call times
+#   out mid-kill.  ``timeout_hint=360`` gives 60 s slack on top of the
+#   schema-documented ``wait_timeout_seconds`` cap of 300 s.
 
 _registry = get_registry()
 for tool_def in CORE_TOOLS + [WEB_FETCH_SCHEMA, MCP_SCHEMA, SUBAGENT_SCHEMA, CHECK_AGENT_SCHEMA, WEB_SEARCH_SCHEMA]:
