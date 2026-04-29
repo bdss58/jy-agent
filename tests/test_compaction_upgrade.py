@@ -196,6 +196,34 @@ def test_summarize_if_needed_accepts_system_prompt():
     assert "system_prompt" in sig.parameters
 
 
+def test_compaction_system_prompt_includes_base_and_memory(monkeypatch):
+    """Auto-compaction should reuse the full base+memory prompt prefix."""
+    import shutil
+    import jyagent.config as config
+    import jyagent.agent as agent
+    from jyagent.memory.operations import ensure_dirs, write_memory_md
+
+    tmpdir = tempfile.mkdtemp(prefix="jy_compact_prompt_test_")
+    monkeypatch.setattr(config, "MEMORY_DIR", os.path.join(tmpdir, "memory"))
+    monkeypatch.setattr(config, "TOPICS_DIR", os.path.join(tmpdir, "memory", "topics"))
+    monkeypatch.setattr(config, "JOURNAL_DIR", os.path.join(tmpdir, "memory", "journal"))
+    monkeypatch.setattr(config, "MEMORY_MD_FILE", os.path.join(tmpdir, "memory", "MEMORY.md"))
+
+    try:
+        ensure_dirs()
+        write_memory_md("# Agent Memory\n\n[tip] compaction-memory-marker\n")
+        agent._cached_memory_context = None
+
+        prompt = agent._build_compaction_system_prompt("trigger compaction")
+
+        assert "TOOL-FIRST PRINCIPLE" in prompt
+        assert "SELF-USE MEMORY" in prompt
+        assert "compaction-memory-marker" in prompt
+    finally:
+        agent._cached_memory_context = None
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 # ─── Phase 2: P1.4 — File re-injection ───────────────────────────────────────
 
 def test_file_access_tracker_basic():

@@ -13,6 +13,23 @@ from .. import config as _cfg
 # tests can patch config attributes *after* this module is imported.
 MAX_MEMORY_INDEX_LINES = _cfg.MAX_MEMORY_INDEX_LINES
 MAX_MEMORY_INDEX_BYTES = _cfg.MAX_MEMORY_INDEX_BYTES
+MAX_DURABLE_MEMORY_TEXT_CHARS = 400
+
+_ALLOWED_MEMORY_CATEGORIES = {
+    "",
+    "correction",
+    "preference",
+    "gotcha",
+    "tip",
+    "workflow",
+    "user_stated",
+    "goal",
+    # Internal default used by supersede() when the caller does not specify
+    # one. Keep it accepted so the existing non-destructive update format
+    # remains compatible.
+    "superseding",
+}
+_MEMORY_CATEGORY_RE = re.compile(r"^[a-z_]+$")
 
 
 # ─── Concurrency ──────────────────────────────────────────────────────────────
@@ -36,6 +53,7 @@ MAX_MEMORY_INDEX_BYTES = _cfg.MAX_MEMORY_INDEX_BYTES
 # wholesale and we accept last-writer-wins for them since the topic name
 # itself is the concurrency partition).
 _MEMORY_MD_LOCK = threading.RLock()
+_JOURNAL_LOCK = threading.Lock()
 
 
 def ensure_dirs() -> None:
@@ -106,6 +124,34 @@ def append_memory_md(text: str) -> None:
                 f.write(f"{text}\n")
 
 
+def _validate_memory_entry(text: str, category: str = "") -> tuple[str, str]:
+    """Validate one durable MEMORY.md entry and return stripped text/category.
+
+    MEMORY.md is injected into the system prompt, so durable entries must stay
+    one-line facts/rules rather than arbitrary markdown blocks.
+    """
+    entry = text.strip()
+    cat = category.strip().lower()
+
+    if not entry:
+        raise ValueError("memory entry text must be non-empty")
+    if len(entry.splitlines()) != 1:
+        raise ValueError("memory entry text must be exactly one line")
+    if len(entry) > MAX_DURABLE_MEMORY_TEXT_CHARS:
+        raise ValueError(
+            f"memory entry text must be <= {MAX_DURABLE_MEMORY_TEXT_CHARS} chars"
+        )
+    if entry.lstrip().startswith(("#", "~~")):
+        raise ValueError(
+            "memory entry text must not start with a markdown heading or strikethrough"
+        )
+    if cat and (cat not in _ALLOWED_MEMORY_CATEGORIES or not _MEMORY_CATEGORY_RE.match(cat)):
+        allowed = ", ".join(sorted(c for c in _ALLOWED_MEMORY_CATEGORIES if c))
+        raise ValueError(f"invalid memory category {category!r}; allowed: {allowed}")
+
+    return entry, cat
+
+
 def forget_from_memory_md(keyword: str) -> int:
     """Remove lines containing keyword from MEMORY.md. Returns count removed.
 
@@ -117,7 +163,7 @@ def forget_from_memory_md(keyword: str) -> int:
             return 0
         lines = content.split("\n")
         keyword_lower = keyword.lower()
-        new_lines = [l for l in lines if keyword_lower not in l.lower()]
+        new_lines = [line for line in lines if keyword_lower not in line.lower()]
         removed = len(lines) - len(new_lines)
         if removed > 0:
             write_memory_md("\n".join(new_lines))
@@ -332,80 +378,78 @@ def _extract_topic_description(body: str) -> str:
     return "(no description)"
 
 
-def _add_topic_index_entry(name: str, description: str) -> None:
-    """Add a topic entry to the ``## Topic Files Index`` section of MEMORY.md.
+def _upsert_topic_index_entry(name: str, description: str) -> None:
+    """Add or update a topic entry in the ``## Topic Files Index`` section.
 
-    Creates the section if it doesn't exist.  Skips if the topic is already
-    listed (idempotent).
+    This is a MEMORY.md read-modify-write operation, so the whole sequence is
+    guarded by ``_MEMORY_MD_LOCK``. Existing entries are replaced in place so
+    the always-loaded topic index does not go stale after topic rewrites.
     """
-    content = read_memory_md()
     entry_marker = f"**{name}.md**"
-
-    # Already indexed?
-    if entry_marker in content:
-        return
-
     new_entry = f"- {entry_marker} — {description}"
 
-    if _TOPIC_INDEX_HEADING in content:
-        # Section exists — append entry after the heading line
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        if not content:
+            write_memory_md(f"# Agent Memory\n\n{_TOPIC_INDEX_HEADING}\n{new_entry}\n")
+            return
+
         lines = content.split("\n")
-        result: list[str] = []
-        inserted = False
-        for i, line in enumerate(lines):
-            result.append(line)
-            if not inserted and line.strip() == _TOPIC_INDEX_HEADING:
-                # Find insertion point: after last existing entry in this section
-                j = i + 1
-                while j < len(lines) and (
-                    lines[j].startswith("- **") or lines[j].strip() == ""
-                ):
-                    j += 1
-                # Insert before the first non-entry line after heading
-                # (but we need to continue appending lines up to j first)
-                pass
-        # Simpler approach: find the heading, collect section lines, append
-        lines = content.split("\n")
-        result = []
-        inserted = False
-        for i, line in enumerate(lines):
-            result.append(line)
-            if not inserted and line.strip() == _TOPIC_INDEX_HEADING:
-                # Scan forward past existing entries (lines starting with "- **")
-                # and blank lines
-                j = i + 1
-                while j < len(lines):
-                    next_line = lines[j]
-                    if next_line.startswith("- **") or next_line.strip() == "":
-                        result.append(next_line)
-                        j += 1
-                    else:
-                        break
-                # Insert the new entry
+        if _TOPIC_INDEX_HEADING in content:
+            result: list[str] = []
+            in_index = False
+            replaced = False
+            appended = False
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped == _TOPIC_INDEX_HEADING:
+                    in_index = True
+                    result.append(line)
+                    continue
+
+                if in_index:
+                    if line.startswith("- **"):
+                        if entry_marker in line:
+                            if not replaced:
+                                result.append(new_entry)
+                                replaced = True
+                            continue
+                        result.append(line)
+                        continue
+                    if stripped == "":
+                        result.append(line)
+                        continue
+
+                    if not replaced and not appended:
+                        result.append(new_entry)
+                        appended = True
+                    in_index = False
+
+                result.append(line)
+
+            if in_index and not replaced and not appended:
                 result.append(new_entry)
-                inserted = True
-                # Skip already-appended lines
-                for k in range(i + 1, j):
-                    pass  # already appended in the scan loop
-                # Append remaining lines
-                result.extend(lines[j:])
-                break
-        if not inserted:
-            # Heading found but loop didn't insert (shouldn't happen)
-            result.append(new_entry)
-        write_memory_md("\n".join(result))
-    else:
-        # Section doesn't exist — create it
-        # Insert before "## Repo Snapshot" or append at end
-        lines = content.split("\n")
+
+            write_memory_md("\n".join(result))
+            return
+
+        # Section doesn't exist — create it before later repo/project sections
+        # when possible, otherwise append at end.
         result = []
         inserted = False
+        protected_before_index = {
+            "## User Profile",
+            "## Behavioral Rules (CRITICAL)",
+            "## User Preferences",
+            "## Environment",
+            _TOPIC_INDEX_HEADING,
+        }
         for line in lines:
-            # Insert before common sections that should come after the index
-            if not inserted and line.strip().startswith("## ") and line.strip() not in (
-                "## User Profile", "## Behavioral Rules (CRITICAL)",
-                "## User Preferences", "## Environment",
-                _TOPIC_INDEX_HEADING,
+            if (
+                not inserted
+                and line.strip().startswith("## ")
+                and line.strip() not in protected_before_index
             ):
                 result.append(_TOPIC_INDEX_HEADING)
                 result.append(new_entry)
@@ -413,43 +457,49 @@ def _add_topic_index_entry(name: str, description: str) -> None:
                 inserted = True
             result.append(line)
         if not inserted:
-            # No suitable section found — append at end
-            result.append("")
+            if result and result[-1] != "":
+                result.append("")
             result.append(_TOPIC_INDEX_HEADING)
             result.append(new_entry)
         write_memory_md("\n".join(result))
 
 
+def _add_topic_index_entry(name: str, description: str) -> None:
+    """Compatibility wrapper: upsert the topic entry in MEMORY.md."""
+    _upsert_topic_index_entry(name, description)
+
+
 def _remove_topic_index_entry(name: str) -> None:
     """Remove a topic entry from the ``## Topic Files Index`` in MEMORY.md."""
-    content = read_memory_md()
-    entry_marker = f"**{name}.md**"
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        entry_marker = f"**{name}.md**"
 
-    if entry_marker not in content:
-        return
+        if entry_marker not in content:
+            return
 
-    lines = content.split("\n")
-    new_lines = [l for l in lines if entry_marker not in l]
+        lines = content.split("\n")
+        new_lines = [line for line in lines if entry_marker not in line]
 
-    # If the section is now empty (only heading + blanks), remove it too
-    cleaned = []
-    skip_empty_section = False
-    for i, line in enumerate(new_lines):
-        if line.strip() == _TOPIC_INDEX_HEADING:
-            # Check if next non-blank line is another ## heading or EOF
-            j = i + 1
-            while j < len(new_lines) and new_lines[j].strip() == "":
-                j += 1
-            if j >= len(new_lines) or new_lines[j].startswith("## "):
-                # Section is empty — skip heading and trailing blanks
-                skip_empty_section = True
-                continue
-        if skip_empty_section and line.strip() == "":
-            continue
+        # If the section is now empty (only heading + blanks), remove it too
+        cleaned = []
         skip_empty_section = False
-        cleaned.append(line)
+        for i, line in enumerate(new_lines):
+            if line.strip() == _TOPIC_INDEX_HEADING:
+                # Check if next non-blank line is another ## heading or EOF
+                j = i + 1
+                while j < len(new_lines) and new_lines[j].strip() == "":
+                    j += 1
+                if j >= len(new_lines) or new_lines[j].startswith("## "):
+                    # Section is empty — skip heading and trailing blanks
+                    skip_empty_section = True
+                    continue
+            if skip_empty_section and line.strip() == "":
+                continue
+            skip_empty_section = False
+            cleaned.append(line)
 
-    write_memory_md("\n".join(cleaned))
+        write_memory_md("\n".join(cleaned))
 
 
 def write_topic(name: str, content: str) -> None:
@@ -473,8 +523,6 @@ def write_topic(name: str, content: str) -> None:
         raise ValueError(
             f"invalid topic name {name!r}: must match [A-Za-z0-9][A-Za-z0-9_.-]{{0,79}}"
         )
-    is_new = not os.path.exists(filepath)
-
     now = _now_iso()
 
     # Preserve original created timestamp if file already exists
@@ -496,10 +544,10 @@ def write_topic(name: str, content: str) -> None:
         if body and not body.endswith("\n"):
             f.write("\n")
 
-    # Auto-index new topics in MEMORY.md
-    if is_new:
-        description = _extract_topic_description(body)
-        _add_topic_index_entry(name, description)
+    # Keep the always-loaded topic index current for both new and rewritten
+    # topics. The helper is idempotent and locked against concurrent writers.
+    description = _extract_topic_description(body)
+    _upsert_topic_index_entry(name, description)
 
 
 def delete_topic(name: str) -> bool:
@@ -577,13 +625,10 @@ def append_journal(text: str, category: str = "note") -> str:
     Returns the journal-relative path that was written, so callers (and the
     agent) know where the note lives without having to guess.
 
-    Concurrency: the header is written via O_CREAT|O_EXCL so two parallel
-    sub-agents racing on the first entry of a fresh month cannot produce a
-    duplicate ``# Journal —`` heading. The body write uses plain append mode;
-    on POSIX a single ``write()`` under ``O_APPEND`` is atomic up to
-    ``PIPE_BUF`` (4 KB on macOS) — entries longer than that can interleave at
-    the file level. That's an acceptable trade-off for a human-readable
-    journal and matches how most structured-log files behave.
+    Concurrency: local threads serialize the header+body append under
+    ``_JOURNAL_LOCK``. The header still uses O_CREAT|O_EXCL so a separate
+    process racing on the first entry of a fresh month cannot produce a
+    duplicate ``# Journal —`` heading.
     """
     ensure_dirs()
     now = datetime.now(ASIA_SHANGHAI_TZ)
@@ -591,26 +636,27 @@ def append_journal(text: str, category: str = "note") -> str:
     timestamp = now.strftime("%Y-%m-%d %H:%M")
     path = _journal_path(month)
 
-    # Race-free header install: whoever wins the O_EXCL create writes the
-    # header; everyone else raises FileExistsError and skips straight to the
-    # append step.
-    header = (
-        f"# Journal — {month}\n\n"
-        "Tier 3 / append-only / NEVER auto-loaded. Chronological session "
-        "notes live here so they don't pollute MEMORY.md (the always-loaded "
-        "index) or topic files (curated knowledge).\n\n"
-    )
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with _JOURNAL_LOCK:
+        # Race-free header install: whoever wins the O_EXCL create writes the
+        # header; everyone else raises FileExistsError and skips straight to the
+        # append step.
+        header = (
+            f"# Journal — {month}\n\n"
+            "Tier 3 / append-only / NEVER auto-loaded. Chronological session "
+            "notes live here so they don't pollute MEMORY.md (the always-loaded "
+            "index) or topic files (curated knowledge).\n\n"
+        )
         try:
-            os.write(fd, header.encode("utf-8"))
-        finally:
-            os.close(fd)
-    except FileExistsError:
-        pass  # another writer already installed the header — safe to append
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                os.write(fd, header.encode("utf-8"))
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            pass  # another writer already installed the header — safe to append
 
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"## {timestamp} [{category}]\n{text.rstrip()}\n\n")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"## {timestamp} [{category}]\n{text.rstrip()}\n\n")
 
     return f"data/memory/journal/{month}.md"
 
@@ -825,9 +871,10 @@ def remember(text: str, category: str = "", *, suppress_warning: bool = False) -
     its load limit. Set ``suppress_warning=True`` for programmatic callers /
     tests that parse the return value.
     """
-    prefix = f"[{category}] " if category else "- "
-    append_memory_md(f"{prefix}{text}")
-    msg = f"Remembered: {text[:100]}"
+    entry, cat = _validate_memory_entry(text, category)
+    prefix = f"[{cat}] " if cat else "- "
+    append_memory_md(f"{prefix}{entry}")
+    msg = f"Remembered: {entry[:100]}"
     if not suppress_warning:
         warning = memory_index_size_warning()
         if warning:

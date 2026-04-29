@@ -324,6 +324,18 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_
     return full_system_prompt
 
 
+def _build_compaction_system_prompt(user_input: str) -> str:
+    """Build the base+memory prompt prefix used for cache-friendly compaction."""
+    global _cached_memory_context
+
+    if _cached_memory_context is None:
+        _cached_memory_context = build_memory_context(query=user_input) or ""
+    compact_sys_prompt = _base_system_prompt()
+    if _cached_memory_context:
+        compact_sys_prompt += "\n\n" + _cached_memory_context
+    return compact_sys_prompt
+
+
 # ─── Main agent loop ─────────────────────────────────────────────────────────
 
 def run(runtime_owner: LLMOwner) -> None:
@@ -405,9 +417,9 @@ def run(runtime_owner: LLMOwner) -> None:
                     """Callback after auto-compaction: signal context rebuild."""
                     state["_force_rebuild_context"] = True
 
-                # Pass system_prompt so compaction can reuse it (cache-friendly).
-                # Use cached system prompt if available, otherwise the base prompt.
-                compact_sys_prompt = _cached_memory_context or _base_system_prompt()
+                # Pass the same base+memory prefix shape used for normal turns
+                # so compaction remains cache-friendly without dropping rules.
+                compact_sys_prompt = _build_compaction_system_prompt(user_input)
                 summarize_if_needed(
                     conversation, runtime_owner,
                     system_prompt_rebuilder=_on_compacted,

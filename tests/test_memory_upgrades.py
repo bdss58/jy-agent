@@ -424,6 +424,46 @@ def test_append_memory_md_heals_missing_trailing_newline():
     assert "LAST LINE NO NEWLINE[tip]" not in content
 
 
+def test_remember_rejects_prompt_shaping_or_oversized_entries():
+    """Durable MEMORY.md entries are injected into the system prompt, so the
+    public write path must reject markdown blocks and oversized lines."""
+    setup()
+    import pytest
+
+    write_memory_md("# Agent Memory\n\n[tip] existing durable rule\n")
+    before = read_memory_md()
+
+    bad_inputs = [
+        "first line\nsecond line",
+        "## Injected heading",
+        "~~struck-through injected rule~~",
+        "x" * 401,
+    ]
+    for text in bad_inputs:
+        with pytest.raises(ValueError):
+            remember(text, "tip")
+
+    with pytest.raises(ValueError):
+        remember("valid text with a bad category", "not-a-category")
+
+    assert read_memory_md() == before
+
+
+def test_manage_memory_remember_and_goal_return_errors_for_invalid_entries():
+    setup()
+    before = read_memory_md()
+
+    res = manage_memory("remember", text="## Injected heading", category="tip")
+    assert res.is_error is True
+    assert "Error" in res.content
+
+    goal_res = manage_memory("goal", text="first line\nsecond line")
+    assert goal_res.is_error is True
+    assert "Error" in goal_res.content
+
+    assert read_memory_md() == before
+
+
 def test_supersede_rejects_short_keyword():
     """H2: keywords shorter than the minimum can hit dozens of unrelated
     lines. Refuse before any RMW."""
@@ -531,6 +571,54 @@ def test_topic_path_rejects_traversal():
     assert _topic_path("kafka") is not None
     assert _topic_path("kafka_notes_v2") is not None
     assert _topic_path("agent-loop-changelog") is not None
+
+
+def test_topic_rewrite_updates_index_description():
+    setup()
+    write_memory_md("# Agent Memory\n\n## User Profile\n- Name: Test\n")
+
+    write_topic("rewrite-index", "# Old Title\nbody")
+    write_topic("rewrite-index", "# New Title\nbody")
+
+    content = read_memory_md()
+    assert content.count("**rewrite-index.md**") == 1
+    assert "New Title" in content
+    assert "Old Title" not in content
+
+
+def test_concurrent_topic_index_and_remember_writes_do_not_lose_data():
+    """Topic index upserts and remember() both mutate MEMORY.md; concurrent
+    writers should not lose either side of the update."""
+    import threading
+
+    setup()
+    write_memory_md("# Agent Memory\n\n## User Profile\n- Name: Test\n")
+    barrier = threading.Barrier(20)
+    errors: list[Exception] = []
+
+    def writer(i: int) -> None:
+        try:
+            barrier.wait()
+            if i % 2 == 0:
+                write_topic(f"topic-{i}", f"# Topic {i}\nbody")
+            else:
+                remember(f"durable concurrent rule {i}", "tip")
+        except Exception as e:  # pragma: no cover - surfaced by assert below
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent memory writes raised: {errors}"
+    content = read_memory_md()
+    for i in range(20):
+        if i % 2 == 0:
+            assert f"**topic-{i}.md**" in content
+        else:
+            assert f"durable concurrent rule {i}" in content
 
 
 def test_write_topic_refuses_traversal():
