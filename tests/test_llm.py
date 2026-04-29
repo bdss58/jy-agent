@@ -6,6 +6,8 @@ Uses unittest.mock throughout — no actual anthropic/openai SDK required.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1375,6 +1377,85 @@ class TestProviderAutoRegistration:
         with patch("builtins.__import__", side_effect=fake_import):
             with pytest.raises(ImportError, match="internal import failed"):
                 llm_module._auto_register_providers()
+
+
+class TestProviderExtraHeaders:
+    """Tests for provider-specific extra HTTP headers."""
+
+    def test_parse_extra_headers_valid_json_object(self):
+        from jyagent.config import get_extra_headers_from_env
+
+        with patch.dict(os.environ, {"OPENAI_EXTRA_HEADERS": '{"X-Test":"abc","X-Trace":"123"}'}):
+            assert get_extra_headers_from_env("OPENAI_EXTRA_HEADERS") == {
+                "X-Test": "abc",
+                "X-Trace": "123",
+            }
+
+    @pytest.mark.parametrize(
+        ("raw", "match"),
+        [
+            ("{bad-json", "OPENAI_EXTRA_HEADERS must be a JSON object"),
+            ('["X-Test"]', "got list"),
+            ('{"X-Test": 123}', "invalid entry 'X-Test': int"),
+        ],
+    )
+    def test_parse_extra_headers_rejects_invalid_values(self, raw, match):
+        from jyagent.config import get_extra_headers_from_env
+
+        with patch.dict(os.environ, {"OPENAI_EXTRA_HEADERS": raw}):
+            with pytest.raises(ValueError, match=match):
+                get_extra_headers_from_env("OPENAI_EXTRA_HEADERS")
+
+    def test_anthropic_adapter_passes_extra_headers_to_http_client(self):
+        from jyagent.llm.providers.anthropic import AnthropicAdapter
+
+        http_client = MagicMock()
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_EXTRA_HEADERS": '{"X-Route":"edge"}'}),
+            patch("jyagent.llm.providers.anthropic.httpx.Client", return_value=http_client) as mock_httpx_client,
+            patch("jyagent.llm.providers.anthropic.anthropic.Anthropic") as mock_anthropic,
+        ):
+            AnthropicAdapter()._client()
+
+        assert mock_httpx_client.call_args.kwargs["headers"] == {"X-Route": "edge"}
+        assert mock_anthropic.call_args.kwargs["http_client"] is http_client
+
+    def test_openai_adapter_passes_extra_headers_to_http_client(self):
+        pytest.importorskip("openai")
+        from jyagent.llm.providers.openai import OpenAIAdapter
+
+        http_client = MagicMock()
+        with (
+            patch.dict(os.environ, {"OPENAI_EXTRA_HEADERS": '{"X-Route":"edge"}'}),
+            patch("jyagent.llm.providers.openai.httpx.Client", return_value=http_client) as mock_httpx_client,
+            patch("jyagent.llm.providers.openai._openai_sdk.OpenAI") as mock_openai,
+        ):
+            OpenAIAdapter()._client()
+
+        assert mock_httpx_client.call_args.kwargs["headers"] == {"X-Route": "edge"}
+        assert mock_openai.call_args.kwargs["http_client"] is http_client
+
+    def test_openai_adapter_rebuilds_cached_client_when_extra_headers_change(self):
+        pytest.importorskip("openai")
+        from jyagent.llm.providers.openai import OpenAIAdapter
+
+        adapter = OpenAIAdapter()
+        with (
+            patch("jyagent.llm.providers.openai.httpx.Client", side_effect=[MagicMock(), MagicMock()]),
+            patch(
+                "jyagent.llm.providers.openai._openai_sdk.OpenAI",
+                side_effect=[MagicMock(), MagicMock()],
+            ) as mock_openai,
+        ):
+            with patch.dict(os.environ, {"OPENAI_EXTRA_HEADERS": '{"X-Route":"one"}'}):
+                first = adapter._client()
+                cached = adapter._client()
+            with patch.dict(os.environ, {"OPENAI_EXTRA_HEADERS": '{"X-Route":"two"}'}):
+                second = adapter._client()
+
+        assert cached is first
+        assert second is not first
+        assert mock_openai.call_count == 2
 
 
 class TestRuntimeOwnerCompleteText:

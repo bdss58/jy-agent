@@ -3,6 +3,7 @@
 # Every module reads from here instead of doing its own os.environ.get().
 # Override any value via environment variables.
 
+import json
 import os
 
 # ─── Project root (absolute, from __file__ — immune to CWD changes) ──────────
@@ -26,6 +27,31 @@ SUPPORTED_RUNTIME_PROVIDERS: set[str] = {"anthropic"}
 def register_provider(name: str) -> None:
     """Register an additional runtime provider name as valid."""
     SUPPORTED_RUNTIME_PROVIDERS.add(name)
+
+
+def get_extra_headers_from_env(env_var: str) -> dict[str, str]:
+    """Parse provider-specific extra HTTP headers from a JSON env var."""
+    raw = (os.environ.get(env_var) or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise ValueError(
+            f"{env_var} must be a JSON object of string header names to string values: {err.msg}."
+        ) from err
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"{env_var} must be a JSON object of string header names to string values; "
+            f"got {type(parsed).__name__}."
+        )
+    for key, value in parsed.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                f"{env_var} must be a JSON object of string header names to string values; "
+                f"invalid entry {key!r}: {type(value).__name__}."
+            )
+    return parsed
 
 # ─── Planner / Tool dispatch ─────────────────────────────────────────────────
 

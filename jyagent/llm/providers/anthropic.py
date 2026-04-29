@@ -6,6 +6,7 @@ from typing import Any
 import anthropic
 import httpx
 
+from ...config import get_extra_headers_from_env
 from ..core import register_adapter
 from ..streams import BaseStream, ErrorStream, make_error_assistant_message
 from ..types import AssistantMessage, Context, ModelSpec, LLMOptions, LLMStream
@@ -104,19 +105,24 @@ class AnthropicAdapter:
         self._cached_client: anthropic.Anthropic | None = None
         self._cached_base_url: str | None = None
         self._cached_auth_token: str | None = None
+        self._cached_extra_headers: tuple[tuple[str, str], ...] | None = None
 
     def _client(self) -> anthropic.Anthropic:
         base_url = os.environ.get("ANTHROPIC_BASE_URL")
         auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
+        extra_headers = get_extra_headers_from_env("ANTHROPIC_EXTRA_HEADERS")
+        extra_headers_key = tuple(sorted(extra_headers.items()))
         if (
             self._cached_client is not None
             and self._cached_base_url == base_url
             and self._cached_auth_token == auth_token
+            and self._cached_extra_headers == extra_headers_key
         ):
             return self._cached_client
         kwargs: dict[str, Any] = {
             "http_client": httpx.Client(
                 verify=os.environ.get("SSL_VERIFY", "1").lower() not in ("0", "false", "no"),
+                headers=extra_headers,
             ),
         }
         if base_url:
@@ -126,6 +132,7 @@ class AnthropicAdapter:
         self._cached_client = anthropic.Anthropic(**kwargs)
         self._cached_base_url = base_url
         self._cached_auth_token = auth_token
+        self._cached_extra_headers = extra_headers_key
         return self._cached_client
 
     def stream(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> LLMStream:

@@ -18,10 +18,8 @@ cd "$SCRIPT_DIR"
 # Activate venv
 source .venv/bin/activate
 
-# Load .env
-if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
-fi
+# .env is loaded by jyagent.__main__ with python-dotenv.
+# Shell-loading here corrupts quoted JSON values such as *_EXTRA_HEADERS.
 
 # Run the agent
 python -m jyagent "$@"
