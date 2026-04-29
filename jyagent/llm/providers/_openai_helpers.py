@@ -32,9 +32,10 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
 # ─── Model capability detection ─────────────────────────────────────────────
 
 _OPENAI_LEGACY_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
-_OPENAI_REASONING_MIN_MINOR_VERSION = 4  # gpt-5.4 is the first version to accept reasoning_effort
 
-_OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
+_OPENAI_REASONING_EFFORTS = {"minimal", "none", "low", "medium", "high", "xhigh"}
+_OPENAI_REASONING_MODEL_EXACT = {"gpt-5"}
+_OPENAI_REASONING_MODEL_MINOR_MINIMUM = 4
 
 
 def validate_openai_reasoning(reasoning: Any, *, model: str | None = None) -> dict[str, Any]:
@@ -46,20 +47,15 @@ def validate_openai_reasoning(reasoning: Any, *, model: str | None = None) -> di
         allowed = ", ".join(sorted(_OPENAI_REASONING_EFFORTS))
         raise ValueError(f"OpenAI reasoning effort must be one of: {allowed}. Got '{effort}'.")
     if model and effort and not supports_openai_reasoning_effort(model):
-        raise ValueError(
-            f"OpenAI reasoning effort is not supported by model '{model}'. "
-            "Use 'gpt-5.4' or newer."
-        )
+        raise ValueError(f"OpenAI reasoning effort is not supported by model '{model}'.")
     return reasoning
 
 
 def supports_openai_reasoning_effort(model: str) -> bool:
-    """Return True for GPT-5.4+ models that accept reasoning_effort.
-
-    Matches ``gpt-5.<minor>[-<suffix>]`` where minor >= 4
-    (e.g. ``gpt-5.4``, ``gpt-5.4-mini``, ``gpt-5.5``, ``gpt-5.6-turbo``).
-    """
+    """Return True for the OpenAI reasoning models this project supports."""
     normalized = model.strip().lower()
+    if normalized in _OPENAI_REASONING_MODEL_EXACT:
+        return True
     if not normalized.startswith("gpt-5."):
         return False
     rest = normalized[len("gpt-5."):]
@@ -73,7 +69,7 @@ def supports_openai_reasoning_effort(model: str) -> bool:
         return False
     if rest != digits and not rest.startswith(f"{digits}-"):
         return False
-    return int(digits) >= _OPENAI_REASONING_MIN_MINOR_VERSION
+    return int(digits) >= _OPENAI_REASONING_MODEL_MINOR_MINIMUM
 
 
 def uses_openai_legacy_reasoning_transport(model: str) -> bool:
@@ -137,6 +133,15 @@ def map_stop_reason(status: str | None, has_tool_calls: bool = False) -> str:
     return "error"
 
 
+def _reasoning_summary_texts(summary_parts: Any) -> list[str]:
+    summary_texts: list[str] = []
+    for sp in summary_parts or []:
+        text = _field(sp, "text", "") if not isinstance(sp, str) else sp
+        if text:
+            summary_texts.append(text)
+    return summary_texts
+
+
 def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMessage:
     """Build an AssistantMessage from an OpenAI Responses API ``Response`` object."""
     content: list[dict[str, Any]] = []
@@ -174,19 +179,22 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
             })
 
         elif item_type == "reasoning":
-            # Preserve reasoning/thinking output if available
-            summary_parts = _field(item, "summary") or []
-            summary_texts: list[str] = []
-            for sp in summary_parts:
-                text = _field(sp, "text", "") if not isinstance(sp, str) else sp
-                if text:
-                    summary_texts.append(text)
-            if summary_texts:
-                content.append({
-                    "type": "thinking",
-                    "thinking": "\n".join(summary_texts),
-                    "summary": summary_texts,
-                })
+            summary_texts = _reasoning_summary_texts(_field(item, "summary") or [])
+            reasoning_block: dict[str, Any] = {
+                "type": "thinking",
+                "thinking": "\n".join(summary_texts),
+                "summary": summary_texts,
+            }
+            for source_key, target_key in (
+                ("id", "id"),
+                ("encrypted_content", "encrypted_content"),
+                ("status", "status"),
+            ):
+                value = _field(item, source_key, None)
+                if value:
+                    reasoning_block[target_key] = value
+            if summary_texts or reasoning_block.get("id") or reasoning_block.get("encrypted_content"):
+                content.append(reasoning_block)
 
     if not any(block.get("type") == "text" for block in content):
         output_text = _field(response, "output_text", "")
@@ -212,7 +220,39 @@ def assistant_from_response(model_spec: ModelSpec, response: Any) -> AssistantMe
 
 # ─── Request building — messages (Responses API input items) ──────────────
 
-def _convert_assistant_to_input_items(message: dict[str, Any]) -> list[dict[str, Any]]:
+def _is_same_openai_responses_message(message: dict[str, Any], model_spec: ModelSpec) -> bool:
+    return (
+        message.get("provider") == "openai"
+        and message.get("api") == "openai-responses"
+        and message.get("model") == model_spec.model
+    )
+
+
+def _convert_openai_reasoning_block(block: dict[str, Any]) -> dict[str, Any] | None:
+    item: dict[str, Any] = {"type": "reasoning"}
+    for key in ("id", "encrypted_content", "status"):
+        value = block.get(key)
+        if value:
+            item[key] = value
+
+    if not item.get("id") and not item.get("encrypted_content"):
+        return None
+
+    summary = block.get("summary") or []
+    if summary:
+        item["summary"] = [
+            part if isinstance(part, dict) else {"type": "summary_text", "text": str(part)}
+            for part in summary
+        ]
+    elif item.get("id"):
+        item["summary"] = []
+
+    if len(item) == 1:
+        return None
+    return item
+
+
+def _convert_assistant_to_input_items(model_spec: ModelSpec, message: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert a normalized AssistantMessage to Responses API input items.
 
     An assistant message may expand to multiple items:
@@ -221,13 +261,19 @@ def _convert_assistant_to_input_items(message: dict[str, Any]) -> list[dict[str,
     """
     text_parts: list[str] = []
     items: list[dict[str, Any]] = []
+    preserve_openai_reasoning = _is_same_openai_responses_message(message, model_spec)
 
     for block in message.get("content", []):
         block_type = block.get("type")
         if block_type == "text":
             text_parts.append(block.get("text", ""))
         elif block_type == "thinking":
-            # Cross-model thinking: wrap in <thinking> text for replay.
+            if preserve_openai_reasoning:
+                reasoning_item = _convert_openai_reasoning_block(block)
+                if reasoning_item is not None:
+                    items.append(reasoning_item)
+                    continue
+            # Cross-provider/model thinking: wrap in <thinking> text for replay.
             if block.get("redacted"):
                 continue  # drop redacted thinking
             thinking_text = block.get("thinking", "").strip()
@@ -275,7 +321,7 @@ def convert_messages(model_spec: ModelSpec, messages: list[Message]) -> list[dic
             out.append({"role": "user", "content": message.get("content", "")})
 
         elif role == "assistant":
-            out.extend(_convert_assistant_to_input_items(message))
+            out.extend(_convert_assistant_to_input_items(model_spec, message))
 
         elif role == "tool_result":
             tool_result = cast(ToolResultMessage, message)
@@ -407,6 +453,7 @@ def build_request_kwargs(
         effort = validated.get("effort")
         if effort and supports_reasoning:
             kwargs["reasoning"] = {"effort": effort}
+            kwargs["include"] = ["reasoning.encrypted_content"]
 
     return kwargs
 

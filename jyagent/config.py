@@ -171,7 +171,7 @@ def get_reasoning_config_for_provider(
         if not supports_openai_reasoning_effort(resolved_model):
             # Globally-set env var should not block runs with other models.
             return None
-        valid_efforts = {"none", "low", "medium", "high", "xhigh"}
+        valid_efforts = {"minimal", "none", "low", "medium", "high", "xhigh"}
         if effort not in valid_efforts:
             raise ValueError(
                 f"OPENAI_REASONING_EFFORT must be one of: {sorted(valid_efforts)}. Got '{effort}'."

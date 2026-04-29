@@ -19,6 +19,7 @@ from jyagent.llm.types import (
     ThinkingBlock,
     Usage,
     compute_total_tokens,
+    LLMOptions,
     ModelSpec,
 )
 
@@ -510,6 +511,8 @@ from jyagent.llm.providers._openai_helpers import (
     map_stop_reason as openai_map_stop_reason,
     usage_from_response as openai_usage_from_response,
     assistant_from_response as openai_assistant_from_response,
+    build_request_kwargs as openai_build_request_kwargs,
+    convert_messages as openai_convert_messages,
     convert_tools as openai_convert_tools,
     supports_openai_reasoning_effort,
 )
@@ -517,7 +520,7 @@ from jyagent.llm.providers._openai_helpers import (
 
 class TestValidateOpenAIReasoning:
     def test_valid_efforts_accepted(self):
-        for effort in ("none", "low", "medium", "high", "xhigh"):
+        for effort in ("minimal", "none", "low", "medium", "high", "xhigh"):
             result = validate_openai_reasoning({"effort": effort})
             assert result["effort"] == effort
 
@@ -536,6 +539,10 @@ class TestValidateOpenAIReasoning:
     def test_model_check_supported(self):
         result = validate_openai_reasoning({"effort": "high"}, model="gpt-5.4")
         assert result["effort"] == "high"
+
+    def test_model_check_supported_base_gpt_5(self):
+        result = validate_openai_reasoning({"effort": "minimal"}, model="gpt-5")
+        assert result["effort"] == "minimal"
 
     def test_no_effort_accepted(self):
         result = validate_openai_reasoning({})
@@ -727,7 +734,10 @@ class TestOpenAIAssistantFromResponse:
             output=[
                 SimpleNamespace(
                     type="reasoning",
+                    id="rs_123",
                     summary=[SimpleNamespace(text="Step 1"), SimpleNamespace(text="Step 2")],
+                    encrypted_content="enc_abc",
+                    status="completed",
                 ),
                 SimpleNamespace(
                     type="message",
@@ -745,6 +755,95 @@ class TestOpenAIAssistantFromResponse:
         assert len(thinking) == 1
         assert "Step 1" in thinking[0]["thinking"]
         assert "Step 2" in thinking[0]["thinking"]
+        assert thinking[0]["id"] == "rs_123"
+        assert thinking[0]["encrypted_content"] == "enc_abc"
+        assert thinking[0]["status"] == "completed"
+
+    def test_same_openai_reasoning_replayed_as_native_item(self):
+        spec = self._spec()
+        messages = [
+            {
+                "role": "assistant",
+                "provider": "openai",
+                "api": "openai-responses",
+                "model": spec.model,
+                "content": [
+                    {
+                        "type": "thinking",
+                        "id": "rs_123",
+                        "thinking": "Step 1",
+                        "summary": ["Step 1"],
+                        "encrypted_content": "enc_abc",
+                    },
+                    {
+                        "type": "tool_call",
+                        "id": "call_1",
+                        "name": "search",
+                        "arguments": {"query": "test"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+            {
+                "role": "tool_result",
+                "tool_call_id": "call_1",
+                "tool_name": "search",
+                "content": "result",
+                "is_error": False,
+            },
+        ]
+
+        result = openai_convert_messages(spec, messages)
+
+        assert result[0]["type"] == "reasoning"
+        assert result[0]["id"] == "rs_123"
+        assert result[0]["encrypted_content"] == "enc_abc"
+        assert result[0]["summary"] == [{"type": "summary_text", "text": "Step 1"}]
+        assert result[1] == {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "search",
+            "arguments": '{"query": "test"}',
+        }
+        assert result[2] == {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "result",
+        }
+
+    def test_cross_openai_reasoning_replayed_as_text(self):
+        target = ModelSpec(provider="openai", model="gpt-5.5")
+        messages = [
+            {
+                "role": "assistant",
+                "provider": "openai",
+                "api": "openai-responses",
+                "model": "gpt-5.4",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "id": "rs_123",
+                        "thinking": "Step 1",
+                        "summary": ["Step 1"],
+                        "encrypted_content": "enc_abc",
+                    },
+                ],
+            },
+        ]
+
+        result = openai_convert_messages(target, messages)
+
+        assert result == [{"role": "assistant", "content": "<thinking>\nStep 1\n</thinking>"}]
+
+    def test_reasoning_request_includes_encrypted_content(self):
+        kwargs = openai_build_request_kwargs(
+            self._spec(),
+            {"messages": [{"role": "user", "content": "hi"}]},
+            LLMOptions(reasoning={"effort": "high"}),
+        )
+
+        assert kwargs["reasoning"] == {"effort": "high"}
+        assert kwargs["include"] == ["reasoning.encrypted_content"]
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1241,6 +1340,43 @@ class TestAdapterRegistry:
         assert adapters == sorted(adapters)
 
 
+class TestProviderAutoRegistration:
+    def test_missing_optional_openai_dependency_is_skipped(self):
+        import jyagent.llm as llm_module
+
+        def fake_import(name, *args, **kwargs):
+            if name == "jyagent.llm.providers.openai":
+                raise ImportError("No module named 'openai'", name="openai")
+            return object()
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            llm_module._auto_register_providers()
+
+    def test_missing_required_anthropic_dependency_is_clear_error(self):
+        import jyagent.llm as llm_module
+
+        def fake_import(name, *args, **kwargs):
+            if name == "jyagent.llm.providers.anthropic":
+                raise ImportError("No module named 'anthropic'", name="anthropic")
+            return object()
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            with pytest.raises(RuntimeError, match="Required LLM provider dependency 'anthropic'"):
+                llm_module._auto_register_providers()
+
+    def test_internal_provider_import_error_is_reraised(self):
+        import jyagent.llm as llm_module
+
+        def fake_import(name, *args, **kwargs):
+            if name == "jyagent.llm.providers.openai":
+                raise ImportError("internal import failed", name="jyagent.llm.providers.openai._internal")
+            return object()
+
+        with patch("builtins.__import__", side_effect=fake_import):
+            with pytest.raises(ImportError, match="internal import failed"):
+                llm_module._auto_register_providers()
+
+
 class TestRuntimeOwnerCompleteText:
     """Test LLMOwner.complete_text convenience method (mock adapter)."""
 
@@ -1383,6 +1519,9 @@ class TestTransformAndInjectIntegration:
 
 
 class TestSupportsOpenAIReasoningEffort:
+    def test_gpt_5_supported(self):
+        assert supports_openai_reasoning_effort("gpt-5") is True
+
     def test_gpt_5_4_supported(self):
         assert supports_openai_reasoning_effort("gpt-5.4") is True
 

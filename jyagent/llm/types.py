@@ -32,6 +32,7 @@ class ThinkingBlock(TypedDict, total=False):
     id: str
     summary: list[str]
     encrypted_content: str
+    status: str
 
 
 class ToolCallBlock(TypedDict):
@@ -166,7 +167,7 @@ from .providers._anthropic_reasoning import (
 
 
 class OpenAIReasoningConfig(TypedDict, total=False):
-    effort: Literal["none", "low", "medium", "high", "xhigh"]
+    effort: Literal["minimal", "none", "low", "medium", "high", "xhigh"]
 
 
 # Union of all provider reasoning configs — extend as providers are added.

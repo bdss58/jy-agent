@@ -23,20 +23,28 @@ from .types import (
 
 # Import provider modules for registration side effects.
 # Each provider module calls register_adapter() at import time.
+_PROVIDER_DEPENDENCIES = {
+    "anthropic": ("anthropic", True),
+    "openai": ("openai", False),
+}
+
+
 def _auto_register_providers():
-    """Import provider modules for registration side effects, skip missing deps."""
-    _provider_modules = ["anthropic", "openai"]
-    for name in _provider_modules:
+    """Import provider modules for registration side effects."""
+    for name, (dependency, required) in _PROVIDER_DEPENDENCIES.items():
         try:
             __import__(f"{__name__}.providers.{name}", fromlist=[name])
         except ImportError as exc:
-            # Only skip if the top-level SDK package is missing.
-            # Re-raise if it's an internal import error within our code.
-            module_name = f"{__name__}.providers.{name}"
-            if exc.name and not exc.name.startswith(module_name):
-                pass  # SDK not installed — skip this provider
-            else:
-                raise  # Bug inside provider module — don't swallow
+            # Only dependency imports may be handled here.  Internal import
+            # errors in provider modules must stay visible.
+            if exc.name == dependency:
+                if required:
+                    raise RuntimeError(
+                        f"Required LLM provider dependency '{dependency}' is not installed "
+                        f"for provider '{name}'."
+                    ) from exc
+                continue
+            raise
 
 _auto_register_providers()
 
