@@ -356,6 +356,8 @@ def run(runtime_owner: LLMOwner) -> None:
 
         conversation = ConversationMemory()
         runtime_owner.set_session_id(conversation.session_id)
+        from .tools.subagent import set_runtime_owner
+        set_runtime_owner(runtime_owner)
 
         # Notify if a previous session can be resumed
         if has_saved_session():
