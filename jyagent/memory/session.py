@@ -11,7 +11,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from .. import config
-from .conversation import ConversationMemory
+from .conversation import ConversationMemory, _new_session_id
 
 
 ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -26,6 +26,7 @@ def _build_payload(conversation: ConversationMemory, metadata: Optional[dict] = 
     now = datetime.now(ASIA_SHANGHAI_TZ)
     return {
         "version": 1,
+        "session_id": conversation.session_id,
         "saved_at": now.isoformat(timespec="seconds"),
         "message_count": len(conversation.messages),
         "metadata": metadata or {},
@@ -93,7 +94,7 @@ def load_session(conversation: ConversationMemory, path: Optional[str] = None) -
         path: File path to load. Defaults to latest.json.
 
     Returns:
-        Metadata dict with saved_at, message_count, loaded (bool).
+        Metadata dict with saved_at, message_count, session_id, loaded (bool).
     """
     path = path or config.LATEST_SESSION_FILE
     try:
@@ -110,13 +111,17 @@ def load_session(conversation: ConversationMemory, path: Optional[str] = None) -
     if not messages:
         return {"loaded": False, "error": "Session file has no messages"}
 
+    session_id = payload.get("session_id") or _new_session_id()
+
     # Clear and reload
     conversation.clear()
+    conversation.session_id = session_id
     for msg in messages:
         conversation.messages.append(msg)
 
     return {
         "loaded": True,
+        "session_id": session_id,
         "saved_at": payload.get("saved_at", "unknown"),
         "message_count": len(messages),
         "metadata": payload.get("metadata", {}),

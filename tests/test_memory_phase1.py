@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import shutil
+from uuid import UUID
 
 # Ensure we import from the worktree, not the main checkout
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -129,6 +130,7 @@ def test_save_and_load_session():
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
     conv.add_message("assistant", "Hi there!")
+    session_id = conv.session_id
 
     path = save_session(conv)
     assert path, "save_session returned empty path"
@@ -139,6 +141,8 @@ def test_save_and_load_session():
     result = load_session(conv2)
     assert result["loaded"] is True, f"Load failed: {result}"
     assert result["message_count"] == 2
+    assert result["session_id"] == session_id
+    assert conv2.session_id == session_id
     assert len(conv2.messages) == 2
     assert conv2.messages[0]["content"] == "Hello"
     assert conv2.messages[1]["content"] == "Hi there!"
@@ -218,10 +222,69 @@ def test_session_json_structure():
     with open(config.LATEST_SESSION_FILE) as f:
         data = json.load(f)
     assert data["version"] == 1
+    assert data["session_id"] == conv.session_id
+    UUID(data["session_id"])
     assert data["message_count"] == 2
     assert data["metadata"]["provider"] == "anthropic"
     assert len(data["messages"]) == 2
     print("  ✅ session JSON structure is correct")
+
+
+def test_session_archive_preserves_session_id():
+    setup()
+    conv = ConversationMemory()
+    conv.add_message("user", "Hello")
+    save_session(conv)
+
+    with open(config.LATEST_SESSION_FILE) as f:
+        latest = json.load(f)
+
+    archive_files = [
+        f for f in os.listdir(config.SESSIONS_DIR)
+        if f.endswith(".json") and f != "latest.json"
+    ]
+    assert len(archive_files) == 1, f"Expected one archive, got: {archive_files}"
+    with open(os.path.join(config.SESSIONS_DIR, archive_files[0])) as f:
+        archived = json.load(f)
+
+    assert latest["session_id"] == conv.session_id
+    assert archived["session_id"] == conv.session_id
+    print("  ✅ session archives preserve session_id")
+
+
+def test_load_legacy_session_without_session_id():
+    setup()
+    legacy_path = os.path.join(config.SESSIONS_DIR, "legacy.json")
+    with open(legacy_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "version": 1,
+            "saved_at": "2026-04-29T12:00:00+08:00",
+            "message_count": 1,
+            "metadata": {},
+            "messages": [{"role": "user", "content": "legacy"}],
+        }, f)
+
+    conv = ConversationMemory()
+    result = load_session(conv, path=legacy_path)
+
+    assert result["loaded"] is True, f"Load failed: {result}"
+    assert result["session_id"] == conv.session_id
+    UUID(result["session_id"])
+    assert conv.messages[0]["content"] == "legacy"
+    print("  ✅ legacy sessions without session_id still load")
+
+
+def test_conversation_clear_rotates_session_id():
+    conv = ConversationMemory()
+    original_session_id = conv.session_id
+    conv.add_message("user", "Hello")
+
+    conv.clear()
+
+    assert conv.session_id != original_session_id
+    UUID(conv.session_id)
+    assert conv.messages == []
+    print("  ✅ conversation clear rotates session_id")
 
 
 # ─── Test 3: Config Change ──────────────────────────────────────────────────
@@ -385,6 +448,9 @@ if __name__ == "__main__":
         test_session_archive_created,
         test_session_prune,
         test_session_json_structure,
+        test_session_archive_preserves_session_id,
+        test_load_legacy_session_without_session_id,
+        test_conversation_clear_rotates_session_id,
         # 3. Config
         test_max_memory_prompt_chars,
         # 4. Extraction

@@ -1,6 +1,7 @@
 # In-memory conversation history and token estimation helpers.
 
 from typing import Any
+from uuid import uuid4
 
 from ..config import CHARS_PER_TOKEN
 
@@ -55,10 +56,15 @@ def estimate_conversation_tokens(messages: list) -> int:
     return sum(estimate_message_tokens(msg) for msg in messages)
 
 
+def _new_session_id() -> str:
+    return str(uuid4())
+
+
 class ConversationMemory:
     """In-memory conversation history."""
 
     def __init__(self):
+        self.session_id = _new_session_id()
         self.messages = []
 
     def add_message(self, role: str, content: Any) -> None:
@@ -71,6 +77,7 @@ class ConversationMemory:
         return self.messages[-n:]
 
     def clear(self) -> None:
+        self.session_id = _new_session_id()
         self.messages = []
 
     def estimated_tokens(self) -> int:
