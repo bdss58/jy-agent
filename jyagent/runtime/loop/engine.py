@@ -273,6 +273,7 @@ class AgentLoop(LoopThreadHelper):
         tool_source: ToolSource | None = None,
         model_spec: ModelSpec | None = None,
         cancel_event: threading.Event | None = None,
+        session_id: str | None = None,
     ):
         self._runtime_owner = runtime_owner
         self._config = config
@@ -280,6 +281,7 @@ class AgentLoop(LoopThreadHelper):
         self._tool_source = tool_source
         self._model_spec = model_spec  # override for sub-agent model tier
         self._cancel_event = cancel_event
+        self._session_id = session_id or ""
         # Reuse the module-level shared executor to avoid accumulating
         # ThreadPoolExecutor objects and atexit handlers across turns and
         # sub-agent dispatches.  A2 fix: ensure the pool is at least as
@@ -541,6 +543,7 @@ class AgentLoop(LoopThreadHelper):
                         cfg.initial_max_tokens,
                         model_spec=self._model_spec,
                         metadata={"component": "loop_engine", "step": cfg.max_steps + 1, "fallback": True},
+                        session_id=self._session_id,
                     )
                     fallback_opts = LLMOptions(
                         max_output_tokens=_base.max_output_tokens,

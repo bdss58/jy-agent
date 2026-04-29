@@ -45,6 +45,7 @@ class LLMOwner:
         resolved = build_model_spec(model_spec.provider, model_spec.model, source="model spec provider")
         get_adapter(resolved.provider)
         self._model_spec = resolved
+        self._session_id = ""
 
     @property
     def model_spec(self) -> ModelSpec:
@@ -59,12 +60,33 @@ class LLMOwner:
         self._model_spec = resolved
         return self._model_spec
 
+    def set_session_id(self, session_id: str | None) -> None:
+        self._session_id = session_id or ""
+
+    def _options_with_session(self, options: LLMOptions | None) -> LLMOptions:
+        options = options or LLMOptions()
+        if not self._session_id:
+            return options
+        metadata = dict(options.metadata or {})
+        metadata.setdefault("session_id", self._session_id)
+        if metadata == (options.metadata or {}):
+            return options
+        return LLMOptions(
+            max_output_tokens=options.max_output_tokens,
+            timeout=options.timeout,
+            reasoning=options.reasoning,
+            metadata=metadata,
+            tool_choice=options.tool_choice,
+        )
+
     def stream(self, context: Context, options: LLMOptions | None = None, model_spec: ModelSpec | None = None) -> LLMStream:
         resolved = model_spec or self._model_spec
+        options = self._options_with_session(options)
         return get_adapter(resolved.provider).stream(resolved, context, options)
 
     def complete(self, context: Context, options: LLMOptions | None = None, model_spec: ModelSpec | None = None) -> AssistantMessage:
         resolved = model_spec or self._model_spec
+        options = self._options_with_session(options)
         return get_adapter(resolved.provider).complete(resolved, context, options)
 
     def complete_text(

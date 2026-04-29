@@ -154,9 +154,13 @@ def build_runtime_options(
     max_output_tokens: int,
     model_spec: ModelSpec | None = None,
     metadata: dict | None = None,
+    session_id: str | None = None,
 ) -> LLMOptions:
     """Build LLMOptions with reasoning config for the active provider."""
     spec = model_spec or runtime_owner.model_spec
+    merged_metadata = dict(metadata or {})
+    if session_id:
+        merged_metadata["session_id"] = session_id
     return LLMOptions(
         max_output_tokens=max_output_tokens,
         timeout=STREAM_TIMEOUT,
@@ -165,7 +169,7 @@ def build_runtime_options(
             max_output_tokens=max_output_tokens,
             model=spec.model,
         ),
-        metadata=metadata,
+        metadata=merged_metadata,
     )
 
 

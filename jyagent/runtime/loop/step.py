@@ -434,6 +434,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
         state.current_max_tokens,
         model_spec=loop._model_spec,
         metadata={"component": "loop_engine", "step": step + 1},
+        session_id=getattr(loop, "_session_id", ""),
     )
 
     # Phase-aware tool_choice shaping (see jyagent/phases.py).

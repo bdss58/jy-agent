@@ -67,6 +67,7 @@ class FakeLoop:
         self._partial_side_effects: list = []
         self._todos: list = []
         self._run_id: str = ""
+        self._session_id: str = ""
         self.llm_response = llm_response or (
             "default text", [], "end_turn",
             {"content": [{"type": "text", "text": "default text"}], "usage": {}},
@@ -74,6 +75,7 @@ class FakeLoop:
         # Recorders for assertions.
         self.fired: list[tuple] = []
         self.checkpoints: list[dict] = []
+        self.llm_options: list[Any] = []
 
     # ── Engine surface used by run_step ────────────────────────────────
 
@@ -84,6 +86,7 @@ class FakeLoop:
         self.fired.append((name, args))
 
     def _call_llm_with_retry(self, context, opts, step):
+        self.llm_options.append(opts)
         return self.llm_response
 
     def _call_complete(self, context, opts):  # for the max_steps fallback
@@ -175,6 +178,15 @@ class TestCompletion:
 
         progress_events = [args for (name, args) in loop.fired if name == "on_step_progress"]
         assert progress_events == [(3, 10)]
+
+    def test_session_id_threads_into_llm_options(self):
+        loop = FakeLoop(llm_response=_llm_text_only())
+        loop._session_id = "session-123"
+        state = _build_state(loop, messages=[{"role": "user", "content": "hi"}])
+
+        run_step(loop, state)
+
+        assert loop.llm_options[-1].metadata["session_id"] == "session-123"
 
 
 # ─── T2: cancellation → StepBreak ────────────────────────────────────────────

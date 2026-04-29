@@ -30,6 +30,7 @@ from ._openai_helpers import (
     assistant_from_response,
     build_request_kwargs,
 )
+from ._headers import request_headers_from_options
 
 # Register "openai" as a known provider in the config layer too.
 from ...config import (
@@ -370,12 +371,17 @@ class OpenAIAdapter:
     ) -> LLMStream:
         options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
+        request_headers = request_headers_from_options(options)
         timeout = options.timeout
         try:
             client = self._client()
             # client.responses.stream() returns a context manager;
             # no need to pass stream=True — the .stream() method handles it.
-            stream_cm = client.responses.stream(**kwargs, timeout=timeout)
+            stream_cm = client.responses.stream(
+                **kwargs,
+                extra_headers=request_headers or None,
+                timeout=timeout,
+            )
         except Exception as err:
             return ErrorStream(model_spec, err)
         return _OpenAIStream(stream_cm, model_spec)
@@ -388,9 +394,14 @@ class OpenAIAdapter:
     ) -> AssistantMessage:
         options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
+        request_headers = request_headers_from_options(options)
         timeout = options.timeout
         client = self._client()
-        response = client.responses.create(**kwargs, timeout=timeout)
+        response = client.responses.create(
+            **kwargs,
+            extra_headers=request_headers or None,
+            timeout=timeout,
+        )
         return assistant_from_response(model_spec, response)
 
 

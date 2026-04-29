@@ -14,6 +14,7 @@ from ._anthropic_helpers import (
     assistant_from_response,
     build_request_kwargs,
 )
+from ._headers import request_headers_from_options
 
 
 # ─── _AnthropicStream ────────────────────────────────────────────────────────
@@ -138,10 +139,15 @@ class AnthropicAdapter:
     def stream(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> LLMStream:
         options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
+        request_headers = request_headers_from_options(options)
         timeout = options.timeout
         try:
             client = self._client()
-            stream_cm = client.messages.stream(**kwargs, timeout=timeout)
+            stream_cm = client.messages.stream(
+                **kwargs,
+                extra_headers=request_headers or None,
+                timeout=timeout,
+            )
         except Exception as err:
             return ErrorStream(model_spec, err)
         return _AnthropicStream(stream_cm, model_spec)
@@ -149,9 +155,14 @@ class AnthropicAdapter:
     def complete(self, model_spec: ModelSpec, context: Context, options: LLMOptions | None = None) -> AssistantMessage:
         options = options or LLMOptions()
         kwargs = build_request_kwargs(model_spec, context, options)
+        request_headers = request_headers_from_options(options)
         timeout = options.timeout
         client = self._client()
-        response = client.messages.create(**kwargs, timeout=timeout)
+        response = client.messages.create(
+            **kwargs,
+            extra_headers=request_headers or None,
+            timeout=timeout,
+        )
         return assistant_from_response(model_spec, response)
 
 

@@ -251,12 +251,14 @@ def compact_conversation(
         if system_prompt:
             summary = _complete_with_system_prompt(
                 runtime_owner, system_prompt, compact_instruction,
+                session_id=conversation.session_id,
             )
         else:
             # Fallback: standalone prompt (cache miss, but works)
             summary = runtime_owner.complete_text(
                 compact_instruction,
                 max_output_tokens=min(4096, DEFAULT_MAX_TOKENS),
+                metadata={"component": "compaction", "session_id": conversation.session_id},
             )
 
         if not summary.strip():
@@ -399,7 +401,7 @@ def _run_reflection_pass(
 
 
 def _complete_with_system_prompt(
-    runtime_owner, system_prompt: str, user_prompt: str,
+    runtime_owner, system_prompt: str, user_prompt: str, session_id: str | None = None,
 ) -> str:
     """Run a completion reusing the existing system prompt for cache friendliness.
 
@@ -424,7 +426,11 @@ def _complete_with_system_prompt(
                 max_output_tokens=min(4096, DEFAULT_MAX_TOKENS),
                 model=runtime_owner.model_spec.model,
             ),
-            metadata={"component": "compaction", "mode": "cache_friendly"},
+            metadata={
+                "component": "compaction",
+                "mode": "cache_friendly",
+                **({"session_id": session_id} if session_id else {}),
+            },
         ),
     )
     parts = []

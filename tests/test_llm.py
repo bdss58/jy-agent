@@ -1457,9 +1457,102 @@ class TestProviderExtraHeaders:
         assert second is not first
         assert mock_openai.call_count == 2
 
+    def test_request_headers_from_options_adds_session_id(self):
+        from jyagent.llm.providers._headers import request_headers_from_options
+        from jyagent.llm.types import LLMOptions
+
+        headers = request_headers_from_options(
+            LLMOptions(metadata={"session_id": "  session-123  "})
+        )
+
+        assert headers == {"x-stepcode-session-id": "session-123"}
+
+    def test_anthropic_complete_passes_session_id_request_header(self):
+        from jyagent.llm.providers import anthropic as anthropic_provider
+        from jyagent.llm.providers.anthropic import AnthropicAdapter
+        from jyagent.llm.types import LLMOptions, ModelSpec
+
+        client = MagicMock()
+        client.messages.create.return_value = object()
+        adapter = AnthropicAdapter()
+        adapter._client = MagicMock(return_value=client)
+
+        with patch.object(
+            anthropic_provider,
+            "assistant_from_response",
+            return_value={"role": "assistant", "content": []},
+        ):
+            adapter.complete(
+                ModelSpec(provider="anthropic", model="claude-sonnet-4-6"),
+                {"messages": [{"role": "user", "content": "hi"}]},
+                LLMOptions(metadata={"session_id": "session-123"}),
+            )
+
+        assert client.messages.create.call_args.kwargs["extra_headers"] == {
+            "x-stepcode-session-id": "session-123",
+        }
+
+    def test_openai_complete_passes_session_id_request_header(self):
+        pytest.importorskip("openai")
+        from jyagent.llm.providers import openai as openai_provider
+        from jyagent.llm.providers.openai import OpenAIAdapter
+        from jyagent.llm.types import LLMOptions, ModelSpec
+
+        client = MagicMock()
+        client.responses.create.return_value = object()
+        adapter = OpenAIAdapter()
+        adapter._client = MagicMock(return_value=client)
+
+        with patch.object(
+            openai_provider,
+            "assistant_from_response",
+            return_value={"role": "assistant", "content": []},
+        ):
+            adapter.complete(
+                ModelSpec(provider="openai", model="gpt-5"),
+                {"messages": [{"role": "user", "content": "hi"}]},
+                LLMOptions(metadata={"session_id": "session-123"}),
+            )
+
+        assert client.responses.create.call_args.kwargs["extra_headers"] == {
+            "x-stepcode-session-id": "session-123",
+        }
+
 
 class TestRuntimeOwnerCompleteText:
     """Test LLMOwner.complete_text convenience method (mock adapter)."""
+
+    def test_owner_injects_session_id_metadata(self):
+        from jyagent.llm.core import LLMOwner
+
+        mock_adapter = MagicMock()
+        mock_adapter.provider = "test_session"
+        mock_adapter.api_name = "test-api"
+        mock_adapter.complete.return_value = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+        }
+
+        saved = dict(_ADAPTERS)
+        try:
+            register_adapter(mock_adapter)
+            with patch("jyagent.llm.core.build_model_spec") as mock_bms:
+                mock_bms.return_value = ModelSpec(provider="test_session", model="test-model")
+                owner = LLMOwner(ModelSpec(provider="test_session", model="test-model"))
+                owner.set_session_id("session-123")
+                owner.complete(
+                    {"messages": [{"role": "user", "content": "hi"}]},
+                    options=LLMOptions(metadata={"component": "unit"}),
+                )
+
+            options = mock_adapter.complete.call_args.args[2]
+            assert options.metadata == {
+                "component": "unit",
+                "session_id": "session-123",
+            }
+        finally:
+            _ADAPTERS.clear()
+            _ADAPTERS.update(saved)
 
     def test_complete_text_returns_concatenated_text(self):
         from jyagent.llm.core import LLMOwner

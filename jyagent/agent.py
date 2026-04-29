@@ -112,6 +112,7 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
 
     # Clear conversation history
     conversation.clear()
+    runtime_owner.set_session_id(conversation.session_id)
 
     # Clear active skills
     get_skill_manager().deactivate_all()
@@ -227,6 +228,7 @@ def _cmd_continue(cli, conversation, runtime_owner, **_):
 
     result = load_session(conversation)
     if result.get("loaded"):
+        runtime_owner.set_session_id(conversation.session_id)
         cli.print_system(
             f"✅ Resumed session from {result['saved_at']} "
             f"({result['message_count']} messages, ~{conversation.estimated_tokens()} tokens)"
@@ -353,6 +355,7 @@ def run(runtime_owner: LLMOwner) -> None:
         cli.print_banner(runtime_owner.label())
 
         conversation = ConversationMemory()
+        runtime_owner.set_session_id(conversation.session_id)
 
         # Notify if a previous session can be resumed
         if has_saved_session():
@@ -489,7 +492,13 @@ def run(runtime_owner: LLMOwner) -> None:
                     tool_source = _tool_source
 
                     # Create AgentLoop and run
-                    loop = AgentLoop(runtime_owner, config, callbacks=callbacks, tool_source=tool_source)
+                    loop = AgentLoop(
+                        runtime_owner,
+                        config,
+                        callbacks=callbacks,
+                        tool_source=tool_source,
+                        session_id=conversation.session_id,
+                    )
                     try:
                         result: LoopResult = loop.run(full_system_prompt, messages)
                     except KeyboardInterrupt:
