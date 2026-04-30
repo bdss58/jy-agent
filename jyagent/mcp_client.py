@@ -23,7 +23,9 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
-# ─── P5: PID-capturing stdio_client wrapper ──────────────────────────────────
+# ─── PID-capturing stdio_client wrapper ──────────────────────────────────────
+# Needed to force-kill the MCP server subprocess group when graceful shutdown
+# times out — the SDK's stdio_client doesn't expose the child PID.
 
 @asynccontextmanager
 async def _stdio_client_with_pid(params: StdioServerParameters, stderr_sink, pid_callback):
@@ -64,7 +66,8 @@ async def _stdio_client_with_pid(params: StdioServerParameters, stderr_sink, pid
         yield read, write
 
 
-# ─── P4: MCP subprocess stderr sink ──────────────────────────────────────────
+# ─── MCP subprocess stderr sink ──────────────────────────────────────────────
+# Keeps noisy MCP servers from polluting the agent's terminal.
 
 def _get_mcp_stderr_sink(server_name: str) -> io.TextIOWrapper:
     """Get a sink for redirecting MCP subprocess stderr away from the terminal."""
@@ -72,7 +75,8 @@ def _get_mcp_stderr_sink(server_name: str) -> io.TextIOWrapper:
     return open(os.devnull, "a", encoding="utf-8", buffering=1)
 
 
-# ─── P1: Extended ClientSession with notification handling ────────────────────
+# ─── Extended ClientSession with notification handling ───────────────────────
+# Adds tools/list_changed support (the base SDK ClientSession ignores it).
 
 class AgentClientSession(ClientSession):
     """Extended ClientSession that handles tools/list_changed notifications.
@@ -92,7 +96,7 @@ class AgentClientSession(ClientSession):
         # Let the parent handle its known notifications first
         await super()._received_notification(notification)
 
-        # P1: Handle tools/list_changed
+        # Handle tools/list_changed
         if isinstance(notification.root, types.ToolListChangedNotification):
             if self._tools_list_changed_callback:
                 try:
@@ -112,8 +116,8 @@ class MCPClient:
       in the same async context, avoiding cancel scope issues.
     - disconnect() signals the lifecycle task to exit, properly closing all contexts.
     
-    P1: Uses AgentClientSession (subclass of ClientSession) that intercepts
-        tools/list_changed notifications to auto-invalidate tool cache.
+    Uses AgentClientSession (subclass of ClientSession) that intercepts
+    tools/list_changed notifications to auto-invalidate the tool cache.
     """
 
     def __init__(self, name: str = "unnamed"):
@@ -134,13 +138,13 @@ class MCPClient:
         self._lifecycle_task = None
         self._connected = False
 
-        # P4: stderr sink for MCP subprocess
+        # stderr sink for MCP subprocess (redirected away from terminal)
         self._stderr_sink: Optional[io.TextIOWrapper] = None
 
-        # P5: Track subprocess PID for force-kill on disconnect timeout
+        # Subprocess PID — used for force-kill on disconnect timeout
         self._subprocess_pid: Optional[int] = None
 
-        # P1: Notification tracking
+        # Notification tracking (tools/list_changed)
         self._tools_changed = False  # Set by notification callback
         self._on_tools_changed_callback: Optional[Callable] = None  # External callback (MCPManager)
 
@@ -248,7 +252,7 @@ class MCPClient:
                             env=process_env, cwd=cwd,
                         )
                         
-                        # P4: Redirect MCP subprocess stderr away from sys.stderr
+                        # Redirect MCP subprocess stderr away from sys.stderr
                         # so prompt_toolkit output does not get corrupted.
                         self._stderr_sink = _get_mcp_stderr_sink(self.name)
                         
@@ -259,7 +263,7 @@ class MCPClient:
                             )
                         )
 
-                    # P1: Create session with tools_list_changed notification handler
+                    # Create session with tools_list_changed notification handler
                     self._session = await exit_stack.enter_async_context(
                         AgentClientSession(
                             read, write,
@@ -308,7 +312,7 @@ class MCPClient:
             finally:
                 self._session = None
                 self._connected = False
-                # P5: Clear subprocess PID — if we reach here, the AsyncExitStack
+                # Clear subprocess PID — if we reach here, the AsyncExitStack
                 # already ran stdio_client's cleanup which kills the subprocess.
                 self._subprocess_pid = None
 
@@ -407,7 +411,7 @@ class MCPClient:
     def disconnect(self) -> dict:
         """Disconnect from the MCP server. Follows MCP spec shutdown sequence.
 
-        P5: If graceful shutdown times out, force-kill the subprocess by process group.
+        If graceful shutdown times out, force-kill the subprocess by process group.
         This prevents zombie MCP server processes from accumulating on reconnect.
         """
         if not self._connected and not self._lifecycle_task:
@@ -437,7 +441,7 @@ class MCPClient:
         self._call_queue = None
         self._disconnect_event = None
 
-        # P4: Close stderr sink
+        # Close stderr sink
         if self._stderr_sink:
             try:
                 self._stderr_sink.close()
@@ -448,7 +452,7 @@ class MCPClient:
         # Stop the background event loop
         self._stop_loop()
 
-        # P5+: ALWAYS force-kill the subprocess tree on disconnect.
+        # ALWAYS force-kill the subprocess tree on disconnect.
         # Even when graceful shutdown "succeeds" (lifecycle task completes),
         # the MCP server's child processes (e.g., Chrome launched with setsid())
         # may survive in their own process group. Graceful shutdown only closes
@@ -465,7 +469,7 @@ class MCPClient:
     def _force_kill_subprocess(self, pid: int):
         """Force-kill a subprocess and all its descendants.
 
-        P5: Last-resort cleanup when graceful disconnect times out.
+        Last-resort cleanup when graceful disconnect times out.
 
         Challenge: The MCP server (npm → chrome-devtools-mcp) is in one process group,
         but Chrome (launched by the MCP server) does setsid() and runs in its own
@@ -551,7 +555,7 @@ class MCPClient:
     def list_tools(self, use_cache: bool = True) -> list[dict]:
         """List all tools. Supports pagination automatically.
         
-        P1: If tools_changed flag is set (from notification), cache is already
+        If tools_changed flag is set (from notification), cache is already
         invalidated. Clear the flag after re-fetching.
         """
         if use_cache and self._tools_cache is not None and not self._tools_changed:
@@ -573,7 +577,7 @@ class MCPClient:
             return _list()
 
         self._tools_cache = self._submit_call(_factory, timeout=30)
-        self._tools_changed = False  # P1: Reset flag after successful refresh
+        self._tools_changed = False  # Reset flag after successful refresh
         return [self._tool_to_dict(t) for t in self._tools_cache]
 
     def call_tool(self, tool_name: str, arguments: dict = None,
@@ -633,7 +637,7 @@ class MCPClient:
     def _call_result_to_dict(result: types.CallToolResult) -> dict:
         """Convert CallToolResult → dict for agent compatibility.
         
-        P3: Forward-compatible with SDK v2's structured_content field.
+        Forward-compatible with SDK v2's structured_content field.
         """
         content = []
         for item in (result.content or []):
@@ -658,7 +662,7 @@ class MCPClient:
             "isError": result.isError or False,
         }
 
-        # P3: Forward-compat — extract structured_content if SDK v2 adds it
+        # Forward-compat — extract structured_content if SDK v2 adds it
         if hasattr(result, 'structuredContent') and result.structuredContent:
             result_dict["structuredContent"] = result.structuredContent
         elif hasattr(result, 'structured_content') and result.structured_content:

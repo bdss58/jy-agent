@@ -19,7 +19,7 @@ from .runtime.tools.result import ToolResult
 # Module version marker — bump this to confirm reloads are taking effect
 _MODULE_VERSION = "2.1.0"
 
-# P2: Keepalive configuration
+# Keepalive configuration
 KEEPALIVE_INTERVAL_SECONDS = 60  # Ping every 60 seconds
 KEEPALIVE_MAX_FAILURES = 3       # Mark dead after 3 consecutive failures
 
@@ -136,8 +136,8 @@ class MCPManager:
     which wraps the SDK's async ClientSession with a sync interface.
     
     Improvements (2025-03):
-    - P1: Handles tools/list_changed notifications via MCPClient callback
-    - P2: Background keepalive thread pings connected servers every 60s
+    - Handles tools/list_changed notifications via MCPClient callback
+    - Background keepalive thread pings connected servers every 60s
     """
 
     def __init__(self):
@@ -147,12 +147,12 @@ class MCPManager:
         self._tool_to_mcp_name: dict[str, str] = {}  # agent_tool_name → original mcp tool name
         self._registered_tools: set[str] = set()
         
-        # P2: Keepalive
+        # Keepalive
         self._keepalive_thread: Optional[threading.Thread] = None
         self._keepalive_stop = threading.Event()
         self._ping_failures: dict[str, int] = {}  # server_name → consecutive failure count
         
-        # P1: Lock for thread-safe tool re-registration
+        # Lock for thread-safe tool re-registration
         self._tools_lock = threading.Lock()
         
         # Chrome concurrency: page-level lock + connection refcount.
@@ -207,7 +207,7 @@ class MCPManager:
         # Create client and connect
         client = MCPClient(name=server_name)
         
-        # P1: Register tools_changed callback before connecting
+        # Register tools_changed callback before connecting
         client.set_on_tools_changed(self._on_tools_changed)
 
         if transport == "http":
@@ -228,13 +228,13 @@ class MCPManager:
             )
 
         self._clients[server_name] = client
-        self._ping_failures[server_name] = 0  # P2: Reset failure counter
+        self._ping_failures[server_name] = 0  # Reset failure counter
 
         # Discover and register tools
         tool_count = self._register_server_tools(server_name, client, server_config)
         result["tools_registered"] = tool_count
 
-        # P2: Start keepalive if not already running
+        # Start keepalive if not already running
         self._start_keepalive()
 
         return result
@@ -254,7 +254,7 @@ class MCPManager:
         else:
             result = {"status": "not_connected", "name": server_name}
         
-        # P2: Stop keepalive if no more connected servers
+        # Stop keepalive if no more connected servers
         if not self._clients:
             self._stop_keepalive()
         
@@ -262,7 +262,7 @@ class MCPManager:
 
     def disconnect_all(self):
         """Disconnect from all MCP servers."""
-        # P2: Stop keepalive first
+        # Stop keepalive first
         self._stop_keepalive()
         
         for name in list(self._clients.keys()):
@@ -436,7 +436,7 @@ class MCPManager:
                 return 120
         return 60  # Default: 60s (was 30s, increased for reliability)
 
-    # ─── P1: tools/list_changed notification handler ──────────────────────────
+    # ─── tools/list_changed notification handler ──────────────────────────
 
     def _on_tools_changed(self, server_name: str):
         """Called by MCPClient when a tools/list_changed notification is received.
@@ -456,7 +456,7 @@ class MCPManager:
             # Re-register with fresh tool list (cache was already invalidated by MCPClient)
             self._register_server_tools(server_name, client, server_config)
 
-    # ─── P2: Background keepalive ─────────────────────────────────────────────
+    # ─── Background keepalive ─────────────────────────────────────────────
 
     def _start_keepalive(self):
         """Start the background keepalive thread if not already running."""
@@ -790,7 +790,7 @@ class MCPManager:
             else:
                 lines.append(f"  • {name}: ⬚ not connected (transport: {transport})")
         
-        # P2: Show keepalive status
+        # Show keepalive status
         keepalive_status = "running" if (self._keepalive_thread and self._keepalive_thread.is_alive()) else "stopped"
         lines.append(f"\n  Keepalive: {keepalive_status} (interval: {KEEPALIVE_INTERVAL_SECONDS}s)")
         
