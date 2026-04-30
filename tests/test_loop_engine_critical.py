@@ -90,7 +90,7 @@ def _sleep_tool(ms: int):
     return _fn
 
 
-# ─── P0 #1 — Nested-future deadlock ──────────────────────────────────────────
+# ─── Nested-future deadlock ─────────────────────────────────────────────────
 
 
 class TestNoNestedPoolDeadlock:
@@ -183,7 +183,7 @@ class TestNoNestedPoolDeadlock:
         assert result.content == "t-done"
 
 
-# ─── P0 #3 — Cost tracker uses effective model spec ──────────────────────────
+# ─── Cost tracker uses effective model spec ────────────────────────────────
 
 
 class TestCostTrackerUsesEffectiveSpec:
@@ -230,7 +230,7 @@ class TestCostTrackerUsesEffectiveSpec:
         assert "effective_spec.provider" in fallback_snippet
 
 
-# ─── P0 #4 — Max-steps fallback always fires when enabled ────────────────────
+# ─── Max-steps fallback always fires when enabled ──────────────────────────
 
 
 class TestMaxStepsFallbackCondition:

@@ -107,7 +107,12 @@ def is_transient_error(error: BaseException) -> bool:
     # --- Provider SDK errors (transient if server-side) ---
     try:
         import anthropic as _anth
-        if isinstance(error, _anth.APIStatusError) and error.status_code in (429, 500, 502, 503, 529):
+        # 424 = proxy/gateway envelope error (e.g. domestic relay wrapping
+        # upstream flakes). Treat as transient; if the inner cause is a
+        # deterministic 4xx (quota/billing/bad-request) it will simply
+        # re-raise after burning the retry budget — acceptable tradeoff
+        # since most 424s we see in practice are upstream transients.
+        if isinstance(error, _anth.APIStatusError) and error.status_code in (424, 429, 500, 502, 503, 529):
             return True
         if isinstance(error, (_anth.APIConnectionError, _anth.APITimeoutError)):
             return True
@@ -115,7 +120,10 @@ def is_transient_error(error: BaseException) -> bool:
         pass
     try:
         import openai as _oai
-        if isinstance(error, _oai.APIStatusError) and error.status_code in (429, 500, 502, 503):
+        # See comment above on 424 for rationale (symmetric treatment for
+        # OpenAI-compatible proxies). OpenAI-canonical services never emit
+        # 424, so this only fires for proxy/relay envelopes.
+        if isinstance(error, _oai.APIStatusError) and error.status_code in (424, 429, 500, 502, 503):
             return True
         if isinstance(error, (_oai.APIConnectionError, _oai.APITimeoutError)):
             return True

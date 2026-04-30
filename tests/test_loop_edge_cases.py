@@ -1190,6 +1190,32 @@ class TestC4Phase3LLMRunnerExtraction:
         assert isinstance(r1, LLMRunner)
         assert r1 is r2
 
+    def test_is_transient_error_retries_424_from_anthropic(self):
+        """424 is a common proxy/gateway envelope code (e.g. domestic
+        Anthropic relays wrapping upstream transients). We treat it as
+        transient alongside 429/5xx. 400 stays non-transient because it
+        almost always indicates a client-side error (bad request, quota,
+        billing, invalid schema) where retry just burns budget."""
+        import anthropic
+        import httpx
+        from jyagent.runtime.loop.llm_runner import is_transient_error
+
+        def _mk(status: int) -> anthropic.APIStatusError:
+            req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+            resp = httpx.Response(status, request=req)
+            return anthropic.APIStatusError(message="x", response=resp, body=None)
+
+        # 424 (new) + existing whitelist members must all retry.
+        for code in (424, 429, 500, 502, 503, 529):
+            assert is_transient_error(_mk(code)) is True, f"expected {code} transient"
+
+        # 400 deliberately stays non-transient — retrying a billing/quota
+        # error just wastes the retry budget.
+        assert is_transient_error(_mk(400)) is False
+        # Other 4xx should also stay non-transient.
+        for code in (401, 403, 404, 422):
+            assert is_transient_error(_mk(code)) is False, f"{code} should NOT retry"
+
     def test_call_complete_delegates_to_runner(self):
         """_call_complete is a thin delegate onto LLMRunner.call_complete —
         patching the runner's method must be visible through the engine
