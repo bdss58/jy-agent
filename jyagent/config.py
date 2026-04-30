@@ -23,6 +23,27 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
 MAX_TOKENS_CAP = int(os.environ.get("AGENT_MAX_TOKENS_CAP", "128000"))
 SUPPORTED_RUNTIME_PROVIDERS: set[str] = {"anthropic"}
 
+# ─── Anthropic prompt caching ─────────────────────────────────────────────────
+# Anthropic Messages API requires an explicit ``cache_control`` field to enable
+# prompt caching. Setting it at the top level of the request (vs. on individual
+# content blocks) tells the API to auto-place the cache breakpoint at the last
+# cacheable block and slide it forward as the conversation grows — perfect for
+# multi-turn agents like jy-agent. See:
+#   https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+#
+# Pricing impact (per Anthropic docs):
+#   - cache write tokens cost 1.25× base input (5m TTL) or 2× (1h TTL)
+#   - cache read tokens cost 0.10× base input
+# So as long as a cached prefix is read at least ~3 times before expiring,
+# caching is a net win. For a typical agent session this is essentially always.
+#
+# Set ANTHROPIC_PROMPT_CACHE=0 to disable (default: enabled).
+# Set ANTHROPIC_PROMPT_CACHE_TTL=1h for 1-hour cache (default: 5m).
+ANTHROPIC_PROMPT_CACHE_ENABLED = (
+    os.environ.get("ANTHROPIC_PROMPT_CACHE", "1").lower() not in ("0", "false", "no", "off")
+)
+ANTHROPIC_PROMPT_CACHE_TTL = os.environ.get("ANTHROPIC_PROMPT_CACHE_TTL", "5m").strip()
+
 
 def register_provider(name: str) -> None:
     """Register an additional runtime provider name as valid."""

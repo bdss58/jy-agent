@@ -10,6 +10,10 @@ from __future__ import annotations
 from typing import Any, cast
 
 from ._anthropic_reasoning import build_anthropic_request_reasoning
+from ...config import (
+    ANTHROPIC_PROMPT_CACHE_ENABLED,
+    ANTHROPIC_PROMPT_CACHE_TTL,
+)
 from ..messages import (  # noqa: F401 — re-export for backward compat
     assistant_text,
     inject_missing_tool_results,
@@ -184,6 +188,16 @@ def build_request_kwargs(
         "max_tokens": options.max_output_tokens,
         "messages": convert_messages(model_spec, context.get("messages", [])),
     }
+    # ── Prompt caching (top-level automatic mode) ────────────────────
+    # A single top-level cache_control field tells the Messages API to
+    # auto-place the cache breakpoint at the last cacheable block and
+    # slide it forward as the conversation grows. Without this, NO
+    # caching happens — verified against current docs (2026-04).
+    if ANTHROPIC_PROMPT_CACHE_ENABLED:
+        cc: dict[str, Any] = {"type": "ephemeral"}
+        if ANTHROPIC_PROMPT_CACHE_TTL and ANTHROPIC_PROMPT_CACHE_TTL != "5m":
+            cc["ttl"] = ANTHROPIC_PROMPT_CACHE_TTL
+        kwargs["cache_control"] = cc
     if options.reasoning is not None:
         thinking, output_config = build_anthropic_request_reasoning(
             options.reasoning,

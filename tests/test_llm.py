@@ -1096,6 +1096,69 @@ class TestAnthropicConvertTools:
         assert result[0]["input_schema"] == {"type": "object", "properties": {}}
 
 
+# ── Prompt cache (top-level cache_control) ─────────────────────────────────
+
+from jyagent.llm.providers import _anthropic_helpers as _ah_mod
+from jyagent.llm.providers._anthropic_helpers import build_request_kwargs as anthropic_build_request_kwargs
+from jyagent.llm.types import LLMOptions as _LLMOptions
+
+
+class TestAnthropicPromptCache:
+    """Verify that build_request_kwargs injects the cache_control field
+    that Anthropic Messages API needs to actually enable prompt caching.
+
+    Without this field, cache_creation_input_tokens / cache_read_input_tokens
+    are always 0 — verified against current docs (2026-04).
+
+    NOTE: Tests patch the module-level constants in ``_anthropic_helpers``
+    directly via monkeypatch.setattr — NOT via env vars + importlib.reload,
+    because reloading ``jyagent.config`` resets module-level path constants
+    (MEMORY_DIR etc.) that other test modules patch at import time.
+    """
+
+    def _spec(self):
+        return ModelSpec(provider="anthropic", model="claude-sonnet-4-6")
+
+    def _ctx(self):
+        return {
+            "system_prompt": "You are helpful.",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+    def test_cache_control_present_by_default(self, monkeypatch):
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_ENABLED", True)
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_TTL", "5m")
+        kwargs = anthropic_build_request_kwargs(
+            self._spec(), self._ctx(), _LLMOptions(max_output_tokens=128),
+        )
+        assert kwargs.get("cache_control") == {"type": "ephemeral"}
+
+    def test_cache_control_absent_when_disabled(self, monkeypatch):
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_ENABLED", False)
+        kwargs = anthropic_build_request_kwargs(
+            self._spec(), self._ctx(), _LLMOptions(max_output_tokens=128),
+        )
+        assert "cache_control" not in kwargs
+
+    def test_cache_control_with_1h_ttl(self, monkeypatch):
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_ENABLED", True)
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_TTL", "1h")
+        kwargs = anthropic_build_request_kwargs(
+            self._spec(), self._ctx(), _LLMOptions(max_output_tokens=128),
+        )
+        assert kwargs["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+    def test_cache_control_default_ttl_omits_ttl_field(self, monkeypatch):
+        # 5m is the API default — we omit the ttl field to keep payload minimal.
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_ENABLED", True)
+        monkeypatch.setattr(_ah_mod, "ANTHROPIC_PROMPT_CACHE_TTL", "5m")
+        kwargs = anthropic_build_request_kwargs(
+            self._spec(), self._ctx(), _LLMOptions(max_output_tokens=128),
+        )
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+        assert "ttl" not in kwargs["cache_control"]
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # §6  providers/_anthropic_reasoning.py
 # ════════════════════════════════════════════════════════════════════════════════
