@@ -423,7 +423,8 @@ def _is_blocked(status: int, body: str) -> bool:
 # ─── Main function ────────────────────────────────────────────────────────────
 
 def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
-              raw: bool = False, strategy: str = "auto") -> ToolResult:
+              raw: bool = False, strategy: str = "auto",
+              _cancel_event: "threading.Event | None" = None) -> ToolResult:
     """Fetch a URL and return its content as clean readable text.
 
     5-tier anti-blocking cascade: curl_cffi (Chrome TLS impersonation) →
@@ -441,6 +442,11 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
         start_index: Start position for pagination (default 0)
         raw: If True, return raw HTML without text extraction (default False)
         strategy: Fetch strategy — auto, cffi, direct, jina, chrome (default "auto")
+        _cancel_event: cooperative-cancel hook (runtime-injected; see
+            ``runtime/loop/tool_executor.py``).  Checked between
+            strategy attempts so a cancelled fetch returns within the
+            current strategy's HTTP timeout instead of running through
+            all 5 tiers.
 
     Returns:
         Formatted string with URL, status, content length, and extracted text.
@@ -467,6 +473,20 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
     errors = []
 
     for fetcher in fetchers:
+        # Cooperative-cancel check between strategy attempts.  An
+        # in-flight fetcher cannot be interrupted (httpx/curl_cffi/
+        # Jina/Chrome each block in their own way), but the cascade
+        # itself can take 30-60s if every strategy fails — stopping
+        # before the next attempt makes Ctrl-C feel responsive.
+        if _cancel_event is not None and _cancel_event.is_set():
+            error_detail = "\n".join(f"  • {e}" for e in errors) or "  • (none)"
+            return ToolResult(
+                f"Cancelled: web_fetch aborted on cancel signal "
+                f"after {len(errors)} strategy attempt(s).\n\n"
+                f"Details:\n{error_detail}",
+                is_error=True,
+            )
+
         strategy_name = fetcher.__name__.replace("_fetch_", "")
         try:
             status, body = fetcher(url)

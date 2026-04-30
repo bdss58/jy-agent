@@ -153,10 +153,18 @@ _ENGINES: dict[str, Callable[[str, int], list[dict]]] = {
 _MIN_RESULTS_TO_STOP = 3
 
 
-def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
+def _cascade(
+    query: str,
+    max_results: int,
+    cancel_event: "threading.Event | None" = None,
+) -> tuple[str, list[dict], list[str]]:
     """Run engines in priority order until one returns enough results.
 
     Returns (winning_engine_name, results, errors).
+
+    ``cancel_event`` (optional) is checked between engine attempts so a
+    cancelled search returns within the current engine's HTTP timeout
+    rather than running the full cascade.
     """
     # Force-override via env?
     forced = os.environ.get("WEB_SEARCH_ENGINE", "").strip().lower()
@@ -174,6 +182,12 @@ def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
     best_name, best_results = "", []
 
     for name, fn in engines:
+        # Cooperative-cancel check between engines.  An in-flight HTTP
+        # call cannot be interrupted, but skipping the next engine on
+        # cancel is enough to make Ctrl-C feel responsive.
+        if cancel_event is not None and cancel_event.is_set():
+            errors.append(f"{name}: skipped (cancel signal)")
+            break
         # Skip SearxNG silently when not configured.
         if name == "searxng" and not os.environ.get("SEARXNG_URL"):
             continue
@@ -197,7 +211,11 @@ def _cascade(query: str, max_results: int) -> tuple[str, list[dict], list[str]]:
 # ─── Main function ───────────────────────────────────────────────────────────
 
 
-def web_search(query: str, max_results: int = 10) -> ToolResult:
+def web_search(
+    query: str,
+    max_results: int = 10,
+    _cancel_event: "threading.Event | None" = None,
+) -> ToolResult:
     """Search the web and return structured results.
 
     Cascade: SearxNG (if SEARXNG_URL set) → DuckDuckGo. First engine
@@ -206,6 +224,10 @@ def web_search(query: str, max_results: int = 10) -> ToolResult:
     Args:
         query: Search query string
         max_results: Maximum number of results to return (default 10)
+        _cancel_event: cooperative-cancel hook (runtime-injected; see
+            ``runtime/loop/tool_executor.py``).  Checked between engine
+            attempts so a cancelled search returns promptly instead of
+            running the full cascade.
 
     Returns:
         Structured search results with titles, URLs, and snippets.
@@ -214,9 +236,27 @@ def web_search(query: str, max_results: int = 10) -> ToolResult:
         return ToolResult("Error: query parameter is required", is_error=True)
 
     query = query.strip()
-    engine, results, errors = _cascade(query, max_results)
+
+    # Pre-cancellation short-circuit.
+    if _cancel_event is not None and _cancel_event.is_set():
+        return ToolResult(
+            "Cancelled: web_search aborted on cancel signal "
+            "(no engine queried).",
+            is_error=True,
+        )
+
+    engine, results, errors = _cascade(query, max_results, cancel_event=_cancel_event)
 
     if not results:
+        # Distinguish "all engines failed naturally" from "cancelled" so
+        # the model can plan accordingly.
+        if _cancel_event is not None and _cancel_event.is_set():
+            err_summary = "; ".join(errors) if errors else "cancelled before any engine returned"
+            return ToolResult(
+                f"Cancelled: web_search aborted for query: {query}\n"
+                f"{err_summary}",
+                is_error=True,
+            )
         err_summary = "; ".join(errors) if errors else "no engine returned results"
         return ToolResult(
             f"All search engines failed for query: {query}\n{err_summary}\n\n"

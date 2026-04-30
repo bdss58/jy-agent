@@ -58,6 +58,46 @@ _nesting_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
 _MAX_NESTING = 2  # sub-agent can spawn sub-sub-agent, but no deeper
 
 
+# ─── Parent → child cancel mirror ─────────────────────────────────────────────
+
+
+def _install_cancel_mirror(
+    parent: "threading.Event | None",
+    child: threading.Event,
+) -> "callable[[], None]":
+    """Mirror ``parent.set()`` onto ``child.set()`` until the returned
+    ``stop()`` callable fires.
+
+    Returns a no-op when ``parent`` is None (no parent cancel event
+    plumbed from the runtime).  When parent is provided, spawns a
+    daemon watcher thread that wakes either when the parent fires or
+    every 500ms to re-check whether the caller has called ``stop()``.
+
+    Why polling instead of ``parent.wait(timeout=None)``?  A pure-wait
+    watcher leaks a thread per dispatch — once spawned it sits blocked
+    forever on a parent event that may never fire, and the thread can
+    only die at process exit.  The poll-and-stop pattern lets the
+    caller release the watcher when the sub-agent's future returns.
+    """
+    if parent is None:
+        return lambda: None
+    stop = threading.Event()
+
+    def _watch() -> None:
+        while not stop.is_set():
+            # Returns True if parent fired, False on timeout.
+            if parent.wait(timeout=0.5):
+                child.set()
+                return
+
+    threading.Thread(
+        target=_watch,
+        name="jyagent-subagent-cancel-mirror",
+        daemon=True,
+    ).start()
+    return stop.set
+
+
 # ─── Runtime owner access ─────────────────────────────────────────────────────
 
 _runtime_owner = None
@@ -850,8 +890,18 @@ def dispatch_agent(
     tool_whitelist: list = None,
     background: bool = False,
     timeout: int = 0,
+    _cancel_event: "threading.Event | None" = None,
 ) -> ToolResult:
-    """Spawn a sub-agent to handle a focused subtask."""
+    """Spawn a sub-agent to handle a focused subtask.
+
+    ``_cancel_event`` (runtime-injected, optional): when the parent
+    agent's cancel event fires, the sub-agent's own cancel event is
+    mirrored from it via a small daemon watcher thread, so a Ctrl-C in
+    the parent reaches the foreground sub-agent's loop on the next
+    cancel-aware checkpoint without waiting for ``effective_timeout``.
+    Background sub-agents are unaffected (they survive their parent by
+    design — that's what background means).
+    """
     max_steps = _DEFAULT_MAX_STEPS
     custom_system_prompt = None
 
@@ -900,6 +950,14 @@ def dispatch_agent(
 
     task_preview = task[:80] if len(task) > 80 else task
     cancel_event = threading.Event()
+    # If the runtime injected a parent cancel event (Ctrl-C / programmatic
+    # cancel from the outer agent loop), mirror it onto our local
+    # ``cancel_event`` so the sub-agent's loop observes parent cancellation
+    # within ~500ms.  ``_stop_cancel_mirror()`` is called in the finally
+    # blocks below to retire the watcher thread when the sub-agent
+    # completes naturally — without it, every dispatch_agent invocation
+    # would leak a daemon watcher until process exit.
+    _stop_cancel_mirror = _install_cancel_mirror(_cancel_event, cancel_event)
 
     # Increment nesting depth, then snapshot the context so the worker
     # thread inherits the updated value.  ThreadPoolExecutor does NOT
@@ -917,6 +975,7 @@ def dispatch_agent(
         # the correct bg_id once we register it after the grace period.
         progress_ids = {"spinner_id": spinner_id, "bg_id": None}
 
+        future = None
         try:
             future = _get_bg_executor().submit(
                 ctx.run, _run_subagent, task, context, model_spec,
@@ -960,6 +1019,14 @@ def dispatch_agent(
         finally:
             _nesting_depth.reset(_depth_token)
             _subagent_tracker.remove(spinner_id)
+            # Retire the parent→child cancel mirror UNLESS the future is
+            # still running (handoff-to-bg case): in that case the bg
+            # registry takes ownership and we want the mirror to keep
+            # propagating parent cancel into the long-running sub-agent.
+            # The mirror is a daemon thread so leaking it on handoff is
+            # bounded by process lifetime.
+            if future is None or future.done():
+                _stop_cancel_mirror()
 
         # Fast finish — return inline (same as sync path)
         elapsed = time.time() - t0
@@ -975,6 +1042,7 @@ def dispatch_agent(
         # Shared mutable dict for progress routing after potential handoff.
         progress_ids = {"spinner_id": agent_id, "bg_id": None}
 
+        future = None
         try:
             # Submit to the shared executor (NOT a per-call `with ThreadPoolExecutor`
             # which blocks on __exit__ with shutdown(wait=True), making timeout
@@ -1025,6 +1093,12 @@ def dispatch_agent(
             if not _depth_reset:
                 _nesting_depth.reset(_depth_token)
             _subagent_tracker.remove(agent_id)
+            # Retire the parent→child cancel mirror UNLESS the future is
+            # still running (timeout-handoff case): in that case the bg
+            # registry takes ownership and we want the mirror to keep
+            # propagating parent cancel into the long-running sub-agent.
+            if future is None or future.done():
+                _stop_cancel_mirror()
 
         elapsed = time.time() - t0
         return _finalize_outcome(outcome, elapsed, model_spec, task_preview)

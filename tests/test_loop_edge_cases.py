@@ -1927,3 +1927,59 @@ class TestCooperativeCancelEvent:
         # And one with the param.
         def g(x, _cancel_event=None): return x
         assert _accepts_cancel_event(g) is True
+
+
+# ─── Cancel mirror: parent → child sub-agent propagation ──────────────────
+
+
+class TestSubagentCancelMirror:
+    """``_install_cancel_mirror(parent, child)`` propagates parent
+    cancellation onto a child sub-agent's local cancel event.  Used by
+    ``dispatch_agent`` to wire the runtime's ``_cancel_event`` into the
+    sub-agent's loop so a Ctrl-C in the parent reaches the foreground
+    sub-agent within ~500ms.
+    """
+
+    def test_parent_set_propagates_to_child(self):
+        from jyagent.tools.subagent import _install_cancel_mirror
+
+        parent = threading.Event()
+        child = threading.Event()
+        stop = _install_cancel_mirror(parent, child)
+        try:
+            assert not child.is_set()
+            parent.set()
+            # Watcher polls every 500ms; allow up to 1s for propagation.
+            assert child.wait(timeout=1.5), "child did not fire after parent.set()"
+        finally:
+            stop()
+
+    def test_none_parent_returns_noop_stop(self):
+        from jyagent.tools.subagent import _install_cancel_mirror
+
+        child = threading.Event()
+        stop = _install_cancel_mirror(None, child)
+        # No-op stop must be callable and not raise.
+        stop()
+        # No watcher was spawned, so child stays clear.
+        assert not child.is_set()
+
+    def test_stop_retires_watcher_before_parent_fires(self):
+        """Calling stop() before parent.set() must prevent later parent
+        firing from propagating — the watcher must observe stop and
+        exit.  This is the leak-prevention contract for the foreground
+        path."""
+        from jyagent.tools.subagent import _install_cancel_mirror
+
+        parent = threading.Event()
+        child = threading.Event()
+        stop = _install_cancel_mirror(parent, child)
+        # Retire immediately.
+        stop()
+        # Give the watcher one full poll interval to notice.
+        time.sleep(0.7)
+        # Now firing parent must NOT propagate (watcher is gone).
+        parent.set()
+        assert not child.wait(timeout=0.7), (
+            "child fired after stop() — watcher leaked"
+        )
