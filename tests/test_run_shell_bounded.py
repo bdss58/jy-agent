@@ -1,0 +1,225 @@
+"""Memory-safety tests for ``run_shell``.
+
+These exist because the previous implementation buffered the entire
+child stdout+stderr in RAM before truncating to 50 000 chars. A runaway
+command (recursive find, ``yes`` pipe, infinite log loop) could push the
+parent agent into multi-GB territory and trip macOS jetsam — see
+journal 2026-04-30 (~74 GiB resident → SIGKILL in the wild).
+
+The contract these tests pin down:
+
+1. Normal commands still work (exit code, stdout, stderr, timeout).
+2. A child that emits hundreds of MB does NOT inflate the parent's RSS
+   beyond a small bound.
+3. A child that exceeds ``_RUN_SHELL_HARD_KILL_BYTES`` on a single
+   stream gets SIGKILLed and the result is tagged with an overflow
+   marker.
+4. The existing 50 000-char user-visible cap is still applied.
+"""
+
+from __future__ import annotations
+
+import os
+import resource
+import threading
+import time
+
+import pytest
+
+from jyagent.tools import core as tools_core
+from jyagent.tools.core import run_shell
+
+
+def _rss_kb() -> int:
+    """Self RSS in KB. macOS reports bytes, Linux KB — normalize to KB."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if os.uname().sysname == "Darwin":
+        return rss // 1024
+    return rss
+
+
+# ---------------------------------------------------------------------------
+# Baseline: behaviour preserved
+# ---------------------------------------------------------------------------
+
+
+def test_simple_stdout():
+    result = run_shell("echo hello")
+    assert not result.is_error
+    assert "hello" in result.content
+
+
+def test_nonzero_exit():
+    result = run_shell("false")
+    assert result.is_error
+    # Empty-output non-zero path emits a synthetic message.
+    assert "exit" in result.content.lower() or result.content.strip() != ""
+
+
+def test_stderr_captured():
+    result = run_shell("echo oops 1>&2; exit 3")
+    assert result.is_error
+    assert "oops" in result.content
+    assert "STDERR" in result.content
+
+
+def test_timeout_kills_child():
+    t0 = time.monotonic()
+    result = run_shell("sleep 30", timeout=1)
+    elapsed = time.monotonic() - t0
+    assert result.is_error
+    assert "timed out" in result.content.lower()
+    assert elapsed < 5, f"timeout should fire promptly, took {elapsed:.1f}s"
+
+
+def test_user_visible_char_cap():
+    # 200 KB of 'x' — well under the hard kill but well over the 50k char cap.
+    result = run_shell("python3 -c 'print(\"x\"*200000)'")
+    assert not result.is_error
+    assert len(result.content) <= tools_core._RUN_SHELL_OUTPUT_CHAR_CAP + 200
+    assert "truncated at 50000 chars" in result.content
+
+
+# ---------------------------------------------------------------------------
+# Memory safety — the actual fix
+# ---------------------------------------------------------------------------
+
+
+def test_huge_output_does_not_inflate_rss():
+    """500 MB of stdout must NOT cost the parent 500 MB of RSS.
+
+    Pre-fix, ``capture_output=True`` would have grown RSS by ≥500 MB
+    (often more, due to the ``str`` decode step). Post-fix the bounded
+    drain caps RAM at head + tail (~136 KB) per stream.
+    """
+    rss_before = _rss_kb()
+
+    # Stream 500 MB to stdout in 1 MB chunks. ``dd`` with /dev/zero is
+    # the cleanest portable way to get high-throughput output.
+    # The hard kill is 32 MB → child will be SIGKILLed long before
+    # 500 MB lands. That is itself part of the contract: the parent
+    # never has to absorb the full stream.
+    result = run_shell(
+        "dd if=/dev/zero bs=1048576 count=500 2>/dev/null", timeout=30,
+    )
+
+    rss_after = _rss_kb()
+    growth_mb = (rss_after - rss_before) / 1024
+    # Generous bound — Python interpreter wiggle, GC pressure, test
+    # framework overhead. The pre-fix code would blow past 500 MB here;
+    # 100 MB is comfortably below that and well above the bounded
+    # buffer's true cost.
+    assert growth_mb < 100, (
+        f"RSS grew {growth_mb:.1f} MB during 500 MB stdout — "
+        "bounded drain is leaking"
+    )
+
+    # Either: child got SIGKILLed via overflow path, OR finished
+    # cleanly with a fully-bounded captured output. Both are acceptable.
+    if "output exceeded" in result.content:
+        assert result.is_error  # overflow tagged as error
+    # Output, regardless of path, must be bounded by the user-visible cap.
+    assert len(result.content) <= tools_core._RUN_SHELL_OUTPUT_CHAR_CAP + 500
+
+
+def test_overflow_kills_child_and_tags_output():
+    """A stream that crosses the 32 MB threshold must SIGKILL the child."""
+    t0 = time.monotonic()
+    # 64 MB > _RUN_SHELL_HARD_KILL_BYTES (32 MB).
+    result = run_shell(
+        "dd if=/dev/zero bs=1048576 count=64 2>/dev/null", timeout=30,
+    )
+    elapsed = time.monotonic() - t0
+
+    assert result.is_error
+    assert "output exceeded" in result.content
+    # Should kill quickly, well before timeout.
+    assert elapsed < 15, f"overflow kill was slow: {elapsed:.1f}s"
+
+
+def test_overflow_on_stderr_also_triggers():
+    """stderr is on its own bounded buffer; overflow there also kills."""
+    result = run_shell(
+        "dd if=/dev/zero bs=1048576 count=64 1>&2 2>/dev/null; "
+        "true",  # ensure shell sees dd's exit code via stderr only
+        timeout=30,
+    )
+    # dd was killed → parent shell may or may not exit clean; what we
+    # assert is that the marker appeared.
+    assert "output exceeded" in result.content
+
+
+# ---------------------------------------------------------------------------
+# Cancellation
+# ---------------------------------------------------------------------------
+
+
+def test_cooperative_cancel():
+    cancel = threading.Event()
+
+    def fire_cancel_soon():
+        time.sleep(0.5)
+        cancel.set()
+
+    threading.Thread(target=fire_cancel_soon, daemon=True).start()
+
+    t0 = time.monotonic()
+    result = run_shell("sleep 30", timeout=30, _cancel_event=cancel)
+    elapsed = time.monotonic() - t0
+
+    assert result.is_error
+    assert "cancel" in result.content.lower()
+    assert elapsed < 5, f"cancel was slow: {elapsed:.1f}s"
+
+
+# ---------------------------------------------------------------------------
+# Drain helper unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_bounded_reader_keeps_head_and_tail():
+    """Direct test of the buffer logic with a fake stream."""
+    import io
+
+    payload = b"H" * 100 + b"M" * 100_000 + b"T" * 100
+    stream = io.BytesIO(payload)
+
+    fired = []
+    reader = tools_core._BoundedStreamReader(
+        stream,
+        head_bytes=50,
+        tail_bytes=50,
+        hard_kill_bytes=10**9,
+        on_overflow=lambda: fired.append(True),
+    )
+    reader.start()
+    reader.join(timeout=5)
+
+    text, overflowed = reader.collect()
+    assert not overflowed
+    # First 50 bytes are 'H', last 50 bytes are 'T'.
+    assert text.startswith("H" * 50)
+    assert text.endswith("T" * 50)
+    assert "elided" in text
+
+
+def test_bounded_reader_fires_overflow():
+    import io
+
+    payload = b"x" * 5000
+    stream = io.BytesIO(payload)
+
+    fired = []
+    reader = tools_core._BoundedStreamReader(
+        stream,
+        head_bytes=100,
+        tail_bytes=100,
+        hard_kill_bytes=1000,  # well below total → must fire
+        on_overflow=lambda: fired.append(True),
+    )
+    reader.start()
+    reader.join(timeout=5)
+
+    _, overflowed = reader.collect()
+    assert overflowed
+    assert fired == [True]  # fired exactly once

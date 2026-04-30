@@ -99,6 +99,175 @@ def is_binary_ext(path: str) -> bool:
     return ext.lower() in BINARY_EXTS
 
 
+# --- Bounded-output drain for run_shell -----------------------------------
+#
+# Why this exists: the previous implementation used
+# ``subprocess.run(capture_output=True, text=True, ...)`` (or
+# ``proc.communicate()``), both of which buffer the *entire* stdout+stderr
+# in RAM before truncating to 50 000 chars. A runaway command (recursive
+# find, ``kubectl logs -f``, infinite log loop, accidental ``yes`` pipe…)
+# could push the parent agent into multi-GB territory and trigger
+# macOS jetsam / Linux OOM-killer (we observed ~74 GiB resident → SIGKILL
+# in the wild — see journal 2026-04-30).
+#
+# The drain helper below keeps a bounded head + tail byte buffer per
+# stream and SIGKILLs the child's process group if either stream blows
+# past ``hard_kill_bytes``. Memory usage is O(head + tail) regardless of
+# how much the child writes.
+_RUN_SHELL_HEAD_BYTES = 8 * 1024            # 8 KB — keep banners/prompts
+_RUN_SHELL_TAIL_BYTES = 128 * 1024          # 128 KB — final 50 000 chars
+                                            # easily fit after utf-8 decode
+_RUN_SHELL_HARD_KILL_BYTES = 32 * 1024 * 1024  # 32 MB per stream → kill
+_RUN_SHELL_OUTPUT_CHAR_CAP = 50000          # user-visible cap (unchanged)
+
+
+class _BoundedStreamReader(threading.Thread):
+    """Drain a binary pipe into a bounded head+tail buffer.
+
+    Total RAM held per instance ≈ ``head_bytes + tail_bytes``. When the
+    child exceeds ``hard_kill_bytes`` of output on this stream, ``on_overflow``
+    is invoked (typically to SIGKILL the whole process group) and further
+    bytes are still consumed (so the child's ``write()`` calls don't block
+    on a full pipe) but discarded.
+    """
+
+    _CHUNK = 64 * 1024
+
+    def __init__(
+        self,
+        stream,
+        head_bytes: int,
+        tail_bytes: int,
+        hard_kill_bytes: int,
+        on_overflow,
+    ):
+        super().__init__(daemon=True)
+        self._stream = stream
+        self._head_max = head_bytes
+        self._tail_max = tail_bytes
+        self._hard_kill = hard_kill_bytes
+        self._on_overflow = on_overflow
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._total = 0
+        self._overflow_fired = False
+
+    def run(self) -> None:  # noqa: D401 — Thread.run override
+        try:
+            while True:
+                chunk = self._stream.read(self._CHUNK)
+                if not chunk:
+                    break
+                self._total += len(chunk)
+
+                # Head: fill up to head_max, then stop appending.
+                if len(self._head) < self._head_max:
+                    take = self._head_max - len(self._head)
+                    self._head.extend(chunk[:take])
+
+                # Tail: keep last tail_max bytes via concat + slice.
+                # (For the chunk sizes we use, this is cheap; bytearray
+                # slicing copies but stays bounded by tail_max + chunk.)
+                self._tail.extend(chunk)
+                if len(self._tail) > self._tail_max:
+                    del self._tail[: len(self._tail) - self._tail_max]
+
+                if (
+                    not self._overflow_fired
+                    and self._total >= self._hard_kill
+                ):
+                    self._overflow_fired = True
+                    try:
+                        self._on_overflow()
+                    except Exception:
+                        pass
+                    # Keep draining so the child can exit cleanly on
+                    # SIGKILL; ``read`` will return b'' shortly.
+        except Exception:
+            # Pipe closed / decode error / EBADF — drain ends, caller
+            # will collect whatever we have.
+            pass
+
+    def collect(self) -> tuple[str, bool]:
+        """Decode the bounded buffer to str. Returns (text, truncated)."""
+        truncated = self._total > (len(self._head) + len(self._tail))
+        if not truncated:
+            data = bytes(self._tail)  # tail contains everything
+        else:
+            elided = self._total - len(self._head) - len(self._tail)
+            data = (
+                bytes(self._head)
+                + f"\n\n[... {elided} bytes elided ...]\n\n".encode("utf-8")
+                + bytes(self._tail)
+            )
+        text = data.decode("utf-8", errors="replace")
+        return text, self._overflow_fired
+
+
+def _killpg_quiet(pid: int, sig: int) -> None:
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _drain_proc_bounded(proc: "subprocess.Popen") -> tuple[
+    "_BoundedStreamReader", "_BoundedStreamReader"
+]:
+    """Spawn drain threads for proc.stdout and proc.stderr."""
+    overflow_kill = lambda: _killpg_quiet(proc.pid, 9)  # SIGKILL on overflow
+    out_reader = _BoundedStreamReader(
+        proc.stdout,
+        _RUN_SHELL_HEAD_BYTES,
+        _RUN_SHELL_TAIL_BYTES,
+        _RUN_SHELL_HARD_KILL_BYTES,
+        overflow_kill,
+    )
+    err_reader = _BoundedStreamReader(
+        proc.stderr,
+        _RUN_SHELL_HEAD_BYTES,
+        _RUN_SHELL_TAIL_BYTES,
+        _RUN_SHELL_HARD_KILL_BYTES,
+        overflow_kill,
+    )
+    out_reader.start()
+    err_reader.start()
+    return out_reader, err_reader
+
+
+def _format_run_shell_output(
+    stdout_text: str,
+    stderr_text: str,
+    returncode: int,
+    overflowed: bool,
+) -> str:
+    output = stdout_text
+    if stderr_text:
+        if output and not output.endswith("\n"):
+            output += "\n"
+        output += "STDERR: " + stderr_text
+    if returncode != 0 and not output.strip() and not overflowed:
+        output = f"Command exited with code {returncode}"
+    # Apply the user-visible char cap *before* appending the overflow
+    # marker. Otherwise a runaway child fills the cap with garbage and
+    # the marker gets sliced off — silent regression of the very signal
+    # we care about.
+    if len(output) > _RUN_SHELL_OUTPUT_CHAR_CAP:
+        output = (
+            output[:_RUN_SHELL_OUTPUT_CHAR_CAP]
+            + f"\n\n[... output truncated at {_RUN_SHELL_OUTPUT_CHAR_CAP} chars ...]"
+        )
+    if overflowed:
+        if output and not output.endswith("\n"):
+            output += "\n"
+        output += (
+            f"\n[!! output exceeded {_RUN_SHELL_HARD_KILL_BYTES // (1024*1024)} MB "
+            "on a single stream — child process group SIGKILLed to protect "
+            "the agent. Use run_background for high-volume commands.]"
+        )
+    return output
+
+
 def run_shell(
     command: str,
     timeout: int = 60,
@@ -106,60 +275,44 @@ def run_shell(
 ) -> ToolResult:
     """Execute a shell command and return the output.
 
+    Memory safety
+    -------------
+    Output is drained through bounded head+tail byte buffers
+    (``_BoundedStreamReader``) so a child emitting GBs of output cannot
+    push this process into the OOM-killer. If either stdout or stderr
+    exceeds ``_RUN_SHELL_HARD_KILL_BYTES`` we SIGKILL the child's
+    process group and tag the output with an overflow marker.
+
     Cooperative cancellation
     ------------------------
     When the runtime injects ``_cancel_event`` (i.e. the engine has a
-    cancellation event wired up), we switch from the blocking
-    ``subprocess.run`` to a ``Popen``-and-poll loop so a Ctrl-C / cancel
-    signal teardowns the child process cleanly instead of leaking it as
-    a daemon-thread side effect.  Tools that don't opt into the kwarg
-    keep using the legacy blocking path.
+    cancellation event wired up), the poll loop checks it on every tick
+    and tears down the child's process group on cancel. Without the
+    event we just block on ``proc.wait`` with a timeout.
     """
     try:
         effective_timeout = max(1, min(int(timeout), 600))
     except (TypeError, ValueError):
         effective_timeout = 60
 
-    # Legacy path — no cancel event wired up.  Preserved verbatim so the
-    # blocking semantics on offline / scripted callers are unchanged.
-    if _cancel_event is None:
-        try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                timeout=effective_timeout,
-            )
-            output = result.stdout
-            if result.stderr:
-                output += "\nSTDERR: " + result.stderr
-            if result.returncode != 0 and not output.strip():
-                output = f"Command exited with code {result.returncode}"
-            if len(output) > 50000:
-                output = output[:50000] + "\n\n[... output truncated at 50000 chars ...]"
-            return ToolResult(output, is_error=(result.returncode != 0))
-        except subprocess.TimeoutExpired:
-            return ToolResult(
-                f"Error: Command timed out after {effective_timeout} seconds",
-                is_error=True,
-            )
-        except Exception as e:
-            return ToolResult(f"Error: {e}", is_error=True)
-
-    # Cooperative-cancel path: spawn the child in its own process group,
-    # poll for completion / cancel / timeout, terminate gracefully on
-    # cancel.  Process-group teardown ensures we kill the whole shell-
-    # spawned tree (most ``run_shell`` invocations look like
-    # ``foo && bar``), not just ``/bin/sh``.
+    # Always Popen + drain. ``start_new_session=True`` puts the child in
+    # its own process group so ``killpg`` cleans up the whole tree
+    # (most run_shell invocations look like ``foo && bar``, not a single
+    # exec).
     try:
         proc = subprocess.Popen(
             command,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,  # POSIX: detach into new process group
+            start_new_session=True,
+            # NOTE: text=False (default) — we decode at collect() time so
+            # the bounded buffer holds bytes, not Python str objects.
         )
     except Exception as e:
         return ToolResult(f"Error: {e}", is_error=True)
+
+    out_reader, err_reader = _drain_proc_bounded(proc)
 
     deadline = time.monotonic() + effective_timeout
     poll_interval = 0.1
@@ -168,7 +321,7 @@ def run_shell(
     while True:
         if proc.poll() is not None:
             break
-        if _cancel_event.is_set():
+        if _cancel_event is not None and _cancel_event.is_set():
             cancelled = True
             break
         if time.monotonic() >= deadline:
@@ -177,28 +330,29 @@ def run_shell(
         time.sleep(poll_interval)
 
     if cancelled or timed_out:
-        # Graceful shutdown: SIGTERM the whole process group, give it a
-        # short grace period, then SIGKILL anything still alive.
-        try:
-            os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        # SIGTERM, brief grace period, then SIGKILL the whole pgroup.
+        _killpg_quiet(proc.pid, 15)
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+            _killpg_quiet(proc.pid, 9)
             try:
                 proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 pass
 
+    # Make sure the child is reaped and drain threads finish — they exit
+    # as soon as the pipes close, which happens at child exit.
     try:
-        stdout, stderr = proc.communicate(timeout=2)
+        proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        stdout, stderr = "", ""
+        _killpg_quiet(proc.pid, 9)
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    out_reader.join(timeout=2)
+    err_reader.join(timeout=2)
 
     if cancelled:
         return ToolResult(
@@ -212,15 +366,12 @@ def run_shell(
             is_error=True,
         )
 
-    output = stdout or ""
-    if stderr:
-        output += "\nSTDERR: " + stderr
+    stdout_text, stdout_overflow = out_reader.collect()
+    stderr_text, stderr_overflow = err_reader.collect()
+    overflowed = stdout_overflow or stderr_overflow
     rc = proc.returncode if proc.returncode is not None else -1
-    if rc != 0 and not output.strip():
-        output = f"Command exited with code {rc}"
-    if len(output) > 50000:
-        output = output[:50000] + "\n\n[... output truncated at 50000 chars ...]"
-    return ToolResult(output, is_error=(rc != 0))
+    output = _format_run_shell_output(stdout_text, stderr_text, rc, overflowed)
+    return ToolResult(output, is_error=(rc != 0 or overflowed))
 
 
 def read_file(path: str, offset: int = 0, limit: int = 0, line_numbers: bool = False) -> ToolResult:
