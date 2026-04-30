@@ -22,6 +22,17 @@ class LoopConfig:
     tool_timeout: int = 120
     retry_attempts: int = 3
     retry_base_delay: float = 1.0
+    # When True (default), the LLM retry loop retries ANY exception up to
+    # ``retry_attempts``, not just errors classified transient by
+    # ``is_transient_error``.  Rationale: in practice non-transient
+    # classification is heuristic (provider SDKs evolve, proxies wrap
+    # errors, etc.), and the retry budget is small enough that burning it
+    # on a deterministic 4xx is preferable to bailing out on a real
+    # transient that wasn't recognized.  Set to False to restore the
+    # strict transient-only retry policy.  Reason label passed to
+    # ``on_stream_retry`` still distinguishes "transient_error" vs "error"
+    # so UI/telemetry can tell them apart.
+    retry_on_all_errors: bool = True
     compact_messages: bool = True
     max_working_tokens: int = 100_000
     compact_tool_result_chars: int = 2000

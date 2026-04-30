@@ -516,7 +516,12 @@ class LLMRunner(LoopThreadHelper):
                 raise
             except Exception as err:
                 last_error = err
-                if is_transient_error(err) and attempt < cfg.retry_attempts:
+                transient = is_transient_error(err)
+                should_retry = (
+                    (transient or cfg.retry_on_all_errors)
+                    and attempt < cfg.retry_attempts
+                )
+                if should_retry:
                     if self._is_cancelled():
                         raise
                     # Exponential backoff with "equal jitter" (AWS architecture
@@ -533,7 +538,8 @@ class LLMRunner(LoopThreadHelper):
                     # ``call_streaming`` on the exception; missing for
                     # non-streaming path.
                     partial_text = getattr(err, "partial_stream_text", "")
-                    self._fire("on_stream_retry", "transient_error", partial_text)
+                    reason = "transient_error" if transient else "error"
+                    self._fire("on_stream_retry", reason, partial_text)
                     # Cancel-aware backoff: wake immediately on Ctrl-C so we
                     # don't burn through a long retry window after cancel.
                     if self._cancellable_sleep(delay):
