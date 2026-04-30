@@ -65,6 +65,107 @@ class LLMClient(Protocol):
         Streaming completion.  Returns an iterator that yields provider-
         normalized stream events; the engine consumes these to update
         UI callbacks and assemble the final message.
+
+    Normalized data contract (the runtime depends on these shapes)
+    --------------------------------------------------------------
+    Provider adapters (``jyagent.llm.providers.*``) MUST decode their
+    wire format into these normalized shapes — the engine
+    (``runtime/loop/llm_runner.py``, ``runtime/loop/engine.py``) reads
+    them directly.  Diverging from these shapes will silently break the
+    loop with no type error (everything is plain ``dict``).
+
+    1. **Request context** (``complete()`` / ``stream()`` arg)::
+
+           {
+               "system_prompt": str,        # MUST stay byte-stable across a
+                                            #   session — see MEMORY.md prompt-
+                                            #   caching rule.  Dynamic context
+                                            #   goes in tail user messages.
+               "messages": list[dict],      # ordered turns; see (2).
+           }
+
+    2. **Message** (entries in ``context["messages"]``, and the dict
+       returned by ``complete()`` / yielded as ``done.message`` by
+       ``stream()``)::
+
+           {
+               "role": "user" | "assistant",
+               "content": list[ContentBlock],
+               "stop_reason": str,          # assistant only; see (4).
+               "usage": dict,               # assistant only; see (5).
+           }
+
+    3. **Content blocks** (entries in ``message["content"]``).  Discriminated
+       by ``type``::
+
+           {"type": "text",        "text": str}
+           {"type": "thinking",    "thinking": str, ...}    # provider-specific
+                                                            #   extras allowed;
+                                                            #   compaction
+                                                            #   strips these
+                                                            #   from old turns.
+           {"type": "tool_call",   "id": str,
+                                   "name": str,
+                                   "arguments": dict}       # the runtime's
+                                                            #   normalized form
+                                                            #   of an Anthropic
+                                                            #   ``tool_use`` /
+                                                            #   OpenAI
+                                                            #   ``tool_calls``
+                                                            #   entry.
+           {"type": "tool_result", "tool_use_id": str,
+                                   "content": str | list,
+                                   "is_error": bool}        # appended by the
+                                                            #   engine after
+                                                            #   tool dispatch.
+
+    4. **stop_reason** values the engine special-cases (provider adapters
+       MUST normalize to these strings)::
+
+           "stop"        — natural completion (terminal turn condition).
+           "tool_use"    — assistant emitted tool_call blocks; loop continues.
+           "length"      — output truncated by max_tokens.  Triggers the
+                           truncation-retry / token-scale path in step.py.
+           "error"       — streaming adapter only; final_message carries an
+                           ``error_message`` field that becomes the retry
+                           layer's exception text.
+
+    5. **Usage** (``message["usage"]``).  All keys optional; missing keys
+       are treated as zero by the cost tracker::
+
+           {
+               "input_tokens":         int,
+               "output_tokens":        int,
+               "cache_creation_input_tokens": int,  # Anthropic prompt-cache
+               "cache_read_input_tokens":     int,  # Anthropic prompt-cache
+           }
+
+    6. **Stream events** (``stream()`` iterator yields these dicts).  The
+       engine in ``llm_runner._stream_loop`` switches on ``event["type"]``::
+
+           {"type": "text_delta",        "text": str}
+           {"type": "thinking_start"}
+           {"type": "thinking_delta",    "text": str}
+           {"type": "thinking_end"}
+           {"type": "tool_call_start",   ...}    # used only to drop thinking
+           {"type": "tool_call_delta",   ...}    # used only to drop thinking
+           {"type": "done",  "message":  Message}     # see (2).
+           {"type": "error", "message":  Message}     # final_message with
+                                                      # stop_reason="error".
+
+       The stream object MAY also expose ``get_final_message()`` for the
+       fallback-flush path; this is optional but the Anthropic adapter
+       provides it.
+
+    Why the runtime owns these shapes
+    ---------------------------------
+    Provider adapters are the natural home for wire-format quirks
+    (Anthropic's ``tool_use``, OpenAI's ``tool_calls``, signed
+    ``thinking`` blocks, reasoning items).  Concentrating wire-format
+    knowledge in the adapters lets the engine reason about a single
+    stable shape — tested via the ``test_step_runner.py`` and
+    ``test_loop_edge_cases.py`` suites which build messages by hand
+    against this contract.
     """
 
     @property
