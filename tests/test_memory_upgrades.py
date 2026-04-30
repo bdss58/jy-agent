@@ -1,7 +1,8 @@
 # Tests for the four 2026-04-25 memory upgrades:
 #   1. BM25 search across topics + journal (jyagent.memory.search)
 #   2. Reconciliation in extraction (ADD / UPDATE / NOOP directives)
-#   3. supersede() — non-destructive update with strikethrough
+#   3. UPDATE replacement (forget old + journal-archive + remember new) —
+#      replaced the old supersede() Tier-1 strikethrough behavior
 #   4. Reflection pass at compaction (writes [reflection] candidates to journal)
 #   5. Section-level topic reads (read_topic_section, list_topic_sections)
 #
@@ -28,8 +29,8 @@ from jyagent.memory.operations import (
     write_memory_md, read_memory_md,
     write_topic, read_topic,
     read_topic_section, list_topic_sections,
-    supersede, remember,
-    append_journal, list_journals,
+    remember,
+    append_journal, list_journals, read_journal,
     ensure_dirs,
 )
 from jyagent.memory.search import (
@@ -151,7 +152,10 @@ def test_extract_directive_add_appends_new_line():
     assert "[tip]" in content
 
 
-def test_extract_directive_update_supersedes_old_line():
+def test_extract_directive_update_replaces_old_line():
+    """UPDATE directive: old MEMORY.md line is removed (Tier 1 stays lean),
+    archived to current month's journal (Tier 3 audit trail), and the new
+    line is appended via remember()."""
     setup()
     write_memory_md(
         "# Agent Memory\n\n"
@@ -170,11 +174,19 @@ def test_extract_directive_update_supersedes_old_line():
     _wait_for_extraction()
 
     content = read_memory_md()
-    # Old line is struck-through, not deleted
-    assert "~~" in content
-    assert "wan2.think-force.com" in content
-    # New line present
+    # Tier 1: old line gone, new line present
+    assert "wan2.think-force.com" not in content
     assert "wan3.think-force.com" in content
+    # No strikethrough syntax should leak into MEMORY.md any more
+    assert "~~" not in content
+
+    # Tier 3: old line archived to journal
+    months = list_journals()
+    assert months, "journal month should exist after UPDATE replacement"
+    journal_text = "".join(read_journal(m) for m in months)
+    assert "[memory_revision]" in journal_text
+    assert "wan2.think-force.com" in journal_text
+    assert "Replaced via UPDATE directive" in journal_text
 
 
 def test_extract_directive_noop_writes_nothing():
@@ -211,67 +223,134 @@ def test_extract_handles_NONE_response():
     assert read_memory_md() == before
 
 
-# ─── 3. SUPERSEDE ────────────────────────────────────────────────────────────
+# ─── 3. UPDATE REPLACEMENT (forget + journal-archive + remember) ─────────────
+# These tests target ``extraction._replace_line``, which is the implementation
+# behind the LLM-driven UPDATE directive after we removed the public
+# supersede() action. The behavioural surface mirrors the old supersede
+# safety rails (keyword length, protected sections, no-match → skip) but
+# tier placement changed: old lines move to journal instead of staying in
+# MEMORY.md as ``~~strikethrough~~``.
 
-def test_supersede_marks_old_appends_new():
+def test_update_replaces_old_archives_to_journal():
     setup()
     write_memory_md(
         "# Agent Memory\n\n"
         "[user_stated] K8s test host: wan2.think-force.com\n"
         "[tip] unrelated line\n"
     )
-    msg = supersede("wan2.think-force.com", "K8s test host: wan3.think-force.com", "user_stated")
+    status, msg = extraction._replace_line(
+        "wan2.think-force.com",
+        "K8s test host: wan3.think-force.com",
+        "user_stated",
+    )
+    assert status == "update"
+    assert "Replaced 1" in msg
 
     content = read_memory_md()
-    assert "Superseded 1" in msg
-    # Old line marked, not removed
-    assert "~~[user_stated] K8s test host: wan2.think-force.com~~" in content
-    assert "(superseded " in content
-    # New line appended
+    # Tier 1: old line gone, no strikethrough leakage, new line present
+    assert "wan2.think-force.com" not in content
+    assert "~~" not in content
     assert "wan3.think-force.com" in content
     # Unrelated line untouched
     assert "[tip] unrelated line" in content
-    assert "~~[tip] unrelated line~~" not in content
+
+    # Tier 3: old line archived under [memory_revision]
+    months = list_journals()
+    assert months
+    journal_text = "".join(read_journal(m) for m in months)
+    assert "[memory_revision]" in journal_text
+    assert "wan2.think-force.com" in journal_text
 
 
-def test_supersede_no_match_returns_message_no_write():
+def test_update_no_match_returns_skip_no_writes():
     setup()
     write_memory_md("# Agent Memory\n\n[tip] foo\n")
     before = read_memory_md()
-    msg = supersede("nonexistent", "this should not land", "tip")
+    status, msg = extraction._replace_line(
+        "nonexistent-keyword", "this should not land", "tip",
+    )
+    assert status == "skip"
     assert "No entries matched" in msg
+    # MEMORY.md unchanged AND no journal write — without a match we have
+    # nothing to archive.
     assert read_memory_md() == before
+    assert list_journals() == []
 
 
-def test_supersede_idempotent_on_already_struck():
+def test_update_rejects_short_keyword():
+    """H2-equivalent: keywords shorter than the minimum can hit dozens of
+    unrelated lines. Refuse before any RMW."""
+    setup()
+    write_memory_md("# Agent Memory\n\n[tip] aaa\n[tip] bbb\n")
+    before = read_memory_md()
+    status, msg = extraction._replace_line("aa", "this should not land", "tip")
+    assert status == "skip"
+    assert "Error" in msg
+    assert read_memory_md() == before
+    assert list_journals() == []
+
+
+def test_update_skips_protected_headers_and_rules():
+    """H2-equivalent: the LLM must not be able to overwrite a markdown
+    heading or a Behavioral Rules entry via UPDATE. (`Critical` matches
+    the heading text 'Behavioral Rules (CRITICAL)'.)"""
     setup()
     write_memory_md(
         "# Agent Memory\n\n"
-        "[user_stated] foo bar baz\n"
+        "## Behavioral Rules (CRITICAL)\n"
+        "- Never fabricate command results\n"
+        "\n"
+        "## Random Section\n"
+        "- ordinary line about CRITICAL bugs\n"
     )
-    supersede("foo bar", "foo bar quux", "user_stated")
-    after_first = read_memory_md()
-
-    # Second call with same keyword should NOT double-wrap the existing
-    # ~~struck~~ line.
-    supersede("foo bar", "foo bar zzz", "user_stated")
-    after_second = read_memory_md()
-
-    # `~~~~` would indicate double-wrap
-    assert "~~~~" not in after_second
-    # But the new entry from the 2nd call IS appended (it doesn't start with ~~)
-    assert "foo bar zzz" in after_second
-
-
-def test_supersede_via_facade():
-    setup()
-    write_memory_md("# Agent Memory\n\n[tip] old style approach\n")
-    res = manage_memory("supersede", text="old style approach|new shiny approach", category="tip")
-    assert res.is_error is False
-    assert "Superseded" in res.content
+    status, msg = extraction._replace_line(
+        "CRITICAL bugs", "ordinary line about important bugs", "tip",
+    )
     content = read_memory_md()
-    assert "~~[tip] old style approach~~" in content
-    assert "new shiny approach" in content
+    # Heading not touched
+    assert "## Behavioral Rules (CRITICAL)" in content
+    # Behavioral rule child line not touched
+    assert "- Never fabricate command results" in content
+    # Ordinary line WAS replaced (gone from MEMORY.md)
+    assert "ordinary line about CRITICAL bugs" not in content
+    # New line landed
+    assert "important bugs" in content
+    assert status == "update"
+    assert "Replaced 1" in msg
+
+
+def test_update_only_protected_matches_returns_skip():
+    """If the only matches were protected, return skip and DO NOT write
+    anything (neither MEMORY.md nor journal)."""
+    setup()
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## Behavioral Rules (CRITICAL)\n"
+        "- protected unique phrase\n"
+    )
+    before = read_memory_md()
+    status, msg = extraction._replace_line(
+        "protected unique phrase", "replacement text here", "tip",
+    )
+    assert status == "skip"
+    assert "No entries matched" in msg
+    assert "protected" in msg
+    # Memory unchanged, no journal entry
+    assert read_memory_md() == before
+    assert list_journals() == []
+
+
+def test_supersede_action_no_longer_recognized():
+    """Regression: the public 'supersede' action was removed. The facade
+    must reject it cleanly so any old caller (or LLM emitting the old
+    action name) gets an explicit error rather than a silent no-op."""
+    setup()
+    res = manage_memory("supersede", text="old|new")
+    assert res.is_error is True
+    assert "Unknown action" in res.content
+    # The error lists valid actions; 'supersede' must NOT appear in that list
+    valid_section = res.content.lower().split("valid:", 1)[-1]
+    assert "supersede" not in valid_section
 
 
 # ─── 4. REFLECTION PASS AT COMPACTION ────────────────────────────────────────
@@ -464,61 +543,6 @@ def test_manage_memory_remember_and_goal_return_errors_for_invalid_entries():
     assert read_memory_md() == before
 
 
-def test_supersede_rejects_short_keyword():
-    """H2: keywords shorter than the minimum can hit dozens of unrelated
-    lines. Refuse before any RMW."""
-    setup()
-    write_memory_md("# Agent Memory\n\n[tip] aaa\n[tip] bbb\n")
-    res = supersede("aa", "this should not land", "tip")
-    assert "Error" in res
-    # Original content unchanged
-    assert read_memory_md() == "# Agent Memory\n\n[tip] aaa\n[tip] bbb\n"
-
-
-def test_supersede_skips_protected_headers_and_rules():
-    """H2: the LLM must not be able to strike-through a markdown heading or
-    a Behavioral Rules entry via UPDATE. (`Critical` matches the heading
-    text 'Behavioral Rules (CRITICAL)'.)"""
-    setup()
-    write_memory_md(
-        "# Agent Memory\n\n"
-        "## Behavioral Rules (CRITICAL)\n"
-        "- Never fabricate command results\n"
-        "\n"
-        "## Random Section\n"
-        "- ordinary line about CRITICAL bugs\n"
-    )
-    # 'CRITICAL' appears in the heading, in the Behavioral Rules child line,
-    # and in the ordinary line. Only the ordinary line should be marked.
-    res = supersede("CRITICAL bugs", "ordinary line about important bugs", "tip")
-    content = read_memory_md()
-    # Heading not touched
-    assert "## Behavioral Rules (CRITICAL)" in content
-    assert "~~## Behavioral Rules" not in content
-    # Behavioral rule child line not touched
-    assert "- Never fabricate command results" in content
-    assert "~~- Never fabricate" not in content
-    # Ordinary line WAS struck
-    assert "~~- ordinary line about CRITICAL bugs~~" in content
-    assert "Superseded 1" in res
-
-
-def test_supersede_only_protected_matches_returns_no_op():
-    """H2: if the *only* matches were protected, return a no-op message and
-    do NOT append the new line."""
-    setup()
-    write_memory_md(
-        "# Agent Memory\n\n"
-        "## Behavioral Rules (CRITICAL)\n"
-        "- protected unique phrase\n"
-    )
-    before = read_memory_md()
-    res = supersede("protected unique phrase", "replacement text here", "tip")
-    assert "No entries matched" in res
-    assert "protected" in res
-    # Memory unchanged
-    assert read_memory_md() == before
-
 
 def test_apply_directive_rejects_no_match_update_as_skip():
     """C3: an UPDATE directive whose keyword matches nothing must NOT count
@@ -661,21 +685,6 @@ def test_facade_topic_write_returns_error_for_bad_name():
     assert "invalid topic name" in res.content.lower() or "error" in res.content.lower()
 
 
-def test_supersede_concurrent_writes_dont_lose_data():
-    """C2: concurrent supersede + remember on MEMORY.md must not lose either
-    write. We can't reliably reproduce a race in a unit test, but we can at
-    least verify the lock is acquired (reentrant), so nested supersede→remember
-    doesn't deadlock and both writes land."""
-    setup()
-    write_memory_md("# Agent Memory\n\n[user_stated] before-supersede\n")
-    res = supersede("before-supersede", "after-supersede text", "user_stated")
-    assert "Superseded 1" in res
-    content = read_memory_md()
-    # Both halves present
-    assert "~~[user_stated] before-supersede~~" in content
-    assert "after-supersede text" in content
-
-
 # ─── runner ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -688,13 +697,15 @@ if __name__ == "__main__":
         ("search_empty_query_returns_no_hits", test_search_empty_query_returns_no_hits),
         ("render_hits_handles_empty", test_render_hits_handles_empty),
         ("extract_directive_add_appends_new_line", test_extract_directive_add_appends_new_line),
-        ("extract_directive_update_supersedes_old_line", test_extract_directive_update_supersedes_old_line),
+        ("extract_directive_update_replaces_old_line", test_extract_directive_update_replaces_old_line),
         ("extract_directive_noop_writes_nothing", test_extract_directive_noop_writes_nothing),
         ("extract_handles_NONE_response", test_extract_handles_NONE_response),
-        ("supersede_marks_old_appends_new", test_supersede_marks_old_appends_new),
-        ("supersede_no_match_returns_message_no_write", test_supersede_no_match_returns_message_no_write),
-        ("supersede_idempotent_on_already_struck", test_supersede_idempotent_on_already_struck),
-        ("supersede_via_facade", test_supersede_via_facade),
+        ("update_replaces_old_archives_to_journal", test_update_replaces_old_archives_to_journal),
+        ("update_no_match_returns_skip_no_writes", test_update_no_match_returns_skip_no_writes),
+        ("update_rejects_short_keyword", test_update_rejects_short_keyword),
+        ("update_skips_protected_headers_and_rules", test_update_skips_protected_headers_and_rules),
+        ("update_only_protected_matches_returns_skip", test_update_only_protected_matches_returns_skip),
+        ("supersede_action_no_longer_recognized", test_supersede_action_no_longer_recognized),
         ("reflection_writes_journal_candidates", test_reflection_writes_journal_candidates),
         ("reflection_NONE_writes_nothing", test_reflection_NONE_writes_nothing),
         ("reflection_swallows_owner_exceptions", test_reflection_swallows_owner_exceptions),
@@ -709,16 +720,12 @@ if __name__ == "__main__":
         ("facade_search_action", test_facade_search_action),
         ("search_with_plural_query_matches_singular_body", test_search_with_plural_query_matches_singular_body),
         ("append_memory_md_heals_missing_trailing_newline", test_append_memory_md_heals_missing_trailing_newline),
-        ("supersede_rejects_short_keyword", test_supersede_rejects_short_keyword),
-        ("supersede_skips_protected_headers_and_rules", test_supersede_skips_protected_headers_and_rules),
-        ("supersede_only_protected_matches_returns_no_op", test_supersede_only_protected_matches_returns_no_op),
         ("apply_directive_rejects_no_match_update_as_skip", test_apply_directive_rejects_no_match_update_as_skip),
         ("apply_directive_rejects_overlong_body", test_apply_directive_rejects_overlong_body),
         ("topic_path_rejects_traversal", test_topic_path_rejects_traversal),
         ("write_topic_refuses_traversal", test_write_topic_refuses_traversal),
         ("delete_topic_refuses_traversal", test_delete_topic_refuses_traversal),
         ("facade_topic_write_returns_error_for_bad_name", test_facade_topic_write_returns_error_for_bad_name),
-        ("supersede_concurrent_writes_dont_lose_data", test_supersede_concurrent_writes_dont_lose_data),
     ]
     passed = failed = 0
     for name, fn in tests:
