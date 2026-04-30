@@ -8,6 +8,7 @@ from .memory import (
     ConversationMemory, summarize_if_needed,
     build_memory_context,
     save_session, load_session, has_saved_session, archive_session,
+    list_sessions, find_session,
     should_extract, extract_and_remember,
     record_file_access,
 )
@@ -216,25 +217,75 @@ def _cmd_model(cli, runtime_owner: LLMOwner, user_input: str, **_):
     cli.print_system(f"Switched model to {provider}:{model}")
 
 
-def _cmd_continue(cli, conversation, runtime_owner, **_):
-    """Load the last saved session and continue where we left off."""
-    if not has_saved_session():
-        cli.print_system("No saved session found. Start a new conversation.")
-        return
+def _cmd_continue(cli, conversation, runtime_owner, user_input: str = "/continue", **_):
+    """Load a saved session and continue where we left off.
+
+    Usage:
+        /continue                  resume latest.json (default)
+        /continue latest           resume latest.json (explicit)
+        /continue <session_id>     resume by session id (full or unique prefix)
+        /continue <timestamp>      resume by archive filename / saved_at prefix
+                                   (e.g. 20260430_215012)
+    """
+    parts = user_input.split(None, 1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
 
     if conversation.messages:
         cli.print_system("⚠ Current conversation is not empty. Use /new first to clear, then /continue.")
         return
 
-    result = load_session(conversation)
+    target_path = None
+    if arg:
+        entry = find_session(arg)
+        if entry is None:
+            cli.print_error(
+                f"No session matched '{arg}'. Use /sessions to list available sessions."
+            )
+            return
+        target_path = entry["path"]
+    else:
+        if not has_saved_session():
+            cli.print_system("No saved session found. Start a new conversation.")
+            return
+
+    result = load_session(conversation, path=target_path)
     if result.get("loaded"):
         runtime_owner.set_session_id(conversation.session_id)
+        sid = result.get("session_id", "")
+        sid_short = (sid[:12] + "…") if len(sid) > 13 else sid
         cli.print_system(
-            f"✅ Resumed session from {result['saved_at']} "
+            f"✅ Resumed session {sid_short} from {result['saved_at']} "
             f"({result['message_count']} messages, ~{conversation.estimated_tokens()} tokens)"
         )
     else:
         cli.print_system(f"Failed to load session: {result.get('error', 'unknown error')}")
+
+
+def _cmd_sessions(cli, **_):
+    """List saved sessions (newest first)."""
+    entries = list_sessions(limit=20)
+    if not entries:
+        cli.print_system("No saved sessions found.")
+        return
+    lines = ["💾 Saved sessions (newest first):"]
+    for i, e in enumerate(entries, start=1):
+        marker = "●" if e["is_latest"] else " "
+        sid = e["session_id"] or "(no-id)"
+        sid_short = (sid[:12] + "…") if len(sid) > 13 else sid
+        meta = e.get("metadata") or {}
+        model = ""
+        if meta.get("provider") or meta.get("model"):
+            model = f"  [{meta.get('provider','?')}:{meta.get('model','?')}]"
+        reason = f"  ({meta['reason']})" if meta.get("reason") else ""
+        lines.append(
+            f"  {marker} {i:>2}. {e['saved_at']:<25} {sid_short:<14} "
+            f"{e['message_count']:>3} msgs{model}{reason}"
+        )
+    lines.append("")
+    lines.append("  ● = latest (default for /continue)")
+    lines.append("  Resume:  /continue <session_id>   or   /continue <timestamp-prefix>")
+    cli.print_system("\n".join(lines))
+
 
 
 # Command dispatch table
@@ -245,6 +296,7 @@ COMMAND_TABLE = {
     "/history": _cmd_history,
     "/new": _cmd_new,
     "/continue": _cmd_continue,
+    "/sessions": _cmd_sessions,
     "/tools": _cmd_tools,
     "/skills": _cmd_skills,
     "/stats": _cmd_stats,
@@ -399,6 +451,15 @@ def run(runtime_owner: LLMOwner) -> None:
 
                 if user_input.startswith("/model"):
                     _cmd_model(cli=cli, runtime_owner=runtime_owner, user_input=user_input)
+                    continue
+
+                if user_input.startswith("/continue "):
+                    _cmd_continue(
+                        cli=cli,
+                        runtime_owner=runtime_owner,
+                        conversation=conversation,
+                        user_input=user_input,
+                    )
                     continue
 
 

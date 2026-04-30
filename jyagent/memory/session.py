@@ -134,6 +134,134 @@ def has_saved_session(path: Optional[str] = None) -> bool:
     return os.path.isfile(path)
 
 
+def list_sessions(limit: Optional[int] = None) -> list[dict]:
+    """List saved sessions sorted by saved_at (newest first).
+
+    Returns a list of dicts with keys:
+      ``path``, ``filename``, ``session_id``, ``saved_at``,
+      ``message_count``, ``metadata``, ``is_latest``.
+
+    Bad / unreadable session files are silently skipped.
+    """
+    ensure_session_dir()
+    latest_real_path = ""
+    try:
+        # latest.json may be a regular file (atomic rename); resolve to detect dupes
+        if os.path.isfile(config.LATEST_SESSION_FILE):
+            latest_real_path = os.path.realpath(config.LATEST_SESSION_FILE)
+    except OSError:
+        latest_real_path = ""
+
+    out: list[dict] = []
+    seen_paths: set[str] = set()
+    try:
+        names = os.listdir(config.SESSIONS_DIR)
+    except OSError:
+        return out
+
+    # Always include latest.json first if present
+    candidates: list[str] = []
+    if os.path.isfile(config.LATEST_SESSION_FILE):
+        candidates.append(config.LATEST_SESSION_FILE)
+    for name in names:
+        if not name.endswith(".json") or name == "latest.json":
+            continue
+        candidates.append(os.path.join(config.SESSIONS_DIR, name))
+
+    for full in candidates:
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        # Dedupe latest.json against its archive twin (same content, different name)
+        try:
+            real = os.path.realpath(full)
+        except OSError:
+            real = full
+        sid = payload.get("session_id") or ""
+        saved_at = payload.get("saved_at") or ""
+        # If the latest file and an archive both have the same session_id +
+        # saved_at, prefer the latest entry (already added) and skip the dup.
+        dup_key = (sid, saved_at)
+        if dup_key in seen_paths:
+            continue
+        seen_paths.add(dup_key)
+        out.append({
+            "path": full,
+            "filename": os.path.basename(full),
+            "session_id": sid,
+            "saved_at": saved_at,
+            "message_count": payload.get("message_count", len(payload.get("messages", []))),
+            "metadata": payload.get("metadata", {}),
+            "is_latest": (real == latest_real_path) or (full == config.LATEST_SESSION_FILE),
+        })
+
+    out.sort(key=lambda e: e["saved_at"], reverse=True)
+    if limit:
+        out = out[:limit]
+    return out
+
+
+def find_session(query: str) -> Optional[dict]:
+    """Resolve a user-supplied query to a session entry.
+
+    Accepted query forms (in order of precedence):
+      * ``"latest"`` → latest.json (if it exists)
+      * exact ``session_id`` match
+      * unique session_id prefix match (≥4 chars)
+      * exact filename match (with or without .json extension)
+      * unique filename / saved_at prefix match (e.g. ``20260430``)
+
+    Returns the session entry dict (same shape as ``list_sessions``) or
+    ``None`` if no unambiguous match is found.
+    """
+    if not query:
+        return None
+    q = query.strip()
+    if not q:
+        return None
+
+    if q.lower() == "latest":
+        if has_saved_session():
+            entries = list_sessions()
+            for e in entries:
+                if e["is_latest"]:
+                    return e
+            return entries[0] if entries else None
+        return None
+
+    entries = list_sessions()
+    if not entries:
+        return None
+
+    # Exact session_id
+    for e in entries:
+        if e["session_id"] == q:
+            return e
+
+    # Exact filename (with or without .json)
+    q_fn = q if q.endswith(".json") else q + ".json"
+    for e in entries:
+        if e["filename"] == q_fn or e["filename"] == q:
+            return e
+
+    # Prefix matches — require ≥4 chars to avoid accidental hits
+    if len(q) >= 4:
+        sid_matches = [e for e in entries if e["session_id"].startswith(q)]
+        if len(sid_matches) == 1:
+            return sid_matches[0]
+        # Filename / saved_at prefix (timestamp like "20260430")
+        fn_matches = [
+            e for e in entries
+            if e["filename"].startswith(q) or e["saved_at"].replace("-", "").replace(":", "").startswith(q)
+        ]
+        if len(fn_matches) == 1:
+            return fn_matches[0]
+
+    return None
+
+
 def delete_session(path: Optional[str] = None) -> bool:
     """Delete a saved session file."""
     path = path or config.LATEST_SESSION_FILE

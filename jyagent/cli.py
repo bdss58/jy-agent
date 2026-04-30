@@ -268,6 +268,8 @@ class CLI:
             ("/history", "Show last 10 messages"),
             ("/new", "Clear conversation and start fresh"),
             ("/continue", "Resume last saved session"),
+            ("/continue <id>", "Resume by session id / timestamp prefix"),
+            ("/sessions", "List saved sessions"),
             ("/tools", "List registered tools"),
             ("/model", "Show or switch provider/model"),
             ("/multi", "Toggle multi-line input mode"),
