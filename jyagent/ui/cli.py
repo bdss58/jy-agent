@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from .runtime.stats import get_stats
+from ..runtime.stats import get_stats
 
 
 # ─── Rich console with custom theme ──────────────────────────────────────────
@@ -54,7 +54,9 @@ class CLI:
         self.multiline_mode = [False]  # mutable container for toggle
 
         # Resolve history file path relative to project root
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # NOTE: cli.py lives at jyagent/ui/cli.py (depth 2 inside the package),
+        # so we need three dirname() calls to escape to the project root.
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         history_path = os.path.join(project_root, history_file)
 
         self.session = PromptSession(
@@ -112,7 +114,7 @@ class CLI:
     def print_banner(self, model_label: str = ""):
         """Print the startup banner."""
         if not model_label:
-            from .config import AGENT_PROVIDER, AGENT_MODEL
+            from ..config import AGENT_PROVIDER, AGENT_MODEL
             model_label = f"{AGENT_PROVIDER}:{AGENT_MODEL}"
 
         banner_text = Text()

@@ -137,7 +137,9 @@ jyagent/
   mcp/                  # MCP protocol — client + server lifecycle / tool registration
     client.py           #   Sync wrapper around the official MCP SDK
     manager.py          #   MCPManager (lifecycle, keepalive, Chrome helpers)
-  terminal_ux.py        # CLI-side LoopCallbacks implementation
+  ui/                   # Terminal UI — prompt_toolkit + rich + LoopCallbacks
+    cli.py              #   Multi-line prompt, status bar, slash-command dispatch
+    terminal.py         #   Streaming callbacks (LoopCallbacks impl) + spinner
   config.py             # Env-driven config (overridable by library users)
 
 data/
