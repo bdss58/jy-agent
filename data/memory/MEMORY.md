@@ -77,3 +77,4 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 [gotcha] `warnings.deprecated` (PEP 702) requires Python 3.13+; use `typing_extensions.deprecated` for 3.12 compat
 [tip] For generic build pipelines that need both build-host and customer-host validation: bake the validator INTO the image (e.g. /app/preflight.sh + /app/preflight.d/*.sh). Both sides run `docker exec <ct> /app/preflight.sh` — eliminates the dual-list drift bug.
 [tip] Dockerfile build-arg cache: declare `ARG FOO_VERSION` JUST BEFORE the RUN that uses it, not at the top of the stage. Adding/changing an ARG invalidates the cache for every downstream RUN, even ones that don't reference it.
+[gotcha] `claude -p --bare` buffers ALL output until completion. If SIGTERMed at deadline, you get an empty `output` field BUT disk changes already persisted — recover via `git status` / `git diff`. Don't conclude "Claude Code did nothing".
