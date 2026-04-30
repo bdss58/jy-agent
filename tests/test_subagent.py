@@ -184,6 +184,119 @@ class TestCheckAgentRunningStatus:
         # Cleanup
         gate.set()
 
+class TestCheckAgentWait:
+    """check_agent(agent_id, action='wait') should block until the agent
+    finishes (or until wait_timeout_seconds elapses), then return the same
+    response shape as action='status'."""
+
+    def test_wait_returns_result_when_agent_finishes_during_window(self):
+        """If the agent completes during the wait window, we should get
+        the final result without paying for an extra polling turn."""
+        gate = threading.Event()
+
+        def slow_then_done(*args, **kwargs):
+            # Finish ~0.2s after dispatch — well within the wait window
+            gate.wait(timeout=10)
+            return _completed_outcome("waited answer")
+
+        with (
+            patch("jyagent.tools.subagent._run_subagent", side_effect=slow_then_done),
+            patch("jyagent.tools.subagent._BG_GRACE_PERIOD", 0.05),
+        ):
+            result = dispatch_agent(task="wait task", background=True)
+            payload = json.loads(result.content)
+            agent_id = payload["agent_id"]
+
+            # Release the worker so it finishes shortly into the wait
+            def _release():
+                time.sleep(0.2)
+                gate.set()
+            threading.Thread(target=_release, daemon=True).start()
+
+            t0 = time.monotonic()
+            check_result = check_agent(
+                agent_id=agent_id, action="wait", wait_timeout_seconds=5,
+            )
+            elapsed = time.monotonic() - t0
+
+        assert not check_result.is_error
+        assert "waited answer" in check_result.content
+        # Should have unblocked roughly when the worker finished, NOT after
+        # the full 5s timeout.
+        assert elapsed < 3.0, f"wait took too long: {elapsed:.2f}s"
+
+    def test_wait_returns_running_status_after_timeout(self):
+        """If the agent does NOT finish within wait_timeout_seconds, wait
+        should return the running-status payload (same shape as action='status'
+        on a still-running agent)."""
+        gate = threading.Event()
+
+        def blocking(*args, **kwargs):
+            gate.wait(timeout=10)
+            return _completed_outcome("never seen")
+
+        with (
+            patch("jyagent.tools.subagent._run_subagent", side_effect=blocking),
+            patch("jyagent.tools.subagent._BG_GRACE_PERIOD", 0.05),
+        ):
+            result = dispatch_agent(task="slow task", background=True)
+            payload = json.loads(result.content)
+            agent_id = payload["agent_id"]
+
+            t0 = time.monotonic()
+            check_result = check_agent(
+                agent_id=agent_id, action="wait", wait_timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - t0
+            gate.set()  # cleanup
+
+        assert not check_result.is_error
+        status_payload = json.loads(check_result.content)
+        assert status_payload["status"] == "running"
+        assert status_payload["agent_id"] == agent_id
+        # Must have actually blocked for ~1s (not returned instantly)
+        assert elapsed >= 0.9, f"wait did not actually block: {elapsed:.2f}s"
+        assert elapsed < 3.0, f"wait blocked too long: {elapsed:.2f}s"
+
+    def test_wait_returns_immediately_when_already_done(self):
+        """If the agent is already done before wait is called, wait should
+        return the result immediately without blocking."""
+        gate = threading.Event()
+
+        def slow_then_done(*args, **kwargs):
+            # Wait briefly so we miss the grace period and go to background,
+            # then finish before the test calls wait().
+            gate.wait(timeout=10)
+            return _completed_outcome("already done")
+
+        with (
+            patch("jyagent.tools.subagent._run_subagent", side_effect=slow_then_done),
+            patch("jyagent.tools.subagent._BG_GRACE_PERIOD", 0.05),
+        ):
+            result = dispatch_agent(task="instant task", background=True)
+            payload = json.loads(result.content)
+            agent_id = payload["agent_id"]
+
+            # Let the worker finish well before we call wait
+            gate.set()
+            # Poll the future directly — robust against any scheduling jitter
+            agent = _bg_registry.get(agent_id)
+            assert agent is not None
+            agent.future.result(timeout=5)
+
+            t0 = time.monotonic()
+            check_result = check_agent(
+                agent_id=agent_id, action="wait",
+                wait_timeout_seconds=10,
+            )
+            elapsed = time.monotonic() - t0
+
+        assert not check_result.is_error
+        assert "already done" in check_result.content
+        # Must not have blocked for anywhere near 10s
+        assert elapsed < 1.0, f"wait blocked unexpectedly: {elapsed:.2f}s"
+
+
 
 class TestCheckAgentKill:
     """check_agent(agent_id, action='kill') should cancel the agent."""

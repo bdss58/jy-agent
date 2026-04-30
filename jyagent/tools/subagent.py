@@ -43,6 +43,10 @@ _SUBAGENT_STATUS_COMPLETED = "completed"
 _SUBAGENT_STATUS_MAX_STEPS = "max_steps"
 _SUBAGENT_STATUS_API_ERROR = "api_error"
 
+# Hard cap on action="wait" blocking time for check_agent. Mirrors
+# _BG_WAIT_MAX_SECONDS in tools/core.py for check_background.
+_BG_AGENT_WAIT_MAX_SECONDS = 300
+
 # Track nesting to prevent runaway recursion.
 # Uses contextvars.ContextVar + explicit copy_context().run() because sub-agents
 # run in ThreadPoolExecutor worker threads.  ThreadPoolExecutor does NOT auto-
@@ -692,7 +696,11 @@ CHECK_AGENT_SCHEMA = {
     "description": (
         "Check status of a background sub-agent or manage background agents. "
         "Use after dispatch_agent(background=True) to poll for results. "
-        "action='status' returns progress/result. action='kill' cancels the agent. "
+        "action='status' (default) returns current progress/result. "
+        "action='wait' blocks up to wait_timeout_seconds for the agent to finish "
+        "then returns its result — prefer this over tight polling loops "
+        "(each poll costs a model turn). "
+        "action='kill' cancels the agent (cooperative cancel via cancel_event). "
         "action='list' shows all active background agents."
     ),
     "input_schema": {
@@ -700,12 +708,18 @@ CHECK_AGENT_SCHEMA = {
         "properties": {
             "agent_id": {
                 "type": "integer",
-                "description": "ID of the background agent (from dispatch_agent response). Required for status/kill.",
+                "description": "ID of the background agent (from dispatch_agent response). Required for status/kill/wait.",
             },
             "action": {
                 "type": "string",
-                "enum": ["status", "kill", "list"],
-                "description": "Action: 'status' (default) check progress, 'kill' cancel agent, 'list' show all active.",
+                "enum": ["status", "wait", "kill", "list"],
+                "description": "Action: 'status' (default) check progress, 'wait' block until done or timeout, 'kill' cancel agent, 'list' show all active.",
+            },
+            "wait_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 300,
+                "description": "Only used with action='wait'. Max seconds to block waiting for the agent to finish. Default 60, hard cap 300.",
             },
         },
         "required": [],
@@ -713,14 +727,18 @@ CHECK_AGENT_SCHEMA = {
 }
 
 
-def check_agent(agent_id: int = -1, action: str = "status") -> ToolResult:
+def check_agent(
+    agent_id: int = -1,
+    action: str = "status",
+    wait_timeout_seconds: int = 60,
+) -> ToolResult:
     """Check on or manage background sub-agents."""
     if action == "list":
         return ToolResult(json.dumps(_bg_registry.list_active()))
 
     if agent_id < 0:
         return ToolResult(
-            "Error: agent_id is required for status/kill actions.",
+            "Error: agent_id is required for status/kill/wait actions.",
             is_error=True,
         )
 
@@ -732,7 +750,26 @@ def check_agent(agent_id: int = -1, action: str = "status") -> ToolResult:
             is_error=True,
         )
 
-    if action == "kill":
+    if action == "wait":
+        # Block up to the cap; no-op if already done. After the wait, fall
+        # through to the same "status" handling below so the response shape
+        # is identical regardless of whether the agent finished during the
+        # wait or is still running.
+        if not agent.future.done():
+            wait_s = max(
+                1, min(int(wait_timeout_seconds), _BG_AGENT_WAIT_MAX_SECONDS)
+            )
+            try:
+                agent.future.result(timeout=wait_s)
+            except concurrent.futures.TimeoutError:
+                pass  # still running — caller can re-wait or check status
+            except Exception:
+                # Real failure — let the status branch surface it via the
+                # standard error path below.
+                pass
+        # Fall through to status handling.
+
+    elif action == "kill":
         agent.cancel_event.set()  # cooperative cancel
         try:
             agent.future.result(timeout=10)  # wait for clean shutdown
@@ -753,7 +790,7 @@ def check_agent(agent_id: int = -1, action: str = "status") -> ToolResult:
         _bg_registry.remove(agent_id)
         return ToolResult(f"Agent {agent_id} cancelled.")
 
-    # action == "status"
+    # action == "status" (or "wait" falling through after blocking)
     if agent.future.done():
         try:
             outcome = agent.future.result(timeout=0)
