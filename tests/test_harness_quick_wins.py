@@ -102,7 +102,7 @@ class TestRemediation:
 
 # ─── Cost budget ───────────────────────────────────────────────────────────
 
-from jyagent.runtime.loop.engine import _CostTracker
+from jyagent.runtime.loop.cost import CostTracker as _CostTracker
 
 
 class TestCostTracker:
@@ -154,7 +154,8 @@ class TestCostTracker:
 
 # --- Response-aware stuck-loop detection ---
 
-from jyagent.runtime.loop.engine import _StuckLoopDetector, ToolCallRequest
+from jyagent.runtime.loop.stuck_loop import StuckLoopDetector as _StuckLoopDetector
+from jyagent.runtime.loop.engine import ToolCallRequest
 
 
 class TestStuckLoopDetector:

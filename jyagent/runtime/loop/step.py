@@ -116,7 +116,7 @@ class RunState:
 
     # Heavy collaborators (built in setup; never replaced after)
     cost_tracker: "CostTracker | None" = None
-    stuck_detector: Any = None        # _StuckLoopDetector instance
+    stuck_detector: Any = None        # StuckLoopDetector instance
     tools_batch: ToolBatch = field(default_factory=ToolBatch.empty)
     trace: Any = None                 # tracer or None
     effective_spec: Any = None        # ModelSpec
@@ -240,13 +240,13 @@ class RunState:
         # caller never runs the loop (e.g. test collection).
         from .tracing import get_tracer
         from .cost import CostTracker
-        from .engine import _StuckLoopDetector
+        from .stuck_loop import StuckLoopDetector
 
         trace = get_tracer()
         if trace:
             trace.start(effective_spec.provider, effective_spec.model)
         cost_tracker = CostTracker() if cfg.max_cost_usd is not None else None
-        stuck_detector = _StuckLoopDetector(cfg.dedup_threshold)
+        stuck_detector = StuckLoopDetector(cfg.dedup_threshold)
 
         return cls(
             system_prompt=system_prompt,
@@ -318,7 +318,8 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     """
     # Lazy imports break the engine→step→engine cycle without polluting
     # module-load order. Cost: one dict lookup per step (negligible).
-    from .engine import _finalize_run, _is_truncated, _StuckLoopDetector
+    from .engine import _finalize_run, _is_truncated
+    from .stuck_loop import StuckLoopDetector
     from .llm_runner import (
         extract_text as _extract_text,
         build_runtime_options as _build_runtime_options,
@@ -731,7 +732,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     stuck_feedback = None
     seen_batch_keys: set[str] = set()
     for block, result in tool_results_tuples:
-        batch_key = _StuckLoopDetector._make_key(
+        batch_key = StuckLoopDetector._make_key(
             block.name, block.input if isinstance(block.input, dict) else {},
         )
         if batch_key in seen_batch_keys:

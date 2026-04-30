@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import pytest
 
 from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop import tool_executor as le_te
 from jyagent.runtime.loop.todos import (
     TodoItem,
     WRITE_TODOS_SCHEMA,
@@ -264,7 +265,7 @@ class TestAgentLoopTodosWiring:
         loop._tool_source = None
         loop._model_spec = None
         loop._cancel_event = None
-        loop._executor = le._tool_dispatch_executor
+        loop._executor = le_te.tool_dispatch_executor
         loop._todos = []
         return loop
 

@@ -18,6 +18,7 @@ import pytest
 
 from jyagent.runtime.loop import checkpoint
 from jyagent.runtime.loop import engine as loop_engine
+from jyagent.runtime.loop import tool_executor as loop_engine_te
 from jyagent.runtime.loop.config import LoopConfig
 from jyagent.runtime.tools.registry import ToolRegistry
 
@@ -127,7 +128,7 @@ class TestDispatchExecutorGrowsWithConfig:
         # Snapshot + reset module state so the test is independent.
         # The canonical home for this state is now
         # runtime/loop/tool_executor.py.  Restoring by writing through
-        # ``loop_engine._tool_dispatch_executor`` would create a STATIC
+        # ``loop_engine_te.tool_dispatch_executor`` would create a STATIC
         # attribute that shadows the PEP-562 ``__getattr__`` passthrough,
         # breaking later tests (e.g. test_backcompat_alias_points_to_dispatch)
         # that expect the back-compat names to mirror the live pool.
@@ -135,13 +136,13 @@ class TestDispatchExecutorGrowsWithConfig:
         original_executor = _te.tool_dispatch_executor
         original_cap = _te.tool_dispatch_cap
         try:
-            exe_small = loop_engine._get_tool_dispatch_executor(8)
-            cap_small = loop_engine._tool_dispatch_cap
+            exe_small = loop_engine_te.get_tool_dispatch_executor(8)
+            cap_small = loop_engine_te.tool_dispatch_cap
             assert cap_small >= 8
             assert exe_small._max_workers >= 8
 
-            exe_big = loop_engine._get_tool_dispatch_executor(16)
-            cap_big = loop_engine._tool_dispatch_cap
+            exe_big = loop_engine_te.get_tool_dispatch_executor(16)
+            cap_big = loop_engine_te.tool_dispatch_cap
             assert cap_big >= 16
             assert exe_big._max_workers >= 16
             # Growth must have replaced the executor.
@@ -152,26 +153,26 @@ class TestDispatchExecutorGrowsWithConfig:
 
     def test_get_executor_reuses_when_already_big_enough(self):
         """Asking for a smaller size than current cap returns the same pool."""
-        a = loop_engine._get_tool_dispatch_executor(64)
-        b = loop_engine._get_tool_dispatch_executor(4)
+        a = loop_engine_te.get_tool_dispatch_executor(64)
+        b = loop_engine_te.get_tool_dispatch_executor(4)
         assert a is b
 
     def test_get_executor_floor_is_8(self):
         """Tiny requests still get at least 8 workers."""
-        exe = loop_engine._get_tool_dispatch_executor(1)
-        assert loop_engine._tool_dispatch_cap >= 8
+        exe = loop_engine_te.get_tool_dispatch_executor(1)
+        assert loop_engine_te.tool_dispatch_cap >= 8
         assert exe._max_workers >= 8
 
     def test_agent_loop_init_sizes_executor_from_config(self, monkeypatch):
         """AgentLoop(__init__) must pass cfg.max_tool_workers into the grow helper."""
         captured: dict = {}
-        original = loop_engine._get_tool_dispatch_executor
+        original = loop_engine_te.get_tool_dispatch_executor
 
         def spy(min_workers: int = 8):
             captured["min_workers"] = min_workers
             return original(min_workers)
 
-        monkeypatch.setattr(loop_engine, "_get_tool_dispatch_executor", spy)
+        monkeypatch.setattr(loop_engine, "get_tool_dispatch_executor", spy)
 
         # Minimal stub for LLMOwner — AgentLoop only stores it.
         owner = types.SimpleNamespace()
@@ -519,7 +520,7 @@ class TestRunShellTimeoutCoercion:
         )
         batch = reg.freeze()
         # "30s" cannot be int()-coerced — old code raised ValueError here.
-        result = loop_engine._execute_tool_with_timeout(
+        result = loop_engine_te.execute_tool_with_timeout(
             "run_shell",
             {"command": "echo hi", "timeout": "30s"},
             batch,
@@ -540,7 +541,7 @@ class TestRunShellTimeoutCoercion:
             {"name": "run_shell", "input_schema": {"type": "object"}},
         )
         batch = reg.freeze()
-        result = loop_engine._execute_tool_with_timeout(
+        result = loop_engine_te.execute_tool_with_timeout(
             "run_shell",
             {"command": "ls", "timeout": [1, 2, 3]},
             batch,
@@ -567,7 +568,7 @@ class TestRunShellTimeoutCoercion:
         )
         batch = reg.freeze()
         # Valid int → coercion path runs fine, no fallback.
-        result = loop_engine._execute_tool_with_timeout(
+        result = loop_engine_te.execute_tool_with_timeout(
             "run_shell",
             {"command": "echo ok", "timeout": 30},
             batch,
@@ -809,7 +810,7 @@ class TestAgentLoopReentranceGuard:
         loop._tool_source = None
         loop._model_spec = None
         loop._cancel_event = None
-        loop._executor = loop_engine._tool_dispatch_executor
+        loop._executor = loop_engine_te.tool_dispatch_executor
         loop._todos = []
         loop._partial_side_effects = []
         return loop
@@ -945,7 +946,7 @@ class TestC1CancellationLatency:
         loop._tool_source = None
         loop._model_spec = None
         loop._cancel_event = cancel_event
-        loop._executor = loop_engine._tool_dispatch_executor
+        loop._executor = loop_engine_te.tool_dispatch_executor
         loop._todos = []
         loop._partial_side_effects = []
         return loop
@@ -1128,13 +1129,6 @@ class TestC4Phase1CostExtraction:
         assert ct.cost == 0.0
         assert ct.has_unpriced_usage is False
 
-    def test_engine_reexport_still_works(self):
-        """Engine's private `_CostTracker` alias must still point at the
-        same class for any internal call site that didn't migrate."""
-        from jyagent.runtime.loop import engine as _engine
-        from jyagent.runtime.loop.cost import CostTracker
-        assert _engine._CostTracker is CostTracker
-
     def test_cost_tracker_records_priced_call(self):
         from jyagent.runtime.loop.cost import CostTracker
         ct = CostTracker()
@@ -1184,62 +1178,6 @@ class TestC4Phase2ToolExecutorExtraction:
         assert callable(execute_tools)
         assert callable(get_tool_dispatch_executor)
 
-    def test_engine_reexport_still_works(self):
-        """Engine's underscore-prefixed aliases must be the same objects
-        as the tool_executor public names (identity, not equality)."""
-        from jyagent.runtime.loop import engine as _engine
-        from jyagent.runtime.loop import tool_executor as _te
-        assert _engine._execute_tool is _te.execute_tool
-        assert _engine._execute_tool_with_timeout is _te.execute_tool_with_timeout
-        assert _engine._execute_tools is _te.execute_tools
-        assert _engine._get_tool_dispatch_executor is _te.get_tool_dispatch_executor
-
-    def test_module_globals_track_live_value(self):
-        """Critical: engine._tool_dispatch_executor must mirror the LIVE pool
-        in tool_executor.py, even after a grow.  This is the PEP-562 passthrough
-        test — a naive ``from .tool_executor import _tool_dispatch_executor``
-        would snapshot at import time and go stale on the first grow."""
-        from jyagent.runtime.loop import engine as _engine
-        from jyagent.runtime.loop import tool_executor as _te
-        # Grow to a large size, then confirm engine's back-compat name
-        # returns the NEW pool object (not a stale snapshot).
-        pre_grow = _engine._tool_dispatch_executor
-        _engine._get_tool_dispatch_executor(256)
-        post_grow_engine = _engine._tool_dispatch_executor
-        post_grow_te = _te.tool_dispatch_executor
-        assert post_grow_engine is post_grow_te, (
-            f"engine view ({id(post_grow_engine)}) diverged from "
-            f"tool_executor view ({id(post_grow_te)}) after grow — "
-            "PEP-562 passthrough broken"
-        )
-        # The post-grow object MUST differ from pre-grow (otherwise the
-        # test isn't actually exercising the rebind case).
-        assert post_grow_engine is not pre_grow, (
-            "grow didn't rebind — pool already >= 256 before the call? "
-            "retry the test in isolation"
-        )
-
-    def test_tool_dispatch_cap_tracks_live_value(self):
-        """Same PEP-562 check but for the integer cap (a non-object type)."""
-        from jyagent.runtime.loop import engine as _engine
-        from jyagent.runtime.loop import tool_executor as _te
-        _engine._get_tool_dispatch_executor(300)
-        assert _engine._tool_dispatch_cap == _te.tool_dispatch_cap
-        assert _engine._tool_dispatch_cap >= 300
-
-    def test_tool_executor_alias_points_at_dispatch(self):
-        """engine._tool_executor (historical shorthand) must equal
-        engine._tool_dispatch_executor — both names forward to the same
-        live object in tool_executor.py."""
-        from jyagent.runtime.loop import engine as _engine
-        assert _engine._tool_executor is _engine._tool_dispatch_executor
-
-    def test_engine_getattr_raises_on_unknown(self):
-        """The __getattr__ shim must still raise AttributeError for names
-        it doesn't own — no silent fallback."""
-        from jyagent.runtime.loop import engine as _engine
-        with pytest.raises(AttributeError, match="no attribute"):
-            _ = _engine._definitely_does_not_exist  # noqa: SLF001
 
 
 # ─── LLM call + retry extracted to runtime/loop/llm_runner.py ────────────────
@@ -1282,18 +1220,6 @@ class TestC4Phase3LLMRunnerExtraction:
         ):
             assert hasattr(llm_runner, name), name
             assert callable(getattr(llm_runner, name)), name
-
-    def test_engine_aliases_point_at_llm_runner(self):
-        """engine._{extract_text,extract_tool_calls,is_transient_error,
-        build_runtime_options} must be identical objects to the
-        llm_runner public names.  Any divergence here means two copies of
-        the function live in the tree."""
-        from jyagent.runtime.loop import engine as _engine
-        from jyagent.runtime.loop import llm_runner as _lr
-        assert _engine._extract_text is _lr.extract_text
-        assert _engine._extract_tool_calls is _lr.extract_tool_calls
-        assert _engine._is_transient_error is _lr.is_transient_error
-        assert _engine._build_runtime_options is _lr.build_runtime_options
 
     def test_agent_loop_get_llm_runner_caches(self):
         """AgentLoop._get_llm_runner() must build once and cache — the
@@ -1434,12 +1360,12 @@ class TestC4Phase3LLMRunnerExtraction:
             # in engine.py and imports is_transient_error via a local
             # alias at module-load time.
             import jyagent.runtime.loop.engine as _engine
-            _engine._is_transient_error = llm_runner.is_transient_error
+            _engine.is_transient_error = llm_runner.is_transient_error
             result = loop_c._call_llm_with_retry({}, None, step=0)
         finally:
             llm_runner.is_transient_error = orig
             import jyagent.runtime.loop.engine as _engine
-            _engine._is_transient_error = orig
+            _engine.is_transient_error = orig
         assert result == final
         assert complete_calls == 2, "retry should invoke self._call_complete twice"
 
@@ -1452,12 +1378,12 @@ class TestC4Phase3LLMRunnerExtraction:
         try:
             llm_runner.is_transient_error = lambda e: isinstance(e, _Transient)
             import jyagent.runtime.loop.engine as _engine
-            _engine._is_transient_error = llm_runner.is_transient_error
+            _engine.is_transient_error = llm_runner.is_transient_error
             result = loop_s._call_llm_with_retry({}, None, step=0)
         finally:
             llm_runner.is_transient_error = orig
             import jyagent.runtime.loop.engine as _engine
-            _engine._is_transient_error = orig
+            _engine.is_transient_error = orig
         assert result == final
         assert streaming_calls == 2, "retry should invoke self._call_streaming twice"
 
@@ -1484,17 +1410,6 @@ class TestC4Phase4CompactionExtraction:
         for name in ("truncate_result", "compact_messages", "truncate_tool_call_blocks"):
             assert hasattr(compaction, name), name
             assert callable(getattr(compaction, name)), name
-
-    def test_engine_aliases_point_at_compaction(self):
-        """engine._{truncate_result,compact_messages,truncate_tool_call_blocks}
-        must be the same object as the compaction-module original.
-        Any divergence means two copies of the function exist in the
-        tree."""
-        from jyagent.runtime.loop import engine as _engine
-        from jyagent.runtime.loop import compaction as _c
-        assert _engine._truncate_result is _c.truncate_result
-        assert _engine._compact_messages is _c.compact_messages
-        assert _engine._truncate_tool_call_blocks is _c.truncate_tool_call_blocks
 
     def test_truncate_result_head_tail_split(self):
         """truncate_result keeps first 85% + last 10% of max_chars when

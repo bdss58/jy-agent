@@ -17,12 +17,24 @@ from dataclasses import dataclass
 import pytest
 
 from jyagent.runtime.loop import engine as le
-from jyagent.runtime.loop.engine import (
-    _execute_tool_with_timeout,
-    _execute_tools,
-    ToolCallRequest,
+from jyagent.runtime.loop import tool_executor as le_te
+from jyagent.runtime.loop.compaction import compact_messages
+from jyagent.runtime.loop.cost import CostTracker
+from jyagent.runtime.loop.engine import ToolCallRequest
+from jyagent.runtime.loop.stuck_loop import StuckLoopDetector
+from jyagent.runtime.loop.tool_executor import (
+    execute_tool_with_timeout as _execute_tool_with_timeout,
+    execute_tools as _execute_tools,
 )
 from jyagent.runtime.tools.result import ToolResult
+
+# Anthropic preserver registration is a module-import side effect of
+# the adapter.  TestCompactionPreservesThinkingAdjacency and
+# TestCompactionThinkingPairedWithToolCall both depend on the rule
+# being live in compaction._content_preservers; importing the adapter
+# here at module level guarantees it (some test orderings would
+# otherwise skip the registration when this file is run in isolation).
+import jyagent.llm.providers.anthropic  # noqa: F401  — registration import
 from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
 
 
@@ -102,30 +114,17 @@ class TestNoNestedPoolDeadlock:
     second pool — so there's no inner-future contention to deadlock on.
     """
 
-    def test_backcompat_alias_points_to_dispatch(self):
-        # Read both names via the live module attribute path.
-        # The pool is now canonical in
-        # runtime/loop/tool_executor.py and engine.py forwards via PEP-562
-        # ``__getattr__``.  The earlier-imported ``_tool_dispatch_executor``
-        # at the top of this file is an import-time snapshot that goes stale
-        # once any test grows the pool (previous tests in TestDispatchExecutorGrowsWithConfig
-        # do exactly that).  Do a fresh read so this back-compat invariant
-        # check tests the POST-MOVE semantics (both names surface the
-        # current live pool) instead of the pre-move invariant (both names
-        # were module-load aliases to the same frozen object).
-        assert le._tool_executor is le._tool_dispatch_executor
-
     def test_parallel_batch_larger_than_dispatch_pool_completes(self):
         """A parallel batch of tools equal to the dispatch-pool width must
         complete.  With the old one-pool design this was a hang; with two
         pools it completes in roughly sleep_ms (not sleep_ms × N).
         """
         # Match dispatch width — this is the failure mode of the old design.
-        # The pool is lazy-init; trigger it before reading
-        # `_max_workers` so we don't get None.  `le._tool_dispatch_executor`
-        # routes through the PEP-562 __getattr__ to the LIVE value.
-        le._get_tool_dispatch_executor(8)
-        n = le._tool_dispatch_executor._max_workers  # type: ignore[attr-defined]
+        # The pool is lazy-init; trigger it before reading ``_max_workers``
+        # so we don't get None.  Read from the canonical location
+        # (tool_executor.py) directly; the engine no longer forwards.
+        le_te.get_tool_dispatch_executor(8)
+        n = le_te.tool_dispatch_executor._max_workers  # type: ignore[attr-defined]
         sleep_ms = 150
         functions = {f"t{i}": _sleep_tool(sleep_ms) for i in range(n)}
         batch = _make_batch(functions=functions, parallel_safe=True)
@@ -296,7 +295,7 @@ class TestCancellableRetrySleep:
         loop._tool_source = None
         loop._model_spec = None
         loop._cancel_event = cancel_event
-        loop._executor = le._tool_dispatch_executor
+        loop._executor = le_te.tool_dispatch_executor
         return loop
 
     def test_sleep_without_cancel_event_blocks(self):
@@ -386,7 +385,7 @@ class TestStuckDetectorBatchDedup:
         """Direct white-box test: simulate the per-batch recording logic with
         dedup and assert no stuck feedback is produced.
         """
-        detector = le._StuckLoopDetector(threshold=3)
+        detector = StuckLoopDetector(threshold=3)
         # Simulate 3 identical parallel reads in a single batch.
         name = "read_file"
         args = {"path": "/tmp/a"}
@@ -396,7 +395,7 @@ class TestStuckDetectorBatchDedup:
         seen: set[str] = set()
         feedbacks = []
         for _ in range(3):
-            key = le._StuckLoopDetector._make_key(name, args)
+            key = StuckLoopDetector._make_key(name, args)
             if key in seen:
                 continue
             seen.add(key)
@@ -413,7 +412,7 @@ class TestStuckDetectorBatchDedup:
         """Positive control: genuinely stuck pattern (same call across 3
         separate steps) must still trigger.
         """
-        detector = le._StuckLoopDetector(threshold=3)
+        detector = StuckLoopDetector(threshold=3)
         name, args, content = "run_shell", {"command": "sleep 1"}, "done"
 
         results = [detector.record(name, args, content) for _ in range(3)]
@@ -536,7 +535,7 @@ class TestRetryJitter:
             pass
 
         # Pretend every exception is transient so retries are exercised.
-        with patch.object(le, "_is_transient_error", return_value=True):
+        with patch.object(le, "is_transient_error", return_value=True):
             delays: list[float] = []
 
             class _Loop(le.AgentLoop):
@@ -659,7 +658,7 @@ def _make_loop_for_streaming(owner, *, buffered: bool = False, callbacks=None):
     loop._tool_source = None
     loop._model_spec = None
     loop._cancel_event = None
-    loop._executor = le._tool_dispatch_executor
+    loop._executor = le_te.tool_dispatch_executor
     return loop
 
 
@@ -794,7 +793,7 @@ class TestStreamRetryCallbacks:
         loop = _make_loop_for_streaming(owner, buffered=False, callbacks=cbs)
         # Treat the simulated 503 as transient.
         from unittest.mock import patch
-        with patch.object(le, "_is_transient_error", return_value=True):
+        with patch.object(le, "is_transient_error", return_value=True):
             text, _, stop, _ = loop._call_llm_with_retry(context={}, options=None, step=0)
         assert stop == "stop"
         assert text == "full answer"
@@ -896,7 +895,7 @@ class TestCompactionPreservesThinkingAdjacency:
     def test_thinking_preserved_when_paired_with_tool_use(self):
         msgs, _, _ = self._make_conv(n_padding=30)
         # Aggressive token budget — force compaction to run.
-        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
+        compacted = compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
         # Must be a different list (compaction ran).
         assert compacted is not msgs, "compaction did not run — test setup issue"
 
@@ -922,7 +921,7 @@ class TestCompactionPreservesThinkingAdjacency:
 
     def test_standalone_thinking_still_stripped_for_token_economy(self):
         msgs, _, _ = self._make_conv(n_padding=30)
-        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
+        compacted = compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
         # Find the standalone assistant (text "Here's my answer.").
         stand = None
         for m in compacted:
@@ -958,7 +957,7 @@ class TestDaemonThreadTimeout:
 
         batch = _make_batch(functions={"slow_tool": _slow}, parallel_safe=False)
         t0 = time.perf_counter()
-        result = le._execute_tool_with_timeout(
+        result = _execute_tool_with_timeout(
             "slow_tool", {"label": "x"}, batch, 1,
         )
         elapsed = time.perf_counter() - t0
@@ -996,7 +995,7 @@ class TestDaemonThreadTimeout:
         # Fire 20 timeouts.  Under the old design this would pin 16+ pool
         # workers indefinitely.  Budget: 20 × 1s ≈ 20s + overhead.
         for _ in range(20):
-            r = le._execute_tool_with_timeout(
+            r = _execute_tool_with_timeout(
                 "slow", {"label": "x"}, slow_batch, 1,
             )
             assert r.is_error and "timed out" in r.content.lower()
@@ -1007,7 +1006,7 @@ class TestDaemonThreadTimeout:
         # would block up to ~60 seconds waiting for a worker to free.
         # Under the new design: daemon thread, instant start.
         t0 = time.perf_counter()
-        result = le._execute_tool_with_timeout(
+        result = _execute_tool_with_timeout(
             "fast", {"label": "x"}, fast_batch, 5,
         )
         elapsed_fast = time.perf_counter() - t0
@@ -1030,7 +1029,7 @@ class TestDaemonThreadTimeout:
         import ast
         import inspect
 
-        source = inspect.getsource(le._execute_tool_with_timeout)
+        source = inspect.getsource(_execute_tool_with_timeout)
         tree = ast.parse(source)
         fn_node = tree.body[0]
         assert isinstance(fn_node, ast.FunctionDef)
@@ -1105,7 +1104,7 @@ class TestCompactionThinkingPairedWithToolCall:
 
     def test_thinking_preserved_when_paired_with_tool_call(self):
         msgs, _ = self._make_conv(tool_block_type="tool_call")
-        compacted = le._compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
+        compacted = compact_messages(msgs, max_tokens=1000, compact_chars=200, batch=le.ToolBatch.empty())
         assert compacted is not msgs, "compaction did not run — test setup issue"
         # Locate the signed assistant message.
         signed_after = None
@@ -1352,7 +1351,7 @@ class TestCostTrackerLowerBound:
     """
 
     def test_cost_excludes_unpriced_and_flags_it(self):
-        tracker = le._CostTracker()
+        tracker = CostTracker()
         # One priced call at a known-to-exist model; one call at a bogus
         # provider that lookup will miss.
         tracker.record(

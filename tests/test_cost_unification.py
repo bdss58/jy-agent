@@ -16,6 +16,7 @@ import pytest
 
 from jyagent.runtime import stats as st
 from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop.cost import CostTracker
 
 
 @pytest.fixture
@@ -42,7 +43,7 @@ class TestPricingUnification:
         ss.record_usage(usage, provider=provider, model=model)
         session_cost = ss.total_cost
 
-        ct = le._CostTracker()
+        ct = CostTracker()
         ct.record(usage, provider, model)
         tracker_cost = ct.cost
         return session_cost, tracker_cost
@@ -151,7 +152,7 @@ class TestPricingUnification:
         assert ss.total_cost is None
         assert ss._known_total_cost == 0.0
 
-        ct = le._CostTracker()
+        ct = CostTracker()
         ct.record(usage, "nope", "nope-model")
         assert ct.has_unpriced_usage is True
         assert ct.cost == 0.0

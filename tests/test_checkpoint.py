@@ -16,6 +16,7 @@ import threading
 import pytest
 
 from jyagent.runtime.loop import engine as le
+from jyagent.runtime.loop import tool_executor as le_te
 from jyagent.runtime.loop.checkpoint import (
     LoopCheckpoint,
     checkpoint_path,
@@ -211,7 +212,7 @@ def _make_bare_loop(cfg: le.LoopConfig) -> le.AgentLoop:
     loop._tool_source = None
     loop._model_spec = None
     loop._cancel_event = None
-    loop._executor = le._tool_dispatch_executor
+    loop._executor = le_te.tool_dispatch_executor
     loop._todos = []
     loop._run_id = ""
     return loop

@@ -65,35 +65,15 @@ def _t_as_dict(t: Any) -> dict:
 
 # ─── Shared dispatch executor ────────────────────────────────────────────────
 # The shared tool-dispatch pool, its lazy-grow helper, and the
-# ``_execute_tool*`` helpers moved to
-# ``runtime/loop/tool_executor.py``.  Internal call sites still use the
-# underscore-prefixed names via these aliases; tests that poke module
-# globals (``_tool_dispatch_executor``, ``_tool_dispatch_cap``, etc.) also
-# see them here via the PEP-562 ``__getattr__`` at the bottom of the file.
-#
-# ⚠️ IMPORTANT — back-compat scope:
-# The per-step body in ``runtime/loop/step.py::run_step`` calls
-# ``tool_executor.execute_tools`` DIRECTLY, NOT through this engine-level
-# alias.  Consequently, any downstream test or extension that patches
-# ``jyagent.runtime.loop.engine._execute_tools`` (or the other names
-# aliased below) will NOT intercept tool calls made during the normal
-# loop step.  The engine alias now only covers callers that imported
-# ``_execute_tools`` from ``engine`` directly before the helper moved.
-# New code and tests should patch ``jyagent.runtime.loop.tool_executor``
-# instead.
+# tool-execution helpers live in ``runtime/loop/tool_executor.py``.
+# Engine imports the public names directly — the per-step body in
+# ``runtime/loop/step.py::run_step`` calls ``tool_executor.execute_tools``
+# directly, so any patching/monkeypatching for tests should target
+# ``jyagent.runtime.loop.tool_executor`` (not ``engine``).
 from .tool_executor import (  # noqa: E402
-    execute_tool as _execute_tool,
-    execute_tool_with_timeout as _execute_tool_with_timeout,
-    execute_tools as _execute_tools,
-    get_tool_dispatch_executor as _get_tool_dispatch_executor,
+    execute_tool_with_timeout,
+    get_tool_dispatch_executor,
 )
-# The pool + lock + cap are MODULE STATE that ``get_tool_dispatch_executor``
-# REBINDS when the pool grows.  A plain ``from .tool_executor import
-# _tool_dispatch_executor`` would snapshot the pre-grow object and go stale.
-# The engine-level back-compat names (``_tool_dispatch_executor``,
-# ``_tool_dispatch_cap``, ``_tool_dispatch_lock``, ``_tool_executor``) are
-# served by a module-level ``__getattr__`` (PEP 562) at the bottom of this
-# file, which delegates to the live attribute on ``tool_executor``.
 
 
 # ─── Private helpers ─────────────────────────────────────────────────────────
@@ -102,33 +82,20 @@ from .tool_executor import (  # noqa: E402
 # ─── Harness helpers ─────────────────────────────────────────────────────────
 
 # Cost-accounting helpers live in runtime/loop/cost.py.
-# Kept as a private alias so internal imports (`_CostTracker()`) continue
-# to work without churn.
-from .cost import CostTracker as _CostTracker  # noqa: E402
+from .cost import CostTracker  # noqa: E402
 
 
-# The stuck-loop detector moved to its own
-# module (``runtime/loop/stuck_loop.py``) so this file can shrink toward its
-# thin-orchestrator role.  The underscore-prefixed back-compat
-# alias is preserved because ``runtime/loop/step.py`` and any out-of-tree
-# consumers reference ``engine._StuckLoopDetector`` directly.
-from .stuck_loop import StuckLoopDetector as _StuckLoopDetector  # noqa: E402
+# Stuck-loop detector lives in runtime/loop/stuck_loop.py.
+from .stuck_loop import StuckLoopDetector  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
 
-
-# LLM extraction helpers moved to
-# runtime/loop/llm_runner.py.  Engine keeps back-compat aliases with the
-# historical underscore-prefixed names so internal call sites (and tests
-# that monkeypatch them) continue to work unchanged.
+# LLM extraction helpers live in runtime/loop/llm_runner.py.
 from .llm_runner import (
-    extract_text as _extract_text,
-    extract_tool_calls as _extract_tool_calls,
-    is_transient_error as _is_transient_error,
-    build_runtime_options as _build_runtime_options,
+    is_transient_error,
+    build_runtime_options,
 )
 
 
@@ -236,14 +203,9 @@ def _finalize_run(
     )
 
 
-# Compaction helpers live in
-# runtime/loop/compaction.py.  Engine keeps underscore-prefixed back-compat
-# aliases so tests and internal callers that import the historical names
-# continue to work unchanged.
+# Compaction helpers live in runtime/loop/compaction.py.
 from .compaction import (  # noqa: E402
-    compact_messages as _compact_messages,
-    truncate_result as _truncate_result,
-    truncate_tool_call_blocks as _truncate_tool_call_blocks,
+    truncate_tool_call_blocks,
 )
 
 
@@ -284,7 +246,7 @@ class AgentLoop(LoopThreadHelper):
         # wide as the configured ``max_tool_workers`` (the historical
         # singleton was hard-capped at 8, silently throttling configs
         # that asked for more dispatch parallelism).
-        self._executor = _get_tool_dispatch_executor(config.max_tool_workers)
+        self._executor = get_tool_dispatch_executor(config.max_tool_workers)
         # Task-plan scratchpad (see jyagent/todos.py).  Populated via the
         # `write_todos` tool and seeded optionally via run(initial_todos=...)
         # so outer layers can carry the plan across turns.
@@ -557,7 +519,7 @@ class AgentLoop(LoopThreadHelper):
                     }
 
                     # Create fallback options with tool_choice=none
-                    _base = _build_runtime_options(
+                    _base = build_runtime_options(
                         self._runtime_owner,
                         cfg.initial_max_tokens,
                         model_spec=self._model_spec,
@@ -609,7 +571,7 @@ class AgentLoop(LoopThreadHelper):
                     if cfg.truncate_large_inputs:
                         content = fallback_message.get("content", [])
                         fallback_message = dict(fallback_message)
-                        fallback_message["content"] = _truncate_tool_call_blocks(content, state.last_step_batch)
+                        fallback_message["content"] = truncate_tool_call_blocks(content, state.last_step_batch)
 
                     # Append fallback turn — directive first, then the
                     # assistant reply — so the persisted transcript stays
@@ -743,7 +705,7 @@ class AgentLoop(LoopThreadHelper):
                 raise
             except Exception as err:
                 last_error = err
-                if _is_transient_error(err) and attempt < cfg.retry_attempts:
+                if is_transient_error(err) and attempt < cfg.retry_attempts:
                     if self._is_cancelled():
                         raise
                     # Exponential backoff with "equal jitter" (AWS
@@ -787,32 +749,3 @@ class AgentLoop(LoopThreadHelper):
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Thin delegate → ``LLMRunner.call_streaming``."""
         return self._get_llm_runner().call_streaming(context, options)
-
-
-# ─── PEP 562 back-compat shim for tool_executor module state ────────────────
-#
-# The pool + lock + cap are MUTABLE module state that
-# ``get_tool_dispatch_executor()`` rebinds inside ``tool_executor.py`` when
-# the pool grows.  If engine.py imported them as values at module-import
-# time, every post-grow read from ``loop_engine._tool_dispatch_executor``
-# would see the pre-grow snapshot.  47 test references across 4 files
-# read those names through the engine module path.
-#
-# PEP 562 (Python 3.7+) lets a module define ``__getattr__`` for lazy /
-# forwarding attribute access.  Each lookup takes one import (cheap) plus
-# one ``getattr`` and returns the live object from tool_executor.py.
-
-_TOOL_EXECUTOR_PASSTHROUGH = {
-    "_tool_dispatch_executor": "tool_dispatch_executor",
-    "_tool_dispatch_cap":      "tool_dispatch_cap",
-    "_tool_dispatch_lock":     "tool_dispatch_lock",
-    "_tool_executor":          "tool_dispatch_executor",
-}
-
-
-def __getattr__(name: str):
-    target = _TOOL_EXECUTOR_PASSTHROUGH.get(name)
-    if target is not None:
-        from . import tool_executor as _te
-        return getattr(_te, target)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
