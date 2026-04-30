@@ -114,11 +114,12 @@ class TestRunImplWiresPhasePolicy:
     def test_source_consults_policy_and_rebuilds_opts(self):
         import inspect
         from jyagent.runtime.loop import step
-        # Phase-policy wiring lives in step.run_step.
-        source = inspect.getsource(step.run_step)
+        # Phase-policy wiring lives in step._build_step_options
+        # (extracted from run_step during the C4-followup decomposition).
+        source = inspect.getsource(step._build_step_options)
         # Policy must be consulted each step after opts is built.
         assert "cfg.phase_policy(" in source, (
-            "phase policy is not invoked inside run_step"
+            "phase policy is not invoked inside _build_step_options"
         )
         # Override must rebuild LLMOptions with the directive's tool_choice.
         assert "tool_choice=directive.tool_choice" in source, (
@@ -142,7 +143,7 @@ class TestRunImplWiresPhasePolicy:
         """
         import inspect
         from jyagent.runtime.loop import step
-        source = inspect.getsource(step.run_step)
+        source = inspect.getsource(step._build_step_options)
         assert "directive = None" in source, (
             "policy-exception path must set directive=None and continue"
         )

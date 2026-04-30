@@ -202,22 +202,25 @@ class TestRunImplWiresReflection:
         from jyagent.runtime.loop import step
         # Lazy import lives in RunState.prepare_for_run(); the
         # consumption (should_reflect / build_reflection_prompt /
-        # on_reflection / last_reflection_count) lives in step.run_step.
+        # on_reflection / last_reflection_count) was extracted from
+        # run_step into step._maybe_reflect during the C4-followup
+        # decomposition.
         prepare_src = inspect.getsource(step.RunState.prepare_for_run)
-        run_step_src = inspect.getsource(step.run_step)
+        reflect_src = inspect.getsource(step._maybe_reflect)
         assert "from . import reflection" in prepare_src, (
             "RunState.prepare_for_run must lazy-import the reflection module "
             "when either reflection config knob is enabled."
         )
-        assert "reflection.should_reflect(" in run_step_src, (
-            "reflection.should_reflect must be consulted each step"
+        assert "reflection.should_reflect(" in reflect_src, (
+            "reflection.should_reflect must be consulted each step "
+            "inside step._maybe_reflect"
         )
-        assert "reflection.build_reflection_prompt(" in run_step_src, (
+        assert "reflection.build_reflection_prompt(" in reflect_src, (
             "build_reflection_prompt must be used to produce the user msg"
         )
-        assert '_fire("on_reflection"' in run_step_src, (
+        assert '_fire("on_reflection"' in reflect_src, (
             "on_reflection callback must fire when an injection happens"
         )
-        assert "last_reflection_count = " in run_step_src and "tool_calls_count" in run_step_src, (
+        assert "last_reflection_count = " in reflect_src and "tool_calls_count" in reflect_src, (
             "cadence counter must advance on every injection"
         )

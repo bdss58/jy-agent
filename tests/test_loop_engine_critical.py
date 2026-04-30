@@ -39,19 +39,37 @@ from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
 
 
 # Combined-source helper for structural tests that grep the loop body.
-# The per-step body lives in
-# ``runtime.loop.step.run_step``; the engine's ``AgentLoop._run_impl``
-# now contains only setup + the for-loop dispatcher + post-loop terminal
-# handlers + the outer try/except. Tests that grep for patterns must
-# therefore consult both sources.
+# The per-step body lives in ``runtime.loop.step``: ``run_step`` is a thin
+# orchestrator that delegates to private ``_prepare_step_batch``,
+# ``_compact_and_build_context``, ``_build_step_options``,
+# ``_record_llm_usage_and_cost``, ``_append_assistant_message``,
+# ``_execute_tool_round``, ``_check_stuck_loop``, ``_maybe_reflect``, and
+# ``_maybe_checkpoint`` helpers.  The engine's ``AgentLoop._run_impl``
+# contains only setup + the for-loop dispatcher + post-loop terminal
+# handlers + the outer try/except.  Tests that grep for patterns must
+# therefore consult all of them.
 def _loop_combined_source():
     import inspect
     from jyagent.runtime.loop import engine as _le, step as _step
-    return (
-        inspect.getsource(_le.AgentLoop._run_impl)
-        + "\n# ─── step.run_step ───\n"
-        + inspect.getsource(_step.run_step)
-    )
+    parts = [inspect.getsource(_le.AgentLoop._run_impl),
+             "\n# ─── step.run_step ───\n",
+             inspect.getsource(_step.run_step)]
+    for helper_name in (
+        "_prepare_step_batch",
+        "_compact_and_build_context",
+        "_build_step_options",
+        "_record_llm_usage_and_cost",
+        "_append_assistant_message",
+        "_execute_tool_round",
+        "_check_stuck_loop",
+        "_maybe_reflect",
+        "_maybe_checkpoint",
+    ):
+        helper = getattr(_step, helper_name, None)
+        if helper is not None:
+            parts.append(f"\n# ─── step.{helper_name} ───\n")
+            parts.append(inspect.getsource(helper))
+    return "".join(parts)
 
 
 # ─── Shared fake registry ────────────────────────────────────────────────────
@@ -198,18 +216,21 @@ class TestCostTrackerUsesEffectiveSpec:
         from jyagent.runtime.loop import step
         # effective_spec is hoisted in RunState.prepare_for_run()
         # (the run-state factory called at the top of _run_impl). The
-        # cost_tracker.record(...) call lives in step.run_step.
+        # cost_tracker.record(...) call lives in the per-step helper
+        # step._record_llm_usage_and_cost (extracted from run_step).
         prepare_src = inspect.getsource(step.RunState.prepare_for_run)
-        run_step_src = inspect.getsource(step.run_step)
+        record_src = inspect.getsource(step._record_llm_usage_and_cost)
 
         assert "effective_spec = loop._model_spec or loop._runtime_owner.model_spec" in prepare_src, (
             "RunState.prepare_for_run must resolve effective_spec once at the top of "
             "the run-state factory (formerly at the top of _run_impl)."
         )
         # cost_tracker.record(...) must consume effective_spec.
-        idx = run_step_src.find("cost_tracker.record(")
-        assert idx != -1, "cost_tracker.record(...) call is missing in run_step"
-        snippet = run_step_src[idx : idx + 400]
+        idx = record_src.find("cost_tracker.record(")
+        assert idx != -1, (
+            "cost_tracker.record(...) call is missing in step._record_llm_usage_and_cost"
+        )
+        snippet = record_src[idx : idx + 400]
         assert "effective_spec.provider" in snippet
         assert "effective_spec.model" in snippet
         assert "loop._runtime_owner.model_spec.provider" not in snippet, (
@@ -227,6 +248,28 @@ class TestCostTrackerUsesEffectiveSpec:
             "in the fallback path."
         )
         assert "effective_spec.provider" in fallback_snippet
+
+class TestExecuteToolsReceivesCancelEvent:
+    """Regression: the per-step tool-execution call must forward
+    ``loop._cancel_event`` to ``execute_tools`` so cooperative cancellation
+    reaches in-flight tools (see commit 7e388ec).
+
+    Codex review 2026-04 caught this wiring being silently dropped during
+    the run_step decomposition — no existing test pinned it, and unit
+    tests that construct AgentLoop via ``__new__`` set
+    ``_cancel_event = None`` so the default argument masks the regression.
+    """
+
+    def test_execute_tools_call_forwards_cancel_event(self):
+        import inspect
+        from jyagent.runtime.loop import step
+        source = inspect.getsource(step._execute_tool_round)
+        assert "cancel_event=loop._cancel_event" in source, (
+            "step._execute_tool_round must pass cancel_event=loop._cancel_event "
+            "to execute_tools — otherwise cooperative cancellation is a no-op "
+            "once a tool batch has started dispatching."
+        )
+
 
 
 # ─── Max-steps fallback always fires when enabled ──────────────────────────
