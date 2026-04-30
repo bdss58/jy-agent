@@ -223,3 +223,94 @@ def test_bounded_reader_fires_overflow():
     _, overflowed = reader.collect()
     assert overflowed
     assert fired == [True]  # fired exactly once
+
+
+
+# ---------------------------------------------------------------------------
+# Three-regime collect() correctness — regression test for the boundary bug
+# where ``tail_max < total <= head_max + tail_max`` was silently returning
+# only the tail (dropping head bytes that tail had overflowed past).
+# ---------------------------------------------------------------------------
+
+
+def _run_reader(payload: bytes, head_bytes: int, tail_bytes: int):
+    import io
+    reader = tools_core._BoundedStreamReader(
+        io.BytesIO(payload),
+        head_bytes=head_bytes,
+        tail_bytes=tail_bytes,
+        hard_kill_bytes=10**9,
+        on_overflow=lambda: None,
+    )
+    reader.start()
+    reader.join(timeout=5)
+    return reader.collect()
+
+
+def test_collect_regime1_tail_holds_everything():
+    """total <= tail_max: full output, no elision marker, no data loss."""
+    payload = b"A" * 30 + b"B" * 40  # total=70, tail_max=100 → tail has all
+    text, overflowed = _run_reader(payload, head_bytes=20, tail_bytes=100)
+    assert not overflowed
+    assert text == payload.decode()
+    assert "elided" not in text
+
+
+def test_collect_regime2_overlap_no_gap_no_loss():
+    """tail_max < total <= head_max + tail_max: dedupe, no marker, no loss.
+
+    Pre-fix this regime silently returned tail-only, dropping the early
+    bytes that head had but tail had overflowed past.
+    """
+    # head_max=20, tail_max=50, total=60 → in (50, 70] → regime 2.
+    # Bytes 0..19 are 'H', bytes 20..59 are 'T'. tail will hold the
+    # last 50 bytes = bytes 10..59 → tail has 'H'*10 + 'T'*40.
+    # head has 'H'*20.  Dedupe: head[:60-50] + tail = 'H'*10 + tail.
+    # Final reconstruction must equal the full 60-byte payload.
+    payload = b"H" * 20 + b"T" * 40
+    text, overflowed = _run_reader(payload, head_bytes=20, tail_bytes=50)
+    assert not overflowed
+    assert text == payload.decode(), (
+        f"regime 2 lost data: expected {len(payload)} bytes, got {len(text)}"
+    )
+    assert "elided" not in text  # no gap, no marker
+
+
+def test_collect_regime2_exact_boundary():
+    """total == head_max + tail_max: still no gap, still no marker."""
+    # head_max=20, tail_max=50, total=70 → tail holds last 50 (bytes 20..69),
+    # head holds first 20 (bytes 0..19). They are adjacent, no overlap, no
+    # gap. head[:total-tail_max] = head[:20] = full head.
+    payload = b"H" * 20 + b"T" * 50
+    text, overflowed = _run_reader(payload, head_bytes=20, tail_bytes=50)
+    assert not overflowed
+    assert text == payload.decode()
+    assert "elided" not in text
+
+
+def test_collect_regime3_real_gap_marker_present():
+    """total > head_max + tail_max: marker present, head + tail visible."""
+    # head_max=20, tail_max=50, total=200 → 130 bytes elided.
+    payload = b"H" * 100 + b"M" * 50 + b"T" * 50
+    text, overflowed = _run_reader(payload, head_bytes=20, tail_bytes=50)
+    assert not overflowed
+    assert text.startswith("H" * 20)
+    assert text.endswith("T" * 50)
+    assert "[... 130 bytes elided ...]" in text
+
+
+def test_collect_regime_default_config_boundary_band():
+    """In default config (head=8 KB, tail=128 KB), the buggy band was
+    (128 KB, 136 KB]. Smoke-test a payload there."""
+    H = tools_core._RUN_SHELL_HEAD_BYTES   # 8 KB
+    T = tools_core._RUN_SHELL_TAIL_BYTES   # 128 KB
+    total = T + (H // 2)                    # 132 KB → middle of the band
+    payload = b"S" * (H // 2) + b"x" * (total - (H // 2))  # distinct head prefix
+    assert len(payload) == total            # arithmetic sanity
+    text, overflowed = _run_reader(payload, head_bytes=H, tail_bytes=T)
+    assert not overflowed
+    # The original head bytes ('S'*4096) MUST appear at the start —
+    # pre-fix they were silently dropped.
+    assert text.startswith("S" * (H // 2))
+    assert len(text) == total
+    assert "elided" not in text

@@ -189,12 +189,29 @@ class _BoundedStreamReader(threading.Thread):
             pass
 
     def collect(self) -> tuple[str, bool]:
-        """Decode the bounded buffer to str. Returns (text, truncated)."""
-        truncated = self._total > (len(self._head) + len(self._tail))
-        if not truncated:
-            data = bytes(self._tail)  # tail contains everything
+        """Decode the bounded buffer to str. Returns (text, truncated).
+
+        Three regimes, depending on how much the child wrote:
+
+        1. ``total <= tail_max``: the tail buffer never overflowed, so it
+           holds the entire output (and head is a prefix of it). Return
+           tail. No data loss.
+        2. ``tail_max < total <= head_max + tail_max``: tail dropped its
+           early bytes but head still has them. The two buffers overlap
+           in the middle and together cover the full output — dedupe by
+           taking the prefix of head that tail no longer has, then all
+           of tail. No data loss, no elision marker.
+        3. ``total > head_max + tail_max``: real gap between head and
+           tail. Return ``head + elision_marker + tail``.
+        """
+        if self._total <= self._tail_max:
+            data = bytes(self._tail)
+        elif self._total <= self._head_max + self._tail_max:
+            # head_keep = bytes that head has but tail dropped.
+            head_keep = self._total - self._tail_max
+            data = bytes(self._head[:head_keep]) + bytes(self._tail)
         else:
-            elided = self._total - len(self._head) - len(self._tail)
+            elided = self._total - self._head_max - len(self._tail)
             data = (
                 bytes(self._head)
                 + f"\n\n[... {elided} bytes elided ...]\n\n".encode("utf-8")
