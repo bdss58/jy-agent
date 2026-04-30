@@ -314,3 +314,205 @@ def test_collect_regime_default_config_boundary_band():
     assert text.startswith("S" * (H // 2))
     assert len(text) == total
     assert "elided" not in text
+
+
+
+# ---------------------------------------------------------------------------
+# Spill-to-disk: large outputs land in /tmp and are recoverable by the agent
+# ---------------------------------------------------------------------------
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_no_spill_for_small_output(tmp_path):
+    """Output that fits in the tail buffer creates no spill file."""
+    # Snapshot files in spill dir before/after.
+    before = set(os.listdir("/tmp"))
+    result = run_shell("echo hello")
+    after = set(os.listdir("/tmp"))
+    new_files = after - before
+    spill_files = {f for f in new_files if f.startswith("jyagent_runshell_")}
+    assert not spill_files, (
+        f"small output should not spill, got: {spill_files}"
+    )
+    assert "spilled" not in result.content
+
+
+def test_spill_activates_when_tail_overflows():
+    """Output > tail_max bytes triggers spill, file contains full output."""
+    # Default tail_max = 128 KB. Emit 256 KB → must spill.
+    payload_size = 256 * 1024
+    result = run_shell(
+        f"python3 -c 'import sys; sys.stdout.write(\"x\"*{payload_size})'",
+        timeout=15,
+    )
+    assert not result.is_error
+    assert "spilled to /tmp/jyagent_runshell_out_" in result.content
+
+    # Extract the spill path from the marker.
+    import re
+    m = re.search(r"spilled to (/tmp/jyagent_runshell_out_\S+\.out)", result.content)
+    assert m, f"no spill path in output: {result.content[-500:]}"
+    spill_path = m.group(1)
+    try:
+        data = _read_bytes(spill_path)
+        # Spill file should contain the FULL payload (recoverable).
+        assert len(data) == payload_size, (
+            f"spill incomplete: {len(data)} bytes, expected {payload_size}"
+        )
+        assert data == b"x" * payload_size
+    finally:
+        os.unlink(spill_path)
+
+
+def test_spill_captures_data_before_hard_kill():
+    """When child is SIGKILLed for overflow, spill still has up to that point."""
+    # Default hard kill = 32 MB. Emit 64 MB → child killed, spill has ~32 MB.
+    result = run_shell(
+        "dd if=/dev/zero bs=1048576 count=64 2>/dev/null", timeout=30,
+    )
+    assert result.is_error
+    assert "output exceeded" in result.content
+    assert "spilled to /tmp/jyagent_runshell_out_" in result.content
+
+    import re
+    m = re.search(r"spilled to (/tmp/jyagent_runshell_out_\S+\.out)", result.content)
+    assert m, f"no spill path in output: {result.content[-500:]}"
+    spill_path = m.group(1)
+    try:
+        size = os.path.getsize(spill_path)
+        # We started spilling at tail_max=128 KB and kept teeing until kill
+        # at 32 MB. So spill file is at least ~30 MB.  Allow slack for
+        # buffering / chunk timing.
+        assert size > 20 * 1024 * 1024, (
+            f"spill file should have most of pre-kill bytes, got {size}"
+        )
+        assert size < 64 * 1024 * 1024, (
+            f"spill file should be bounded by kill threshold, got {size}"
+        )
+    finally:
+        os.unlink(spill_path)
+
+
+def test_spill_disabled_via_env(monkeypatch):
+    """JYAGENT_RUN_SHELL_SPILL=0 disables spill entirely."""
+    monkeypatch.setattr(tools_core, "_RUN_SHELL_SPILL_ENABLED", False)
+    before = set(os.listdir("/tmp"))
+    result = run_shell(
+        "python3 -c 'import sys; sys.stdout.write(\"x\"*200000)'", timeout=10,
+    )
+    after = set(os.listdir("/tmp"))
+    new_files = after - before
+    spill_files = {f for f in new_files if f.startswith("jyagent_runshell_")}
+    assert not spill_files
+    assert "spilled to" not in result.content
+    # Inline output should still be capped (50 K chars).
+    assert "truncated at 50000 chars" in result.content
+
+
+def test_spill_path_factory_failure_is_silent_fallback():
+    """If the spill factory raises (e.g. /tmp is RO), we fall back to in-memory only."""
+    import io
+    payload = b"x" * 200_000
+
+    def boom():
+        raise OSError("read-only filesystem (simulated)")
+
+    reader = tools_core._BoundedStreamReader(
+        io.BytesIO(payload),
+        head_bytes=8 * 1024,
+        tail_bytes=128 * 1024,
+        hard_kill_bytes=10**9,
+        on_overflow=lambda: None,
+        spill_path_factory=boom,
+    )
+    reader.start()
+    reader.join(timeout=5)
+    text, overflowed = reader.collect()
+    assert reader.spill_path is None       # spill never created
+    assert not overflowed                   # below hard kill
+    assert text.startswith("x" * 100)       # inline buffer still works
+
+
+def test_spill_round_trip_via_unit():
+    """Direct unit test of the reader: spill activates, file has full payload."""
+    import io, tempfile
+    payload = b"H" * 100 + b"M" * 200_000 + b"T" * 100
+    spill_holder = {}
+
+    def factory():
+        fd, path = tempfile.mkstemp(prefix="jyagent_test_", suffix=".out")
+        spill_holder["path"] = path
+        return path, os.fdopen(fd, "ab")
+
+    reader = tools_core._BoundedStreamReader(
+        io.BytesIO(payload),
+        head_bytes=8 * 1024,
+        tail_bytes=128 * 1024,
+        hard_kill_bytes=10**9,
+        on_overflow=lambda: None,
+        spill_path_factory=factory,
+    )
+    reader.start()
+    reader.join(timeout=5)
+
+    assert reader.spill_path == spill_holder["path"]
+    try:
+        data = _read_bytes(spill_holder["path"])
+        assert data == payload, (
+            f"spill file content mismatch: {len(data)} vs {len(payload)}"
+        )
+    finally:
+        os.unlink(spill_holder["path"])
+
+
+# ---------------------------------------------------------------------------
+# Env-var configuration: malformed values must warn loudly, not silently fall
+# back (the regression Claude Code shipped in v2.1.2 with BASH_MAX_OUTPUT_LENGTH).
+# ---------------------------------------------------------------------------
+
+
+def test_env_int_valid(monkeypatch):
+    monkeypatch.setenv("FOO_BAR", "12345")
+    assert tools_core._env_int("FOO_BAR", 99) == 12345
+
+
+def test_env_int_unset_uses_default(monkeypatch):
+    monkeypatch.delenv("FOO_BAR", raising=False)
+    assert tools_core._env_int("FOO_BAR", 99) == 99
+
+
+def test_env_int_malformed_warns_and_uses_default(monkeypatch, capsys):
+    monkeypatch.setenv("FOO_BAR", "not-an-int")
+    val = tools_core._env_int("FOO_BAR", 99)
+    assert val == 99
+    captured = capsys.readouterr()
+    # Must NOT be silent — claude-code's #17944 was a silent ignore.
+    assert "FOO_BAR" in captured.err
+    assert "not an int" in captured.err
+
+
+def test_env_int_below_minimum_warns(monkeypatch, capsys):
+    monkeypatch.setenv("FOO_BAR", "5")
+    val = tools_core._env_int("FOO_BAR", 99, minimum=10)
+    assert val == 99
+    assert "below minimum" in capsys.readouterr().err
+
+
+def test_env_bool_variants(monkeypatch):
+    for raw, expected in [
+        ("1", True), ("true", True), ("yes", True), ("on", True), ("TRUE", True),
+        ("0", False), ("false", False), ("no", False), ("off", False),
+    ]:
+        monkeypatch.setenv("FOO_BOOL", raw)
+        assert tools_core._env_bool("FOO_BOOL", default=not expected) == expected
+
+
+def test_env_bool_malformed_warns(monkeypatch, capsys):
+    monkeypatch.setenv("FOO_BOOL", "maybe")
+    val = tools_core._env_bool("FOO_BOOL", default=True)
+    assert val is True  # default
+    assert "FOO_BOOL" in capsys.readouterr().err

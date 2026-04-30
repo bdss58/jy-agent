@@ -5,7 +5,7 @@ CORE_TOOLS = [
     # --- run_shell ---
     {
         "name": "run_shell",
-        "description": "Execute a shell command and return the output. Defaults to 60 seconds when timeout is omitted. Use timeout=600 for long-running commands such as agent CLIs (`claude -p`, `codex exec`, `codex review`), installs, builds, and test runs. If a 600-second command still times out, retry with a narrower scope instead of repeating the same broad command.",
+        "description": "Execute a shell command and return the output. Defaults to 60 seconds when timeout is omitted. Use timeout=600 for long-running commands such as agent CLIs (`claude -p`, `codex exec`, `codex review`), installs, builds, and test runs. If a 600-second command still times out, retry with a narrower scope instead of repeating the same broad command. Output is capped at ~50 000 chars inline; if the child writes more than ~128 KB the FULL output is also spilled to a `/tmp/jyagent_runshell_out_*.out` file (path included in the result) — read that file with `read_file` / `run_shell tail`/`grep` to recover the elided middle.",
         "input_schema": {
             "type": "object",
             "properties": {
