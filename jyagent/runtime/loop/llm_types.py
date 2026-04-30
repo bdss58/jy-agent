@@ -7,13 +7,12 @@ engine imported them from there, which inverted the intended dependency
 direction: the runtime defines *what it needs from an LLM*; provider
 packages *implement* that contract.
 
-Codex review 2026-04-25 Part 3 #5 flagged the runtime → llm import as a
-reversed dependency.  A first pass (commit ``4046792``) extracted the
-*behavioural* contract into the ``LLMClient`` Protocol
-(``runtime/loop/llm_client.py``).  This module closes the other half:
-the *value types* that the engine constructs (``LLMOptions(...)``) and
-threads through sub-agent tier swaps (``ModelSpec``) now live under the
-runtime package itself.
+The runtime → llm import was a reversed dependency.  A first pass extracted
+the *behavioural* contract into the ``LLMClient`` Protocol
+(``runtime/loop/llm_client.py``).  This module closes the other half: the
+*value types* that the engine constructs (``LLMOptions(...)``) and threads
+through sub-agent tier swaps (``ModelSpec``) now live under the runtime
+package itself.
 
 ``jyagent.llm.types`` re-exports the names so existing imports keep
 working — this is a pure reorganisation, not an API break.  After this

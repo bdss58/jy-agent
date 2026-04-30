@@ -1,20 +1,8 @@
 """LLM call stack — streaming, complete, retry, fallback, cancellation.
 
-Extracted from ``engine.py`` as Phase 3 of the 5-phase engine split plan
-(C4 follow-up to the codex review 2026-04-25 — see
-``data/memory/topics/runtime-c1-c4-deferrals.md``).
-
-The split reduces ``engine.py`` (previously 1862 lines) into five owned
-components:
-
-    cost.py        ← Phase 1 (landed 4e7b5d5)
-    tool_executor  ← Phase 2 (landed 13fa6b2)
-    llm_runner     ← this module (Phase 3)
-    compaction     (Phase 4)
-    LoopController (Phase 5 — what remains in engine.py)
-
-Phase 3 owns everything between "AgentLoop decided it wants another
-inference" and "we have an AssistantMessage + tool calls back":
+Extracted from ``engine.py`` to keep the loop controller focused on
+orchestration.  This module owns everything between "AgentLoop decided it
+wants another inference" and "we have an AssistantMessage + tool calls back":
 
     * Streaming event consumption (``LLMRunner.call_streaming``) —
       includes the C1 cancellation watcher that closes a network-stuck
@@ -27,20 +15,18 @@ inference" and "we have an AssistantMessage + tool calls back":
     * Free-function helpers: ``extract_text``, ``extract_tool_calls``,
       ``is_transient_error``, ``build_runtime_options``.
 
-Unlike Phase 1/2 (plain-alias pattern), Phase 3 uses a ``LLMRunner``
-*class* because the call stack has too much injected state (runtime
-owner, config, callbacks, cancel_event, model_spec) for a flat-function
-translation to be clean.  ``AgentLoop`` constructs one per instance and
-keeps thin delegation methods for back-compat with callers (and tests
-that mock ``_call_complete`` etc.).
+Unlike the plain-alias helper modules, this module uses a ``LLMRunner`` class
+because the call stack has too much injected state (runtime owner, config,
+callbacks, cancel_event, model_spec) for a flat-function translation to be
+clean.  ``AgentLoop`` constructs one per instance and keeps thin delegation
+methods for back-compat with callers (and tests that mock ``_call_complete``
+etc.).
 
 The ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` helpers live on
 the ``LoopThreadHelper`` mixin (``_thread_helpers.py``) — both ``LLMRunner``
 and ``AgentLoop`` inherit them and override the helper's two class-level
 attribute-name strings to point at their respective instance attributes.
-This was previously ~30 lines of cut-and-paste between the two classes;
-extracted in L-2 (codex review 2026-04-29) once it was clear neither class
-was going to evolve the helpers in divergent ways.
+This was previously ~30 lines of cut-and-paste between the two classes.
 """
 
 from __future__ import annotations
@@ -195,13 +181,13 @@ class LLMRunner(LoopThreadHelper):
       * model_spec — optional override (sub-agent tier)
 
     Inherits ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` from
-    ``LoopThreadHelper`` (L-2, codex review 2026-04-29).  Overrides the
+    ``LoopThreadHelper``.  Overrides the
     helper's two attribute-name class-vars because LLMRunner uses
     un-prefixed instance attribute names (``cancel_event`` / ``callbacks``)
     while AgentLoop uses underscore-prefixed names.
     """
 
-    # L-2: tell the LoopThreadHelper mixin which instance attributes hold
+    # Tell the LoopThreadHelper mixin which instance attributes hold
     # the cancel event and callbacks dataclass.
     _helper_cancel_event_attr = "cancel_event"
     _helper_callbacks_attr = "callbacks"
@@ -220,7 +206,7 @@ class LLMRunner(LoopThreadHelper):
         self.cancel_event = cancel_event
         self.model_spec = model_spec
 
-    # ── cancellation + callback helpers (L-2: mixin from LoopThreadHelper) ──
+    # ── cancellation + callback helpers from LoopThreadHelper ───────────────
     # ``_is_cancelled``, ``_cancellable_sleep``, ``_fire`` live on the
     # ``LoopThreadHelper`` mixin (see ``_thread_helpers.py``).  Class-var
     # overrides at the top of this class point the helper's attribute
@@ -236,7 +222,7 @@ class LLMRunner(LoopThreadHelper):
     ) -> tuple[str, list["ToolCallRequest"], str, dict]:
         """Non-streaming: runtime_owner.complete() -> extract text/tool_calls.
 
-        C1 fix (codex review 2026-04-25): the sync SDK call is a single
+        The sync SDK call is a single
         blocking network operation with zero yield points, so cooperative
         cancellation between yields (which the streaming path has) isn't
         possible here.  Run the call in a daemon worker thread and poll
@@ -353,7 +339,7 @@ class LLMRunner(LoopThreadHelper):
                 self._fire("on_text_delta", pending)
                 emitted_len += len(pending)
 
-        # C1: watcher-thread state.  Declared before the try so the finally
+        # Watcher-thread state.  Declared before the try so the finally
         # block can always see them, even on exceptions raised mid-setup.
         watcher_stop: threading.Event | None = None
         watcher_thread: threading.Thread | None = None
@@ -362,7 +348,7 @@ class LLMRunner(LoopThreadHelper):
             stream = self.runtime_owner.stream(
                 context, options=options, model_spec=self.model_spec,
             )
-            # C1 fix (codex review 2026-04-25): the between-yields cancel
+            # The between-yields cancel
             # check at the top of the loop only fires if the iterator is
             # yielding.  When the provider hangs mid-chunk (network stuck
             # waiting for bytes), the `for event in stream` call blocks
@@ -487,7 +473,7 @@ class LLMRunner(LoopThreadHelper):
             raise
 
         finally:
-            # C1: signal the cancel watcher to exit BEFORE closing the
+            # Signal the cancel watcher to exit BEFORE closing the
             # stream ourselves, so it doesn't race with our own close().
             if watcher_stop is not None:
                 watcher_stop.set()

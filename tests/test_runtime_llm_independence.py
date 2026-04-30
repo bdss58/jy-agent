@@ -1,5 +1,5 @@
 # tests/test_runtime_llm_independence.py — Pins the no-llm-imports
-# invariant that Codex review 2026-04-25 Part 3 #5 called out.
+# runtime/LLM independence invariant.
 #
 # The runtime package must be importable without eagerly loading any
 # module from ``jyagent.llm``.  A regression here would put us back in

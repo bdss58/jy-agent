@@ -114,8 +114,8 @@ class TestLoopCheckpointSaveLoad:
         atomic visibility to the running kernel — a crash after rename can
         still revert the file to its pre-rename name on ext4/xfs.
 
-        Codex review 2026-04-25 Part 2 #3: docstring claimed atomicity but
-        had neither fsync.  This regression test pins the fix.
+        The docstring claimed atomicity but had neither fsync.  This
+        regression test pins the fix.
         """
         fsynced_fds: list[int] = []
         real_fsync = os.fsync

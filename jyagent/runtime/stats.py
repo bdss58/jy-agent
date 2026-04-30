@@ -69,7 +69,6 @@ _MODEL_PRICING = {
 #     from background threads, widening the window.
 #   * The lock is uncontended on the hot path (one read per LLM call)
 #     so the cost is a couple of CAS instructions.
-# Codex review 2026-04-25 Part 1 #6.
 _PRICING_LOCK = threading.RLock()
 
 
@@ -123,7 +122,7 @@ def set_model_pricing(
 # the long-context multiplier and the ``input_tokens_include_cache_reads``
 # credit).  The two drifted on Anthropic 1M-context models: the session
 # status bar reported one cost while ``LoopConfig.max_cost_usd`` enforced
-# a different (lower) figure.  Codex review 2026-04-25 Part 1 #9/#10.
+# a different (lower) figure.
 #
 # Keep this function pure: no locks, no mutation, no I/O.  Both
 # ``SessionStats._record_cost`` and the engine's ``_CostTracker`` call
@@ -255,7 +254,7 @@ class SessionStats:
 
     @property
     def provider(self) -> str:
-        # C3 (codex review 2026-04-25): lock the read so it's correct under
+        # Lock the read so it's correct under
         # free-threaded CPython (3.13t+) where attribute reads are not
         # guaranteed atomic without the GIL.  On GIL'd CPython the lock is
         # cheap and documents the intent — the set_active_model writer at

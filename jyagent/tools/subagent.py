@@ -304,7 +304,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
 
     callbacks = LoopCallbacks(on_step_progress=_on_step_progress)
 
-    # TODO (L-4, codex review 2026-04-29): parent run-id propagation for
+    # TODO: parent run-id propagation for
     # cross-process checkpoint correlation is not yet implemented.  Sub-
     # agents get a fresh run id from ``new_run_id()`` (assigned inside
     # ``RunState.prepare_for_run``) when checkpointing is enabled at
@@ -521,7 +521,7 @@ _subagent_tracker = _SubagentTracker()
 
 # ─── Background Agent Registry ──────────────────────────────────────────────
 
-# N-3 (codex review 2026-04-29): lazy pool initialisation, mirroring
+# Lazy pool initialisation, mirroring
 # ``tool_executor.get_tool_dispatch_executor``.  Eager creation here used
 # to spin up a 5-worker daemon thread pool and register an ``atexit``
 # shutdown hook on every ``import jyagent.tools.subagent``, even for
@@ -876,7 +876,7 @@ def dispatch_agent(
     model_spec = runtime_owner.model_spec
 
     # Build tool schemas & functions for the sub-agent.
-    # P1-11 (Codex review 2026-04-25): freeze() gives a batch-atomic
+    # freeze() gives a batch-atomic
     # deep-copied snapshot where schemas can't be mutated post-freeze.
     # Replaces the legacy snapshot() which returned the raw schema list.
     registry = get_registry()

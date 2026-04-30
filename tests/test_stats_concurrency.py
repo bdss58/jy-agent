@@ -1,12 +1,12 @@
 # tests/test_stats_concurrency.py — Concurrency invariants for the
 # session-stats pricing table.
 #
-# Codex review 2026-04-25 Part 1 #6 flagged that ``set_model_pricing``
-# mutates the inner ``_MODEL_PRICING[provider]`` dict without a lock,
-# while ``_lookup_pricing`` iterates over the same dict's items().  Under
-# concurrent registration (e.g. an MCP-driven extension that adds models
-# after sub-agents are already running), this can raise
-# ``RuntimeError: dictionary changed size during iteration``.
+# ``set_model_pricing`` used to mutate the inner
+# ``_MODEL_PRICING[provider]`` dict without a lock, while
+# ``_lookup_pricing`` iterates over the same dict's items().  Under concurrent
+# registration (e.g. an MCP-driven extension that adds models after sub-agents
+# are already running), this can raise ``RuntimeError: dictionary changed size
+# during iteration``.
 #
 # This test reproduces the race deterministically — it fails on the
 # pre-fix code in well under a second on CPython 3.14, and passes after

@@ -6,11 +6,11 @@ satisfy this Protocol structurally — they need not subclass anything.
 
 Why this exists
 ---------------
-Codex review 2026-04-25 (Part 3 finding #5) flagged that
-``jyagent/runtime/loop/engine.py`` imported ``LLMOwner``, ``LLMOptions``,
-and ``ModelSpec`` directly from ``jyagent.llm`` — a runtime-→-implementation
-dependency that reverses the intended direction (the runtime should declare
-*what it needs*; provider packages should *implement* that contract).
+``jyagent/runtime/loop/engine.py`` used to import ``LLMOwner``,
+``LLMOptions``, and ``ModelSpec`` directly from ``jyagent.llm`` — a
+runtime-→-implementation dependency that reverses the intended direction
+(the runtime should declare *what it needs*; provider packages should
+*implement* that contract).
 
 This Protocol fixes the **behavioural** half of that coupling:
 

@@ -1,10 +1,9 @@
-"""Stuck-loop detector — extracted from engine.py (L-1, codex review 2026-04-29).
+"""Stuck-loop detector.
 
-Extracted as part of the L-1 cleanup so engine.py can shrink toward its
-post-Phase-5 role as a thin orchestrator.  ``_StuckLoopDetector`` was the
-only non-AgentLoop class still living in engine.py (~95 lines) and has no
-upward dependencies — it only references ``hashlib`` and ``json`` from the
-stdlib.
+Extracted from engine.py so that module can focus on orchestration.
+``_StuckLoopDetector`` was the only non-AgentLoop class still living in
+engine.py (~95 lines) and has no upward dependencies — it only references
+``hashlib`` and ``json`` from the stdlib.
 
 Engine.py keeps a back-compat alias ``_StuckLoopDetector = StuckLoopDetector``
 so the underscore-prefixed name continues to work for in-tree callers

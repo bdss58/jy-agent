@@ -53,15 +53,14 @@ def should_verify(
        run_background, plus any dynamic MCP tool that registers as
        mutating).  Classification is done via ``batch.is_mutating(name)``
        so a freshly-registered MCP mutator surfaces the gate without a
-       static keyword change here (B-1 fix, codex review 2026-04-29).
+       static keyword change here.
     4. A verification prompt has not already been injected this turn.
 
     ``since_index`` (default 0, i.e. scan everything) bounds the mutation
     scan to messages appended during *this* turn — pass the value of
     ``len(messages)`` captured at the start of ``_run_impl``.  Without
     this, a replayed historical mutation in prior turns would re-arm the
-    verification gate on a non-mutating new turn (Codex review
-    2026-04-25 Part 2 #5).
+    verification gate on a non-mutating new turn.
 
     ``batch`` is the immutable per-step ``ToolBatch`` snapshot the engine
     already builds for dispatch — re-using it keeps the mutating-set
@@ -151,8 +150,7 @@ def _has_mutation(
     partial-side-effects accumulation, so a tool that's flagged
     mutating in one place is flagged mutating everywhere.  Unknown names
     (e.g. tools unregistered between the call and the verification scan)
-    default to False — the historical default for the gate (B-1 fix,
-    codex review 2026-04-29).
+    default to False — the historical default for the gate.
     """
     for msg in messages[since_index:]:
         # Anthropic format: role "user" with tool_result content blocks

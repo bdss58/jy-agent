@@ -200,8 +200,8 @@ ToolChoice = ToolChoiceAuto | ToolChoiceAny | ToolChoiceNone | ToolChoiceTool
 #
 # ``ModelSpec`` and ``LLMOptions`` were moved into
 # ``jyagent.runtime.loop.llm_types`` as part of closing the
-# runtime → llm dependency reversal flagged in Codex review 2026-04-25
-# Part 3 #5.  The runtime owns the *shape* of these inputs because they
+# runtime → llm dependency reversal.  The runtime owns the *shape* of these
+# inputs because they
 # are constructed by the engine and consumed by the LLM client; placing
 # them on the consumer side rather than the producer side reverses the
 # import direction.  We re-export here so existing

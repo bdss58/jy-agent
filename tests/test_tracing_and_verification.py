@@ -235,9 +235,9 @@ class TestShouldVerify:
             assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is True
 
     def test_dynamic_mcp_mutating_tool_triggers_verification(self):
-        """B-1 (codex review 2026-04-29): a dynamic MCP-flagged-mutating
-        tool — one not in the historical hard-coded VERIFY_TOOL_NAMES set
-        — must arm the verification gate as soon as it's used.
+        """A dynamic MCP-flagged-mutating tool — one not in the historical
+        hard-coded VERIFY_TOOL_NAMES set — must arm the verification gate as
+        soon as it's used.
 
         This test injects the mutating flag via ``with_overlay(mutating=...)``
         — the same code path an MCP integration uses to add a freshly
@@ -250,9 +250,9 @@ class TestShouldVerify:
             assert should_verify(msgs, tool_calls_count=1, batch=batch) is True
 
     def test_only_nonmutating_tools_skips_verification(self):
-        """B-1 (codex review 2026-04-29): a turn that only used read-only
-        tools (e.g. read_file) must NOT arm the verification gate, even
-        when VERIFICATION_ENABLED=1 and at least one tool was called.
+        """A turn that only used read-only tools (e.g. read_file) must NOT arm
+        the verification gate, even when VERIFICATION_ENABLED=1 and at least
+        one tool was called.
         """
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             batch = _mutating_batch()
@@ -263,12 +263,11 @@ class TestShouldVerify:
         """Replayed historical mutations must NOT re-arm verification on a
         non-mutating turn.
 
-        Codex review 2026-04-25 Part 2 #5: ``_has_mutation`` previously
-        scanned the entire ``messages`` list, so a prior turn's
-        ``edit_file`` (still present in the persisted history) would
-        trigger verification on a follow-up turn that only did read-only
-        work.  Fix: the engine passes ``since_index = len(messages)`` at
-        turn start so the scan is bounded to this-turn appends.
+        ``_has_mutation`` previously scanned the entire ``messages`` list, so
+        a prior turn's ``edit_file`` (still present in the persisted history)
+        would trigger verification on a follow-up turn that only did read-only
+        work.  The engine passes ``since_index = len(messages)`` at turn start
+        so the scan is bounded to this-turn appends.
         """
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             # Prior turn left a write_file in history; current turn only
@@ -390,9 +389,9 @@ class TestAlreadyInjected:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Integration: VERIFY_TOOL_NAMES has been removed (B-1, codex review
-# 2026-04-29).  Mutating-classification now lives on the registry's
-# ``mutating=True`` flag and is consulted via ``ToolBatch.is_mutating(...)``;
-# see TestShouldVerify.test_dynamic_mcp_mutating_tool_triggers_verification
-# for the regression test that pins the new behaviour.
+# Integration: VERIFY_TOOL_NAMES has been removed.  Mutating-classification
+# now lives on the registry's ``mutating=True`` flag and is consulted via
+# ``ToolBatch.is_mutating(...)``; see
+# TestShouldVerify.test_dynamic_mcp_mutating_tool_triggers_verification for
+# the regression test that pins the new behaviour.
 # ═══════════════════════════════════════════════════════════════════════════

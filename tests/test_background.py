@@ -323,12 +323,12 @@ class TestCleanupAndLifecycle:
         assert info["process"].poll() is not None
 
 
-# ── H-1 (codex review 2026-04-29): check_background metadata corrections ────
+# ── check_background metadata corrections ──────────────────────────────────
 
 
 class TestCheckBackgroundMetadata:
     """``check_background`` was originally registered with no timeout hint and
-    ``mutating=False``.  The H-1 fix flags it ``mutating=True`` (the
+    ``mutating=False``.  It is now flagged ``mutating=True`` because the
     ``action="kill"`` branch SIGTERM/SIGKILLs the target process group, an
     irreversible side effect that cannot be retried) and bumps its timeout
     hint to 360 s — schema documents ``wait_timeout_seconds`` up to 300 s,
@@ -339,14 +339,14 @@ class TestCheckBackgroundMetadata:
         from jyagent.runtime.tools.registry import get_registry
         batch = get_registry().freeze()
         assert batch.is_mutating("check_background") is True, (
-            "H-1 (codex review 2026-04-29): check_background must be flagged "
-            "mutating=True because action='kill' is irreversible"
+            "check_background must be flagged mutating=True because "
+            "action='kill' is irreversible"
         )
 
     def test_check_background_timeout_hint_is_360(self):
         from jyagent.runtime.tools.registry import get_registry
         batch = get_registry().freeze()
         assert batch.get_timeout_hint("check_background") == 360, (
-            "H-1: timeout_hint=360 gives 60s slack over the 300s "
+            "timeout_hint=360 gives 60s slack over the 300s "
             "wait_timeout_seconds schema cap"
         )

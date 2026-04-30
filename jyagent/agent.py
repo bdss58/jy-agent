@@ -543,7 +543,7 @@ def run(runtime_owner: LLMOwner) -> None:
                     callbacks, spinner = build_streaming_callbacks(stats, runtime_owner)
 
                     # Create tool source factory.
-                    # P1-11 (Codex review 2026-04-25): use ``freeze()`` (the
+                    # Use ``freeze()`` (the
                     # batch-atomic deep-copy snapshot) rather than the legacy
                     # ``snapshot()`` shallow tuple.  The engine builds its own
                     # per-step ToolBatch from this output anyway; freeze gives

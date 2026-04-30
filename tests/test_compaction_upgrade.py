@@ -1,15 +1,15 @@
 # tests/test_compaction_upgrade.py — Tests for the context compaction improvements.
 #
 # Covers:
-#   Phase 1: P0.1 observation masking, P0.2 thinking pruning, P0.3 cache-friendly sig
-#   Phase 2: P1.4 file reinjection, P1.5 compaction priority, P1.6 9-section prompt
+#   Observation masking, thinking pruning, and cache-friendly signatures.
+#   File reinjection, compaction priority, and the 9-section prompt.
 
 import os
 import tempfile
 from jyagent.runtime.tools.registry import get_registry
 import pytest
 
-# ─── Phase 1: P0.1 + P0.2 — Observation masking + thinking pruning ──────────
+# ─── Observation masking + thinking pruning ─────────────────────────────────
 
 def test_thinking_blocks_pruned_from_old_messages():
     """Tier 0: thinking blocks are stripped from old messages, EXCEPT when
@@ -178,7 +178,7 @@ def test_last_two_messages_always_intact():
     assert result[-2]["content"] == "end question"
 
 
-# ─── Phase 1: P0.3 — Cache-friendly compaction signature ─────────────────────
+# ─── Cache-friendly compaction signature ────────────────────────────────────
 
 def test_compact_conversation_accepts_system_prompt():
     """compact_conversation accepts system_prompt parameter for cache reuse."""
@@ -224,7 +224,7 @@ def test_compaction_system_prompt_includes_base_and_memory(monkeypatch):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ─── Phase 2: P1.4 — File re-injection ───────────────────────────────────────
+# ─── File re-injection ──────────────────────────────────────────────────────
 
 def test_file_access_tracker_basic():
     """FileAccessTracker records and returns files in order."""
@@ -291,7 +291,7 @@ def test_file_reinjection_skips_missing_files():
     tracker.clear()
 
 
-# ─── Phase 2: P1.5 — Compaction priority ─────────────────────────────────────
+# ─── Compaction priority ────────────────────────────────────────────────────
 
 def test_compaction_priority_in_registry():
     """Registry correctly stores and retrieves compaction_priority."""
@@ -300,9 +300,9 @@ def test_compaction_priority_in_registry():
     reg = ToolRegistry()
     reg.register("test_tool", lambda: None, {"name": "test_tool"},
                  compaction_priority="ephemeral")
-    # Use ``freeze()`` rather than the deprecated live-read accessor
-    # (P1-11 / Codex review 2026-04-25): the per-step ToolBatch is the
-    # canonical metadata API; the registry-level method is a footgun.
+    # Use ``freeze()`` rather than the deprecated live-read accessor.  The
+    # per-step ToolBatch is the canonical metadata API; the registry-level
+    # method is a footgun.
     batch = reg.freeze()
     assert batch.get_compaction_priority("test_tool") == "ephemeral"
     assert batch.get_compaction_priority("unknown_tool") == "standard"  # default
@@ -312,8 +312,8 @@ def test_builtin_tools_have_correct_priorities():
     """Built-in tools registered with expected compaction priorities."""
     import jyagent.tools  # noqa
     from jyagent.runtime.tools.registry import get_registry
-    # P1-11 (2026-04-27): use freeze() rather than the deprecated
-    # registry-level live-read accessor.
+    # Use freeze() rather than the deprecated registry-level live-read
+    # accessor.
     batch = get_registry().freeze()
 
     assert batch.get_compaction_priority("run_shell") == "ephemeral"
@@ -323,7 +323,7 @@ def test_builtin_tools_have_correct_priorities():
     assert batch.get_compaction_priority("write_file") == "standard"
 
 
-# ─── Phase 2: P1.6 — Enhanced 9-section summary prompt ───────────────────────
+# ─── Enhanced 9-section summary prompt ──────────────────────────────────────
 
 def test_compact_prompt_has_nine_sections():
     """The compact prompt includes all 9 required sections."""

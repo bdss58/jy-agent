@@ -1,6 +1,6 @@
 # step.py — One iteration of the agent loop.
 #
-# C4 Phase 5 (codex review 2026-04-25, follow-up): the per-step body of
+# The per-step body of
 # ``AgentLoop._run_impl`` (LLM call → tool dispatch → reflection → checkpoint
 # → cancel checks) lives here as a free function ``run_step(loop, state)``.
 #
@@ -16,7 +16,7 @@
 #   - context compaction
 #   - phase-aware tool_choice shaping
 #   - LLM call dispatch (delegated to ``loop._call_llm_with_retry``, which
-#     keeps the subclass-override contract from Phase 3)
+    #     keeps the subclass-override contract)
 #   - cost-budget enforcement
 #   - completion / verification-gate path (no tool calls)
 #   - truncation detection + retry
@@ -141,15 +141,15 @@ class RunState:
         """Run-setup factory: prepares the AgentLoop instance for a fresh
         run and constructs the per-run mutable state.
 
-        Renamed from ``from_loop`` (Codex review of Phase 5, 2026-04-27):
-        the old name read like a pure factory but the method intentionally
-        mutates ``loop._partial_side_effects``, ``loop._run_id``, and
-        ``loop._todos``. The new name signals the side-effect contract.
+        Renamed from ``from_loop``: the old name read like a pure factory but
+        the method intentionally mutates ``loop._partial_side_effects``,
+        ``loop._run_id``, and ``loop._todos``. The new name signals the
+        side-effect contract.
 
         Side effects on ``loop`` (intentional, not just construction):
           - ``loop._partial_side_effects = []`` — reset mutating-timeout
             accumulator so back-to-back turns on the same instance don't
-            carry stale names forward (A1 from codex review 2026-04-25).
+            carry stale names forward.
           - ``loop._run_id`` set when checkpointing is enabled and not
             already preset.
           - ``loop._todos`` seeded from ``initial_todos`` (validated via
@@ -165,7 +165,7 @@ class RunState:
             threshold gates its actual blocking).
           - write_todos closure bound when todos are enabled — the
             closure reads/writes ``loop._todos`` via accessor functions
-            so later mutation by the engine remains visible. (Codex Part 2 #4.)
+            so later mutation by the engine remains visible.
           - reflection module lazily imported only when at least one
             reflection knob is on.
 
@@ -177,8 +177,8 @@ class RunState:
         """
         cfg = loop._config
 
-        # A1: reset accumulator. MUST happen at every run, not just init.
-        # H-2 (codex review 2026-04-29): use ``deque`` (not list) for free-
+        # Reset accumulator. MUST happen at every run, not just init.
+        # Use ``deque`` (not list) for free-
         # threaded-Python forward-compat — ``deque.append`` is documented
         # thread-safe for single-element ops, while ``list.append`` is
         # only atomic on the stock GIL build (PEP 703 / 3.13t / 3.14t
@@ -212,7 +212,7 @@ class RunState:
                     loop._fire("on_warning", f"ignoring invalid initial_todos: {e}")
                     loop._todos = []
             elif initial_todos is None:
-                # M-4 (codex review 2026-04-29): preserve any cross-turn todos
+                # Preserve any cross-turn todos
                 # the caller already set on the loop instance — e.g. an outer
                 # session that wants to chain multiple ``run()`` calls without
                 # restating the plan each time.  Callers that want a fresh
@@ -359,7 +359,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     # metadata" behaviour but now atomically.
     if loop._tool_source is not None:
         src_schemas, src_functions = loop._tool_source()
-        # B-2 fix (codex review 2026-04-29): deep-copy schemas + wrap
+        # Deep-copy schemas + wrap
         # all maps in MappingProxyType views, so the tool_source path
         # has the same immutability guarantees as ToolRegistry.freeze().
         # Metadata classification (parallel_safe, mutating, timeout
@@ -380,7 +380,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     # Overlay the per-loop write_todos tool on top of the
     # registry snapshot when todos are enabled.  This is the
     # closure-scoped injection point recommended by the design
-    # review (avoids ContextVar propagation issues with our
+    # design (avoids ContextVar propagation issues with our
     # daemon-thread tool executor).
     if cfg.todos_enabled:
         from .todos import WRITE_TODOS_SCHEMA
@@ -390,7 +390,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
             # write_todos must NOT be parallel-safe — it would
             # then run concurrently with itself in a batch and
             # the replace-all semantics would silently drop
-            # one of the writes (Codex Part 2 #4).
+            # one of the writes.
         )
     else:
         step_batch = state.tools_batch

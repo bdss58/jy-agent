@@ -466,7 +466,7 @@ class TestCancelEventInterruptsLoop:
         tool_functions = {"dummy_tool": dummy_tool}
 
         # Patch get_reasoning_config_for_provider to avoid model validation errors.
-        # C4 Phase 3 (2026-04-25): ``_build_runtime_options`` moved from
+        # ``_build_runtime_options`` moved from
         # engine.py to runtime/loop/llm_runner.py, so the patch target
         # moved with it (``patch`` must target the module that *looks up*
         # the symbol — not the symbol's defining module).

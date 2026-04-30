@@ -1,6 +1,6 @@
 # test_step_runner.py — Step-level unit tests for runtime/loop/step.py.
 #
-# After C4 Phase 5, the per-step body of the agent loop lives in
+# The per-step body of the agent loop lives in
 # ``runtime/loop/step.py::run_step``. These tests exercise it directly
 # against a tiny fake AgentLoop, bypassing the provider/runtime owner chain
 # entirely. Each test would have required ~50 lines of fixture in the old
@@ -279,20 +279,20 @@ class TestTruncation:
         assert "Repeated truncation" in (outcome.result.error or "")
 
 
-# ─── T5: subclass-override contract preserved (Phase 3 lesson) ───────────────
+# ─── T5: subclass-override contract preserved ───────────────────────────────
 
 
 class TestSubclassOverrideContract:
     """run_step calls loop._call_llm_with_retry — Python attribute lookup
     resolves test subclass overrides automatically. This is the contract
-    Phase 3 navigated; verify it still holds at the step level."""
+    verify it still holds at the step level."""
 
     def test_subclass_override_of_call_llm_is_used(self):
         loop = FakeLoop(llm_response=_llm_text_only("from-base"))
         state = _build_state(loop)
 
         # Replace the bound method with a different one (mimics
-        # tests/test_codex_review_fixes.py::TestCallLLMRetry pattern).
+        # tests/test_loop_edge_cases.py::TestCallLLMRetry pattern).
         called_with: list[tuple] = []
         def overridden(context, opts, step):
             called_with.append((context, opts, step))
@@ -315,11 +315,10 @@ class TestRunStateFromLoop:
         """``prepare_for_run`` resets the partial-side-effects accumulator
         on the loop instance.
 
-        H-2 (codex review 2026-04-29): the accumulator is now a
-        ``collections.deque`` (free-threaded-Python forward-compat —
-        ``list.append`` is no longer atomic on PEP 703 builds; ``deque
-        .append`` is documented thread-safe).  ``list(deque(...)) == []``
-        still works for the empty-state assertion.
+        The accumulator is now a ``collections.deque`` for free-threaded
+        Python forward-compat: ``list.append`` is no longer atomic on PEP 703
+        builds, while ``deque.append`` is documented thread-safe.
+        ``list(deque(...)) == []`` still works for the empty-state assertion.
         """
         import collections as _c
         loop = FakeLoop()
@@ -406,10 +405,9 @@ class TestRunStateFromLoop:
 
 # ─── T7-T13: tool execution + cancellation + dedup + checkpoint + todos ─────
 #
-# These tests fill the largest coverage gaps identified by the Codex review
-# of Phase 5 (2026-04-27).  They exercise code paths in step.run_step that
-# depend on `tool_executor.execute_tools`, so the tests monkeypatch that
-# module-level function rather than touching the registry.
+# These tests exercise code paths in step.run_step that depend on
+# `tool_executor.execute_tools`, so they monkeypatch that module-level function
+# rather than touching the registry.
 #
 # NOTE: step.py calls ``from .tool_executor import execute_tools`` inside
 # run_step (lazy, on every call), so patching the attribute on the
@@ -505,7 +503,7 @@ class TestCancellationBeforeTools:
     """Top-of-step cancel is covered; this covers the SECOND cancel check
     (L648 of step.py — between on_tool_start firing and execute_tools).
     Required invariant: on_tool_end must still fire for every on_tool_start
-    (Codex review of P0 fixes: UI spinner leak prevention)."""
+    for UI spinner leak prevention."""
 
     def test_cancel_after_tool_start_fires_matching_on_tool_ends(self):
         loop = FakeLoop(llm_response=_tool_call_block("read_file", "c1"))

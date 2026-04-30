@@ -20,7 +20,7 @@ from ..config import (
 from .conversation import ConversationMemory, estimate_tokens
 
 
-# ─── 9-section structured summary prompt (Phase 2: P1.6) ─────────────────────
+# ─── 9-section structured summary prompt ─────────────────────────────────────
 # Compared to the original 6-section prompt, this adds:
 #   - Errors & Failures (preserves failure signals — critical per JetBrains research)
 #   - Environment State (working directory, active connections)
@@ -76,7 +76,7 @@ CONVERSATION TO COMPACT:
 """
 
 
-# ─── Reflection prompt (Phase 4 P3 — emit memory-write candidates) ───────────
+# ─── Reflection prompt — emit memory-write candidates ────────────────────────
 # After the structured summary is produced, we ask the model a second, much
 # smaller question: "do any durable lessons fall out of this session?".
 # Candidates are written to the journal rather than directly into MEMORY.md —
@@ -154,7 +154,7 @@ def record_file_access(path: str) -> None:
     _file_tracker.record(path)
 
 
-# ─── File re-injection (Phase 2: P1.4) ───────────────────────────────────────
+# ─── File re-injection ───────────────────────────────────────────────────────
 
 def _build_file_reinjection_content() -> str:
     """Build a context block containing recently accessed file contents.
@@ -217,12 +217,12 @@ def compact_conversation(
     Keeps the most recent `keep_recent` messages intact, and replaces older
     messages with a structured summary.
 
-    **Cache-friendly** (P0.3): When ``system_prompt`` is provided, the
+    **Cache-friendly**: When ``system_prompt`` is provided, the
     compaction call reuses it so the prompt cache prefix stays warm.
     Without this, every compaction is a guaranteed cache miss on the system
     prompt (measured at 98% miss rate in Claude Code's early iterations).
 
-    **File re-injection** (P1.4): After compaction, re-injects the contents
+    **File re-injection**: After compaction, re-injects the contents
     of recently accessed files so the LLM retains working context.
     """
     if keep_recent is None:
@@ -244,7 +244,7 @@ def compact_conversation(
         if custom_instruction:
             compact_instruction += f"\n\nAdditional instruction: {custom_instruction}"
 
-        # ── Cache-friendly compaction (P0.3) ──────────────────────────
+        # ── Cache-friendly compaction ────────────────────────────────
         # Reuse the existing system prompt so the prompt cache prefix stays
         # warm.  The compaction instruction is sent as a user message, not
         # as a standalone prompt.  This mirrors Claude Code's approach.
@@ -283,7 +283,7 @@ def compact_conversation(
             },
         ]
 
-        # ── File re-injection (P1.4) ─────────────────────────────────
+        # ── File re-injection ────────────────────────────────────────
         file_context = _build_file_reinjection_content()
         if file_context:
             new_messages.append({

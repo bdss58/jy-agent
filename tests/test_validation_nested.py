@@ -1,13 +1,10 @@
-"""L-5 (codex review 2026-04-29): nested additionalProperties enforcement.
+"""Nested additionalProperties enforcement.
 
-The review flagged a potential gap in ``_validate_schema_value`` —
-unknown-key detection only walks ``properties`` from the OUTER schema
-at any given recursion level, so nested objects need their OWN
-``additionalProperties=False`` to be enforced.  After tracing the code
-this is actually correct (each recursive call passes the child schema
-through, so the child's ``additionalProperties=False`` gates ITS keys),
-but the behaviour wasn't pinned by a regression test.  This module
-provides that pin.
+Unknown-key detection only walks ``properties`` from the OUTER schema at any
+given recursion level, so nested objects need their OWN
+``additionalProperties=False`` to be enforced.  Each recursive call passes the
+child schema through, so the child's ``additionalProperties=False`` gates ITS
+keys.  This module pins that behaviour.
 """
 
 from __future__ import annotations
@@ -139,4 +136,3 @@ class TestNestedAdditionalProperties:
         )
         assert err is not None, "deeply-nested additionalProperties=False not enforced"
         assert "smuggled" in err
-

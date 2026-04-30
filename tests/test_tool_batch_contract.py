@@ -1,18 +1,17 @@
-"""Regression tests for codex review 2026-04-29 fixes.
+"""Regression tests for tool-batch and background metadata fixes.
 
 Covers:
-    B-2 — ``ToolBatch.from_source`` deep-copies schemas + wraps maps in
-          MappingProxyType.
-    H-1 — ``check_background`` carries ``timeout_hint=360`` and
-          ``mutating=True`` (kill branch SIGTERM/SIGKILLs the process group).
-          (See also tests/test_background.py for the registry-flag check.)
-    M-2 — ``dispatch_agent`` is no longer parallel-safe (serialised
-          coarse-grained sub-agent dispatches).
-    M-5 — ``ToolBatch.with_overlay`` accepts an explicit ``mutating`` set.
-    L-3 — ``LoopCheckpoint.from_json`` filters unknown fields so a newer-
-          version checkpoint loads cleanly in older code.
+    - ``ToolBatch.from_source`` deep-copies schemas + wraps maps in
+      MappingProxyType.
+    - ``check_background`` carries ``timeout_hint=360`` and ``mutating=True``
+      because the kill branch SIGTERM/SIGKILLs the process group.
+    - ``dispatch_agent`` is no longer parallel-safe for coarse-grained
+      sub-agent dispatches.
+    - ``ToolBatch.with_overlay`` accepts an explicit ``mutating`` set.
+    - ``LoopCheckpoint.from_json`` filters unknown fields so a newer-version
+      checkpoint loads cleanly in older code.
 
-The B-1 (verification gate consults batch.is_mutating) regression lives
+The verification gate regression lives
 in ``tests/test_tracing_and_verification.py`` next to the rest of the
 verification-gate tests.
 """
@@ -24,7 +23,7 @@ import json
 import pytest
 
 
-# ─── B-2: ToolBatch.from_source deep-copy + readonly ────────────────────────
+# ─── ToolBatch.from_source deep-copy + readonly ─────────────────────────────
 
 
 class TestB2ToolBatchFromSource:
@@ -118,7 +117,7 @@ class TestB2ToolBatchFromSource:
         assert batch.version == base.version
 
 
-# ─── M-2: dispatch_agent is serial ───────────────────────────────────────────
+# ─── dispatch_agent is serial ───────────────────────────────────────────────
 
 
 class TestM2DispatchAgentSerial:
@@ -132,14 +131,13 @@ class TestM2DispatchAgentSerial:
         from jyagent.runtime.tools.registry import get_registry
         batch = get_registry().freeze()
         assert batch.is_parallel_safe("dispatch_agent") is False, (
-            "dispatch_agent must be serial (M-2 review 2026-04-29) — "
-            "found parallel_safe=True"
+            "dispatch_agent must be serial; found parallel_safe=True"
         )
-        # Sanity: it remains classified as mutating (the original A1 flag).
+        # Sanity: it remains classified as mutating.
         assert batch.is_mutating("dispatch_agent") is True
 
 
-# ─── M-5: with_overlay accepts mutating= ────────────────────────────────────
+# ─── with_overlay accepts mutating= ─────────────────────────────────────────
 
 
 class TestM5OverlayMutating:
@@ -189,7 +187,7 @@ class TestM5OverlayMutating:
         )
 
 
-# ─── L-3: LoopCheckpoint.from_json filters unknown fields ───────────────────
+# ─── LoopCheckpoint.from_json filters unknown fields ────────────────────────
 
 
 class TestL3CheckpointForwardCompat:
@@ -242,4 +240,3 @@ class TestL3CheckpointForwardCompat:
         assert cp.todos == []
         assert cp.tool_calls_count == 0
         assert cp.provider is None
-

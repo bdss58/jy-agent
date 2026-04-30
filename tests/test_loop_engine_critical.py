@@ -1,12 +1,11 @@
-# tests/test_loop_engine_p0_fixes.py — Regression tests for P0 loop-engine bugs.
+# tests/test_loop_engine_critical.py — Regression tests for critical loop-engine bugs.
 #
-# Validates three correctness fixes identified by the 2026-04 cross-review
-# (Codex + Claude Code):
+# Validates three loop-engine correctness fixes:
 #
-#   P0 #1 — Nested same-pool deadlock in _execute_tools / _execute_tool_with_timeout.
-#   P0 #3 — _CostTracker must use the effective model spec (sub-agent override).
-#   P0 #4 — fallback_on_max_steps must fire on max-step exit, regardless of
-#            incidental text emitted from prior tool-use steps.
+#   - Nested same-pool deadlock in _execute_tools / _execute_tool_with_timeout.
+#   - _CostTracker must use the effective model spec (sub-agent override).
+#   - fallback_on_max_steps must fire on max-step exit, regardless of
+#     incidental text emitted from prior tool-use steps.
 
 from __future__ import annotations
 
@@ -28,7 +27,7 @@ from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
 
 
 # Combined-source helper for structural tests that grep the loop body.
-# After the C4 Phase 5 split, the per-step body lives in
+# The per-step body lives in
 # ``runtime.loop.step.run_step``; the engine's ``AgentLoop._run_impl``
 # now contains only setup + the for-loop dispatcher + post-loop terminal
 # handlers + the outer try/except. Tests that grep for patterns must
@@ -105,7 +104,7 @@ class TestNoNestedPoolDeadlock:
 
     def test_backcompat_alias_points_to_dispatch(self):
         # Read both names via the live module attribute path.
-        # C4 Phase 2 (2026-04-25): the pool is now canonical in
+        # The pool is now canonical in
         # runtime/loop/tool_executor.py and engine.py forwards via PEP-562
         # ``__getattr__``.  The earlier-imported ``_tool_dispatch_executor``
         # at the top of this file is an import-time snapshot that goes stale
@@ -122,7 +121,7 @@ class TestNoNestedPoolDeadlock:
         pools it completes in roughly sleep_ms (not sleep_ms × N).
         """
         # Match dispatch width — this is the failure mode of the old design.
-        # P3-2 (2026-04-27): pool is lazy-init; trigger it before reading
+        # The pool is lazy-init; trigger it before reading
         # `_max_workers` so we don't get None.  `le._tool_dispatch_executor`
         # routes through the PEP-562 __getattr__ to the LIVE value.
         le._get_tool_dispatch_executor(8)
@@ -198,7 +197,7 @@ class TestCostTrackerUsesEffectiveSpec:
     def test_cost_record_uses_effective_spec_variable(self):
         import inspect
         from jyagent.runtime.loop import step
-        # After C4 Phase 5, effective_spec is hoisted in RunState.prepare_for_run()
+        # effective_spec is hoisted in RunState.prepare_for_run()
         # (the run-state factory called at the top of _run_impl). The
         # cost_tracker.record(...) call lives in step.run_step.
         prepare_src = inspect.getsource(step.RunState.prepare_for_run)
@@ -219,14 +218,14 @@ class TestCostTrackerUsesEffectiveSpec:
             "sub-agent model overrides."
         )
         # Also confirm the engine's max_steps fallback path records cost
-        # against effective_spec (B1 fix from codex review 2026-04-25).
+        # against effective_spec.
         engine_src = inspect.getsource(le.AgentLoop._run_impl)
         fallback_idx = engine_src.find("fallback_on_max_steps")
         assert fallback_idx != -1, "max_steps fallback block missing"
         fallback_snippet = engine_src[fallback_idx : fallback_idx + 3000]
         assert "cost_tracker.record(" in fallback_snippet, (
             "max_steps fallback must record cost against effective_spec "
-            "(B1 fix)."
+            "in the fallback path."
         )
         assert "effective_spec.provider" in fallback_snippet
 
@@ -443,7 +442,7 @@ class TestStreamLoopCancellationCheck:
 
     def test_stream_loop_has_cancel_check(self):
         import inspect
-        # C4 Phase 3 (2026-04-25): streaming machinery moved to
+        # Streaming machinery moved to
         # ``runtime.loop.llm_runner.LLMRunner.call_streaming``.  The AgentLoop
         # ``_call_streaming`` delegate is a one-liner — inspect the runner.
         from jyagent.runtime.loop.llm_runner import LLMRunner
@@ -1247,8 +1246,8 @@ class TestVerificationCleanupParity:
         assert bare_returns == [], (
             f"Found {len(bare_returns)} bare `return LoopResult(...)` in "
             f"_run_impl — every exit must funnel through _finalize_run() so "
-            f"_strip_dangling_verification cannot be bypassed.  See "
-            f"data/memory/topics/runtime-review-2026-04-25.md for context."
+            f"_strip_dangling_verification cannot be bypassed.  See the "
+            f"runtime tool-batch notes for context."
         )
 
     def test_finalize_run_always_strips_dangling_verification(self):
@@ -1404,9 +1403,7 @@ class TestToolBatchSnapshotIsolation:
     such that a concurrent ``register()``/``unregister()``/schema mutation
     cannot affect any helper that consumed the snapshot.
 
-    Codex review 2026-04-25 (Part 1 #4, #11, #12) flagged three concrete
-    races the engine had under the old "live registry reads everywhere"
-    design:
+    The old "live registry reads everywhere" design had three concrete races:
 
       * #4  — ``get_schema(name)`` was a live unlocked lookup, so validation
               could pair the per-step ``functions`` snapshot with a *new*
@@ -1477,10 +1474,10 @@ class TestToolBatchSnapshotIsolation:
         )
 
     def test_batch_isolates_schema_from_post_freeze_mutation(self):
-        """Codex Part 1 #12: the OLD ``snapshot()`` returned the original
-        schema dict by reference, so a caller mutating the dict it had
-        passed to ``register()`` could change what the snapshot exposed.
-        ``freeze()`` deep-copies — post-freeze mutation must not leak in.
+        """The OLD ``snapshot()`` returned the original schema dict by reference,
+        so a caller mutating the dict it had passed to ``register()`` could
+        change what the snapshot exposed.  ``freeze()`` deep-copies —
+        post-freeze mutation must not leak in.
         """
         reg = ToolRegistry()
         live_schema = {
@@ -1508,12 +1505,12 @@ class TestToolBatchSnapshotIsolation:
         )
 
     def test_dispatch_partition_consistent_when_parallel_safe_flips_mid_step(self):
-        """Codex Part 1 #11: ``_execute_tools`` historically called
-        ``registry.is_parallel_safe(name)`` three times during partition
-        (the outer `any(...)` check, the contiguous-group head check, and
-        the contiguous-group extend check).  If a concurrent register()
-        flipped the flag between those reads, the same batch could be
-        partitioned inconsistently.
+        """``_execute_tools`` historically called
+        ``registry.is_parallel_safe(name)`` three times during partition (the
+        outer `any(...)` check, the contiguous-group head check, and the
+        contiguous-group extend check).  If a concurrent register() flipped
+        the flag between those reads, the same batch could be partitioned
+        inconsistently.
 
         With ``ToolBatch`` the flag lives in a frozen ``frozenset``: no
         amount of concurrent registry churn can change what a frozen

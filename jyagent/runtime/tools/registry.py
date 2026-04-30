@@ -6,8 +6,7 @@ loop in ``runtime.loop.engine`` runs concurrently with potential registrations.
 
 Historically the engine consulted ``ToolRegistry`` *live* throughout a step
 (``is_parallel_safe``, ``get_timeout_hint``, ``get_schema``, ...), with a
-plain ``dict.get`` and no lock.  Codex review 2026-04-25 (Part 1 findings #4,
-#11, #12) flagged three resulting bugs:
+plain ``dict.get`` and no lock.  That exposed three races:
 
   * The ``parallel_safe`` flag could flip mid-batch, so the same step could
     partition a tool as serial in one place and parallel in another.
@@ -36,9 +35,9 @@ from typing import Any, Callable, Mapping, Optional
 def _readonly(d: Mapping) -> Mapping:
     """Wrap ``d`` in a ``MappingProxyType`` for ToolBatch fields.
 
-    B2 fix (codex review 2026-04-25): ``@dataclass(frozen=True)`` only
-    freezes the *field references* on a ToolBatch instance — the dicts
-    they point to are still mutable.  We deep-copy at freeze() time, so
+    ``@dataclass(frozen=True)`` only freezes the *field references* on a
+    ToolBatch instance — the dicts they point to are still mutable.  We
+    deep-copy at freeze() time, so
     cross-batch mutation is already blocked, but a single batch's
     schema_map / functions / timeout_hints / etc. used to be writeable
     by any caller that held the batch reference.  ``MappingProxyType``
@@ -81,10 +80,10 @@ class ToolBatch:
     # classify timeouts: a mutating-tool timeout leaks a daemon thread whose
     # partial side effect is now invisible to the model, and the loop records
     # the name in ``LoopResult.partial_side_effects`` for outer layers to
-    # reconcile.  A1 fix (codex review 2026-04-25): before this, every timeout
-    # returned the same "consider smaller steps" error regardless of whether
-    # the tool was read-only or mutating, so the model would happily retry a
-    # half-completed edit / shell script.
+    # reconcile.  Before this, every timeout returned the same "consider
+    # smaller steps" error regardless of whether the tool was read-only or
+    # mutating, so the model would happily retry a half-completed edit /
+    # shell script.
     mutating: frozenset[str]  # tool names with mutating=True
 
     # ─── Convenience accessors (mirror the legacy ToolRegistry shape so
@@ -166,7 +165,7 @@ class ToolBatch:
         is O(1) and safe.  ``version=base.version`` so the engine's
         per-step ``registry.version != state.tools_batch.version`` cache
         check still semantically tracks "registry has changed since last
-        freeze" (B-2 fix from 2026-04-29 review).
+        freeze".
         """
         schema_map = {
             s.get("name"): copy.deepcopy(s)
@@ -205,11 +204,11 @@ class ToolBatch:
         with empty metadata unless explicitly specified — they default to
         non-parallel-safe, no timeout hint, standard compaction priority.
 
-        ``mutating`` (M-5, codex review 2026-04-29): explicit set of tool
-        names to flag as mutating in the new batch.  Used by tests and
-        by future MCP integrations that need to surface a freshly-added
-        side-effecting tool to the verification gate / partial-side-effects
-        accumulator without going through the canonical registry path.
+        ``mutating`` is an explicit set of tool names to flag as mutating in
+        the new batch.  Used by tests and by future MCP integrations that need
+        to surface a freshly-added side-effecting tool to the verification
+        gate / partial-side-effects accumulator without going through the
+        canonical registry path.
         """
         new_functions = dict(self.functions)
         if functions:
@@ -245,7 +244,7 @@ class ToolBatch:
             large_input_keys=self.large_input_keys,
             compaction_priority=self.compaction_priority,
             # Overlaid tools default to non-mutating unless ``mutating=``
-            # is supplied (M-5).  The two in-tree overlays
+            # is supplied.  The two in-tree overlays
             # (``write_todos``, verification-context injections) are
             # local scratchpad ops with no externally-observable side
             # effects, so the default is correct for every current
@@ -265,13 +264,12 @@ class ToolRegistry:
 
     For per-step dispatch, prefer ``freeze()`` over per-call lookups —
     ``freeze()`` produces an immutable ``ToolBatch`` consumed by the entire
-    step, eliminating mid-step races on metadata (Codex review 2026-04-25).
+    step, eliminating mid-step races on metadata.
 
     The per-call metadata getters that used to live here (``snapshot``,
     ``is_parallel_safe``, ``is_mutating``, ``get_timeout_hint``,
     ``get_large_input_keys``, ``get_compaction_priority``) were deprecated
-    in 2026-04-27 (Codex review Part 1 #11) and removed in 2026-04-28 once
-    all in-tree callers had migrated to ``ToolBatch``.  Single-lookup
+    after all in-tree callers had migrated to ``ToolBatch``.  Single-lookup
     methods (:meth:`get_function`, :meth:`get_schema`, :meth:`get_schemas`,
     :meth:`get_functions`, :meth:`list_tools`, and :attr:`version`) remain
     — they are fine for one-off live reads where cross-call atomicity
@@ -333,7 +331,7 @@ class ToolRegistry:
 
         Schemas are deep-copied so a caller that retained a schema dict
         from ``register()`` cannot mutate the snapshot through shared
-        reference (Codex Part 1 #12).  This is more expensive than the
+        reference.  This is more expensive than the
         old shallow ``snapshot()``, but tool registration is rare and
         per-step freeze cost is negligible compared to the LLM call.
         """

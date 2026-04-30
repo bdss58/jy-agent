@@ -114,7 +114,7 @@ class TestRunImplWiresPhasePolicy:
     def test_source_consults_policy_and_rebuilds_opts(self):
         import inspect
         from jyagent.runtime.loop import step
-        # Phase-policy wiring lives in step.run_step after C4 Phase 5.
+        # Phase-policy wiring lives in step.run_step.
         source = inspect.getsource(step.run_step)
         # Policy must be consulted each step after opts is built.
         assert "cfg.phase_policy(" in source, (

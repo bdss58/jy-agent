@@ -56,7 +56,7 @@ _TOOL_METADATA = {
     "manage_skills":   {"parallel_safe": False},
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180, "compaction_priority": "persistent"},
     "mcp":             {"parallel_safe": False, "timeout_hint": 180, "mutating": True},
-    # M-2 (codex review 2026-04-29): dispatch_agent is now serial.  Sub-agents
+    # dispatch_agent is now serial.  Sub-agents
     # are coarse-grained (each one runs an entire AgentLoop on the shared
     # tool-dispatch pool); serialising at the top level avoids cross-pool
     # reentrancy under high parallel-tool-call fan-outs.  The bg path still
@@ -70,7 +70,7 @@ _TOOL_METADATA = {
     "web_search":      {"parallel_safe": True, "timeout_hint": 180, "compaction_priority": "persistent"},
 }
 
-# NOTE on the ``mutating`` flag (A1 fix, codex review 2026-04-25):
+# NOTE on the ``mutating`` flag:
 #   Flagged tools have externally-observable side effects (filesystem writes,
 #   shell commands, sub-process spawns, sub-agent dispatches, MCP calls) that
 #   the dispatch loop cannot cancel when the tool times out — the daemon
@@ -84,7 +84,7 @@ _TOOL_METADATA = {
 #   to mutating=False because a timed-out read is idempotent — retrying is
 #   always safe.
 #
-#   ``check_background`` is FLAGGED mutating (H-1, codex review 2026-04-29)
+#   ``check_background`` is FLAGGED mutating
 #   because the ``action="kill"`` branch SIGTERM/SIGKILLs the target
 #   process group — that side effect cannot be undone if the call times
 #   out mid-kill.  ``timeout_hint=360`` gives 60 s slack on top of the

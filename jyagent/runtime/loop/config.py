@@ -80,7 +80,7 @@ class LoopResult:
     todos: list = field(default_factory=list)
     # Names of mutating tools (run_shell, edit_file, write_file, mcp,
     # dispatch_agent, run_background) that hit the dispatch-loop timeout
-    # during this run.  A1 fix (codex review 2026-04-25): a timed-out
+    # during this run.  A timed-out
     # mutating tool's daemon thread keeps running past the timeout report,
     # so its side effect may have partially or fully landed in the
     # environment while the model received an "error" ToolResult.  Outer

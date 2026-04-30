@@ -23,8 +23,7 @@ from .llm_client import LLMClient
 # threads through sub-agent tier swaps.  They live under the runtime
 # package itself (`runtime.loop.llm_types`) — provider packages
 # re-export from `jyagent.llm.types` for backward compat.  After this
-# move (Codex review 2026-04-25 Part 3 #5, follow-up commit), the
-# runtime has **zero** runtime-import of `jyagent.llm`.
+# move, the runtime has **zero** runtime-import of `jyagent.llm`.
 from .llm_types import LLMOptions, ModelSpec
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from ..tools.registry import get_registry, ToolBatch
@@ -36,7 +35,7 @@ from .tracing import get_tracer
 from .verification import should_verify, build_verification_prompt
 from .callbacks import LoopCallbacks  # re-exported for back-compat
 from .config import LoopConfig, LoopResult  # re-exported for back-compat
-from ._thread_helpers import LoopThreadHelper  # L-2 mixin (cancel/_fire helpers)
+from ._thread_helpers import LoopThreadHelper  # cancel/_fire helpers
 
 
 _logger = logging.getLogger(__name__)
@@ -67,21 +66,21 @@ def _t_as_dict(t: Any) -> dict:
 
 
 # ─── Shared dispatch executor ────────────────────────────────────────────────
-# C4 Phase 2 (codex review 2026-04-25): the shared tool-dispatch pool, its
-# lazy-grow helper, and the ``_execute_tool*`` helpers moved to
+# The shared tool-dispatch pool, its lazy-grow helper, and the
+# ``_execute_tool*`` helpers moved to
 # ``runtime/loop/tool_executor.py``.  Internal call sites still use the
 # underscore-prefixed names via these aliases; tests that poke module
 # globals (``_tool_dispatch_executor``, ``_tool_dispatch_cap``, etc.) also
 # see them here via the PEP-562 ``__getattr__`` at the bottom of the file.
 #
-# ⚠️ IMPORTANT — back-compat scope (C4 Phase 5 follow-up, 2026-04-27):
+# ⚠️ IMPORTANT — back-compat scope:
 # The per-step body in ``runtime/loop/step.py::run_step`` calls
 # ``tool_executor.execute_tools`` DIRECTLY, NOT through this engine-level
 # alias.  Consequently, any downstream test or extension that patches
 # ``jyagent.runtime.loop.engine._execute_tools`` (or the other names
 # aliased below) will NOT intercept tool calls made during the normal
 # loop step.  The engine alias now only covers callers that imported
-# ``_execute_tools`` from ``engine`` directly (pre-Phase-2 compat only).
+# ``_execute_tools`` from ``engine`` directly before the helper moved.
 # New code and tests should patch ``jyagent.runtime.loop.tool_executor``
 # instead.
 from .tool_executor import (  # noqa: E402
@@ -104,16 +103,15 @@ from .tool_executor import (  # noqa: E402
 
 # ─── Harness helpers ─────────────────────────────────────────────────────────
 
-# C4 Phase 1 (codex review 2026-04-25): extracted to runtime/loop/cost.py.
+# Cost-accounting helpers live in runtime/loop/cost.py.
 # Kept as a private alias so internal imports (`_CostTracker()`) continue
-# to work without churn; phases 2-5 will similarly extract tool executor,
-# LLM runner, compaction, and leave engine.py as just the LoopController.
+# to work without churn.
 from .cost import CostTracker as _CostTracker  # noqa: E402
 
 
-# L-1 (codex review 2026-04-29): the stuck-loop detector moved to its own
+# The stuck-loop detector moved to its own
 # module (``runtime/loop/stuck_loop.py``) so this file can shrink toward its
-# post-Phase-5 thin-orchestrator role.  The underscore-prefixed back-compat
+# thin-orchestrator role.  The underscore-prefixed back-compat
 # alias is preserved because ``runtime/loop/step.py`` and any out-of-tree
 # consumers reference ``engine._StuckLoopDetector`` directly.
 from .stuck_loop import StuckLoopDetector as _StuckLoopDetector  # noqa: E402
@@ -124,7 +122,7 @@ from .stuck_loop import StuckLoopDetector as _StuckLoopDetector  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-# C4 Phase 3 (codex review 2026-04-25): extraction helpers moved to
+# LLM extraction helpers moved to
 # runtime/loop/llm_runner.py.  Engine keeps back-compat aliases with the
 # historical underscore-prefixed names so internal call sites (and tests
 # that monkeypatch them) continue to work unchanged.
@@ -214,7 +212,7 @@ def _finalize_run(
         }
         if trace_total_cost_usd is not None:
             finish_kwargs["total_cost_usd"] = trace_total_cost_usd
-        # A3 (codex review 2026-04-25): tracing must never fail-close a
+        # Tracing must never fail-close a
         # successful run.  Disk-full / read-only fs / permission errors here
         # used to bubble up and discard the entire LoopResult.  Log + swallow
         # so observability stays non-fatal.
@@ -240,7 +238,7 @@ def _finalize_run(
     )
 
 
-# C4 Phase 4 (codex-review 2026-04-25): compaction helpers moved to
+# Compaction helpers live in
 # runtime/loop/compaction.py.  Engine keeps underscore-prefixed back-compat
 # aliases so tests and internal callers that import the historical names
 # continue to work unchanged.
@@ -260,7 +258,7 @@ class AgentLoop(LoopThreadHelper):
     context compaction, truncation recovery, and transient-error retry.
 
     Inherits ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` from
-    ``LoopThreadHelper`` (L-2, codex review 2026-04-29).  Default helper
+    ``LoopThreadHelper``.  Default helper
     attribute names (``_cancel_event`` / ``_callbacks``) match the
     instance attributes set in ``__init__``, so no override is needed.
     """
@@ -284,7 +282,7 @@ class AgentLoop(LoopThreadHelper):
         self._session_id = session_id or ""
         # Reuse the module-level shared executor to avoid accumulating
         # ThreadPoolExecutor objects and atexit handlers across turns and
-        # sub-agent dispatches.  A2 fix: ensure the pool is at least as
+        # sub-agent dispatches.  Ensure the pool is at least as
         # wide as the configured ``max_tool_workers`` (the historical
         # singleton was hard-capped at 8, silently throttling configs
         # that asked for more dispatch parallelism).
@@ -293,14 +291,14 @@ class AgentLoop(LoopThreadHelper):
         # `write_todos` tool and seeded optionally via run(initial_todos=...)
         # so outer layers can carry the plan across turns.
         self._todos: list = []
-        # A1 fix (codex review 2026-04-25): accumulator for mutating-tool
+        # Accumulator for mutating-tool
         # timeouts.  Populated by ``_execute_tool_with_timeout`` via the
         # ``partial_side_effects=`` kwarg threaded through ``_execute_tools``;
         # snapshotted onto ``LoopResult.partial_side_effects`` in ``run()``.
         # Reset at the top of ``_run_impl`` so back-to-back .run() calls on
         # the same AgentLoop instance don't bleed state across turns.
         #
-        # H-2 (codex review 2026-04-29): backed by ``collections.deque``
+        # Backed by ``collections.deque``
         # because parallel-safe tool batches can fan out across multiple
         # daemon threads, each of which may hit a timeout simultaneously
         # and call ``.append(name)`` from its own worker.  Under PEP 703
@@ -311,7 +309,7 @@ class AgentLoop(LoopThreadHelper):
         # ``list(deque(...))`` is a normal iteration — the snapshot
         # in ``run()`` still works unchanged.
         self._partial_side_effects: collections.deque[str] = collections.deque()
-        # C2 (codex review 2026-04-25): AgentLoop holds substantial per-run
+        # AgentLoop holds substantial per-run
         # state on the instance (_todos, _run_id, _partial_side_effects,
         # closures, etc).  Concurrent .run() calls on a single instance
         # would silently corrupt that state — they'd share the todo list,
@@ -334,9 +332,8 @@ class AgentLoop(LoopThreadHelper):
         self._run_id = run_id or ""
 
     # ``_is_cancelled``, ``_cancellable_sleep``, and ``_fire`` are inherited
-    # from ``LoopThreadHelper`` (see ``_thread_helpers.py``).  L-2 (codex
-    # review 2026-04-29) extracted these from AgentLoop and LLMRunner where
-    # they were duplicated verbatim.
+    # from ``LoopThreadHelper`` (see ``_thread_helpers.py``), shared with
+    # LLMRunner where they were previously duplicated verbatim.
 
     def _write_checkpoint(
         self,
@@ -389,7 +386,7 @@ class AgentLoop(LoopThreadHelper):
             self._fire("on_warning", f"checkpoint write failed: {e}")
 
     # ── callback helpers ──────────────────────────────────────────────────
-    # ``_fire`` is provided by ``LoopThreadHelper`` (L-2 mixin).
+    # ``_fire`` is provided by ``LoopThreadHelper``.
 
     # ── public entry point ────────────────────────────────────────────────
 
@@ -406,7 +403,7 @@ class AgentLoop(LoopThreadHelper):
         regardless of which exit path fired.
 
         Raises ``RuntimeError`` if a previous ``run()`` on this instance
-        is still in flight (C2 fix, codex review 2026-04-25): AgentLoop
+        is still in flight: AgentLoop
         owns per-run mutable state (_todos, _run_id, _partial_side_effects,
         closures over _todos) that concurrent or re-entrant runs would
         silently corrupt.
@@ -430,7 +427,7 @@ class AgentLoop(LoopThreadHelper):
                 # Serialize to dict-form for easy JSON persistence by outer layers.
                 from .todos import todo_to_dict
                 result.todos = [todo_to_dict(t) for t in self._todos]
-            # A1 (codex review 2026-04-25): mirror the todos pattern — snapshot
+            # Mirror the todos pattern — snapshot
             # the mutating-timeout accumulator onto the result so every exit
             # path benefits without having to thread the list through every
             # _finalize_run() call site.  Copy defensively so a caller that
@@ -450,7 +447,7 @@ class AgentLoop(LoopThreadHelper):
                 )
             return result
         finally:
-            # C2: release the reentrance guard regardless of how _run_impl
+            # Release the reentrance guard regardless of how _run_impl
             # exited (return, raise, KeyboardInterrupt) so a subsequent
             # run() on the same instance is not deadlocked.
             self._run_lock.release()
@@ -464,7 +461,7 @@ class AgentLoop(LoopThreadHelper):
         """Core run loop.  Public entry point is ``run()`` which also
         snapshots the final todos onto the result.
 
-        After C4 Phase 5, this method is a thin orchestrator: setup is in
+        This method is a thin orchestrator: setup is in
         ``RunState.prepare_for_run()``, the per-step body is in
         ``runtime/loop/step.py::run_step``, and only the for-step counter,
         post-loop terminal handlers (cancelled-exit / max_steps fallback /
@@ -478,7 +475,7 @@ class AgentLoop(LoopThreadHelper):
         # threaded into 5 ``_finalize_run`` calls and ``cost_tracker`` into
         # 7 lexical sites, so the locals earn their keep on readability.
         # ``effective_spec`` is read inline from ``state`` at its single
-        # use site (Codex review of Phase 5, 2026-04-27).
+        # use site.
         trace = state.trace
         cost_tracker = state.cost_tracker
 
@@ -496,7 +493,7 @@ class AgentLoop(LoopThreadHelper):
                 # Defense-in-depth: every other ``run_step`` return must be
                 # ``StepContinue``.  Any future tagged-union member would
                 # silently fall through to the next iteration without this
-                # check (Codex review of Phase 5, 2026-04-27).
+                # check.
                 assert isinstance(outcome, StepContinue), (
                     f"run_step returned unknown outcome type: {type(outcome).__name__}"
                 )
@@ -563,7 +560,7 @@ class AgentLoop(LoopThreadHelper):
                     state.total_input_tokens += usage.get("input_tokens", 0)
                     state.total_output_tokens += usage.get("output_tokens", 0)
                     self._fire("on_usage", usage)
-                    # B1 fix (codex review 2026-04-25): the fallback call's
+                    # The fallback call's
                     # tokens were being added to the totals reported on
                     # LoopResult, but ``cost_tracker`` was never updated —
                     # so ``trace_total_cost_usd`` (read three lines below
@@ -661,7 +658,7 @@ class AgentLoop(LoopThreadHelper):
 
     # ── LLM call + retry/fallback (delegated to LLMRunner) ──────────────
     #
-    # C4 Phase 3 (codex review 2026-04-25): the call machinery lives in
+    # The call machinery lives in
     # ``llm_runner.LLMRunner``.  These methods are kept as thin delegates
     # because internal code and tests call them by name (and tests
     # monkeypatch them on the instance).  The runner is created lazily on
@@ -698,7 +695,7 @@ class AgentLoop(LoopThreadHelper):
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
 
-        C4 Phase 3: we keep the retry loop in AgentLoop (rather than routing
+        We keep the retry loop in AgentLoop (rather than routing
         straight to ``LLMRunner.call_with_retry``) so that it dispatches
         through ``self._call_streaming`` / ``self._call_complete``.  Several
         tests and internal diagnostics override those methods on a subclass
@@ -768,7 +765,7 @@ class AgentLoop(LoopThreadHelper):
 
 # ─── PEP 562 back-compat shim for tool_executor module state ────────────────
 #
-# C4 Phase 2: the pool + lock + cap are MUTABLE module state that
+# The pool + lock + cap are MUTABLE module state that
 # ``get_tool_dispatch_executor()`` rebinds inside ``tool_executor.py`` when
 # the pool grows.  If engine.py imported them as values at module-import
 # time, every post-grow read from ``loop_engine._tool_dispatch_executor``

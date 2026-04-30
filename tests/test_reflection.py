@@ -200,7 +200,7 @@ class TestRunImplWiresReflection:
     def test_source_contains_reflection_import_and_call(self):
         import inspect
         from jyagent.runtime.loop import step
-        # After C4 Phase 5: lazy import lives in RunState.prepare_for_run(); the
+        # Lazy import lives in RunState.prepare_for_run(); the
         # consumption (should_reflect / build_reflection_prompt /
         # on_reflection / last_reflection_count) lives in step.run_step.
         prepare_src = inspect.getsource(step.RunState.prepare_for_run)

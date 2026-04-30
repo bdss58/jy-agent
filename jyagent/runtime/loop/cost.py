@@ -1,20 +1,7 @@
 """Per-run cost tracking for budget enforcement.
 
-Extracted from ``engine.py`` as Phase 1 of the 5-phase engine split plan
-(C4 follow-up to the codex review 2026-04-25 — see
-``data/memory/topics/runtime-c1-c4-deferrals.md``).
-
-The goal of the split is to reduce ``engine.py`` (still 2226 lines) into
-five owned components:
-
-    cost.py        ← this module (Phase 1)
-    tool_executor  (Phase 2)
-    llm_runner     (Phase 3)
-    compaction     (Phase 4)
-    LoopController (Phase 5 — what remains in engine.py)
-
-Phase 1 is deliberately cheap to verify the pattern before committing to
-the bigger moves.  ``_CostTracker`` is self-contained: only depends on
+Extracted from ``engine.py`` to keep the loop controller focused on
+orchestration.  ``_CostTracker`` is self-contained: it only depends on
 ``..stats.compute_call_cost`` for pricing math.
 """
 
@@ -27,9 +14,9 @@ class CostTracker:
     Delegates pricing math to ``stats.compute_call_cost`` so the engine
     and ``SessionStats`` cannot drift on Anthropic 1M-context tier
     multipliers, the ``input_tokens_include_cache_reads`` credit, or
-    cache-creation pricing.  Codex review 2026-04-25 Part 1 #9/#10: the
-    previous implementation reimplemented a simplified pricing formula
-    and quietly under-counted cost on long-context calls.
+    cache-creation pricing.  The previous implementation reimplemented a
+    simplified pricing formula and quietly under-counted cost on
+    long-context calls.
 
     When a call's (provider, model) has no pricing entry the call's
     tokens are NOT included in the running total and ``unpriced_calls``

@@ -489,7 +489,7 @@ def test_search_with_plural_query_matches_singular_body():
 # ─── 6. CRITICAL / HIGH FIX REGRESSIONS (post-review hardening) ──────────────
 
 def test_append_memory_md_heals_missing_trailing_newline():
-    """C1: a hand-edited MEMORY.md without a trailing newline must not glue
+    """A hand-edited MEMORY.md without a trailing newline must not glue
     two unrelated entries onto one line on the next append."""
     setup()
     from jyagent.memory.operations import append_memory_md
@@ -545,7 +545,7 @@ def test_manage_memory_remember_and_goal_return_errors_for_invalid_entries():
 
 
 def test_apply_directive_rejects_no_match_update_as_skip():
-    """C3: an UPDATE directive whose keyword matches nothing must NOT count
+    """An UPDATE directive whose keyword matches nothing must NOT count
     as a successful update — otherwise hallucinated UPDATEs crowd out real
     ADDs against the per-turn cap."""
     from jyagent.memory.extraction import _apply_directive
@@ -561,7 +561,7 @@ def test_apply_directive_rejects_no_match_update_as_skip():
 
 
 def test_apply_directive_rejects_overlong_body():
-    """H3: enforce the prompt's '<120 chars, one line' rule in the parser."""
+    """Enforce the prompt's '<120 chars, one line' rule in the parser."""
     from jyagent.memory.extraction import _apply_directive
     setup()
     write_memory_md("# Agent Memory\n\n[tip] existing\n")
@@ -583,7 +583,7 @@ def test_apply_directive_rejects_overlong_body():
 
 
 def test_topic_path_rejects_traversal():
-    """H1: ../escape, absolute paths, and special chars must be refused."""
+    """../escape, absolute paths, and special chars must be refused."""
     from jyagent.memory.operations import _topic_path, write_topic, delete_topic
     assert _topic_path("../escape") is None
     assert _topic_path("/abs/path") is None

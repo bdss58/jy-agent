@@ -1,36 +1,24 @@
 """Tool execution stack — validated body invocation + timeout + dispatch.
 
-Extracted from ``engine.py`` as Phase 2 of the 5-phase engine split plan
-(C4 follow-up to the codex review 2026-04-25 — see
-``data/memory/topics/runtime-c1-c4-deferrals.md``).
-
-The goal of the split is to reduce ``engine.py`` (still >2100 lines) into
-five owned components:
-
-    cost.py        ← Phase 1 (landed)
-    tool_executor  ← this module (Phase 2)
-    llm_runner     (Phase 3)
-    compaction     (Phase 4)
-    LoopController (Phase 5 — what remains in engine.py)
-
-Phase 2 owns the tool-side of the loop — everything a tool body touches
-from the moment a ToolCallRequest is dequeued to the moment a ToolResult
-comes back:
+Extracted from ``engine.py`` to keep the loop controller focused on
+orchestration.  This module owns the tool-side of the loop — everything a
+tool body touches from the moment a ToolCallRequest is dequeued to the moment
+a ToolResult comes back:
 
     * The shared dispatch pool (``tool_dispatch_executor``) and its
       lazy-grow helper (``get_tool_dispatch_executor``).  Per-run widths
       come from ``LoopConfig.max_tool_workers``; growth recreates the
-      pool under a lock (A2 fix, codex review 2026-04-25).
+      pool under a lock.
     * ``execute_tool`` — validated single-call invocation, always
       returns a ToolResult (never raises, except KeyboardInterrupt).
     * ``execute_tool_with_timeout`` — daemon-thread wrapper that will
       never leak a pool slot on timeout (P0 fix, 2026-04).  Flags
-      mutating-tool timeouts for the caller (A1 fix, codex review
-      2026-04-25) and tolerates non-coercible ``timeout`` inputs (B3).
+      mutating-tool timeouts for the caller and tolerates non-coercible
+      ``timeout`` inputs.
     * ``execute_tools`` — fan-out with parallel-safe / mutating
       partitioning.  Reads parallel-safe + mutating flags from the
       immutable per-step ``ToolBatch`` snapshot, so a concurrent
-      registration cannot flip them mid-batch (Codex Part 1 #4/#11).
+      registration cannot flip them mid-batch.
 
 Engine.py keeps an alias import block that re-exports these under their
 legacy underscore-prefixed names plus a PEP-562 ``__getattr__`` for the
@@ -86,10 +74,10 @@ def get_tool_dispatch_executor(
 ) -> concurrent.futures.ThreadPoolExecutor:
     """Return the shared dispatch executor, growing it if needed.
 
-    A2 fix (codex review 2026-04-25): the eagerly-created executor was
-    hard-capped at 8 workers, so ``LoopConfig.max_tool_workers > 8`` was
-    silently honoured at the body-permit layer but starved at dispatch.
-    This helper lazy-creates and grows the pool to the largest
+    The eagerly-created executor was hard-capped at 8 workers, so
+    ``LoopConfig.max_tool_workers > 8`` was silently honoured at the
+    body-permit layer but starved at dispatch.  This helper lazy-creates and
+    grows the pool to the largest
     ``max_tool_workers`` ever requested across all live ``AgentLoop``
     instances in the process.
 
@@ -126,7 +114,7 @@ def get_tool_dispatch_executor(
         return tool_dispatch_executor
 
 
-# P3-2 (Codex review 2026-04-25 Part 3 #2): the pool is now LAZY.
+# The pool is now LAZY.
 # It used to be eagerly initialised here at module import — but that meant
 # `import jyagent.runtime` (which transitively imports this module) spun up
 # a background thread pool and registered an `atexit.shutdown` hook even
@@ -159,7 +147,7 @@ def execute_tool(
     All tool resolution (function lookup, schema for validation) goes
     through the per-step ``batch`` snapshot — no live registry reads
     here, so a concurrent ``register()``/``unregister()`` cannot pair
-    a function with a different schema mid-batch (Codex Part 1 #4).
+    a function with a different schema mid-batch.
     """
     fn = batch.get_function(name)
     if fn is None:
@@ -211,17 +199,16 @@ def execute_tools(
     Sequential paths don't acquire permits — they're serial by construction.
 
     All ``parallel_safe`` decisions read from the immutable ``batch`` — a
-    concurrent registry mutation cannot flip a tool's flag mid-partition
-    (Codex Part 1 #11).
+    concurrent registry mutation cannot flip a tool's flag mid-partition.
 
     ``partial_side_effects`` (optional) is an accumulator the caller owns —
     every mutating-tool timeout appends its name so ``AgentLoop`` can surface
-    it on ``LoopResult.partial_side_effects`` (A1 fix, codex review
-    2026-04-25).  Non-mutating timeouts and successful calls never touch it.
+    it on ``LoopResult.partial_side_effects``.  Non-mutating timeouts and
+    successful calls never touch it.
     ``None`` disables the accumulator (for ad-hoc callers that don't care).
 
-    H-2 (codex review 2026-04-29): the accumulator must accept both
-    ``list[str]`` (legacy callers) and ``collections.deque[str]`` (the
+    The accumulator must accept both ``list[str]`` (legacy callers) and
+    ``collections.deque[str]`` (the
     AgentLoop default — chosen for free-threaded-Python forward-compat
     where ``list.append`` is no longer atomic but ``deque.append`` is).
     Both share the ``.append(...)`` interface; that's all the timeout
@@ -266,8 +253,8 @@ def execute_tools(
                 parallel_batch.append((i, blocks[i]))
                 i += 1
 
-            # P3-2 (2026-04-27): the module-level `tool_dispatch_executor`
-            # is now lazy.  In production, `executor` is always set
+            # The module-level `tool_dispatch_executor` is now lazy.  In
+            # production, `executor` is always set
             # (`AgentLoop.__init__` passes `loop._executor`), but direct
             # callers (`tool_executor.execute_tools()` with `executor=None`,
             # or the back-compat `engine._execute_tools()` shim) need us to
@@ -347,7 +334,7 @@ def execute_tool_with_timeout(
     and schema — no live registry reads, so a concurrent registration
     cannot change the effective timeout mid-call.
 
-    ``partial_side_effects`` (optional, A1 fix — codex review 2026-04-25):
+    ``partial_side_effects`` (optional):
     when the tool is flagged mutating and times out, its name is appended
     to this list and a WARNING is logged on the module ``_logger``.  The
     returned ToolResult also gets a stronger error message that tells the
@@ -366,7 +353,7 @@ def execute_tool_with_timeout(
     # run_shell manages its own timeout — give extra slack
     if name == "run_shell":
         user_timeout = (tool_input or {}).get("timeout", 60)
-        # B3 fix (codex review 2026-04-25): a non-coercible timeout
+        # A non-coercible timeout
         # (e.g. the model hallucinated ``"30s"`` or a list) used to raise
         # ``TypeError``/``ValueError`` here BEFORE _execute_tool could
         # surface the error through its normal ToolResult path, crashing
@@ -402,7 +389,7 @@ def execute_tool_with_timeout(
         t.start()
         timed_out = not done.wait(timeout)
     finally:
-        # H-3 (codex review 2026-04-29): the permit is released as soon as
+        # The permit is released as soon as
         # ``done.wait(timeout)`` returns, which on timeout is BEFORE the
         # daemon body thread has actually finished.  This is intentional —
         # alternative #1 (hold the permit until the daemon completes) would
@@ -431,7 +418,7 @@ def execute_tool_with_timeout(
         # run_background, mcp, dispatch_agent) the *side effect* is still
         # in flight in the background thread and may partially or fully
         # complete after we've told the model "timeout, try something
-        # else".  A1 fix (codex review 2026-04-25): classify the timeout,
+        # else".  Classify the timeout,
         # log loudly, rewrite the error text so the model knows to verify
         # state, and accumulate the name for LoopResult.partial_side_effects
         # so outer layers can reconcile.  A future PR will tackle the full

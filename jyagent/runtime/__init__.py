@@ -4,12 +4,11 @@ The runtime owns the agentic execution loop, tool dispatch/registry, and
 session statistics.  Skill management (prompt-context routing, LLM-based
 auto-activation) lives in ``jyagent.skills`` — it is a higher-level
 application concern that consumes the runtime, not part of it.
-Refactor #3 (2026-04-25, Codex review Part 3 #3 #4) lifted ``SkillManager``
-out of this package precisely because the loop engine has zero
-dependency on it.
+``SkillManager`` lives outside this package precisely because the loop engine
+has zero dependency on it.
 
-Lazy public API (P3-1, Codex review 2026-04-25 Part 3 #1).
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Lazy public API.
+~~~~~~~~~~~~~~~~
 
 Cheap symbols (configs, callbacks, types, tools, stats) are imported
 eagerly because their leaf modules have zero transitive dependency on

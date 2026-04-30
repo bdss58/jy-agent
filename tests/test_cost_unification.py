@@ -1,9 +1,8 @@
 # tests/test_cost_unification.py — Pin the single-source-of-pricing
 # invariant between SessionStats and the engine's _CostTracker.
 #
-# Codex review 2026-04-25 Part 1 #9/#10 flagged that the engine's
-# _CostTracker reimplemented pricing with a simplified formula —
-# missing the long-context multiplier and the
+# The engine's _CostTracker used to reimplement pricing with a simplified
+# formula — missing the long-context multiplier and the
 # `input_tokens_include_cache_reads` credit that SessionStats applied.
 # The two trackers diverged on Anthropic 1M-context calls: status bar
 # said one number, max_cost_usd budget enforced another.
@@ -103,8 +102,8 @@ class TestPricingUnification:
         a, b = self._both_trackers(usage, "test-vendor", "1m-model")
         assert a == pytest.approx(b), (
             f"Long-context multiplier divergence: SessionStats={a}, "
-            f"_CostTracker={b}.  This is exactly the Codex 2026-04-25 "
-            f"Part 1 #10 bug."
+            f"_CostTracker={b}.  This is exactly the old engine-budget "
+            f"under-counting bug."
         )
         # Below-threshold call must NOT apply the multiplier.
         below = {"input_tokens": 100_000, "output_tokens": 1_000}

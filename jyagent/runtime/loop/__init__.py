@@ -1,7 +1,7 @@
 """Agent loop runtime: engine, callbacks, config, and supporting helpers.
 
-Lazy engine load (P3-1, Codex review 2026-04-25 Part 3 #1).
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Lazy engine load.
+~~~~~~~~~~~~~~~~~
 
 ``AgentLoop`` and ``LoopConfig`` / ``LoopResult`` re-exports from
 ``.engine`` are now lazy.  Cheap leaf modules (``callbacks``, ``config``,

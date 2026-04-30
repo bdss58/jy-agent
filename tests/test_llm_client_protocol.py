@@ -1,8 +1,7 @@
 """Tests for the ``LLMClient`` Protocol contract.
 
-Codex review 2026-04-25 (Part 3 finding #5) flagged that the runtime
-imported the concrete ``LLMOwner`` class.  Refactor #3-B introduced an
-``LLMClient`` Protocol so the engine depends only on the contract; any
+The runtime used to import the concrete ``LLMOwner`` class.  The
+``LLMClient`` Protocol keeps the engine dependent only on the contract; any
 object satisfying it can drive ``AgentLoop``.
 
 These tests guard the contract:
@@ -132,8 +131,8 @@ def test_llmclient_protocol_minimal_surface():
     """The Protocol must stay minimal: model_spec property + complete + stream.
 
     If a fourth method creeps in, every alternative client (test fakes,
-    third-party providers) breaks silently.  Codex Part 3 #5's whole
-    point was to keep the runtime → llm contract small.
+    third-party providers) breaks silently.  The Protocol boundary exists to
+    keep the runtime → llm contract small.
     """
     import inspect
     members = {

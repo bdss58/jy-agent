@@ -1,10 +1,10 @@
-"""Regression tests for Codex review 2026-04-25 Tier-A fixes.
+"""Regression tests for runtime safety fixes.
 
 Covers:
-    A1 — mutating-tool timeouts surface on LoopResult.partial_side_effects
-    A2 — `_tool_dispatch_executor` grows to honour `LoopConfig.max_tool_workers`
-    A3 — tracing finalize errors are logged, not raised
-    A4 — `run_id` containing `..` cannot escape `checkpoint_dir`
+    - Mutating-tool timeouts surface on LoopResult.partial_side_effects.
+    - `_tool_dispatch_executor` grows to honour `LoopConfig.max_tool_workers`.
+    - Tracing finalize errors are logged, not raised.
+    - `run_id` containing `..` cannot escape `checkpoint_dir`.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from jyagent.runtime.loop.config import LoopConfig
 from jyagent.runtime.tools.registry import ToolRegistry
 
 
-# ─── A4: path sanitisation ──────────────────────────────────────────────────
+# ─── Path sanitisation ──────────────────────────────────────────────────────
 
 
 class TestCheckpointRunIdSanitisation:
@@ -58,7 +58,7 @@ class TestCheckpointRunIdSanitisation:
         assert " " not in path
 
 
-# ─── A3: tracing finalize errors are non-fatal ──────────────────────────────
+# ─── Tracing finalize errors are non-fatal ──────────────────────────────────
 
 
 class _ExplodingTrace:
@@ -118,14 +118,14 @@ class TestTraceFinalizeNonFatal:
         assert not caplog.records
 
 
-# ─── A2: dispatch executor honours max_tool_workers ─────────────────────────
+# ─── Dispatch executor honours max_tool_workers ─────────────────────────────
 
 
 class TestDispatchExecutorGrowsWithConfig:
     def test_get_executor_grows_on_demand(self, monkeypatch):
         """Requesting more workers than current cap grows the pool."""
         # Snapshot + reset module state so the test is independent.
-        # C4 Phase 2: the canonical home for this state is now
+        # The canonical home for this state is now
         # runtime/loop/tool_executor.py.  Restoring by writing through
         # ``loop_engine._tool_dispatch_executor`` would create a STATIC
         # attribute that shadows the PEP-562 ``__getattr__`` passthrough,
@@ -181,14 +181,14 @@ class TestDispatchExecutorGrowsWithConfig:
         assert captured["min_workers"] == 12
 
 
-# ─── A1: mutating-tool timeouts surface on LoopResult ───────────────────────
+# ─── Mutating-tool timeouts surface on LoopResult ───────────────────────────
 #
 # The dispatch loop runs every tool body in a daemon thread.  On timeout the
 # thread keeps running but we return an error ToolResult and move on — fine
 # for read-only tools (retry is idempotent), but for MUTATING tools
 # (run_shell, edit_file, write_file, dispatch_agent, run_background, mcp)
 # the side effect may complete invisibly in the background while the model
-# receives "timeout, try something else".  A1 scope: classify + surface
+# receives "timeout, try something else".  Scope: classify + surface
 # (warn, clearer error text, accumulate names into LoopResult); full
 # subprocess hard-kill is out-of-scope for this PR.
 
@@ -416,11 +416,11 @@ class TestA1MutatingTimeout:
         )
 
 
-# ─── B2: ToolBatch dict fields are read-only views ──────────────────────────
+# ─── ToolBatch dict fields are read-only views ──────────────────────────────
 
 
 class TestToolBatchReadOnly:
-    """B2: ToolBatch.{schema_map,functions,timeout_hints,large_input_keys,
+    """ToolBatch.{schema_map,functions,timeout_hints,large_input_keys,
     compaction_priority} are MappingProxyType views.  Mutating them must
     raise TypeError instead of silently corrupting the per-step snapshot.
     """
@@ -487,11 +487,11 @@ class TestToolBatchReadOnly:
         assert "ro_tool" in new.functions  # base tools still present
 
 
-# ─── B3: run_shell timeout coercion is fault-tolerant ───────────────────────
+# ─── run_shell timeout coercion is fault-tolerant ───────────────────────────
 
 
 class TestRunShellTimeoutCoercion:
-    """B3: a malformed ``timeout`` from the model (e.g. ``"30s"`` or a list)
+    """A malformed ``timeout`` from the model (e.g. ``"30s"`` or a list)
     used to raise TypeError/ValueError out of _execute_tool_with_timeout
     BEFORE _execute_tool's normal schema validation could turn it into a
     clean ToolResult error.  Coercion failure now falls back to the
@@ -576,11 +576,11 @@ class TestRunShellTimeoutCoercion:
         assert isinstance(result, loop_engine.ToolResult)
 
 
-# ─── B1: max-steps fallback now records cost ─────────────────────────────────
+# ─── Max-steps fallback now records cost ────────────────────────────────────
 
 
 class TestMaxStepsFallbackCostTracking:
-    """B1: the max-steps fallback call's tokens were added to the LoopResult
+    """The max-steps fallback call's tokens were added to the LoopResult
     totals but never recorded against ``cost_tracker``, so trace cost
     silently under-counted.  Now ``cost_tracker.record(...)`` runs in
     the fallback try-block too.
@@ -666,11 +666,11 @@ class TestMaxStepsFallbackCostTracking:
         )
 
 
-# ─── C2: AgentLoop reentrance guard ─────────────────────────────────────────
+# ─── AgentLoop reentrance guard ─────────────────────────────────────────────
 
 
 class TestAgentLoopReentranceGuard:
-    """C2: a second run() invocation on the same AgentLoop instance — whether
+    """A second run() invocation on the same AgentLoop instance — whether
     concurrent (from another thread) or nested (mid-callback) — must raise
     RuntimeError instead of silently corrupting per-run state.
     """
@@ -745,11 +745,11 @@ class TestAgentLoopReentranceGuard:
         assert isinstance(loop._run_lock, type(threading.Lock()))
 
 
-# ─── C3: SessionStats locked readers ────────────────────────────────────────
+# ─── SessionStats locked readers ────────────────────────────────────────────
 
 
 class TestSessionStatsLockedReaders:
-    """C3: provider/model property reads now acquire self._lock so they're
+    """Provider/model property reads now acquire self._lock so they're
     correct under free-threaded CPython AND consistent with the writer
     contract (set_active_model takes the same lock).
     """
@@ -802,11 +802,11 @@ class TestSessionStatsLockedReaders:
         )
 
 
-# ─── C1: cancellation latency in LLM calls ──────────────────────────────────
+# ─── Cancellation latency in LLM calls ──────────────────────────────────────
 
 
 class TestC1CancellationLatency:
-    """C1: a cancel_event set during a slow LLM complete() or stream()
+    """A cancel_event set during a slow LLM complete() or stream()
     call must unblock the call within ~200 ms instead of waiting for
     the provider timeout.
     """
@@ -988,11 +988,11 @@ class TestC1CancellationLatency:
         assert not t.is_alive(), "streaming call did not unblock after close"
 
 
-# ─── C4 Phase 1: CostTracker extracted to runtime/loop/cost.py ──────────────
+# ─── CostTracker extracted to runtime/loop/cost.py ──────────────────────────
 
 
 class TestC4Phase1CostExtraction:
-    """C4 Phase 1 proof-of-pattern: _CostTracker moved to runtime/loop/cost.py
+    """_CostTracker moved to runtime/loop/cost.py
     under the name CostTracker.  Engine re-exports as _CostTracker for
     internal back-compat.  Both import paths must work.
     """
@@ -1036,11 +1036,11 @@ class TestC4Phase1CostExtraction:
         assert ct.cost == 0.0  # lower bound
 
 
-# ─── C4 Phase 2: tool executor extracted to runtime/loop/tool_executor.py ────
+# ─── Tool executor extracted to runtime/loop/tool_executor.py ────────────────
 
 
 class TestC4Phase2ToolExecutorExtraction:
-    """C4 Phase 2: the tool-execution stack (execute_tool, execute_tool_with_timeout,
+    """The tool-execution stack (execute_tool, execute_tool_with_timeout,
     execute_tools, dispatch-pool state) now lives in runtime/loop/tool_executor.py.
     Engine aliases the functions with underscore-prefixed names for internal
     callers and exposes the mutable pool state via a PEP-562 ``__getattr__``
@@ -1119,11 +1119,11 @@ class TestC4Phase2ToolExecutorExtraction:
             _ = _engine._definitely_does_not_exist  # noqa: SLF001
 
 
-# ─── C4 Phase 3: LLM call + retry extracted to runtime/loop/llm_runner.py ────
+# ─── LLM call + retry extracted to runtime/loop/llm_runner.py ────────────────
 
 
 class TestC4Phase3LLMRunnerExtraction:
-    """C4 Phase 3: the LLM call machinery (``call_complete`` /
+    """The LLM call machinery (``call_complete`` /
     ``call_streaming`` / ``call_with_retry``) plus its helpers
     (``extract_text``, ``extract_tool_calls``, ``is_transient_error``,
     ``build_runtime_options``) now lives in
@@ -1131,7 +1131,8 @@ class TestC4Phase3LLMRunnerExtraction:
     aliases so tests and internal callers that import the
     underscore-prefixed names continue to work.
 
-    Unlike Phase 2, there is no mutable module state to worry about — only
+    Unlike the tool executor module, there is no mutable module state to worry
+    about — only
     functions and a class — so a plain ``from X import Y`` snapshot is
     fine and identity assertions suffice.  AgentLoop's ``_call_complete``
     and ``_call_streaming`` methods are thin delegates onto
@@ -1312,11 +1313,11 @@ class TestC4Phase3LLMRunnerExtraction:
         assert streaming_calls == 2, "retry should invoke self._call_streaming twice"
 
 
-# ─── C4 Phase 4: compaction helpers extracted to runtime/loop/compaction.py ──
+# ─── Compaction helpers extracted to runtime/loop/compaction.py ─────────────
 
 
 class TestC4Phase4CompactionExtraction:
-    """C4 Phase 4: the three compaction helpers (``truncate_result``,
+    """The three compaction helpers (``truncate_result``,
     ``compact_messages``, ``truncate_tool_call_blocks``) moved to
     ``jyagent.runtime.loop.compaction``.  Engine keeps three
     underscore-prefixed back-compat aliases so the many existing test
@@ -1325,7 +1326,7 @@ class TestC4Phase4CompactionExtraction:
     All three are **pure functions** — no closure state, no mutable
     module attributes — so identity checks are sufficient proof that
     the engine alias and the compaction-module original are the same
-    object.  (Phase 2's PEP-562 shim is not needed here because there
+    object.  (The tool executor PEP-562 shim is not needed here because there
     is nothing to rebind.)
     """
 
@@ -1399,12 +1400,12 @@ class TestC4Phase4CompactionExtraction:
         assert out[1] is tool_block  # same object reference
 
 
-# ─── P3-1 + P3-2: import-time cleanup ───────────────────────────────────────
+# ─── Import-time cleanup ────────────────────────────────────────────────────
 #
-# Codex review 2026-04-25 Part 3 #1 (eager engine load on `import runtime`)
-# and Part 3 #2 (module-level pool + atexit at import).  These tests run in
-# subprocess so they get a fresh `sys.modules` — the in-process pytest run
-# has already imported the engine for hundreds of other tests.
+# These tests cover eager engine loading on `import runtime` and accidental
+# module-level pool creation.  They run in subprocess so they get a fresh
+# `sys.modules` — the in-process pytest run has already imported the engine
+# for hundreds of other tests.
 
 class TestC4ImportTimeCleanup:
     """Verify `import jyagent.runtime` is cheap and side-effect-free.
@@ -1427,7 +1428,7 @@ class TestC4ImportTimeCleanup:
         return result.stdout
 
     def test_runtime_import_does_not_load_engine(self):
-        """P3-1: `import jyagent.runtime` must NOT load engine.py.
+        """`import jyagent.runtime` must NOT load engine.py.
 
         Engine pulls in tool_executor/llm_runner/compaction/step — a hard
         regression if it loads on plain `import jyagent.runtime`.
@@ -1449,7 +1450,7 @@ print('OK')
         assert "OK" in out
 
     def test_runtime_loop_import_does_not_load_engine(self):
-        """P3-1: `import jyagent.runtime.loop` must NOT load engine.py either."""
+        """`import jyagent.runtime.loop` must NOT load engine.py either."""
         out = self._run_in_subprocess("""
 import sys
 import jyagent.runtime.loop
@@ -1462,14 +1463,14 @@ print('OK')
         assert "OK" in out
 
     def test_runtime_import_creates_no_thread_pool(self):
-        """P3-2: `import jyagent.runtime` must NOT create the dispatch pool.
+        """`import jyagent.runtime` must NOT create the dispatch pool.
 
         Pool creation registers an atexit hook and spins a daemon thread —
         unwanted for callers that never construct an `AgentLoop`.
         """
         out = self._run_in_subprocess("""
 import jyagent.runtime
-# tool_executor itself isn't loaded yet (P3-1 makes it lazy via engine);
+# tool_executor itself isn't loaded yet; engine keeps it lazy.
 # import it explicitly and check the pool is None.
 from jyagent.runtime.loop import tool_executor as te
 assert te.tool_dispatch_executor is None, 'pool eagerly initialised at import'
@@ -1479,7 +1480,7 @@ print('OK')
         assert "OK" in out
 
     def test_lazy_agentloop_attribute_works(self):
-        """P3-1: `from jyagent.runtime import AgentLoop` lazy-loads engine."""
+        """`from jyagent.runtime import AgentLoop` lazy-loads engine."""
         out = self._run_in_subprocess("""
 import sys
 import jyagent.runtime
@@ -1496,7 +1497,7 @@ print('OK')
         assert "OK" in out
 
     def test_lazy_from_import_pattern_works(self):
-        """P3-1: `from jyagent.runtime import AgentLoop` (statement form)
+        """`from jyagent.runtime import AgentLoop` (statement form)
         triggers __getattr__ exactly like attribute access."""
         out = self._run_in_subprocess("""
 import sys
@@ -1538,7 +1539,7 @@ print('OK')
 """)
         assert "OK" in out
     def test_execute_tools_with_executor_none_lazy_inits_pool(self):
-        """P3-2 regression (Codex follow-up): direct callers of
+        """Direct callers of
         `tool_executor.execute_tools(...)` with `executor=None` MUST work
         even when no AgentLoop has been constructed yet.
 
@@ -1589,4 +1590,3 @@ assert te.tool_dispatch_executor is not None
 print("OK")
 ''', timeout=20)
         assert "OK" in out
-

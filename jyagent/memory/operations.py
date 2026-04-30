@@ -35,7 +35,7 @@ _MEMORY_CATEGORY_RE = re.compile(r"^[a-z_]+$")
 # pipeline replaces an existing line by calling ``forget`` and ``remember``
 # back-to-back inside one critical section.
 #
-# Why we need it (from the code review 2026-04-25):
+# Why we need it:
 #   - The background extraction thread (extraction.py::_do_extract) and the
 #     main thread's synchronous manage_memory calls both mutate MEMORY.md.
 #   - Extraction's ADD/UPDATE pipeline does read → think → write; a parallel
@@ -219,8 +219,8 @@ def list_topics() -> list[str]:
     return topics
 
 
-# Strict topic-name allowlist. Closes the path-traversal lever surfaced in
-# the 2026-04-25 code review (H1) — without this, a topic name like
+# Strict topic-name allowlist. Closes the path-traversal lever — without this,
+# a topic name like
 # "../../../tmp/escape" would resolve outside TOPICS_DIR for read/write/delete.
 # Kept narrow on purpose: even `:` would let a future refactor confuse a
 # topic name with a frontmatter key.
@@ -512,7 +512,7 @@ def write_topic(name: str, content: str) -> None:
     to the ``## Topic Files Index`` section of MEMORY.md.
 
     Raises ``ValueError`` for invalid topic names — closes the path-traversal
-    lever (code-review H1).
+    lever.
     """
     ensure_dirs()
     filepath = _topic_path(name)

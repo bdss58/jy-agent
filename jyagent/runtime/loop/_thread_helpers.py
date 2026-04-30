@@ -1,4 +1,4 @@
-"""Shared thread-helper mixin (L-2, codex review 2026-04-29).
+"""Shared thread-helper mixin.
 
 ``AgentLoop`` (engine.py) and ``LLMRunner`` (llm_runner.py) both need three
 identical helpers — ``_is_cancelled``, ``_cancellable_sleep``, ``_fire`` —

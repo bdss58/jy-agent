@@ -1,7 +1,6 @@
 """Message & tool-call compaction helpers for the agent loop.
 
-C4 Phase 4 (codex-review 2026-04-25): extracted from ``engine.py``.  Three
-pure helper functions drive the loop's context-budget discipline:
+Three pure helper functions drive the loop's context-budget discipline:
 
 * :func:`truncate_result` — shrink an oversized tool-result string with a
   head+tail window and a human-readable marker.  Error results pass
@@ -212,7 +211,7 @@ def truncate_tool_call_blocks(blocks: list, batch: "ToolBatch") -> list:
     ``batch`` is the per-step tool snapshot used for ``large_input_keys``
     metadata.  Tools not in the batch (e.g. unregistered between dispatch
     and the next assistant transformation) degrade to no-truncation —
-    safer than mid-step live registry reads (Codex Part 1 #4).
+    safer than mid-step live registry reads.
     """
     out = []
     for block in blocks:

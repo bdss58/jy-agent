@@ -61,7 +61,7 @@ class LoopCheckpoint:
     @classmethod
     def from_json(cls, text: str) -> "LoopCheckpoint":
         obj = json.loads(text)
-        # L-3 (codex review 2026-04-29): filter unknown fields so a
+        # Filter unknown fields so a
         # checkpoint authored by a NEWER agent version (with extra
         # fields the older code doesn't know about) loads cleanly in an
         # OLDER agent.  Missing-field tolerance comes for free via
