@@ -9,6 +9,7 @@
 import os
 import json
 import time
+import threading
 import difflib
 import fnmatch
 import subprocess
@@ -98,23 +99,128 @@ def is_binary_ext(path: str) -> bool:
     return ext.lower() in BINARY_EXTS
 
 
-def run_shell(command: str, timeout: int = 60) -> ToolResult:
-    """Execute a shell command and return the output."""
+def run_shell(
+    command: str,
+    timeout: int = 60,
+    _cancel_event: "threading.Event | None" = None,
+) -> ToolResult:
+    """Execute a shell command and return the output.
+
+    Cooperative cancellation
+    ------------------------
+    When the runtime injects ``_cancel_event`` (i.e. the engine has a
+    cancellation event wired up), we switch from the blocking
+    ``subprocess.run`` to a ``Popen``-and-poll loop so a Ctrl-C / cancel
+    signal teardowns the child process cleanly instead of leaking it as
+    a daemon-thread side effect.  Tools that don't opt into the kwarg
+    keep using the legacy blocking path.
+    """
     try:
         effective_timeout = max(1, min(int(timeout), 600))
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=effective_timeout)
-        output = result.stdout
-        if result.stderr:
-            output += "\nSTDERR: " + result.stderr
-        if result.returncode != 0 and not output.strip():
-            output = f"Command exited with code {result.returncode}"
-        if len(output) > 50000:
-            output = output[:50000] + "\n\n[... output truncated at 50000 chars ...]"
-        return ToolResult(output, is_error=(result.returncode != 0))
-    except subprocess.TimeoutExpired:
-        return ToolResult(f"Error: Command timed out after {effective_timeout} seconds", is_error=True)
+    except (TypeError, ValueError):
+        effective_timeout = 60
+
+    # Legacy path — no cancel event wired up.  Preserved verbatim so the
+    # blocking semantics on offline / scripted callers are unchanged.
+    if _cancel_event is None:
+        try:
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=effective_timeout,
+            )
+            output = result.stdout
+            if result.stderr:
+                output += "\nSTDERR: " + result.stderr
+            if result.returncode != 0 and not output.strip():
+                output = f"Command exited with code {result.returncode}"
+            if len(output) > 50000:
+                output = output[:50000] + "\n\n[... output truncated at 50000 chars ...]"
+            return ToolResult(output, is_error=(result.returncode != 0))
+        except subprocess.TimeoutExpired:
+            return ToolResult(
+                f"Error: Command timed out after {effective_timeout} seconds",
+                is_error=True,
+            )
+        except Exception as e:
+            return ToolResult(f"Error: {e}", is_error=True)
+
+    # Cooperative-cancel path: spawn the child in its own process group,
+    # poll for completion / cancel / timeout, terminate gracefully on
+    # cancel.  Process-group teardown ensures we kill the whole shell-
+    # spawned tree (most ``run_shell`` invocations look like
+    # ``foo && bar``), not just ``/bin/sh``.
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,  # POSIX: detach into new process group
+        )
     except Exception as e:
         return ToolResult(f"Error: {e}", is_error=True)
+
+    deadline = time.monotonic() + effective_timeout
+    poll_interval = 0.1
+    cancelled = False
+    timed_out = False
+    while True:
+        if proc.poll() is not None:
+            break
+        if _cancel_event.is_set():
+            cancelled = True
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(poll_interval)
+
+    if cancelled or timed_out:
+        # Graceful shutdown: SIGTERM the whole process group, give it a
+        # short grace period, then SIGKILL anything still alive.
+        try:
+            os.killpg(os.getpgid(proc.pid), 15)  # SIGTERM
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    try:
+        stdout, stderr = proc.communicate(timeout=2)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = "", ""
+
+    if cancelled:
+        return ToolResult(
+            "Cancelled: shell command aborted on cancel signal "
+            "(child process group terminated).",
+            is_error=True,
+        )
+    if timed_out:
+        return ToolResult(
+            f"Error: Command timed out after {effective_timeout} seconds",
+            is_error=True,
+        )
+
+    output = stdout or ""
+    if stderr:
+        output += "\nSTDERR: " + stderr
+    rc = proc.returncode if proc.returncode is not None else -1
+    if rc != 0 and not output.strip():
+        output = f"Command exited with code {rc}"
+    if len(output) > 50000:
+        output = output[:50000] + "\n\n[... output truncated at 50000 chars ...]"
+    return ToolResult(output, is_error=(rc != 0))
 
 
 def read_file(path: str, offset: int = 0, limit: int = 0, line_numbers: bool = False) -> ToolResult:

@@ -683,6 +683,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
         cfg.tool_timeout,
         executor=loop._executor,
         partial_side_effects=loop._partial_side_effects,
+        cancel_event=loop._cancel_event,
     )
     tools_dur_ms = (time.perf_counter() - tools_t0) * 1000
 

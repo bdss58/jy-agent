@@ -64,6 +64,11 @@ class FakeLoop:
         self._cancel = cancel
         self._tool_source = None
         self._executor = None
+        # ``_cancel_event`` is read by run_step → _execute_tools → tool_executor
+        # so cooperating tools can be passed the live event.  Default ``None``
+        # disables both kwarg injection and the wait-loop short-circuit, so
+        # legacy tests that don't set up cancellation are unaffected.
+        self._cancel_event = None
         self._partial_side_effects: list = []
         self._todos: list = []
         self._run_id: str = ""

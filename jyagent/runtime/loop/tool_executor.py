@@ -32,6 +32,8 @@ from __future__ import annotations
 import atexit
 import collections
 import concurrent.futures
+import functools
+import inspect
 import logging
 import threading
 import traceback
@@ -45,6 +47,39 @@ from .remediation import enrich_error
 
 
 _logger = logging.getLogger(__name__)
+
+
+# ─── Cooperative cancellation ────────────────────────────────────────────────
+# Tools opt into cooperative cancellation by declaring a ``_cancel_event``
+# keyword parameter (``threading.Event | None``).  At dispatch time the
+# runtime introspects the tool's signature once and, if the parameter
+# exists, threads the active ``AgentLoop._cancel_event`` into the call.
+#
+# This is purely additive: tools without the parameter are called
+# unchanged (back-compat).  Tools that opt in should poll
+# ``_cancel_event.is_set()`` in their inner loops (subprocess polls,
+# HTTP retries, large-file scans) and abort with a ToolResult or by
+# raising ``KeyboardInterrupt``.  The outer ``done.wait()`` loop in
+# ``execute_tool_with_timeout`` also short-circuits on ``cancel_event``
+# so non-cooperating tools see Ctrl-C latency bounded to the polling
+# interval — the kwarg is for tools that want clean teardown of in-
+# flight side effects (open subprocesses, half-uploaded files, …).
+#
+# The introspection cache is keyed on the function object itself;
+# lambdas and bound methods are handled transparently because
+# ``inspect.signature`` accepts both.  Callables whose signature cannot
+# be resolved (C extensions, ``builtin_function_or_method``, exotic
+# ``__call__`` shapes) return False and are called the legacy way.
+
+
+@functools.lru_cache(maxsize=512)
+def _accepts_cancel_event(fn: object) -> bool:
+    """Return True iff ``fn`` declares a ``_cancel_event`` parameter."""
+    try:
+        sig = inspect.signature(fn)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return "_cancel_event" in sig.parameters
 
 
 # ─── Shared dispatch executor ────────────────────────────────────────────────
@@ -136,6 +171,7 @@ def execute_tool(
     name: str,
     tool_input: dict,
     batch: ToolBatch,
+    cancel_event: threading.Event | None = None,
 ) -> ToolResult:
     """Execute a single tool call with validation.  Always returns ToolResult.
 
@@ -143,6 +179,11 @@ def execute_tool(
     through the per-step ``batch`` snapshot — no live registry reads
     here, so a concurrent ``register()``/``unregister()`` cannot pair
     a function with a different schema mid-batch.
+
+    ``cancel_event`` (optional): when the tool body declares a
+    ``_cancel_event`` keyword parameter, this event is threaded in so
+    the tool can cooperatively abort.  Tools that don't opt in are
+    called unchanged (back-compat).
     """
     fn = batch.get_function(name)
     if fn is None:
@@ -159,7 +200,20 @@ def execute_tool(
     try:
         if tool_input is None:
             tool_input = {}
-        raw = fn(**tool_input)
+        # Inject the cancel event only when the tool has opted in by
+        # declaring ``_cancel_event`` in its signature.  We pass the
+        # engine's event even when it's None (not set yet) so tools can
+        # treat it uniformly — polling ``event.is_set()`` on a never-set
+        # event is always False, which is the right semantic.
+        if cancel_event is not None and _accepts_cancel_event(fn):
+            # Don't mutate the caller's dict — the ToolCallRequest.input
+            # is shared back into the persisted transcript and the
+            # runtime-injected kwarg must not leak there.
+            call_kwargs = dict(tool_input)
+            call_kwargs["_cancel_event"] = cancel_event
+            raw = fn(**call_kwargs)
+        else:
+            raw = fn(**tool_input)
         if isinstance(raw, ToolResult):
             return enrich_error(raw, name)
         return ToolResult(str(raw))
@@ -181,6 +235,7 @@ def execute_tools(
     timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     partial_side_effects: "MutableSequence[str] | collections.deque[str] | None" = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[tuple[ToolCallRequest, ToolResult]]:
     """Execute tool calls with selective parallelisation.
 
@@ -208,6 +263,12 @@ def execute_tools(
     where ``list.append`` is no longer atomic but ``deque.append`` is).
     Both share the ``.append(...)`` interface; that's all the timeout
     branch in ``execute_tool_with_timeout`` calls.
+
+    ``cancel_event`` (optional) is threaded down to every tool invocation
+    so cooperating tools (those declaring ``_cancel_event`` in their
+    signature) can abort cleanly, AND so the outer wait loop in
+    ``execute_tool_with_timeout`` can short-circuit on cancel for
+    non-cooperating tools.  ``None`` disables both behaviours.
     """
     if not blocks:
         return []
@@ -219,6 +280,7 @@ def execute_tools(
             result = execute_tool_with_timeout(
                 block.name, block.input, batch, timeout,
                 partial_side_effects=partial_side_effects,
+                cancel_event=cancel_event,
             )
             results.append((block, result))
         return results
@@ -230,6 +292,7 @@ def execute_tools(
             result = execute_tool_with_timeout(
                 block.name, block.input, batch, timeout,
                 partial_side_effects=partial_side_effects,
+                cancel_event=cancel_event,
             )
             results.append((block, result))
         return results
@@ -262,6 +325,7 @@ def execute_tools(
                     block.name, block.input, batch, timeout,
                     body_permits=body_permits,
                     partial_side_effects=partial_side_effects,
+                    cancel_event=cancel_event,
                 ): (idx, block)
                 for idx, block in parallel_batch
             }
@@ -280,6 +344,7 @@ def execute_tools(
             result = execute_tool_with_timeout(
                 block.name, block.input, batch, timeout,
                 partial_side_effects=partial_side_effects,
+                cancel_event=cancel_event,
             )
             results_arr[i] = (block, result)
             i += 1
@@ -299,6 +364,7 @@ def execute_tool_with_timeout(
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     body_permits: threading.BoundedSemaphore | None = None,
     partial_side_effects: "MutableSequence[str] | collections.deque[str] | None" = None,
+    cancel_event: threading.Event | None = None,
 ) -> ToolResult:
     """Execute a tool body with a timeout.
 
@@ -321,9 +387,9 @@ def execute_tool_with_timeout(
 
     ``body_permits`` (optional) caps concurrent live tool bodies to honour
     ``LoopConfig.max_tool_workers`` independent of the dispatch-pool width.
-    Released as soon as ``done.wait(timeout)`` returns, so a tool that
-    times out does not hold a permit while its daemon thread continues in
-    the background.
+    Released as soon as the wait loop returns, so a tool that times out
+    does not hold a permit while its daemon thread continues in the
+    background.
 
     The per-step ``batch`` snapshot supplies the timeout hint, function,
     and schema — no live registry reads, so a concurrent registration
@@ -339,6 +405,16 @@ def execute_tool_with_timeout(
     hint — a read-only tool's timeout is safe to retry verbatim.  Passing
     ``None`` disables the accumulator (the warning + error-text rewrite
     still fire).
+
+    ``cancel_event`` (optional): a ``threading.Event`` the engine sets on
+    Ctrl-C / programmatic cancel.  Two effects:
+      * Threaded down to ``execute_tool`` which injects it into the tool
+        body's call kwargs *iff* the tool declares ``_cancel_event`` in
+        its signature (cooperative-cancel opt-in).
+      * The outer wait loop polls it so a cancelled run returns promptly
+        even when the tool body doesn't cooperate — it returns a
+        cancellation-flagged ToolResult and lets the daemon thread continue
+        in the background like any other timeout.
     """
     timeout = default_timeout
     hint = batch.get_timeout_hint(name)
@@ -367,12 +443,21 @@ def execute_tool_with_timeout(
 
     def _run_body() -> None:
         try:
-            result_holder[0] = execute_tool(name, tool_input, batch)
+            result_holder[0] = execute_tool(
+                name, tool_input, batch, cancel_event=cancel_event,
+            )
         except BaseException as e:  # noqa: BLE001 — we need to propagate everything
             exc_holder[0] = e
         finally:
             done.set()
 
+    # Polling interval for the cancel-event short-circuit.  Small enough
+    # that Ctrl-C feels responsive (≤500ms perceived latency); large
+    # enough that a tool that finishes quickly doesn't pay an extra
+    # syscall round-trip per body invocation.
+    _CANCEL_POLL_INTERVAL = 0.5
+
+    cancelled = False
     if body_permits is not None:
         body_permits.acquire()
     try:
@@ -382,16 +467,37 @@ def execute_tool_with_timeout(
             daemon=True,
         )
         t.start()
-        timed_out = not done.wait(timeout)
+        if cancel_event is None:
+            timed_out = not done.wait(timeout)
+        else:
+            # Polling loop: wait for either the body to finish, the
+            # cancel event to fire, or the timeout to elapse.  We
+            # short-circuit on cancellation so a Ctrl-C during a slow
+            # non-cooperating tool returns within ``_CANCEL_POLL_INTERVAL``
+            # rather than after the full ``timeout`` budget.
+            import time as _time  # local — keeps module-level imports tidy
+            deadline = _time.monotonic() + timeout
+            while True:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    timed_out = not done.is_set()
+                    break
+                if done.wait(min(_CANCEL_POLL_INTERVAL, remaining)):
+                    timed_out = False
+                    break
+                if cancel_event.is_set():
+                    cancelled = True
+                    timed_out = False
+                    break
     finally:
-        # The permit is released as soon as
-        # ``done.wait(timeout)`` returns, which on timeout is BEFORE the
-        # daemon body thread has actually finished.  This is intentional —
-        # alternative #1 (hold the permit until the daemon completes) would
-        # leak a slot permanently for any infinite-loop tool body, draining
+        # The permit is released as soon as the wait loop returns, which
+        # on timeout is BEFORE the daemon body thread has actually
+        # finished.  This is intentional — alternative #1 (hold the
+        # permit until the daemon completes) would leak a slot
+        # permanently for any infinite-loop tool body, draining
         # ``LoopConfig.max_tool_workers`` after enough timeouts and
-        # eventually starving the dispatch loop.  Alternative #2 (kill the
-        # daemon) is impossible — Python threads are not cancellable.
+        # eventually starving the dispatch loop.  Alternative #2 (kill
+        # the daemon) is impossible — Python threads are not cancellable.
         # The trade-off we accept here:
         #   - A leaked-thread-from-timeout no longer counts against
         #     ``max_tool_workers`` (good — the dispatch loop stays healthy).
@@ -405,6 +511,28 @@ def execute_tool_with_timeout(
         # Document loudly here so the trade-off is visible at the call site.
         if body_permits is not None:
             body_permits.release()
+
+    if cancelled:
+        # Cooperative cancel — the daemon body may still be running.
+        # Tools that opted into ``_cancel_event`` should be teardown-
+        # complete by the time they observe the event; tools that did
+        # not opt in keep running and will leak like any other timed-out
+        # body.  Mutating tools get the same partial-side-effects hint
+        # so outer layers can reconcile state.
+        if batch.is_mutating(name):
+            if partial_side_effects is not None:
+                partial_side_effects.append(name)
+            return ToolResult(
+                f"Cancelled: Tool '{name}' aborted on cancel signal. "
+                f"NOTE: This is a mutating tool — the operation may have "
+                f"partially or fully completed in the background. The agent "
+                f"should verify state before retrying.",
+                is_error=True,
+            )
+        return ToolResult(
+            f"Cancelled: Tool '{name}' aborted on cancel signal.",
+            is_error=True,
+        )
 
     if timed_out:
         # Timeout — the daemon thread continues running but holds no pool

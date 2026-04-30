@@ -1739,3 +1739,191 @@ assert te.tool_dispatch_executor is not None
 print("OK")
 ''', timeout=20)
         assert "OK" in out
+
+
+# ─── Cooperative cancellation: _cancel_event plumbing ──────────────────────
+
+
+class TestCooperativeCancelEvent:
+    """Tools opt into cooperative cancellation by declaring a
+    ``_cancel_event`` keyword parameter.  The runtime introspects the
+    signature and threads ``AgentLoop._cancel_event`` into the call
+    only for opt-in tools — non-cooperating tools are called unchanged.
+
+    Codex's 2026-04-30 self-review flagged this as the largest UX gap:
+    a runaway tool could only be abandoned, never stopped.  These tests
+    pin the new opt-in contract and the back-compat invariant.
+    """
+
+    def test_legacy_tool_called_without_kwarg(self):
+        """A tool whose signature does NOT mention ``_cancel_event`` must
+        be called with its declared arguments only — not crash on an
+        unexpected kwarg."""
+        from jyagent.runtime.tools.registry import ToolRegistry
+        from jyagent.runtime.loop import tool_executor as te
+
+        seen_kwargs: list[set[str]] = []
+
+        def legacy_tool(x: int) -> str:
+            seen_kwargs.append(set())  # no kwargs visible
+            return f"got {x}"
+
+        reg = ToolRegistry()
+        reg.register(
+            "legacy_tool",
+            legacy_tool,
+            {"name": "legacy_tool",
+             "input_schema": {"type": "object",
+                              "properties": {"x": {"type": "integer"}}}},
+        )
+        batch = reg.freeze()
+
+        ev = threading.Event()
+        result = te.execute_tool("legacy_tool", {"x": 7}, batch, cancel_event=ev)
+        assert not result.is_error, result.content
+        assert "got 7" in result.content
+
+    def test_opt_in_tool_receives_event(self):
+        """A tool that declares ``_cancel_event`` must observe the live
+        event the runtime passes in."""
+        from jyagent.runtime.tools.registry import ToolRegistry
+        from jyagent.runtime.loop import tool_executor as te
+
+        captured: dict = {}
+
+        def coop_tool(x: int, _cancel_event=None) -> str:
+            captured["event"] = _cancel_event
+            captured["is_set_at_call"] = (
+                _cancel_event.is_set() if _cancel_event else None
+            )
+            return f"x={x}"
+
+        reg = ToolRegistry()
+        reg.register(
+            "coop_tool",
+            coop_tool,
+            {"name": "coop_tool",
+             "input_schema": {"type": "object",
+                              "properties": {"x": {"type": "integer"}}}},
+        )
+        batch = reg.freeze()
+
+        ev = threading.Event()
+        result = te.execute_tool("coop_tool", {"x": 3}, batch, cancel_event=ev)
+        assert not result.is_error
+        assert captured["event"] is ev
+        assert captured["is_set_at_call"] is False
+
+    def test_event_not_leaked_into_persisted_input(self):
+        """The runtime must not mutate the caller's input dict — the
+        ``_cancel_event`` kwarg is runtime-injected and would corrupt
+        the persisted ToolCallRequest if it leaked back."""
+        from jyagent.runtime.tools.registry import ToolRegistry
+        from jyagent.runtime.loop import tool_executor as te
+
+        def coop_tool(x: int, _cancel_event=None) -> str:
+            return "ok"
+
+        reg = ToolRegistry()
+        reg.register(
+            "coop_tool",
+            coop_tool,
+            {"name": "coop_tool",
+             "input_schema": {"type": "object",
+                              "properties": {"x": {"type": "integer"}}}},
+        )
+        batch = reg.freeze()
+
+        original_input = {"x": 9}
+        ev = threading.Event()
+        te.execute_tool("coop_tool", original_input, batch, cancel_event=ev)
+        # The caller's dict must remain unmodified — no _cancel_event key.
+        assert "_cancel_event" not in original_input
+        assert original_input == {"x": 9}
+
+    def test_outer_wait_short_circuits_on_cancel(self):
+        """When a non-cooperating tool is running and the cancel event
+        fires, the outer ``execute_tool_with_timeout`` wait loop must
+        return promptly with a Cancelled ToolResult — without waiting
+        for the full ``timeout`` budget."""
+        from jyagent.runtime.tools.registry import ToolRegistry
+        from jyagent.runtime.loop import tool_executor as te
+
+        # NON-cooperating slow tool — does not declare _cancel_event.
+        def slow_tool() -> str:
+            time.sleep(10)  # would block past the 5s test budget
+            return "should-not-reach"
+
+        reg = ToolRegistry()
+        reg.register(
+            "slow_tool",
+            slow_tool,
+            {"name": "slow_tool", "input_schema": {"type": "object"}},
+        )
+        batch = reg.freeze()
+
+        ev = threading.Event()
+
+        def trigger():
+            time.sleep(0.2)
+            ev.set()
+
+        threading.Thread(target=trigger, daemon=True).start()
+
+        t0 = time.monotonic()
+        result = te.execute_tool_with_timeout(
+            "slow_tool", {}, batch,
+            default_timeout=10,
+            cancel_event=ev,
+        )
+        elapsed = time.monotonic() - t0
+
+        # Must have returned within ~1s of the cancel firing — well under
+        # the 10s default timeout.  Polling interval is 0.5s, so allow a
+        # bit of slack but assert <= 1.5s.
+        assert elapsed < 1.5, (
+            f"cancel short-circuit failed: elapsed={elapsed:.2f}s "
+            f"(should be ~0.2-0.7s)"
+        )
+        assert result.is_error
+        assert "Cancelled" in result.content
+
+    def test_no_cancel_event_uses_legacy_fast_path(self):
+        """Passing ``cancel_event=None`` must keep the legacy fast path
+        (single ``done.wait(timeout)``) — no polling overhead."""
+        from jyagent.runtime.tools.registry import ToolRegistry
+        from jyagent.runtime.loop import tool_executor as te
+
+        def quick_tool() -> str:
+            return "ok"
+
+        reg = ToolRegistry()
+        reg.register(
+            "quick_tool",
+            quick_tool,
+            {"name": "quick_tool", "input_schema": {"type": "object"}},
+        )
+        batch = reg.freeze()
+
+        result = te.execute_tool_with_timeout(
+            "quick_tool", {}, batch,
+            default_timeout=5,
+            cancel_event=None,
+        )
+        assert not result.is_error
+        assert "ok" in result.content
+
+    def test_signature_introspection_failure_falls_back_safely(self):
+        """A callable whose ``inspect.signature`` raises must be treated
+        as legacy (no kwarg injection) — never crash the dispatch."""
+        from jyagent.runtime.loop.tool_executor import _accepts_cancel_event
+
+        # Built-in C functions raise TypeError from inspect.signature.
+        assert _accepts_cancel_event(len) is False
+        assert _accepts_cancel_event(str.upper) is False
+        # Plain Python function without the param.
+        def f(x): return x
+        assert _accepts_cancel_event(f) is False
+        # And one with the param.
+        def g(x, _cancel_event=None): return x
+        assert _accepts_cancel_event(g) is True
