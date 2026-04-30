@@ -349,13 +349,21 @@ def _graceful_exit(cli, conversation=None):
 _cached_memory_context: str | None = None
 
 
-def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_owner: LLMOwner,
-                              force_rebuild: bool = False,
-                              recent_messages: list | None = None) -> str:
-    """Build the complete system prompt with memory, skills, and verification context.
+def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager,
+                              force_rebuild: bool = False) -> str:
+    """Build the complete system prompt: base + memory + skill catalog.
 
-    Memory context is cached between turns (invalidated by force_rebuild).
-    Skills context is always rebuilt — diff-based routing re-evaluates every turn.
+    All three components are stable across most turns, so the assembled
+    prefix is cache-friendly:
+      - ``_base_system_prompt()`` is constant.
+      - ``_cached_memory_context`` is rebuilt only on compaction or memory writes.
+      - The skill catalog (Stage 1, name+description only) changes only when
+        the on-disk skills/ directory changes.
+
+    Active skill bodies (Stage 2) are NOT part of the system prompt — the
+    caller attaches them as a tail block on the last user message so that
+    activation diffs do not invalidate the prefix cache. See
+    ``SkillManager.build_active_bodies_block``.
     """
     global _cached_memory_context
 
@@ -367,13 +375,9 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager, runtime_
     if _cached_memory_context:
         full_system_prompt = base_prompt + "\n\n" + _cached_memory_context
 
-    # Skills: diff-based routing with conversation context for multi-turn continuity
-    skills_context = skill_mgr.build_prompt_context(
-        query=user_input, runtime_owner=runtime_owner,
-        recent_messages=recent_messages,
-    )
-    if skills_context:
-        full_system_prompt = full_system_prompt + "\n\n" + skills_context
+    catalog = skill_mgr.build_catalog_block()
+    if catalog:
+        full_system_prompt = full_system_prompt + "\n\n" + catalog
 
     return full_system_prompt
 
@@ -495,20 +499,32 @@ def run(runtime_owner: LLMOwner) -> None:
                 messages = conversation.get_history()
                 history_len = len(messages)  # snapshot before loop mutates in-place
 
-                # Build system prompt (memory cached, skills diff-routed per turn)
-                # Filter to user/assistant only (skip tool messages) and exclude
-                # the current query (already passed as `query` to the router).
-                # Take last 4 conversational messages ≈ 2 full prior exchanges.
+                # Build system prompt: base + memory(cached) + skill catalog(stable).
+                # Active skill bodies are attached separately as a tail block on
+                # the last user message (below) so per-turn activation diffs do
+                # NOT invalidate the system-prompt prefix cache.
                 force_rebuild = state.pop("_force_rebuild_context", False)
-                conv_messages = [
-                    m for m in messages[:-1]
-                    if m.get("role") in ("user", "assistant")
-                ][-4:]  # last 4 = ~2 prior turns
                 full_system_prompt = _build_full_system_prompt(
-                    user_input, skill_mgr, runtime_owner,
+                    user_input, skill_mgr,
                     force_rebuild=force_rebuild,
-                    recent_messages=conv_messages or None,
                 )
+
+                # Stage 2 — attach active skill bodies to the LAST user message
+                # as a prepended text block. ``get_history()`` returned a
+                # shallow list-copy, but the dicts inside are shared with the
+                # ConversationMemory store; clone the last dict before mutating
+                # its ``content`` so the persisted history stays clean.
+                active_bodies = skill_mgr.build_active_bodies_block()
+                if active_bodies and messages and messages[-1].get("role") == "user":
+                    last = dict(messages[-1])
+                    orig_content = last.get("content", "")
+                    if isinstance(orig_content, list):
+                        last["content"] = (
+                            [{"type": "text", "text": active_bodies}] + list(orig_content)
+                        )
+                    else:
+                        last["content"] = active_bodies + "\n\n" + str(orig_content)
+                    messages[-1] = last
 
                 cli.print_separator()
 

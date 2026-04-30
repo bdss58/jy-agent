@@ -119,6 +119,20 @@ SKILL_ROUTER_PROVIDER = os.environ.get("SKILL_ROUTER_PROVIDER", AGENT_PROVIDER)
 SKILL_ROUTER_MODEL = os.environ.get("SKILL_ROUTER_MODEL", AGENT_MODEL)
 SKILL_ROUTER_TIMEOUT = int(os.environ.get("SKILL_ROUTER_TIMEOUT", "5"))
 
+# Pre-LLM skill router (opt-in). When enabled, the SkillManager runs its
+# LLM-based diff router before every user turn to decide which skills should
+# be active. Default OFF because:
+#   1. It adds a router LLM call to every turn (latency + cost).
+#   2. Changing the active set can invalidate the Anthropic prompt cache if
+#      skill bodies are concatenated into the system prompt.
+# With the default OFF, the main model sees the skill catalog in the system
+# prompt and self-activates via the manage_skills tool (progressive disclosure,
+# same pattern Claude Code uses). Turn ON for workloads with many skills where
+# pre-routing is cheaper than letting the main model scan the full catalog.
+SKILL_PRE_ROUTER_ENABLED = (
+    os.environ.get("SKILL_PRE_ROUTER", "0").lower() in ("1", "true", "yes", "on")
+)
+
 # ─── Web Fetch ────────────────────────────────────────────────────────────────
 
 WEB_FETCH_DEFAULT_MAX_LENGTH = int(os.environ.get("WEB_FETCH_MAX_LENGTH", "8000"))

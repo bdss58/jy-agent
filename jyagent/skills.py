@@ -28,6 +28,7 @@ from typing import Optional
 from .config import (
     MAX_INSTRUCTIONS_CHARS,
     MAX_RESOURCE_CHARS,
+    SKILL_PRE_ROUTER_ENABLED,
     SKILL_ROUTER_TIMEOUT,
     get_skill_router_model_spec,
 )
@@ -279,7 +280,15 @@ class SkillManager:
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: dict[str, dict] = {}       # name → parsed skill
         self._active: set[str] = set()            # currently loaded skill names
-        self._auto_activate: bool = True          # auto-activate on relevant query
+        # Default OFF: skills are activated by the LLM (via manage_skills tool)
+        # or the user (via /skill). Pre-LLM routing is opt-in via the
+        # SKILL_PRE_ROUTER env var (see config.py) because:
+        #   1. it adds a router LLM call to every turn, and
+        #   2. an active-set diff invalidates the system-prompt prompt cache
+        #      when skill bodies are concatenated into the system prompt.
+        # The catalog (Stage 1) is always visible to the LLM in the system
+        # prompt, so the LLM can self-activate skills it deems relevant.
+        self._auto_activate: bool = SKILL_PRE_ROUTER_ENABLED
 
     def discover(self) -> list[str]:
         """
@@ -430,9 +439,6 @@ class SkillManager:
 
         Returns list of skill names in the new active set (not just newly added).
         """
-        if not self._auto_activate:
-            return list(self._active)
-
         if not self._skills:
             return []
 
@@ -632,62 +638,62 @@ class SkillManager:
 
     # ── 改进1: XML prompt format (agentskills.io spec) ────────────────────
 
-    def build_prompt_context(self, query: str = "", runtime_owner=None,
-                             recent_messages: list | None = None) -> str:
+    def build_catalog_block(self) -> str:
         """
-        Build the skills context section for system prompt injection.
-        
-        Uses the official agentskills.io XML format:
-        - <available_skills>: catalog of all skills (always included)
-        - <active_skill>: full instructions for activated skills
-        
-        Implements progressive disclosure:
-        - Stage 1 (advertise): name + description in <skill> elements ~100 tokens/skill
-        - Stage 2 (load): full SKILL.md body in <active_skill> elements
+        Stage 1 — return the lightweight skill catalog as XML.
+
+        Stable across turns (only changes when the on-disk skills/ directory
+        changes), so this is safe to inject into the SYSTEM PROMPT where it
+        will be cached by Anthropic's prompt cache. Active-state is
+        intentionally omitted from this block so per-turn activation diffs
+        do NOT invalidate the prefix cache.
         """
         if not self._skills:
             return ""
 
-        # Route skills for this turn (diff-based: can add AND remove)
-        if query:
-            self.auto_activate_for_query(
-                query, runtime_owner=runtime_owner,
-                recent_messages=recent_messages,
-            )
-
-        lines = []
-
-        # ── Stage 1: Catalog — <available_skills> XML ──
-        lines.append("<available_skills>")
-        lines.append("Use /skill <name> to manually activate, or they auto-activate on relevant queries.")
+        lines = ["<available_skills>"]
+        lines.append(
+            "Use /skill <name> to manually activate, or call the manage_skills "
+            "tool with action='activate' to load a skill's full instructions."
+        )
         for name in sorted(self._skills.keys()):
             skill = self._skills[name]
-            active_attr = ' status="active"' if name in self._active else ''
-            lines.append(f"<skill{active_attr}>")
+            lines.append("<skill>")
             lines.append(f"<name>{html.escape(name)}</name>")
             lines.append(f"<description>{html.escape(skill['description'][:200])}</description>")
             lines.append("</skill>")
         lines.append("</available_skills>")
+        return "\n".join(lines)
 
-        # ── Stage 2: Active skill instructions ──
+    def build_active_bodies_block(self) -> str:
+        """
+        Stage 2 — return full instruction bodies for currently active skills.
+
+        Empty string when no skill is active. Caller should attach this as a
+        TAIL message block (e.g. prepend to the last user message's content)
+        rather than concatenating into the system prompt — that way activation
+        changes do not invalidate the system-prompt prefix cache.
+        """
+        if not self._active:
+            return ""
+
+        lines = []
         for name in sorted(self._active):
             skill = self._skills.get(name)
             if not skill:
                 continue
-
             body = skill.get("body", "")
             if not body:
                 continue
 
-            lines.append("")
+            if lines:
+                lines.append("")
             lines.append(f'<active_skill name="{html.escape(name)}">')
 
-            # Optional: allowed tools
             if skill.get("allowed_tools"):
                 tools_str = ", ".join(skill["allowed_tools"])
                 lines.append(f"<allowed_tools>{html.escape(tools_str)}</allowed_tools>")
 
-            # Optional: available resources
             resources = self.list_resources(name)
             if resources:
                 lines.append(f"<resources>{html.escape(', '.join(resources))}</resources>")
@@ -698,6 +704,34 @@ class SkillManager:
             lines.append("</active_skill>")
 
         return "\n".join(lines)
+
+    def build_prompt_context(self, query: str = "", runtime_owner=None,
+                             recent_messages: list | None = None) -> str:
+        """
+        Legacy combined renderer: catalog + active bodies in one string.
+
+        Kept for back-compat with callers that inject the whole thing into a
+        single buffer (e.g. tests, ad-hoc tooling). The main agent loop now
+        uses ``build_catalog_block`` and ``build_active_bodies_block``
+        separately so they can be placed in cache-friendly positions.
+
+        If ``query`` is non-empty AND ``self._auto_activate`` is True, this
+        runs the diff-based router before rendering. Default is OFF.
+        """
+        if not self._skills:
+            return ""
+
+        if query and self._auto_activate:
+            self.auto_activate_for_query(
+                query, runtime_owner=runtime_owner,
+                recent_messages=recent_messages,
+            )
+
+        catalog = self.build_catalog_block()
+        bodies = self.build_active_bodies_block()
+        if catalog and bodies:
+            return catalog + "\n\n" + bodies
+        return catalog or bodies
 
     def create_skill(self, name: str, description: str, instructions: str,
                      metadata: Optional[dict] = None) -> str:
