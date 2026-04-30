@@ -18,10 +18,11 @@ no provider I/O, no callbacks.  Keeping them out of the engine shrinks
 import-path target for tests and external callers (e.g. analysis
 tools that want to dry-run compaction on stored transcripts).
 
-Engine keeps three underscore-prefixed back-compat aliases
-(``_truncate_result``, ``_compact_messages``, ``_truncate_tool_call_blocks``)
-so the many existing test imports and internal call sites continue to
-work unchanged.
+Public names: ``truncate_result``, ``compact_messages``,
+``truncate_tool_call_blocks``.  Engine and step modules import these
+directly from this module.  (``step.py`` aliases them locally with an
+underscore prefix at a few function-scope import sites — that is a
+readability convention, not a module-level back-compat shim.)
 """
 
 from __future__ import annotations

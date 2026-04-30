@@ -1,8 +1,7 @@
 """Shared Anthropic helpers — pure functions for request/response/message transforms.
 
 No side effects, no client creation, no adapter registration.
-Used by both ``providers/anthropic.py`` (main adapter) and
-``tools/subagent.py`` (legacy shim).
+Imported by ``providers/anthropic.py`` (the main adapter).
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """Per-run cost tracking for budget enforcement.
 
 Extracted from ``engine.py`` to keep the loop controller focused on
-orchestration.  ``_CostTracker`` is self-contained: it only depends on
+orchestration.  ``CostTracker`` is self-contained: it only depends on
 ``..stats.compute_call_cost`` for pricing math.
 """
 
@@ -59,6 +59,4 @@ class CostTracker:
         return self.total_cost
 
 
-# Back-compat alias: existing callers import `_CostTracker` from engine.
-# Engine re-exports the new name as `_CostTracker` to preserve that.
 __all__ = ["CostTracker"]

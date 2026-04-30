@@ -1,13 +1,12 @@
 """Stuck-loop detector.
 
 Extracted from engine.py so that module can focus on orchestration.
-``_StuckLoopDetector`` was the only non-AgentLoop class still living in
+``StuckLoopDetector`` was the only non-AgentLoop class still living in
 engine.py (~95 lines) and has no upward dependencies — it only references
 ``hashlib`` and ``json`` from the stdlib.
 
-Engine.py keeps a back-compat alias ``_StuckLoopDetector = StuckLoopDetector``
-so the underscore-prefixed name continues to work for in-tree callers
-(``runtime/loop/step.py``) and any external tests that import it.
+In-tree callers (``runtime/loop/step.py``) import the public name
+directly from this module.
 """
 
 from __future__ import annotations

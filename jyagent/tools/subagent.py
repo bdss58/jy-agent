@@ -926,9 +926,8 @@ def dispatch_agent(
     model_spec = runtime_owner.model_spec
 
     # Build tool schemas & functions for the sub-agent.
-    # freeze() gives a batch-atomic
-    # deep-copied snapshot where schemas can't be mutated post-freeze.
-    # Replaces the legacy snapshot() which returned the raw schema list.
+    # freeze() gives a batch-atomic deep-copied snapshot where schemas
+    # can't be mutated post-freeze.
     registry = get_registry()
     _batch = registry.freeze()
     all_schemas = list(_batch.schemas)

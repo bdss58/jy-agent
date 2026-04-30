@@ -559,11 +559,10 @@ def run(runtime_owner: LLMOwner) -> None:
                     callbacks, spinner = build_streaming_callbacks(stats, runtime_owner)
 
                     # Create tool source factory.
-                    # Use ``freeze()`` (the
-                    # batch-atomic deep-copy snapshot) rather than the legacy
-                    # ``snapshot()`` shallow tuple.  The engine builds its own
-                    # per-step ToolBatch from this output anyway; freeze gives
-                    # us cross-call atomicity for free.
+                    # ``freeze()`` returns a batch-atomic deep-copy
+                    # ``ToolBatch`` snapshot.  The engine builds its own
+                    # per-step ToolBatch from this output anyway; freeze
+                    # gives us cross-call atomicity for free.
                     registry = get_registry()
                     def _tool_source():
                         batch = registry.freeze()

@@ -20,11 +20,11 @@ a ToolResult comes back:
       immutable per-step ``ToolBatch`` snapshot, so a concurrent
       registration cannot flip them mid-batch.
 
-Engine.py keeps an alias import block that re-exports these under their
-legacy underscore-prefixed names plus a PEP-562 ``__getattr__`` for the
-pool module-state (``_tool_dispatch_executor``, ``_tool_dispatch_cap``,
-``_tool_dispatch_lock``, ``_tool_executor``) — those mutate in-place
-when the pool grows, so back-compat readers MUST see the live value.
+Pool module-state (``tool_dispatch_executor``, ``_tool_dispatch_cap``,
+``_tool_dispatch_lock``) lives at module scope here and mutates in-place
+when ``get_tool_dispatch_executor`` grows the pool — read it via
+``get_tool_dispatch_executor()`` rather than snapshotting at import time
+so callers always see the live value.
 """
 
 from __future__ import annotations
@@ -159,9 +159,9 @@ def get_tool_dispatch_executor(
 #     branch never reaches a None pool in production.
 #
 # Tests that previously did `from .engine import _tool_dispatch_executor` at
-# module-import (snapshotting the eagerly-created pool) MUST switch to live
-# attribute access (`engine._tool_dispatch_executor`) — the engine PEP-562
-# `__getattr__` shim already returns the live value.
+# module-import (snapshotting the eagerly-created pool) MUST switch to
+# `get_tool_dispatch_executor()` here so they see the live (possibly
+# resized) pool rather than a stale captured reference.
 
 
 # ─── Tool invocation ─────────────────────────────────────────────────────────
@@ -314,10 +314,10 @@ def execute_tools(
             # The module-level `tool_dispatch_executor` is now lazy.  In
             # production, `executor` is always set
             # (`AgentLoop.__init__` passes `loop._executor`), but direct
-            # callers (`tool_executor.execute_tools()` with `executor=None`,
-            # or the back-compat `engine._execute_tools()` shim) need us to
-            # materialise the pool here.  `get_tool_dispatch_executor` is
-            # idempotent and grows in place, so this is cheap.
+            # callers (`tool_executor.execute_tools()` with `executor=None`)
+            # need us to materialise the pool here.
+            # `get_tool_dispatch_executor` is idempotent and grows in
+            # place, so this is cheap.
             pool = executor or get_tool_dispatch_executor(max_workers)
             futures = {
                 pool.submit(
