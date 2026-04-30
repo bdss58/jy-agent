@@ -40,16 +40,9 @@ from typing import TYPE_CHECKING
 from .callbacks import LoopCallbacks
 from .config import LoopConfig
 from .llm_client import LLMClient
-from .llm_types import LLMOptions, ModelSpec
+from .llm_types import LLMOptions, ModelSpec, ToolCallRequest
 from ._thread_helpers import LoopThreadHelper
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT
-
-if TYPE_CHECKING:
-    # ToolCallRequest is a dataclass defined in engine.py.  Imported lazily
-    # (inside ``extract_tool_calls``) at runtime to avoid a circular
-    # engine↔llm_runner load at module import.  Same pattern tool_executor
-    # uses.
-    from .engine import ToolCallRequest
 
 
 _logger = logging.getLogger(__name__)
@@ -67,11 +60,8 @@ def extract_text(message: dict) -> str:
     )
 
 
-def extract_tool_calls(message: dict) -> list["ToolCallRequest"]:
+def extract_tool_calls(message: dict) -> list[ToolCallRequest]:
     """Extract tool_call blocks from an AssistantMessage."""
-    # Local import for runtime instantiation — see module docstring re:
-    # circular-import avoidance.
-    from .engine import ToolCallRequest
     return [
         ToolCallRequest(
             id=block["id"],
@@ -227,7 +217,7 @@ class LLMRunner(LoopThreadHelper):
         self,
         context: dict,
         options: LLMOptions,
-    ) -> tuple[str, list["ToolCallRequest"], str, dict]:
+    ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Non-streaming: runtime_owner.complete() -> extract text/tool_calls.
 
         The sync SDK call is a single
@@ -308,7 +298,7 @@ class LLMRunner(LoopThreadHelper):
         self,
         context: dict,
         options: LLMOptions,
-    ) -> tuple[str, list["ToolCallRequest"], str, dict]:
+    ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Streaming: consume LLMStream events and fire callbacks.
 
         Delta-emission policy is controlled by ``cfg.buffered_streaming``:
@@ -504,7 +494,7 @@ class LLMRunner(LoopThreadHelper):
         context: dict,
         options: LLMOptions,
         step: int = 0,
-    ) -> tuple[str, list["ToolCallRequest"], str, dict]:
+    ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
 
         Returns (step_text, tool_call_blocks, stop_reason, final_message).

@@ -665,6 +665,129 @@ class TestMaxStepsFallbackCostTracking:
             f"fallback output tokens missing: {result.total_output_tokens}"
         )
 
+# ─── Max-steps fallback preserves prompt cache (system_prompt stable) ──────
+
+
+class TestMaxStepsFallbackPromptCache:
+    """The fallback call MUST NOT mutate ``system_prompt``.
+
+    Mutating system_prompt mid-run breaks Anthropic prompt caching (~12×
+    cost penalty on the cached portion).  The directive must be injected
+    as a tail user message instead — durable rule from MEMORY.md.
+
+    This is a regression test for the fix that replaced
+    ``system_prompt + "\\n\\n[SYSTEM: ...]"`` with a tail user-message
+    directive in the fallback path.
+    """
+
+    def test_fallback_does_not_mutate_system_prompt(self):
+        from jyagent.runtime.tools.registry import ToolRegistry
+
+        ORIGINAL_SYSTEM = "You are a helpful agent. Original system prompt."
+        captured: dict = {}
+
+        class _ToolForeverOwner:
+            model_spec = _FakeModelSpec()
+
+            def stream(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def complete(self, context, options=None, model_spec=None):
+                wants_no_tools = (
+                    options is not None
+                    and getattr(options, "tool_choice", None) == {"type": "none"}
+                )
+                if wants_no_tools:
+                    # This IS the fallback call.  Capture what it received.
+                    captured["fallback_system_prompt"] = context.get("system_prompt")
+                    captured["fallback_messages"] = list(context.get("messages", []))
+                    msg = _final_text_message("ok.")
+                    msg["usage"] = {"input_tokens": 1, "output_tokens": 1}
+                    return msg
+                # Normal step: ask for a tool to drive into max_steps.
+                tool_msg = {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_call",
+                        "id": "t1",
+                        "name": "noop",
+                        "arguments": {},
+                    }],
+                    "stop_reason": "tool_use",
+                    "usage": {"input_tokens": 5, "output_tokens": 5},
+                }
+                return tool_msg
+
+        reg = ToolRegistry()
+        reg.register(
+            "noop",
+            lambda: "noop-result",
+            {"name": "noop", "input_schema": {"type": "object"}},
+        )
+        batch = reg.freeze()
+
+        cfg = LoopConfig(
+            max_steps=2,
+            tool_timeout=5,
+            concurrent_tools=False,
+            streaming=False,
+            truncate_large_inputs=False,
+            fallback_on_max_steps=True,
+        )
+
+        def _tool_source():
+            return list(batch.schemas), dict(batch.functions)
+
+        owner = _ToolForeverOwner()
+        loop = loop_engine.AgentLoop(owner, cfg, tool_source=_tool_source)  # type: ignore[arg-type]
+
+        original_freeze = loop_engine.get_registry().freeze
+        try:
+            loop_engine.get_registry().freeze = lambda: batch  # type: ignore[method-assign]
+            result = loop.run(system_prompt=ORIGINAL_SYSTEM, messages=[])
+        finally:
+            loop_engine.get_registry().freeze = original_freeze  # type: ignore[method-assign]
+
+        # 1. The fallback call must have received the ORIGINAL system_prompt
+        #    byte-identically — this is what keeps the Anthropic prompt cache
+        #    warm across the fallback turn.
+        assert captured.get("fallback_system_prompt") == ORIGINAL_SYSTEM, (
+            "fallback mutated system_prompt — broke Anthropic prompt cache. "
+            f"got: {captured.get('fallback_system_prompt')!r}"
+        )
+
+        # 2. The directive must appear as a tail user message in the
+        #    fallback's message list (so the model still sees the
+        #    instruction; it just lives in a non-cached suffix).
+        fb_messages = captured.get("fallback_messages") or []
+        assert fb_messages, "fallback received empty messages list"
+        tail = fb_messages[-1]
+        assert tail.get("role") == "user", (
+            f"expected tail user-role directive; got role={tail.get('role')!r}"
+        )
+        tail_text = ""
+        for block in tail.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "text":
+                tail_text += block.get("text", "")
+        assert "WITHOUT using any tools" in tail_text, (
+            f"tail user message missing finalize directive; got: {tail_text!r}"
+        )
+
+        # 3. The persisted transcript on LoopResult must include both the
+        #    directive and the fallback assistant reply (symmetric history).
+        assert result.status == "completed"
+        assert any(
+            m.get("role") == "user"
+            and any(
+                isinstance(b, dict)
+                and b.get("type") == "text"
+                and "WITHOUT using any tools" in b.get("text", "")
+                for b in m.get("content", [])
+            )
+            for m in result.messages
+        ), "finalize directive not persisted in result.messages"
+
+
 
 # ─── AgentLoop reentrance guard ─────────────────────────────────────────────
 

@@ -222,7 +222,7 @@ class TestCostTrackerUsesEffectiveSpec:
         engine_src = inspect.getsource(le.AgentLoop._run_impl)
         fallback_idx = engine_src.find("fallback_on_max_steps")
         assert fallback_idx != -1, "max_steps fallback block missing"
-        fallback_snippet = engine_src[fallback_idx : fallback_idx + 3000]
+        fallback_snippet = engine_src[fallback_idx : fallback_idx + 4000]
         assert "cost_tracker.record(" in fallback_snippet, (
             "max_steps fallback must record cost against effective_spec "
             "in the fallback path."

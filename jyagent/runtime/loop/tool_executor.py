@@ -35,18 +35,13 @@ import concurrent.futures
 import logging
 import threading
 import traceback
-from typing import TYPE_CHECKING, MutableSequence
+from typing import MutableSequence
 
 from ..tools.registry import ToolBatch
 from ..tools.result import ToolResult
 from ..tools.validation import validate_tool_input
+from .llm_types import ToolCallRequest
 from .remediation import enrich_error
-
-if TYPE_CHECKING:
-    # ToolCallRequest is a dataclass defined in engine.py.  Only used
-    # for type hints in ``execute_tools`` — keep the import lazy to
-    # avoid a circular engine↔tool_executor load at module import.
-    from .engine import ToolCallRequest
 
 
 _logger = logging.getLogger(__name__)
@@ -179,14 +174,14 @@ def execute_tool(
 
 
 def execute_tools(
-    blocks: list["ToolCallRequest"],
+    blocks: list[ToolCallRequest],
     batch: ToolBatch,
     concurrent_mode: bool,
     max_workers: int,
     timeout: int,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     partial_side_effects: "MutableSequence[str] | collections.deque[str] | None" = None,
-) -> list[tuple["ToolCallRequest", ToolResult]]:
+) -> list[tuple[ToolCallRequest, ToolResult]]:
     """Execute tool calls with selective parallelisation.
 
     Parallel-safe tools run concurrently; state-mutating tools run sequentially
@@ -244,7 +239,7 @@ def execute_tools(
     body_permits = threading.BoundedSemaphore(max(1, max_workers))
 
     # Partition into contiguous groups
-    results_arr: list[tuple["ToolCallRequest", ToolResult] | None] = [None] * len(blocks)
+    results_arr: list[tuple[ToolCallRequest, ToolResult] | None] = [None] * len(blocks)
     i = 0
     while i < len(blocks):
         if batch.is_parallel_safe(blocks[i].name):

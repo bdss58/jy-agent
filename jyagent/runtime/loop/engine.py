@@ -10,7 +10,6 @@ import collections
 import logging
 import random
 import threading
-from dataclasses import dataclass, field
 from typing import Any, Callable
 
 # Behavioural dependency: the runtime engine consumes an `LLMClient`
@@ -24,7 +23,7 @@ from .llm_client import LLMClient
 # package itself (`runtime.loop.llm_types`) — provider packages
 # re-export from `jyagent.llm.types` for backward compat.  After this
 # move, the runtime has **zero** runtime-import of `jyagent.llm`.
-from .llm_types import LLMOptions, ModelSpec
+from .llm_types import LLMOptions, ModelSpec, ToolCallRequest
 from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT, MAX_TOOL_USE_INPUT_CHARS
 from ..tools.registry import get_registry, ToolBatch
 from ..tools.result import ToolResult
@@ -42,13 +41,12 @@ _logger = logging.getLogger(__name__)
 
 
 # ─── Core types ──────────────────────────────────────────────────────────────
-
-@dataclass
-class ToolCallRequest:
-    id: str
-    name: str
-    input: dict
-
+# ``ToolCallRequest`` lives in ``runtime/loop/llm_types.py`` (sibling to
+# ``LLMOptions`` and ``ModelSpec``).  The import above re-exports it here
+# so legacy ``from jyagent.runtime.loop.engine import ToolCallRequest``
+# imports (tests, out-of-tree callers) continue to work unchanged.  The
+# canonical location is ``llm_types`` — new code should import from
+# there.
 
 # Type alias: returns (schemas_list, functions_dict)
 ToolSource = Callable[[], tuple[list[dict], dict[str, Callable]]]
@@ -527,11 +525,35 @@ class AgentLoop(LoopThreadHelper):
             # and-suspenders.
 
             if cfg.fallback_on_max_steps:
-                # Try one more streaming call with system instruction to avoid tools
+                # Try one more call with a finalize directive.  Preserves the
+                # Anthropic prompt cache by leaving ``system_prompt`` byte-
+                # identical and injecting the directive as a tail user
+                # message — see MEMORY.md (durable rule):
+                #   "Mutating Anthropic system_prompt breaks prompt caching —
+                #    inject dynamic context as a non-persisted tail message
+                #    block instead."
+                # The previous implementation concatenated the directive into
+                # ``system_prompt``, which broke the cached prefix on this
+                # terminal turn (~12× cost penalty on the cached portion).
                 try:
+                    finalize_directive = {
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "[SYSTEM: You have reached the maximum number "
+                                "of tool-use steps. Please provide your best "
+                                "answer now WITHOUT using any tools.]"
+                            ),
+                        }],
+                    }
+                    # Transient view — do NOT mutate ``messages`` until the
+                    # call succeeds, so a fallback failure can fall through
+                    # to the normal max_steps exit with clean history.
+                    fallback_messages = messages + [finalize_directive]
                     fallback_context = {
-                        "system_prompt": system_prompt + "\n\n[SYSTEM: You have reached the maximum number of tool-use steps. Please provide your best answer now WITHOUT using any tools.]",
-                        "messages": messages,
+                        "system_prompt": system_prompt,  # unchanged — cache stays warm
+                        "messages": fallback_messages,
                     }
 
                     # Create fallback options with tool_choice=none
@@ -589,7 +611,11 @@ class AgentLoop(LoopThreadHelper):
                         fallback_message = dict(fallback_message)
                         fallback_message["content"] = _truncate_tool_call_blocks(content, state.last_step_batch)
 
-                    # Append fallback response
+                    # Append fallback turn — directive first, then the
+                    # assistant reply — so the persisted transcript stays
+                    # symmetric (every assistant message answers a real
+                    # preceding user message).
+                    messages.append(finalize_directive)
                     messages.append(fallback_message)
 
                     # Return completed since we got a final answer.

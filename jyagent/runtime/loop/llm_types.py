@@ -74,4 +74,25 @@ class LLMOptions:
     tool_choice: "ToolChoice | None" = None
 
 
-__all__ = ["LLMOptions", "ModelSpec"]
+__all__ = ["LLMOptions", "ModelSpec", "ToolCallRequest"]
+
+
+@dataclass
+class ToolCallRequest:
+    """One tool-use block extracted from an assistant message.
+
+    The runtime's normalized representation of a tool call: provider
+    adapters (``jyagent.llm.providers.*``) decode their wire format
+    (Anthropic ``tool_use``, OpenAI ``tool_calls``) into normalized
+    ``{"type": "tool_call", ...}`` content blocks; the runtime then
+    extracts those into ``ToolCallRequest`` instances via
+    ``llm_runner.extract_tool_calls``.
+
+    Mutable (not ``frozen=True``) — kept this way for back-compat with
+    callers that constructed instances and patched fields. New code
+    should treat instances as immutable.
+    """
+
+    id: str
+    name: str
+    input: dict
