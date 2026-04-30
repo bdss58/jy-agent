@@ -7,14 +7,29 @@ import anthropic
 import httpx
 
 from ...config import get_extra_headers_from_env
+from ...runtime.loop.compaction import register_content_preserver
 from ..core import register_adapter
 from ..streams import BaseStream, ErrorStream, make_error_assistant_message
 from ..types import AssistantMessage, Context, ModelSpec, LLMOptions, LLMStream
 from ._anthropic_helpers import (
     assistant_from_response,
     build_request_kwargs,
+    preserve_signed_thinking_blocks,
 )
 from ._headers import request_headers_from_options
+
+
+# Provider-specific compaction hook: register the signed-thinking
+# preservation rule the moment this adapter module is imported.  When
+# only an OpenAI provider is in use (Anthropic adapter never imported),
+# the rule is never registered and compaction proceeds with default
+# rules — runtime stays provider-neutral by construction, not by
+# comment.  See ``runtime/loop/compaction.py::register_content_preserver``
+# for the contract.
+register_content_preserver(
+    "anthropic_signed_thinking",
+    preserve_signed_thinking_blocks,
+)
 
 
 # ─── _AnthropicStream ────────────────────────────────────────────────────────

@@ -26,13 +26,84 @@ work unchanged.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ...config import MAX_TOOL_USE_INPUT_CHARS, OBSERVATION_MASK_DISTANCE
 from ...memory.conversation import estimate_conversation_tokens
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolBatch
+
+
+# ── Provider-specific content-block preservation hooks ─────────────────────
+#
+# Some providers attach cryptographic signatures or invariants to specific
+# block types that the generic compaction rules would naively strip.  The
+# canonical example: Anthropic extended-thinking emits signed ``thinking``
+# blocks that are bound to a following ``tool_use`` block in the same
+# assistant message; stripping the thinking block invalidates the
+# signature and the next provider call rejects the conversation.
+#
+# Provider adapters register a ``ContentPreserver`` here at import time.
+# The compactor calls every active preserver on each candidate message
+# and unions the protected block indices.  When no Anthropic adapter is
+# loaded, the registry is empty and compaction proceeds with the
+# generic rules only.
+#
+# Why a registry, not an inline rule?
+#   * Codex's 2026-04-30 self-review flagged the inline Anthropic-
+#     specific rule in compaction.py as architecturally leaky:
+#     "neutrality lives in comments more than in design".  The registry
+#     lets the constraint live in the adapter module that owns it.
+#   * Future providers (e.g. OpenAI Responses with reasoning items, or
+#     a hypothetical signed-tool-result format) can register their
+#     own rules without touching this file.
+#
+# Contract
+# --------
+# ``ContentPreserver = Callable[[dict, list], frozenset[int]]``
+#
+# Takes the message dict and its content list.  Returns the set of
+# block-indices (within ``content``) that the compactor MUST NOT strip
+# in this round (Tier 0 thinking pruning).  Returning an empty
+# frozenset means "no opinion" — the compactor uses its default rules.
+#
+# Preservers are NOT consulted by Tier 1/Tier 2 (observation masking
+# and tool-result clearing) — those rules operate on tool-result blocks
+# and never touch signed-thinking territory.
+
+ContentPreserver = Callable[[dict, list], frozenset[int]]
+
+_content_preservers: dict[str, ContentPreserver] = {}
+
+
+def register_content_preserver(name: str, fn: ContentPreserver) -> None:
+    """Register a provider-specific block-preservation rule.
+
+    Idempotent: re-registering the same name replaces the previous
+    function (matters for module reloads in tests).
+    """
+    _content_preservers[name] = fn
+
+
+def unregister_content_preserver(name: str) -> None:
+    """Remove a previously registered preserver.  No-op if absent."""
+    _content_preservers.pop(name, None)
+
+
+def _preserved_block_indices(msg: dict, content: list) -> frozenset[int]:
+    """Union of every active preserver's protected indices for this message."""
+    if not _content_preservers:
+        return frozenset()
+    indices: set[int] = set()
+    for fn in _content_preservers.values():
+        try:
+            indices |= fn(msg, content)
+        except Exception:
+            # A buggy preserver must not break compaction.  Silently
+            # ignore — generic rules still run.
+            pass
+    return frozenset(indices)
 
 
 # ── Tool-result string truncation ─────────────────────────────────────────────
@@ -112,34 +183,26 @@ def compact_messages(
         far_away = distance_from_end > OBSERVATION_MASK_DISTANCE
 
         # ── Tier 0: Thinking block pruning ──────────────────────────
-        # Strip thinking blocks from all but the last few messages.
+        # Strip ``thinking`` blocks from old assistant messages — they
+        # carry a lot of tokens and contribute nothing to a future
+        # provider call beyond the most recent few turns.
         #
-        # Provider-aware rule (P0 fix): Anthropic extended-thinking emits
-        # cryptographically-signed `thinking` blocks that are bound to a
-        # following tool-invocation block in the same assistant message.
-        # If we strip the thinking block but keep the tool block, the
-        # signature becomes invalid and the provider rejects the next turn.
-        # So: preserve all `thinking` blocks in any message that also
-        # contains at least one tool-invocation block.  We check BOTH type
-        # names because the engine sees assistant messages in their
-        # normalized form (`tool_call`, per runtime.types.ToolCallBlock),
-        # while raw Anthropic-SDK payloads sometimes reach compaction with
-        # the provider-native `tool_use` name.  Safe across providers —
-        # non-Anthropic responses simply won't have the adjacency in the
-        # first place.
-        _TOOL_BLOCK_TYPES = ("tool_call", "tool_use")
+        # Provider-specific preservation rules (e.g. Anthropic's signed
+        # thinking blocks bound to following tool_use) are consulted via
+        # the ``ContentPreserver`` registry — see the module-level
+        # ``register_content_preserver`` for the mechanism.  When no
+        # adapter has registered a rule (e.g. running OpenAI-only), the
+        # registry is empty and every thinking block in old messages is
+        # safely dropped.
         content = msg.get("content", "")
         if isinstance(content, list):
-            has_tool_block = any(
-                isinstance(b, dict) and b.get("type") in _TOOL_BLOCK_TYPES
-                for b in content
-            )
+            preserved = _preserved_block_indices(msg, content)
             filtered_blocks = []
-            for block in content:
+            for j, block in enumerate(content):
                 if (
                     isinstance(block, dict)
                     and block.get("type") == "thinking"
-                    and not has_tool_block
+                    and j not in preserved
                 ):
                     did_compact = True
                     continue  # safe to drop

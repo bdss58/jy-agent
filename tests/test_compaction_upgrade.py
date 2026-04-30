@@ -372,3 +372,123 @@ def test_track_file_from_tool_functions():
     _track_file("/test/integration.py")
     assert "/test/integration.py" in tracker.recent(5)
     tracker.clear()
+
+
+# ─── ContentPreserver registry: provider hook mechanism ────────────────────
+
+
+def test_content_preserver_registry_round_trip():
+    """register_content_preserver / unregister_content_preserver round-trip.
+
+    Codex's 2026-04-30 self-review flagged the inline Anthropic-specific
+    rule as a leaky abstraction.  The registry lets provider adapters
+    own their own preservation rules without touching compaction.py.
+    """
+    from jyagent.runtime.loop import compaction as cmp
+
+    sentinel_msg = {"role": "assistant", "content": [{"type": "thinking"}]}
+
+    captured: dict = {}
+
+    def fake_preserver(msg, content):
+        captured["msg"] = msg
+        captured["content"] = list(content)
+        return frozenset({0})
+
+    cmp.register_content_preserver("test_fake", fake_preserver)
+    try:
+        result = cmp._preserved_block_indices(
+            sentinel_msg, sentinel_msg["content"]
+        )
+        assert result == frozenset({0})
+        assert captured["msg"] is sentinel_msg
+    finally:
+        cmp.unregister_content_preserver("test_fake")
+
+    # After unregister, the rule no longer fires.
+    result = cmp._preserved_block_indices(
+        sentinel_msg, sentinel_msg["content"]
+    )
+    # Anthropic's own preserver may still be registered — assert that
+    # OUR sentinel message (no tool_call) returns empty (Anthropic rule
+    # is a no-op without a tool block).
+    assert 0 not in result, (
+        "fake preserver leaked after unregister, OR Anthropic rule "
+        "fired on a tool-block-less message"
+    )
+
+
+def test_anthropic_preserver_registered_on_adapter_import():
+    """Importing the Anthropic adapter must register its preserver.
+
+    The runtime/loop/compaction module stays provider-neutral; the rule
+    is owned by jyagent.llm.providers.anthropic and registered on import
+    so non-Anthropic deployments never see it.
+    """
+    # The Anthropic adapter is imported transitively by jyagent.tools (and
+    # thus by every test that uses tools), so by the time this test runs
+    # the preserver MUST be registered.
+    from jyagent.runtime.loop.compaction import _content_preservers
+
+    assert "anthropic_signed_thinking" in _content_preservers, (
+        "Anthropic adapter loaded but its content preserver not registered "
+        "— register_content_preserver call missing from anthropic.py?"
+    )
+
+
+def test_anthropic_preserver_returns_indices_only_when_tool_block_present():
+    """The Anthropic rule: preserve thinking blocks ONLY when the same
+    message also has a tool_use/tool_call block (signature adjacency).
+    """
+    from jyagent.llm.providers._anthropic_helpers import (
+        preserve_signed_thinking_blocks,
+    )
+
+    # No tool block → no preservation (signature isn't at risk).
+    msg_no_tool = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "text", "text": "hi"},
+        ],
+    }
+    assert preserve_signed_thinking_blocks(msg_no_tool, msg_no_tool["content"]) == frozenset()
+
+    # tool_call adjacent → preserve thinking block at index 0.
+    msg_with_tool = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "tool_call", "id": "t1", "name": "run_shell", "arguments": {}},
+        ],
+    }
+    assert preserve_signed_thinking_blocks(msg_with_tool, msg_with_tool["content"]) == frozenset({0})
+
+    # tool_use (raw Anthropic name) also triggers the rule.
+    msg_with_tool_use = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "..."},
+            {"type": "tool_use", "id": "t1", "name": "run_shell", "input": {}},
+        ],
+    }
+    assert preserve_signed_thinking_blocks(
+        msg_with_tool_use, msg_with_tool_use["content"]
+    ) == frozenset({0})
+
+    # Multiple thinking blocks all preserved when any tool block exists.
+    msg_multi = {
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "a"},
+            {"type": "text", "text": "x"},
+            {"type": "thinking", "thinking": "b"},
+            {"type": "tool_call", "id": "t1", "name": "f", "arguments": {}},
+        ],
+    }
+    assert preserve_signed_thinking_blocks(
+        msg_multi, msg_multi["content"]
+    ) == frozenset({0, 2})
+
+    # Non-list content: graceful empty.
+    assert preserve_signed_thinking_blocks({"content": "string"}, "string") == frozenset()

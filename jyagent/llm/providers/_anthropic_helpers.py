@@ -215,3 +215,43 @@ def build_request_kwargs(
     if options.tool_choice is not None:
         kwargs["tool_choice"] = options.tool_choice
     return {k: v for k, v in kwargs.items() if v is not None}
+
+
+# ─── Content-preservation rule for compaction ────────────────────────────────
+
+
+def preserve_signed_thinking_blocks(msg: dict, content: list) -> frozenset[int]:
+    """Anthropic ``ContentPreserver``: signed-thinking adjacency rule.
+
+    Anthropic extended-thinking emits cryptographically-signed
+    ``thinking`` blocks that are bound to a following tool-invocation
+    block in the same assistant message.  If the compactor strips a
+    thinking block but keeps the tool block, the signature becomes
+    invalid and the next provider call rejects the conversation
+    (``invalid_request_error: signature does not match``).
+
+    Rule: in any assistant message that contains AT LEAST ONE
+    tool-invocation block, preserve every ``thinking`` block in that
+    message.  When no tool block is present, no signature is at risk
+    and the generic compactor is free to drop the thinking block.
+
+    Both block-type names are checked because the engine sees assistant
+    messages in normalized form (``tool_call``), while raw Anthropic-
+    SDK payloads sometimes reach compaction with the provider-native
+    name (``tool_use``).
+
+    Returns a frozenset of indices into ``content`` that must NOT be
+    pruned.  Empty set when no preservation is required.
+    """
+    if not isinstance(content, list):
+        return frozenset()
+    has_tool_block = any(
+        isinstance(b, dict) and b.get("type") in ("tool_call", "tool_use")
+        for b in content
+    )
+    if not has_tool_block:
+        return frozenset()
+    return frozenset(
+        i for i, b in enumerate(content)
+        if isinstance(b, dict) and b.get("type") == "thinking"
+    )
