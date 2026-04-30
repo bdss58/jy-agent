@@ -13,7 +13,7 @@ from .operations import (
     read_topic_section, list_topic_sections,
     list_journals, read_journal, append_journal,
     memory_index_size_warning, consolidate_memory,
-    remember, forget, supersede, show_memory,
+    remember, forget, show_memory,
 )
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens

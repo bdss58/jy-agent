@@ -16,7 +16,10 @@ import threading
 from typing import Optional
 
 from ..config import CHARS_PER_TOKEN
-from .operations import read_memory_md, remember, supersede
+from .operations import (
+    append_journal, forget_from_memory_md, read_memory_md, remember,
+    _MEMORY_MD_LOCK,
+)
 
 
 # Minimum user message length to trigger extraction (skip short commands)
@@ -49,9 +52,10 @@ ONE of the following directives on its own line:
 
   UPDATE::<old_keyword>::[category] <new fact>
       → the user corrected or refined an existing line. <old_keyword> is a
-        short substring that uniquely identifies the line to supersede
-        (case-insensitive). The old line will be marked ~~struck-through~~
-        and the new one appended.
+        short substring that uniquely identifies the line to replace
+        (case-insensitive). The old line is deleted from MEMORY.md and
+        archived to the current month's journal so the audit trail is
+        preserved without bloating the always-loaded index.
 
   NOOP::<reason>
       → the candidate is already covered or not worth remembering. Use this
@@ -155,6 +159,119 @@ _UPDATE_RE = re.compile(
 _NOOP_RE = re.compile(r"^\s*NOOP::", re.IGNORECASE)
 
 
+# Minimum unique-substring length for an UPDATE directive's <old_keyword>.
+# Short substrings (e.g. "k8s") would steamroll many unrelated lines on
+# common tokens. Mirror the old supersede floor.
+_MIN_UPDATE_KEYWORD_LEN = 6
+
+# Section headers and lines under them are protected from UPDATE-driven
+# replacement. The LLM extraction pipeline is a prompt-injection lever; we
+# don't let it rewrite Behavioral Rules, User Preferences, or User Profile
+# from a single conversation turn.
+_PROTECTED_SECTION_HEADERS = {
+    "behavioral rules (critical)",
+    "behavioral rules",
+    "user preferences",
+    "user profile",
+}
+
+
+def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, str]:
+    """Replace MEMORY.md line(s) matching ``old_keyword`` with ``new_text``.
+
+    Replaces the supersede() function the agent used to expose. Behavior
+    differs in tier placement, not in semantics:
+
+      - Old line(s) are removed from MEMORY.md (Tier 1 stays lean — no
+        strikethrough accretion that costs prompt-cache hits forever).
+      - The old line(s) are archived to ``data/memory/journal/YYYY-MM.md``
+        with category ``memory_revision`` so "what did this used to say?"
+        questions can still be answered.
+      - The new line is appended via ``remember`` so soft-cap warnings,
+        category validation and prefix formatting stay in one place.
+
+    Same safety rails as the old supersede:
+      - Keyword must be ≥ ``_MIN_UPDATE_KEYWORD_LEN`` chars.
+      - Header / Behavioral-Rules / User-Profile / User-Preferences lines
+        are skipped silently.
+      - The whole read-modify-write runs under ``_MEMORY_MD_LOCK``.
+
+    Returns (status, message). ``status`` is ``"update"`` on success or
+    ``"skip"`` if no eligible line matched (mirroring the contract the
+    extraction loop relied on).
+    """
+    if len(old_keyword) < _MIN_UPDATE_KEYWORD_LEN:
+        return ("skip", f"Error: UPDATE keyword too short ({len(old_keyword)} < {_MIN_UPDATE_KEYWORD_LEN})")
+
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        if not content:
+            return ("skip", f"No entries matched '{old_keyword}' — MEMORY.md empty")
+
+        # Identify protected line indices (headers + lines inside protected
+        # sections). Keep this logic local to extraction.py — it's only
+        # needed by this code path now that supersede is gone.
+        lines = content.split("\n")
+        protected: set[int] = set()
+        inside_protected_section = False
+        for i, line in enumerate(lines):
+            stripped_line = line.lstrip()
+            if stripped_line.startswith("#"):
+                protected.add(i)
+                heading = stripped_line.lstrip("#").strip().lower()
+                inside_protected_section = heading in _PROTECTED_SECTION_HEADERS
+                continue
+            if inside_protected_section:
+                protected.add(i)
+
+        keyword_lower = old_keyword.lower()
+        matched_lines: list[str] = []
+        skipped_protected = 0
+        for i, line in enumerate(lines):
+            if keyword_lower not in line.lower():
+                continue
+            if i in protected:
+                skipped_protected += 1
+                continue
+            matched_lines.append(line)
+
+        if not matched_lines:
+            if skipped_protected:
+                return (
+                    "skip",
+                    f"No entries matched '{old_keyword}' outside protected "
+                    f"sections ({skipped_protected} header/rule hit(s) ignored)",
+                )
+            return ("skip", f"No entries matched '{old_keyword}'")
+
+        # Archive the old line(s) to journal BEFORE removing them, so a
+        # crash between the two writes leaves the audit trail intact rather
+        # than an unrecoverable delete.
+        archive_body = "\n".join(f"  - {ln.strip()}" for ln in matched_lines)
+        append_journal(
+            f"Replaced via UPDATE directive (keyword='{old_keyword}'):\n"
+            f"{archive_body}\n"
+            f"  → [{category or 'note'}] {new_text}",
+            category="memory_revision",
+        )
+
+        # Now remove the old line(s) and append the new one. forget() runs
+        # its own write under the same RLock — safe.
+        forget_from_memory_md(old_keyword)
+        remember(new_text, category, suppress_warning=True)
+
+        skipped_note = (
+            f" ({skipped_protected} protected line(s) preserved)"
+            if skipped_protected else ""
+        )
+        return (
+            "update",
+            f"♻️ Replaced {len(matched_lines)} line(s) matching '{old_keyword}'"
+            f"{skipped_note} with new [{category or 'note'}] entry "
+            "(old archived to journal)",
+        )
+
+
 def _apply_directive(line: str) -> tuple[str, str] | None:
     """Interpret a single directive line. Returns (action, message) or None.
 
@@ -188,15 +305,7 @@ def _apply_directive(line: str) -> tuple[str, str] | None:
         body = _sanitize_body(m.group("body"))
         if not (old_keyword and body):
             return None
-        result = supersede(old_keyword, body, category)
-        # supersede() is fallible: if nothing matched, or the keyword was
-        # too short, or only protected lines were hit, it returns a message
-        # that starts with "No entries matched" / "Error:". In that case
-        # we must NOT count this as a successful update — otherwise a
-        # hallucinated UPDAte crowds out real ADDs (code-review C3).
-        if result.lstrip().startswith(("No entries matched", "Error:")):
-            return ("skip", result)
-        return ("update", result)
+        return _replace_line(old_keyword, body, category)
 
     m = _ADD_RE.match(stripped)
     if m:
@@ -256,7 +365,7 @@ def extract_and_remember(runtime_owner, user_message: str, assistant_message: st
                 if adds:
                     bits.append(f"+{adds} added")
                 if updates:
-                    bits.append(f"♻️{updates} superseded")
+                    bits.append(f"♻️{updates} replaced")
                 sys.stderr.write(
                     f"\033[2m  🧠 Memory reconciled ({', '.join(bits)})\033[0m\n"
                 )

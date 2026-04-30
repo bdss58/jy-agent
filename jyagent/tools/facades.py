@@ -5,9 +5,9 @@ from ..runtime.tools.result import ToolResult
 
 
 def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult:
-    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'supersede' (mark stale entries with strikethrough and append a corrected one — non-destructive update), 'show' (display all memories), 'search' (BM25 over topic+journal bodies), 'topic' (manage curated topic files: list/read/write/delete/sections), 'goal' (add/complete a goal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/)."""
+    """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'show' (display all memories), 'search' (BM25 over topic+journal bodies), 'topic' (manage curated topic files: list/read/write/delete/sections), 'goal' (add/complete a goal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/). To revise an existing rule: write a 'journal' entry recording the change, then 'forget' the old keyword and 'remember' the new fact — keeps Tier 1 lean while preserving audit history in Tier 3."""
     from ..memory.operations import (
-        remember, forget, supersede, show_memory,
+        remember, forget, show_memory,
         list_topics, read_topic, write_topic, delete_topic,
         read_topic_section, list_topic_sections,
         append_journal, list_journals, read_journal, consolidate_memory,
@@ -24,19 +24,6 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
             if not text:
                 return ToolResult("Error: 'text' parameter required for 'forget' action (keyword to match)", is_error=True)
             return ToolResult(f"🧠 {forget(text)}")
-
-        elif action == "supersede":
-            # Format: '<old_keyword>|<new_text>'.  Non-destructive update:
-            # the matched line(s) get ~~struck-through~~ and the new entry
-            # is appended.  Inspired by Zep's bi-temporal validity model
-            # but cheap enough for a single-user file-based memory.
-            if not text or "|" not in text:
-                return ToolResult(
-                    "Error: format is 'supersede' with text='<old_keyword>|<new_text>'",
-                    is_error=True,
-                )
-            old, new = text.split("|", 1)
-            return ToolResult(f"🧠 {supersede(old.strip(), new.strip(), category)}")
 
         elif action == "search":
             if not text:
@@ -143,7 +130,7 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
             return ToolResult(f"🧠 {remember(text, 'goal')}")
 
         else:
-            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, supersede, show, search, topic, goal, journal, consolidate", is_error=True)
+            return ToolResult(f"Error: Unknown action '{action}'. Valid: remember, forget, show, search, topic, goal, journal, consolidate", is_error=True)
 
     except Exception as e:
         return ToolResult(f"Error managing memory: {e}", is_error=True)

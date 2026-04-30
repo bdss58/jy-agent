@@ -58,7 +58,6 @@ Apply Anthropic's litmus test:
 |---|---|---|
 | `remember` | 1 | Append a 1-line durable rule. Returns size warning if approaching cap. |
 | `forget` | 1 | Remove lines matching a keyword (destructive). |
-| `supersede` | 1 | **Non-destructive update** (Zep-inspired). `text='<old_keyword>|<new_text>'`: matched lines wrapped in `~~ ~~` with dated supersession comment, new line appended. Headers + Behavioral Rules / User Preferences / User Profile sections skipped automatically. Min keyword length 6 chars. |
 | `search` | 2+3 | BM25 over topic + journal bodies, section-chunked. Returns top-5 hits. Use this BEFORE reading whole topic files. |
 | `topic` (`list` / `read:` / `read:<name>#<section>` / `sections:` / `write:` / `delete:`) | 2 | Curated knowledge files; auto-indexed in MEMORY.md. Section subaction reads one `##`/`###` block (with nested sub-sections). Topic names validated against `^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$`. |
 | `journal` | 3 | Append a dated session note to `data/memory/journal/YYYY-MM.md`. |
@@ -80,6 +79,20 @@ The warning is included in:
 
 ## Migration history
 
+- **2026-04-30** — **Removed `supersede` action** (this commit).
+  After 6+ months of single-digit usage, the public `supersede` action was
+  removed. Its tier placement was wrong: keeping ``~~struck~~`` audit lines
+  in the always-loaded MEMORY.md doubled the line's footprint, accreted
+  forever, and invalidated the prompt cache on every revision. The
+  LLM-driven UPDATE directive in `extraction.py` now calls
+  `_replace_line()` instead, which: (a) archives the old line(s) to the
+  current month's journal under `[memory_revision]`, (b) calls
+  `forget_from_memory_md` to remove from Tier 1, (c) calls `remember` to
+  append the new line. Same safety rails (≥6-char keyword, protected
+  sections, RLock-guarded RMW) but audit history is now where it belongs
+  (Tier 3, on-demand, never auto-loaded). Recommended pattern for manual
+  revisions: `journal` (record the change) → `forget` (drop the old) →
+  `remember` (add the new).
 - **2026-04-25** — **Five upgrades + post-review hardening**.
   Five new capabilities (`search_memory` / reconciliation in `extraction.py` /
   non-destructive `supersede` / reflection pass at compaction /
@@ -93,17 +106,20 @@ The warning is included in:
     `_MEMORY_MD_LOCK`. Closes the race between the background extraction
     thread and synchronous `manage_memory` calls.
   - **C3**: `_apply_directive` now distinguishes a real UPDATE from a
-    `supersede` no-match (returns `("skip", msg)` instead of counting it
+    no-match replacement (returns `("skip", msg)` instead of counting it
     as success). Hallucinated UPDATEs no longer crowd out real ADDs
-    against the per-turn cap.
+    against the per-turn cap. *(Originally enforced inside `supersede()`;
+    after the 2026-04-30 removal the same contract is preserved by
+    `_replace_line()` in `extraction.py`.)*
   - **H1**: Introduced `_topic_path(name)` with strict regex
     `^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$` + `realpath` containment check.
     Closes path-traversal in `read_topic` / `write_topic` /
     `delete_topic` / `read_topic_section`.
-  - **H2**: `supersede()` enforces a 6-char minimum keyword and skips
+  - **H2**: `supersede()` enforced a 6-char minimum keyword and skipped
     markdown headers + lines inside Behavioral Rules / User Preferences /
-    User Profile sections. The LLM extraction reconciler can no longer be
-    coaxed into striking through hard agent rules.
+    User Profile sections, so the LLM extraction reconciler could not be
+    coaxed into striking through hard agent rules. *(After the 2026-04-30
+    removal these rails were lifted into `_replace_line()` unchanged.)*
   - **H3**: `_apply_directive` now sanitizes bodies to one line, ≤120
     chars, no leading `#` or `~~`. Closes the residual prompt-injection
     surface in the reconciliation pipeline.
@@ -117,5 +133,5 @@ The warning is included in:
   `action='note'`. Net MEMORY.md size: ~9 KB → ~3 KB.
 - Tests: `tests/test_memory_tiers.py` (29 tests) plus the original
   `test_memory_phase1.py` (28 tests) plus `test_memory_upgrades.py`
-  (40 tests covering BM25 search, reconciliation, supersede, reflection,
+  (40 tests covering BM25 search, reconciliation, UPDATE replacement, reflection,
   section reads, and the post-review hardening).

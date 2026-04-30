@@ -24,10 +24,6 @@ _ALLOWED_MEMORY_CATEGORIES = {
     "workflow",
     "user_stated",
     "goal",
-    # Internal default used by supersede() when the caller does not specify
-    # one. Keep it accepted so the existing non-destructive update format
-    # remains compatible.
-    "superseding",
 }
 _MEMORY_CATEGORY_RE = re.compile(r"^[a-z_]+$")
 
@@ -35,8 +31,9 @@ _MEMORY_CATEGORY_RE = re.compile(r"^[a-z_]+$")
 # ─── Concurrency ──────────────────────────────────────────────────────────────
 #
 # Every read-modify-write on MEMORY.md takes this reentrant lock. The lock is
-# reentrant because several call chains nest — e.g. ``supersede()`` calls
-# ``write_memory_md`` and then ``remember()`` which calls ``append_memory_md``.
+# reentrant because several call chains nest — e.g. the LLM-driven extraction
+# pipeline replaces an existing line by calling ``forget`` and ``remember``
+# back-to-back inside one critical section.
 #
 # Why we need it (from the code review 2026-04-25):
 #   - The background extraction thread (extraction.py::_do_extract) and the
@@ -44,9 +41,9 @@ _MEMORY_CATEGORY_RE = re.compile(r"^[a-z_]+$")
 #   - Extraction's ADD/UPDATE pipeline does read → think → write; a parallel
 #     writer sneaking in between the read and the write silently drops one
 #     side's edits.
-#   - supersede() itself is two writes (write_memory_md + remember), so
-#     without a lock a concurrent reader can see the "old line struck, new
-#     line missing" intermediate state and act on it.
+#   - The UPDATE path is two writes (forget + remember), so without a lock a
+#     concurrent reader can see the "old line gone, new line missing"
+#     intermediate state and act on it.
 #
 # Scope: only MEMORY.md mutations — topic and journal files have their own
 # semantics (journal uses O_EXCL for the header; topics are overwritten
@@ -889,162 +886,6 @@ def forget(keyword: str) -> str:
         return f"Removed {removed} entries matching '{keyword}'"
     return f"No entries found matching '{keyword}'"
 
-
-# ─── Supersede (non-destructive update — Zep-inspired) ───────────────────────
-#
-# Why not just edit the line in place?
-#   - Letta / Mem0 / AgentCore all converged on "old fact stays, validity is
-#     marked" so the system has an audit trail when the user asks "wait,
-#     didn't the K8s host used to be wan2?".
-#   - Zep goes further with bi-temporal edges; we approximate that with a
-#     strikethrough + dated supersession comment, which is good enough for
-#     a single-user file-based memory.
-#
-# Format: an existing line ``[gotcha] foo``  becomes
-#         ``~~[gotcha] foo~~  (superseded YYYY-MM-DD: <new_text first 60 chars…>)``
-# and the new line is appended in the canonical format with category
-# ``superseding`` so a future ``forget`` keyword can find it.
-
-# Protect well-known structural markers from UPDATE-style supersession.
-# The LLM-driven reconciliation pipeline can emit an UPDATE directive whose
-# <old_keyword> matches a heading or behavioral rule by accident; striking
-# those through in the always-loaded index would confuse the model for the
-# rest of the session and is a one-line prompt-injection lever.
-#
-# Rules:
-#   - Any line starting with a markdown header (`#`) is untouchable.
-#   - Any line that lives inside the "## Behavioral Rules" section is
-#     untouchable — those are the hard agent rules set by the user.
-#   - The top-level "# Agent Memory" preamble is protected by rule 1.
-_PROTECTED_SECTION_HEADERS = {
-    "behavioral rules (critical)",
-    "behavioral rules",
-    "user preferences",
-    "user profile",
-}
-
-# UPDATE keywords shorter than this steamroll multiple unrelated lines on
-# common substrings — e.g. `UPDATE::k8s::…` would hit every k8s entry. The
-# prompt asks for a "unique" substring; enforce a floor here too.
-_MIN_SUPERSEDE_KEYWORD_LEN = 6
-
-
-def _iter_protected_line_indices(lines: list[str]) -> set[int]:
-    """Return the indices of lines that must never be superseded."""
-    protected: set[int] = set()
-    inside_protected_section = False
-    for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            protected.add(i)
-            # Enter / exit protected section based on the header text.
-            heading_text = stripped.lstrip("#").strip().lower()
-            inside_protected_section = heading_text in _PROTECTED_SECTION_HEADERS
-            continue
-        if inside_protected_section:
-            protected.add(i)
-    return protected
-
-
-def supersede(old_keyword: str, new_text: str, category: str = "") -> str:
-    """Mark every line containing ``old_keyword`` as superseded and append ``new_text``.
-
-    Non-destructive: old lines are kept (wrapped in ``~~ …~~``) so the agent
-    can answer "what did this used to say?" questions and so accidental
-    keyword matches don't silently destroy unrelated content.
-
-    Safety rails (from the 2026-04-25 code review):
-      - Keyword must be at least ``_MIN_SUPERSEDE_KEYWORD_LEN`` chars — short
-        substrings hit too many unrelated lines.
-      - Headers (``# …``) and lines inside protected sections (Behavioral
-        Rules, User Preferences, User Profile) are skipped silently — the
-        LLM extraction pipeline otherwise becomes a prompt-injection lever.
-      - The whole read-modify-write runs under ``_MEMORY_MD_LOCK`` so a
-        concurrent background extraction can't lose the supersession.
-
-    Returns a human-readable summary. The prefix encodes the outcome
-    machine-parseably: lines starting ``♻️ Superseded`` indicate success;
-    lines starting ``No entries matched`` / ``Error:`` indicate no-write.
-    """
-    if not old_keyword.strip():
-        return "Error: supersede requires a non-empty keyword to match"
-    if not new_text.strip():
-        return "Error: supersede requires non-empty replacement text"
-    if len(old_keyword.strip()) < _MIN_SUPERSEDE_KEYWORD_LEN:
-        return (
-            f"Error: supersede keyword must be ≥{_MIN_SUPERSEDE_KEYWORD_LEN} "
-            f"chars (got {len(old_keyword.strip())}: {old_keyword!r}) — short "
-            "substrings tend to hit unrelated lines"
-        )
-
-    with _MEMORY_MD_LOCK:
-        content = read_memory_md()
-        if not content:
-            return f"MEMORY.md is empty — nothing to supersede for '{old_keyword}'"
-
-        keyword_lower = old_keyword.lower()
-        today = datetime.now(ASIA_SHANGHAI_TZ).strftime("%Y-%m-%d")
-        snippet = new_text.strip().splitlines()[0][:60]
-
-        lines = content.split("\n")
-        protected = _iter_protected_line_indices(lines)
-        marked = 0
-        skipped_protected = 0
-        new_lines: list[str] = []
-        for i, line in enumerate(lines):
-            # Skip already-superseded lines so re-running supersede stays
-            # idempotent and doesn't double-wrap with `~~~~`.
-            is_hit = (
-                keyword_lower in line.lower()
-                and not line.lstrip().startswith("~~")
-            )
-            if is_hit and i in protected:
-                skipped_protected += 1
-                new_lines.append(line)
-                continue
-            if is_hit:
-                stripped = line.rstrip()
-                new_lines.append(
-                    f"~~{stripped}~~  (superseded {today}: {snippet}…)"
-                )
-                marked += 1
-            else:
-                new_lines.append(line)
-
-        if marked == 0:
-            # Nothing matched — don't write the new line either, since the
-            # caller almost certainly wants both halves of the supersession
-            # to land together. If the only matches were protected, say so
-            # explicitly so the agent learns to pick a better keyword.
-            if skipped_protected:
-                return (
-                    f"No entries matched '{old_keyword}' outside protected "
-                    f"sections ({skipped_protected} header/rule hit(s) "
-                    "ignored) — nothing superseded, no new line written"
-                )
-            return (
-                f"No entries matched '{old_keyword}' — nothing superseded, "
-                "no new line written"
-            )
-
-        write_memory_md("\n".join(new_lines))
-
-        # Append the new entry as a fresh durable rule. We deliberately
-        # reuse ``remember`` so soft-cap warnings, prefix formatting and
-        # category handling stay in one place. The lock is reentrant.
-        cat = category or "superseding"
-        remember(new_text, cat, suppress_warning=True)
-
-        warning = memory_index_size_warning()
-        suffix = f"\n{warning}" if warning else ""
-        skipped_note = (
-            f" ({skipped_protected} protected line(s) preserved)"
-            if skipped_protected else ""
-        )
-        return (
-            f"♻️ Superseded {marked} line(s) matching '{old_keyword}'"
-            f"{skipped_note} and appended new [{cat}] entry{suffix}"
-        )
 
 
 def show_memory() -> str:
