@@ -370,7 +370,7 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
 
     Raises RuntimeError on failure (causes fallthrough to next strategy).
     """
-    from ..mcp_manager import get_manager
+    from ..mcp import get_manager
 
     manager = get_manager()
     content = manager.chrome_fetch_page(

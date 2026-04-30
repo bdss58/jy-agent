@@ -134,8 +134,9 @@ jyagent/
     mcp_tool.py         #   MCP bridge
 
   memory/               # Conversation compaction, session save/load, extraction
-  mcp_client.py         # MCP protocol client
-  mcp_manager.py        # MCP connection lifecycle
+  mcp/                  # MCP protocol — client + server lifecycle / tool registration
+    client.py           #   Sync wrapper around the official MCP SDK
+    manager.py          #   MCPManager (lifecycle, keepalive, Chrome helpers)
   terminal_ux.py        # CLI-side LoopCallbacks implementation
   config.py             # Env-driven config (overridable by library users)
 

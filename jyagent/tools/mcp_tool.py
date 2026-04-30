@@ -15,9 +15,9 @@ This tool only handles meta-operations:
 
 import json
 try:
-    from ..mcp_manager import get_manager, reset_manager
+    from ..mcp import get_manager, reset_manager
 except ImportError:
-    from jyagent.mcp_manager import get_manager, reset_manager
+    from jyagent.mcp import get_manager, reset_manager
 try:
     from ..runtime.tools.result import ToolResult
 except ImportError:

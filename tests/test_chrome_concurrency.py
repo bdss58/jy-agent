@@ -17,7 +17,7 @@ import pytest
 
 def _make_manager():
     """Create an MCPManager with mocked MCP client."""
-    from jyagent.mcp_manager import MCPManager
+    from jyagent.mcp import MCPManager
     mgr = MCPManager()
     mgr.load_servers()
     return mgr
@@ -291,7 +291,7 @@ class TestFetchChromeDelgation:
         mock_mgr = MagicMock()
         mock_mgr.chrome_fetch_page.return_value = "page content here"
 
-        with patch("jyagent.mcp_manager.get_manager", return_value=mock_mgr):
+        with patch("jyagent.mcp.get_manager", return_value=mock_mgr):
             from jyagent.tools.web_fetch import _fetch_chrome
             status, content = _fetch_chrome("http://example.com", timeout=15)
 
@@ -313,7 +313,7 @@ class TestFetchChromeDelgation:
         mock_mgr = MagicMock()
         mock_mgr.chrome_fetch_page.return_value = "search results"
 
-        with patch("jyagent.mcp_manager.get_manager", return_value=mock_mgr):
+        with patch("jyagent.mcp.get_manager", return_value=mock_mgr):
             from jyagent.tools.web_fetch import _fetch_chrome, _CHROME_EXTRACT_JS
             _fetch_chrome("https://www.google.com/search?q=test")
 
@@ -325,7 +325,7 @@ class TestFetchChromeDelgation:
         mock_mgr = MagicMock()
         mock_mgr.chrome_fetch_page.return_value = "page content"
 
-        with patch("jyagent.mcp_manager.get_manager", return_value=mock_mgr):
+        with patch("jyagent.mcp.get_manager", return_value=mock_mgr):
             from jyagent.tools.web_fetch import _fetch_chrome, _CHROME_EXTRACT_JS
             _fetch_chrome("https://example.com/article")
 
