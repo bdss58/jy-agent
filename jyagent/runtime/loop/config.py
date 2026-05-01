@@ -84,6 +84,18 @@ class LoopResult:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     tool_calls_count: int = 0
+    # Cache-token totals across the run.  Plumbed through for sub-agent
+    # accounting so parent stats see real cache hits / writes instead of
+    # dropping them to zero at the sub-agent boundary.  Zero when the
+    # provider doesn't report caching (OpenAI only populates cache_read).
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    # Number of discrete LLM API calls made during the run.  Used by the
+    # sub-agent accounting path so parent stats.api_calls reflects the
+    # child's actual call count, not just "1 per dispatch".  Typically
+    # equals ``steps`` but can differ when the loop retries a failed
+    # call or issues fallback best-effort completions (max_steps path).
+    api_calls: int = 0
     error: str | None = None
     # Final state of the task-plan scratchpad.  Empty list when todos are
     # disabled or the model never wrote any.  Outer layers (agent.py) are

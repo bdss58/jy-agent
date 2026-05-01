@@ -36,7 +36,7 @@ def test_shared_runtime_owner_threads_session_metadata_into_subagent(monkeypatch
         owner.set_session_id("session-123")
         subagent.set_runtime_owner(owner)
 
-        monkeypatch.setattr(subagent, "_get_memory_context", lambda: "")
+        monkeypatch.setattr(subagent, "_get_memory_context", lambda *a, **kw: "")
         monkeypatch.setattr(
             "jyagent.runtime.loop.llm_runner.get_reasoning_config_for_provider",
             lambda *args, **kwargs: None,

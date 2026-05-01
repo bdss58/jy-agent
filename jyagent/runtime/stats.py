@@ -49,8 +49,19 @@ def _pricing(
 
 _MODEL_PRICING = {
     "anthropic": {
-        "claude-opus-4-6": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
+        # Prices verified against https://platform.claude.com/docs/en/about-claude/pricing
+        # on 2026-05-01.  Cache writes use the 5-minute tier (1.25× base input).
+        # Cache reads are 0.1× base input per the Anthropic multiplier table.
         "claude-opus-4-7": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
+        "claude-opus-4-6": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
+        "claude-opus-4-5": _pricing(5.0, 25.0, cache_creation_per_million=6.25, cache_read_per_million=0.50),
+        # Sonnet tier — added 2026-05-01.  DEFAULT_ANTHROPIC_MODEL is
+        # "claude-sonnet-4-6" (config.py:19) but this entry was missing,
+        # so session cost was reported as "unknown" on every default-
+        # config run.  Codex flagged this in the context-mgmt review.
+        "claude-sonnet-4-6": _pricing(3.0, 15.0, cache_creation_per_million=3.75, cache_read_per_million=0.30),
+        "claude-sonnet-4-5": _pricing(3.0, 15.0, cache_creation_per_million=3.75, cache_read_per_million=0.30),
+        "claude-sonnet-4":   _pricing(3.0, 15.0, cache_creation_per_million=3.75, cache_read_per_million=0.30),
     },
     "openai": {
         "gpt-5.4": _pricing(2.50, 15.0, cache_read_per_million=0.25),
@@ -348,29 +359,57 @@ class SessionStats:
         status: str = "",
         steps: int = 0,
         tool_calls: int = 0,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        api_calls: int = 0,
     ):
         """Record token usage from a sub-agent (counts toward session totals).
 
         The provider/model are used ONLY for cost calculation — the parent's
         active model label (self._provider / self._model) is never overwritten.
+
+        ``api_calls``: defaults to 0 so the legacy "+1 per dispatch" fallback
+        fires only when the caller didn't plumb through the child's real
+        count.  Callers that pass a real count (the LoopResult path) get
+        accurate accounting; callers that don't (external tests, future
+        callers that forget) still see the sub-agent recorded as at least
+        one unit of API activity — safer default than "+0" which would
+        silently hide sub-agents from session counts.
+
+        ``cache_creation_tokens`` / ``cache_read_tokens``: plumbed through
+        from LoopResult so the parent's cache-savings meter reflects the
+        full session (previously dropped at the sub-agent boundary).
         """
         with self._lock:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
             self.turn_input_tokens += input_tokens
             self.turn_output_tokens += output_tokens
-            self.api_calls += 1  # count sub-agent as at least 1 API call
+            self.total_cache_creation_tokens += cache_creation_tokens
+            self.total_cache_read_tokens += cache_read_tokens
+            # Count the child's real API-call count when provided, else
+            # fall back to the legacy "1 per dispatch" behaviour.  Never
+            # double-count: if the caller passes 0, we still want a
+            # sub-agent dispatch to show up somewhere.
+            self.api_calls += api_calls if api_calls > 0 else 1
 
             # Use the subagent's own provider/model for cost, not the parent's
             cost_provider = provider or self._provider
             cost_model = model or self._model
-            self._record_cost(input_tokens, output_tokens, 0, 0, cost_provider, cost_model)
+            self._record_cost(
+                input_tokens, output_tokens,
+                cache_creation_tokens, cache_read_tokens,
+                cost_provider, cost_model,
+            )
 
             self.subagent_runs.append({
                 "provider": provider,
                 "model": model,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cache_creation_tokens": cache_creation_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "api_calls": api_calls,
                 "task_preview": task_preview,
                 "elapsed": elapsed,
                 "status": status,

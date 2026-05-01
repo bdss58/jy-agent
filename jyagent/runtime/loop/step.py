@@ -97,6 +97,15 @@ class RunState:
     current_max_tokens: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Cache-token totals (Anthropic prompt cache).  OpenAI reports only
+    # cache_read; both are accumulated here so LoopResult can surface
+    # them to sub-agent stats without the parent losing visibility.
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    # Discrete LLM API calls made during the run.  Used by the sub-agent
+    # accounting path so parent stats.api_calls reflects the child's
+    # actual call count instead of the legacy "1 per dispatch".
+    api_calls: int = 0
 
     # Tool / reflection counters
     tool_calls_count: int = 0
@@ -425,6 +434,9 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
             total_input_tokens=state.total_input_tokens,
             total_output_tokens=state.total_output_tokens,
             tool_calls_count=state.tool_calls_count,
+            total_cache_creation_tokens=state.total_cache_creation_tokens,
+            total_cache_read_tokens=state.total_cache_read_tokens,
+            api_calls=state.api_calls,
             trace=trace,
             trace_total_cost_usd=cost or 0.0,
         ))
@@ -445,6 +457,9 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
                 total_input_tokens=state.total_input_tokens,
                 total_output_tokens=state.total_output_tokens,
                 tool_calls_count=state.tool_calls_count,
+                total_cache_creation_tokens=state.total_cache_creation_tokens,
+                total_cache_read_tokens=state.total_cache_read_tokens,
+                api_calls=state.api_calls,
                 error=f"Repeated truncation ({state.consecutive_truncations}x) — model output exceeds capacity",
                 trace=trace,
                 trace_total_cost_usd=cost or 0.0,
@@ -681,6 +696,17 @@ def _record_llm_usage_and_cost(
     usage = final_message.get("usage", {})
     state.total_input_tokens += usage.get("input_tokens", 0)
     state.total_output_tokens += usage.get("output_tokens", 0)
+    # Cache-token accumulators (see RunState comments).  Anthropic reports
+    # both fields; OpenAI currently only reports cache_read.  Missing keys
+    # default to 0 — never raise on a provider that doesn't emit them.
+    state.total_cache_creation_tokens += usage.get("cache_creation_input_tokens", 0) or 0
+    state.total_cache_read_tokens += usage.get("cache_read_input_tokens", 0) or 0
+    # Count any call that produced a usage record as one API call.  Empty
+    # usage dicts (e.g. when the provider adapter fabricates a blank
+    # message on a hard cancel) are NOT counted so the meter doesn't
+    # drift upward on no-op turns.
+    if usage:
+        state.api_calls += 1
     loop._fire("on_usage", usage)
 
     # Trace LLM call.
@@ -731,6 +757,9 @@ def _record_llm_usage_and_cost(
             total_input_tokens=state.total_input_tokens,
             total_output_tokens=state.total_output_tokens,
             tool_calls_count=state.tool_calls_count,
+            total_cache_creation_tokens=state.total_cache_creation_tokens,
+            total_cache_read_tokens=state.total_cache_read_tokens,
+            api_calls=state.api_calls,
             error=f"Cost budget exceeded: ${current_cost:.4f} >= ${cfg.max_cost_usd:.4f}",
             trace=trace,
             trace_total_cost_usd=current_cost,
@@ -944,6 +973,9 @@ def _check_stuck_loop(
         total_input_tokens=state.total_input_tokens,
         total_output_tokens=state.total_output_tokens,
         tool_calls_count=state.tool_calls_count,
+        total_cache_creation_tokens=state.total_cache_creation_tokens,
+        total_cache_read_tokens=state.total_cache_read_tokens,
+        api_calls=state.api_calls,
         error=stuck_feedback,
         trace=trace,
         trace_total_cost_usd=cost or 0.0,
@@ -1007,6 +1039,9 @@ def _maybe_checkpoint(loop: "AgentLoop", state: RunState) -> None:
             total_input_tokens=state.total_input_tokens,
             total_output_tokens=state.total_output_tokens,
             tool_calls_count=state.tool_calls_count,
+            total_cache_creation_tokens=state.total_cache_creation_tokens,
+            total_cache_read_tokens=state.total_cache_read_tokens,
+            api_calls=state.api_calls,
             status="in_progress",
         )
 

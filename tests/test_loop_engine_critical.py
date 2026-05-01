@@ -242,7 +242,13 @@ class TestCostTrackerUsesEffectiveSpec:
         engine_src = inspect.getsource(le.AgentLoop._run_impl)
         fallback_idx = engine_src.find("fallback_on_max_steps")
         assert fallback_idx != -1, "max_steps fallback block missing"
-        fallback_snippet = engine_src[fallback_idx : fallback_idx + 4000]
+        # 6000-char window (was 4000).  Widened 2026-05-01 after the
+        # context-management fixes added cache/api_calls accounting to
+        # the fallback usage accumulator and every _finalize_run() call
+        # site in the fallback block.  The intent of this assertion —
+        # "cost_tracker.record lives inside the fallback block" — is
+        # unchanged; only the proxy-distance bound was stale.
+        fallback_snippet = engine_src[fallback_idx : fallback_idx + 6000]
         assert "cost_tracker.record(" in fallback_snippet, (
             "max_steps fallback must record cost against effective_spec "
             "in the fallback path."

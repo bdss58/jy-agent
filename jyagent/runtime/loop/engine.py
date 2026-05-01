@@ -140,6 +140,9 @@ def _finalize_run(
     total_input_tokens: int,
     total_output_tokens: int,
     tool_calls_count: int,
+    total_cache_creation_tokens: int = 0,
+    total_cache_read_tokens: int = 0,
+    api_calls: int = 0,
     error: str | None = None,
     trace=None,
     trace_status: str | None = None,
@@ -199,6 +202,9 @@ def _finalize_run(
         total_input_tokens=total_input_tokens,
         total_output_tokens=total_output_tokens,
         tool_calls_count=tool_calls_count,
+        total_cache_creation_tokens=total_cache_creation_tokens,
+        total_cache_read_tokens=total_cache_read_tokens,
+        api_calls=api_calls,
         error=error,
     )
 
@@ -469,6 +475,9 @@ class AgentLoop(LoopThreadHelper):
                     total_input_tokens=state.total_input_tokens,
                     total_output_tokens=state.total_output_tokens,
                     tool_calls_count=state.tool_calls_count,
+                    total_cache_creation_tokens=state.total_cache_creation_tokens,
+                    total_cache_read_tokens=state.total_cache_read_tokens,
+                    api_calls=state.api_calls,
                     trace=trace,
                 )
 
@@ -543,6 +552,10 @@ class AgentLoop(LoopThreadHelper):
                     usage = fallback_message.get("usage", {})
                     state.total_input_tokens += usage.get("input_tokens", 0)
                     state.total_output_tokens += usage.get("output_tokens", 0)
+                    state.total_cache_creation_tokens += usage.get("cache_creation_input_tokens", 0) or 0
+                    state.total_cache_read_tokens += usage.get("cache_read_input_tokens", 0) or 0
+                    if usage:
+                        state.api_calls += 1
                     self._fire("on_usage", usage)
                     # The fallback call's
                     # tokens were being added to the totals reported on
@@ -593,6 +606,9 @@ class AgentLoop(LoopThreadHelper):
                         total_input_tokens=state.total_input_tokens,
                         total_output_tokens=state.total_output_tokens,
                         tool_calls_count=state.tool_calls_count,
+                        total_cache_creation_tokens=state.total_cache_creation_tokens,
+                        total_cache_read_tokens=state.total_cache_read_tokens,
+                        api_calls=state.api_calls,
                         trace=trace,
                         trace_total_cost_usd=cost or 0.0,
                     )
@@ -613,6 +629,9 @@ class AgentLoop(LoopThreadHelper):
                 total_input_tokens=state.total_input_tokens,
                 total_output_tokens=state.total_output_tokens,
                 tool_calls_count=state.tool_calls_count,
+                total_cache_creation_tokens=state.total_cache_creation_tokens,
+                total_cache_read_tokens=state.total_cache_read_tokens,
+                api_calls=state.api_calls,
                 trace=trace,
                 trace_total_cost_usd=cost or 0.0,
             )
@@ -627,6 +646,9 @@ class AgentLoop(LoopThreadHelper):
                 total_input_tokens=state.total_input_tokens,
                 total_output_tokens=state.total_output_tokens,
                 tool_calls_count=state.tool_calls_count,
+                total_cache_creation_tokens=state.total_cache_creation_tokens,
+                total_cache_read_tokens=state.total_cache_read_tokens,
+                api_calls=state.api_calls,
                 trace=trace,
             )
         except Exception as e:
@@ -639,6 +661,9 @@ class AgentLoop(LoopThreadHelper):
                 total_input_tokens=state.total_input_tokens,
                 total_output_tokens=state.total_output_tokens,
                 tool_calls_count=state.tool_calls_count,
+                total_cache_creation_tokens=state.total_cache_creation_tokens,
+                total_cache_read_tokens=state.total_cache_read_tokens,
+                api_calls=state.api_calls,
                 error=str(e),
                 trace=trace,
             )

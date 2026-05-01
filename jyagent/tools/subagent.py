@@ -176,6 +176,18 @@ TOOL_SCHEMA = {
                     "Clamp: 60-1800."
                 ),
             },
+            "memory_mode": {
+                "type": "string",
+                "enum": ["none", "matched", "full"],
+                "description": (
+                    "Control what parent memory the sub-agent sees. "
+                    "'none' (default, strict isolation): no MEMORY.md. "
+                    "'matched': BM25-retrieve top relevant topic/journal "
+                    "snippets for the task — best for knowledge transfer "
+                    "without leaking the whole memory index. "
+                    "'full': legacy 4KB MEMORY.md dump (back-compat only)."
+                ),
+            },
         },
         "required": ["task"],
     },
@@ -197,11 +209,72 @@ Rules:
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _get_memory_context() -> str:
-    """Load the first 4KB of MEMORY.md and return it as a formatted context block.
+# ─── Sub-agent memory injection (scoped) ────────────────────────────────────
+#
+# Before 2026-05-01 this was a blanket 4KB dump of MEMORY.md into every
+# sub-agent system prompt.  Codex's context-management review flagged the
+# default as over-broad: the parent's durable user/project memory leaked
+# into every isolated task, many of which had no need for it.  The fix is
+# a three-mode scope gate controlled by the ``memory_mode`` schema param:
+#
+#   * "none"    — strict isolation (default).  No MEMORY.md, no topics,
+#                 no journal.  The sub-agent sees only ``task`` + optional
+#                 ``context``.  Maximally self-contained.
+#
+#   * "matched" — retrieve only the top-K BM25 matches from topics + recent
+#                 journal against the task text.  The sub-agent sees
+#                 relevant durable knowledge without the full index.
+#                 Recommended when the caller wants some knowledge transfer
+#                 but cares about token cost / relevance.
+#
+#   * "full"    — legacy behaviour: first 4KB of MEMORY.md verbatim.  Kept
+#                 so programmatic callers that relied on the old default
+#                 can request it explicitly.
+#
+# This file does NOT call ``build_memory_context`` from ``memory.context``
+# (which always injects MEMORY.md) — that helper is deliberately scoped
+# to the main loop's system prompt.
 
-    Returns an empty string if the file doesn't exist or is empty.
+
+_SUBAGENT_MEMORY_MODES = ("none", "matched", "full")
+_SUBAGENT_MEMORY_DEFAULT = "none"
+_SUBAGENT_MATCHED_TOP_K = 5
+_SUBAGENT_MATCHED_MAX_CHARS = 2000
+
+
+def _get_memory_context(query: str = "", mode: str = _SUBAGENT_MEMORY_DEFAULT) -> str:
+    """Build the memory block injected into the sub-agent system prompt.
+
+    ``mode`` controls scope — see the module-level design note above.
+    Returns an empty string for mode="none" (default), for unknown modes,
+    for empty query in "matched" mode, or when the underlying source is
+    empty / unreadable.  Never raises — memory is best-effort.
     """
+    if mode not in _SUBAGENT_MEMORY_MODES:
+        return ""
+
+    if mode == "none":
+        return ""
+
+    if mode == "matched":
+        if not query:
+            return ""
+        try:
+            from ..memory.search import search_memory, render_hits
+        except Exception:
+            return ""
+        try:
+            hits = search_memory(query, top_k=_SUBAGENT_MATCHED_TOP_K)
+        except Exception:
+            return ""
+        if not hits:
+            return ""
+        rendered = render_hits(hits, max_body_chars=400)
+        if len(rendered) > _SUBAGENT_MATCHED_MAX_CHARS:
+            rendered = rendered[:_SUBAGENT_MATCHED_MAX_CHARS] + "\n[... truncated ...]"
+        return f"\n\n## Relevant Memory (BM25-matched to task)\n{rendered}"
+
+    # mode == "full" — legacy verbatim 4KB dump of MEMORY.md
     try:
         from ..config import MEMORY_MD_FILE
     except ImportError:
@@ -230,8 +303,22 @@ def _extract_text_blocks(message):
     return "\n".join(text_parts)
 
 
-def _make_subagent_outcome(status, content, steps, input_tokens, output_tokens, tool_calls, error=None):
-    """Build a structured terminal result for the wrapper."""
+def _make_subagent_outcome(
+    status, content, steps, input_tokens, output_tokens, tool_calls,
+    error=None,
+    *,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    api_calls: int = 0,
+):
+    """Build a structured terminal result for the wrapper.
+
+    ``cache_creation_tokens`` / ``cache_read_tokens`` / ``api_calls`` are
+    plumbed through from ``LoopResult`` so parent stats can record the
+    sub-agent's real cache activity and LLM call count instead of the
+    legacy "1 API call, no cache" roll-up.  Default to 0 so call sites
+    that don't yet propagate them (e.g. external tests) keep working.
+    """
     outcome = {
         "status": status,
         "content": content,
@@ -239,6 +326,9 @@ def _make_subagent_outcome(status, content, steps, input_tokens, output_tokens, 
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "tool_calls": tool_calls,
+        "cache_creation_tokens": cache_creation_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "api_calls": api_calls,
     }
     if error:
         outcome["error"] = error
@@ -295,17 +385,21 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
 
 def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions,
                   agent_id=None, custom_system_prompt=None, cancel_event=None,
-                  progress_ids=None):
+                  progress_ids=None, memory_mode=_SUBAGENT_MEMORY_DEFAULT):
     """Run a sub-agent's tool loop to completion via AgentLoop engine.
 
     Delegates the entire step loop, tool execution, retry, context compaction,
     and truncation recovery to the shared engine.  Runs silently (no callbacks).
+
+    ``memory_mode``: see ``_get_memory_context``.  Default is "none" for
+    strict isolation — callers that want parent memory visible must opt in.
     """
     runtime_owner = _get_runtime_owner()
 
-    # Build system prompt with optional memory context
+    # Build system prompt with optional scoped memory context.  The task
+    # is the BM25 query when mode="matched"; for "full"/"none" it is ignored.
     system_prompt = custom_system_prompt or _SUBAGENT_SYSTEM_PROMPT
-    system_prompt += _get_memory_context()
+    system_prompt += _get_memory_context(query=task, mode=memory_mode)
 
     # Build initial messages
     user_content = task
@@ -373,6 +467,9 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
             result.total_input_tokens,
             result.total_output_tokens,
             result.tool_calls_count,
+            cache_creation_tokens=result.total_cache_creation_tokens,
+            cache_read_tokens=result.total_cache_read_tokens,
+            api_calls=result.api_calls,
         )
 
     if result.status == "max_steps":
@@ -397,6 +494,9 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
             result.total_input_tokens + extra_in,
             result.total_output_tokens + extra_out,
             result.tool_calls_count,
+            cache_creation_tokens=result.total_cache_creation_tokens,
+            cache_read_tokens=result.total_cache_read_tokens,
+            api_calls=result.api_calls,
             error=f"max_steps:{max_steps}",
         )
 
@@ -412,6 +512,9 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
             result.total_input_tokens,
             result.total_output_tokens,
             result.tool_calls_count,
+            cache_creation_tokens=result.total_cache_creation_tokens,
+            cache_read_tokens=result.total_cache_read_tokens,
+            api_calls=result.api_calls,
             error=result.error,
         )
 
@@ -427,6 +530,9 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         result.total_input_tokens,
         result.total_output_tokens,
         result.tool_calls_count,
+        cache_creation_tokens=result.total_cache_creation_tokens,
+        cache_read_tokens=result.total_cache_read_tokens,
+        api_calls=result.api_calls,
         error=result.status,
     )
 
@@ -724,6 +830,9 @@ def _record_bg_stats(agent: _BackgroundAgent) -> None:
             status=outcome.get("status", "unknown"),
             steps=outcome.get("steps", 0),
             tool_calls=outcome.get("tool_calls", 0),
+            cache_creation_tokens=outcome.get("cache_creation_tokens", 0),
+            cache_read_tokens=outcome.get("cache_read_tokens", 0),
+            api_calls=outcome.get("api_calls", 0),
         )
     except Exception:
         pass  # stats recording is best-effort
@@ -890,9 +999,15 @@ def dispatch_agent(
     tool_whitelist: list = None,
     background: bool = False,
     timeout: int = 0,
+    memory_mode: str = _SUBAGENT_MEMORY_DEFAULT,
     _cancel_event: "threading.Event | None" = None,
 ) -> ToolResult:
     """Spawn a sub-agent to handle a focused subtask.
+
+    ``memory_mode``: scope of parent memory exposed to the sub-agent.
+    Defaults to "none" (strict isolation); see ``_get_memory_context``.
+    Invalid values silently degrade to "none" — we never fail a sub-agent
+    dispatch on a bad memory knob.
 
     ``_cancel_event`` (runtime-injected, optional): when the parent
     agent's cancel event fires, the sub-agent's own cancel event is
@@ -902,6 +1017,8 @@ def dispatch_agent(
     Background sub-agents are unaffected (they survive their parent by
     design — that's what background means).
     """
+    if memory_mode not in _SUBAGENT_MEMORY_MODES:
+        memory_mode = _SUBAGENT_MEMORY_DEFAULT
     max_steps = _DEFAULT_MAX_STEPS
     custom_system_prompt = None
 
@@ -980,7 +1097,7 @@ def dispatch_agent(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 spinner_id, custom_system_prompt, cancel_event,
-                progress_ids,
+                progress_ids, memory_mode,
             )
 
             # Grace period: wait up to 30s for fast finish
@@ -1050,7 +1167,7 @@ def dispatch_agent(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 agent_id, custom_system_prompt, cancel_event,
-                progress_ids,
+                progress_ids, memory_mode,
             )
             try:
                 outcome = future.result(timeout=effective_timeout)
@@ -1179,6 +1296,9 @@ def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
             status=status,
             steps=steps,
             tool_calls=tool_calls,
+            cache_creation_tokens=outcome.get("cache_creation_tokens", 0),
+            cache_read_tokens=outcome.get("cache_read_tokens", 0),
+            api_calls=outcome.get("api_calls", 0),
         )
     except Exception:
         pass  # stats recording is best-effort

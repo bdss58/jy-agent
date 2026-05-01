@@ -307,7 +307,8 @@ class TestCheckAgentKill:
         def blocking_subagent(task, context, model_spec, max_steps,
                               tool_schemas, tool_functions,
                               agent_id=None, custom_system_prompt=None,
-                              cancel_event=None, progress_ids=None):
+                              cancel_event=None, progress_ids=None,
+                              memory_mode="none"):
             # Block until cancelled or gate is set
             while True:
                 if cancel_event is not None and cancel_event.is_set():
