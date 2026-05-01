@@ -203,6 +203,51 @@ def _build_file_reinjection_content() -> str:
     return header + "\n\n".join(parts)
 
 
+# ─── Tool-pair boundary safety ────────────────────────────────────────────────
+
+def _starts_with_orphan_tool_result(msg: dict) -> bool:
+    """Return True if this message is (or leads with) a tool_result block.
+
+    A ``tool_result`` kept in the recent suffix whose matching assistant
+    ``tool_use`` was summarised away becomes an ORPHAN — the provider
+    either rejects the request (strict validation) or has to synthesize a
+    fake tool_use, both are fragile.  We detect both shapes:
+
+    * top-level ``role == "tool_result"`` (the normalised shape used by
+      ``ConversationMemory``),
+    * Anthropic-style user message whose content list contains a
+      ``tool_result`` block (added by the provider transform after
+      normalisation).
+    """
+    if msg.get("role") == "tool_result":
+        return True
+    content = msg.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                return True
+    return False
+
+
+def _choose_split_point(messages: list, keep_recent: int) -> int:
+    """Return the index of the first message to KEEP in the recent suffix.
+
+    Nominally ``len(messages) - keep_recent``.  Walks leftward while that
+    boundary message is an orphan-producing tool_result — pulling the
+    preceding assistant ``tool_use`` message into the recent suffix so
+    the tool-call ↔ tool-result pair stays intact after summarisation.
+
+    Bounded by ``split > 0`` so we never return a negative index.  If the
+    whole conversation is tool_results (pathological), the caller's
+    normal ``len(conversation) < keep_recent + 2`` guard already no-ops.
+    """
+    n = len(messages)
+    split = max(0, n - keep_recent)
+    while split > 0 and _starts_with_orphan_tool_result(messages[split]):
+        split -= 1
+    return split
+
+
 # ─── Core compaction ─────────────────────────────────────────────────────────
 
 def compact_conversation(
@@ -235,8 +280,21 @@ def compact_conversation(
     before_tokens = conversation.estimated_tokens()
 
     try:
-        messages_to_compact = conversation.messages[:-keep_recent]
-        recent_messages = conversation.messages[-keep_recent:]
+        # Tool-pair boundary safety: extend the keep window backward so we
+        # don't split an assistant tool_use from its matching tool_result
+        # (which would orphan the result and risk provider validation
+        # failures on the next turn).  See ``_choose_split_point``.
+        split = _choose_split_point(conversation.messages, keep_recent)
+        if split == 0:
+            # Walked past the beginning — conversation is almost entirely
+            # tool_result-shaped (pathological, or keep_recent larger than
+            # any assistant-text boundary).  No safe summarisation cut —
+            # skip this round rather than produce an empty summary or
+            # risk structural damage.
+            return {"compacted": False, "before_tokens": before_tokens,
+                    "after_tokens": before_tokens, "summary": ""}
+        messages_to_compact = conversation.messages[:split]
+        recent_messages = conversation.messages[split:]
 
         conversation_text = _format_messages_for_compact(messages_to_compact)
 

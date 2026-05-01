@@ -27,6 +27,7 @@ readability convention, not a module-level back-compat shim.)
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Callable
 
 from ...config import MAX_TOOL_USE_INPUT_CHARS, OBSERVATION_MASK_DISTANCE
@@ -34,6 +35,53 @@ from ...memory.conversation import estimate_conversation_tokens
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolBatch
+
+
+# ── Dehydration — preserve recovery pointers when clearing tool results ────
+#
+# When an ephemeral / far-away tool result is cleared, we would normally
+# replace the body with ``"[Tool result cleared]"``.  For run_shell and
+# run_background, the *full* output lives in a spill file on disk
+# (``/tmp/jyagent_runshell_*`` or ``/tmp/jyagent_bg_*``).  Discarding the
+# path forces the agent to re-execute the command if it later needs the
+# output — or worse, silently lose the data.
+#
+# This helper scans the result text for spill-file paths and emits a
+# placeholder that tells the agent how to rehydrate on demand.  Matches
+# LangChain "Deep Agents" filesystem-as-context pattern: the working set
+# lives on disk, the prompt carries pointers.
+#
+# Pattern is restricted to the jyagent spill prefixes so we don't
+# accidentally preserve arbitrary user paths that happen to look like
+# tmp files.
+
+_SPILL_PATH_RE = re.compile(
+    r"(/(?:tmp|var/folders/[^\s\"'`<>]+)/jyagent_(?:runshell|bg)_[\w.\-]+)"
+)
+
+
+def _dehydration_placeholder(result_text: str) -> str:
+    """Return the cleared-result placeholder, preserving spill-file pointers.
+
+    Scans ``result_text`` for spill paths (jyagent's run_shell / run_background
+    tmp files) and includes them so the agent can re-read the full output
+    via ``run_shell cat <path>`` instead of re-running the command.
+    """
+    if not result_text:
+        return "[Tool result cleared]"
+    seen: set[str] = set()
+    paths: list[str] = []
+    for match in _SPILL_PATH_RE.finditer(result_text):
+        p = match.group(1)
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+        if len(paths) >= 3:  # cap to avoid pathological blowup
+            break
+    if not paths:
+        return "[Tool result cleared]"
+    joined = ", ".join(paths)
+    return f"[Tool result cleared — full output on disk: {joined} (recover via run_shell: cat <path>)]"
 
 
 # ── Provider-specific content-block preservation hooks ─────────────────────
@@ -220,9 +268,10 @@ def compact_messages(
             priority = batch.get_compaction_priority(tool_name) if tool_name else "standard"
 
             if far_away or priority == "ephemeral":
-                # Full clear — observation masking
+                # Full clear — observation masking (with rehydration pointer
+                # for run_shell / run_background spill files)
                 if result_text:
-                    compacted[i]["content"] = "[Tool result cleared]"
+                    compacted[i]["content"] = _dehydration_placeholder(result_text)
                     did_compact = True
             elif len(result_text) > compact_chars and priority != "persistent":
                 # Truncate to compact_chars
@@ -246,7 +295,7 @@ def compact_messages(
                     if far_away or priority == "ephemeral":
                         if result_text:
                             block = dict(block)
-                            block["content"] = "[Tool result cleared]"
+                            block["content"] = _dehydration_placeholder(result_text)
                             block_changed = True
                     elif len(result_text) > compact_chars and priority != "persistent":
                         block = dict(block)

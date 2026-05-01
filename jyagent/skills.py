@@ -422,6 +422,38 @@ class SkillManager:
 
     # ── Diff-based skill routing (per-turn re-evaluation) ──────────────────
 
+    @property
+    def pre_router_enabled(self) -> bool:
+        """Whether the per-turn pre-routing path should run.
+
+        Driven by ``SKILL_PRE_ROUTER`` env var at construction.  Exposed as
+        a public predicate so the main agent loop doesn't need to reach into
+        ``_auto_activate`` — the flag controls a cost/latency trade-off
+        (extra LLM call per turn) that callers legitimately need to see.
+        """
+        return bool(self._auto_activate)
+
+    def pre_route_for_turn(self, query: str, runtime_owner=None,
+                           recent_messages: list | None = None) -> list[str]:
+        """Pre-route active skills for this turn if the router is enabled.
+
+        No-op when ``SKILL_PRE_ROUTER`` is off — returns the current active
+        set unchanged.  When enabled, evaluates the full catalog against the
+        user query + recent history and mutates the active set (diff-based
+        activation: skills can be added *and* removed).
+
+        This is the single entry point the main agent loop should call.
+        Back when the router lived only inside ``build_prompt_context`` but
+        the main loop called ``build_catalog_block`` / ``build_active_bodies_block``
+        directly, the SKILL_PRE_ROUTER flag was effectively dead.  Routing
+        it through this method closes that hole.
+        """
+        if not self._auto_activate or not self._skills or not query:
+            return list(self._active)
+        return self.auto_activate_for_query(
+            query, runtime_owner=runtime_owner, recent_messages=recent_messages,
+        )
+
     def auto_activate_for_query(self, query: str, runtime_owner=None,
                                 recent_messages: list | None = None) -> list[str]:
         """

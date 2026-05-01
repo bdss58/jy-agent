@@ -499,6 +499,17 @@ def run(runtime_owner: LLMOwner) -> None:
                 messages = conversation.get_history()
                 history_len = len(messages)  # snapshot before loop mutates in-place
 
+                # Pre-route active skills if SKILL_PRE_ROUTER is enabled.
+                # No-op when the flag is off (default).  Runs AFTER
+                # auto-compaction so the router sees the (possibly reduced)
+                # recent history, and BEFORE system-prompt assembly so the
+                # catalog/bodies reflect the newly decided active set.
+                skill_mgr.pre_route_for_turn(
+                    user_input,
+                    runtime_owner=runtime_owner,
+                    recent_messages=messages[-4:],
+                )
+
                 # Build system prompt: base + memory(cached) + skill catalog(stable).
                 # Active skill bodies are attached separately as a tail block on
                 # the last user message (below) so per-turn activation diffs do
