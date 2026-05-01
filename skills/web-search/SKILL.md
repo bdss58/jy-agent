@@ -15,7 +15,7 @@ description: >-
   multi-engine cascade (SearxNG → DuckDuckGo).
 metadata:
   author: jy-agent
-  version: "6.1"
+  version: "6.2"
 ---
 
 # Web Search
@@ -29,11 +29,22 @@ multi-hop search, dynamic filtering, and citation-first output.
 > a known URL, use `web_fetch()` directly. For comprehensive multi-source
 > research reports (5+ min), escalate to the **deep-research** skill.
 
-## Step 0: Always Verify Date
+## Step 0: Always Verify Date (BEFORE composing queries)
 
 ```python
-run_shell("date")  # NEVER assume the year — model defaults can be wrong
+run_shell("date")  # NEVER assume the year — model defaults anchor to training-data year
 ```
+
+**Critical ordering rule**: run `date` in an **earlier, separate** tool batch — do
+NOT parallelize it with the `web_search` calls that depend on it. In a parallel
+batch, the date result arrives *after* the query strings are already composed,
+so the model falls back to its training-data year (e.g. emitting "2025" when the
+real year is 2026). Observed failure: 2026-05-01 research turn shipped "2025"
+in both queries despite `date` being in the same batch.
+
+Safer alternatives when you can't afford an extra round-trip:
+- Omit the year from the query and let the search engine rank by recency.
+- Use the search engine's built-in time filter (e.g. `&time_range=year` on SearxNG).
 
 ## Decision Tree: Which Approach?
 
