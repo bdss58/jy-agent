@@ -138,8 +138,16 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
 
 def manage_skills(action: str, name: str = "", description: str = "",
                   instructions: str = "", resource_path: str = "") -> ToolResult:
-    """Manage Agent Skills (agentskills.io). Actions: 'list' (show all skills), 'activate'/'deactivate' (control which skills are loaded into context), 'info' (show skill details), 'create' (create new skill), 'delete' (remove skill), 'resources' (list skill files), 'read' (read a skill resource file), 'reload' (re-scan skills directory)."""
+    """Manage Agent Skills (agentskills.io). Actions:
+    'load' (one-shot: return full SKILL.md body as tool result — PREFERRED for model use),
+    'pin' (session-long: keep instructions injected on every turn — use only when user asks),
+    'activate' (deprecated alias of 'pin'),
+    'list' (show all skills), 'deactivate' (un-pin; no name = un-pin all),
+    'info' (show skill details), 'create' (create new skill), 'delete' (remove skill),
+    'resources' (list skill files), 'read' (read a skill resource file),
+    'reload' (re-scan skills directory)."""
     from ..skills import get_skill_manager
+    from ..config import MAX_TOOL_RESULT_CHARS
 
     try:
         mgr = get_skill_manager()
@@ -150,26 +158,89 @@ def manage_skills(action: str, name: str = "", description: str = "",
                 return ToolResult("📦 No skills found. Create one with manage_skills(action='create', ...)")
             lines = ["📦 Agent Skills:"]
             for entry in catalog:
-                status = "✅ ACTIVE" if entry["active"] else "  📦"
+                status = "📌 PINNED" if entry["pinned"] else "  📦"
                 lines.append(f"  {status} {entry['name']}: {entry['description'][:100]}")
-            lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['active'])} active")
+            lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['active'])} pinned")
             return ToolResult("\n".join(lines))
 
-        elif action == "activate":
+        elif action == "load":
+            # One-shot: return the SKILL.md body as the tool result text so it
+            # enters conversation history exactly once. Spec-conformant
+            # progressive disclosure (agentskills.io / Claude Code).
             if not name:
                 return ToolResult("Error: 'name' parameter required", is_error=True)
-            success = mgr.activate(name)
+            skill = mgr.get_skill(name)
+            if not skill:
+                return ToolResult(
+                    f"Error: Skill '{name}' not found. Use manage_skills(action='list').",
+                    is_error=True,
+                )
+            # Short-circuit if the user already pinned this skill — its body is
+            # already injected on every turn, calling load would double-bill.
+            if name in mgr.get_pinned_skills():
+                return ToolResult(
+                    f"📌 Skill '{name}' is already pinned. Its full instructions "
+                    f"are attached to every user message — no need to load again. "
+                    f"Use manage_skills(action='deactivate', name='{name}') to un-pin."
+                )
+
+            body = skill.get("body", "")
+            # Reserve ~1 KB headroom for the wrapper XML so the result does not
+            # collide with MAX_TOOL_RESULT_CHARS (currently 8000) and silently
+            # truncate the tail of SKILL.md.
+            wrapper_budget = 1024
+            body_cap = max(MAX_TOOL_RESULT_CHARS - wrapper_budget, 1000)
+            truncated = len(body) > body_cap
+            body_part = body[:body_cap]
+
+            parts = [f'<skill name="{name}">']
+            if skill.get("allowed_tools"):
+                parts.append(f"<allowed_tools>{', '.join(skill['allowed_tools'])}</allowed_tools>")
+            resources = mgr.list_resources(name)
+            if resources:
+                parts.append(f"<resources>{', '.join(resources)}</resources>")
+            parts.append("<instructions>")
+            parts.append(body_part)
+            if truncated:
+                parts.append(
+                    f"[... SKILL.md body truncated from {len(body)} to {body_cap} chars; "
+                    f"read remaining content via manage_skills(action='read', name='{name}', resource_path=...)]"
+                )
+            parts.append("</instructions>")
+            parts.append("</skill>")
+            return ToolResult("\n".join(parts))
+
+        elif action in ("pin", "activate"):
+            # 'pin' is the new name; 'activate' is a deprecated alias kept
+            # for back-compat. Both call mgr.pin() (the CLI /skill handler
+            # in agent.py also calls mgr.pin() directly).
+            if not name:
+                return ToolResult("Error: 'name' parameter required", is_error=True)
+            success = mgr.pin(name)
             if success:
-                return ToolResult(f"✅ Skill '{name}' activated. Its instructions will be included in the system prompt.")
-            return ToolResult(f"Error: Skill '{name}' not found. Use manage_skills(action='list') to see available skills.", is_error=True)
+                verb = "pinned" if action == "pin" else "pinned (action='activate' is deprecated; prefer 'pin')"
+                return ToolResult(
+                    f"📌 Skill '{name}' {verb}. Its full instructions will be "
+                    f"prepended to every user message until deactivated. For one-shot "
+                    f"use prefer manage_skills(action='load', name='{name}')."
+                )
+            return ToolResult(
+                f"Error: Skill '{name}' not found. Use manage_skills(action='list').",
+                is_error=True,
+            )
 
         elif action == "deactivate":
             if not name:
-                return ToolResult("Error: 'name' parameter required", is_error=True)
-            success = mgr.deactivate(name)
+                # No name → un-pin all (Codex-suggested bonus).
+                pinned = mgr.get_pinned_skills()
+                if not pinned:
+                    return ToolResult("📦 No skills are currently pinned.")
+                mgr.unpin_all()
+                return ToolResult(f"📦 Un-pinned {len(pinned)} skill(s): {', '.join(pinned)}.")
+            success = mgr.unpin(name)
             if success:
-                return ToolResult(f"📦 Skill '{name}' deactivated.")
-            return ToolResult(f"Error: Skill '{name}' not found or not active.", is_error=True)
+                return ToolResult(f"📦 Skill '{name}' un-pinned.")
+            return ToolResult(f"Error: Skill '{name}' is not pinned.", is_error=True)
 
         elif action == "info":
             if not name:
@@ -177,12 +248,12 @@ def manage_skills(action: str, name: str = "", description: str = "",
             skill = mgr.get_skill(name)
             if not skill:
                 return ToolResult(f"Error: Skill '{name}' not found.", is_error=True)
-            is_active = name in mgr.get_active_skills()
+            is_pinned = name in mgr.get_pinned_skills()
             body = skill.get("body", "")
             lines = [
                 f"📦 Skill: {skill['name']}",
                 f"   Description: {skill['description']}",
-                f"   Active: {'✅ Yes' if is_active else '❌ No'}",
+                f"   Pinned: {'📌 Yes' if is_pinned else '❌ No'}",
                 f"   Path: {skill.get('path', 'N/A')}",
                 f"   Instructions ({len(body)} chars):",
                 "   " + body[:500],
@@ -208,9 +279,11 @@ def manage_skills(action: str, name: str = "", description: str = "",
         elif action == "resources":
             if not name:
                 return ToolResult("Error: 'name' parameter required", is_error=True)
-            resources = mgr.list_resources(name)
-            if resources is None:
+            # Distinguish "skill not found" from "skill has no resources":
+            # list_resources() returns [] for both, so check existence first.
+            if not mgr.get_skill(name):
                 return ToolResult(f"Error: Skill '{name}' not found.", is_error=True)
+            resources = mgr.list_resources(name)
             if not resources:
                 return ToolResult(f"📦 Skill '{name}' has no resource files.")
             lines = [f"📦 Resources for '{name}':"]
@@ -234,7 +307,12 @@ def manage_skills(action: str, name: str = "", description: str = "",
             return ToolResult(f"🔄 Skills reloaded. Found {len(catalog)} skills.")
 
         else:
-            return ToolResult(f"Error: Unknown action '{action}'. Valid: list, activate, deactivate, info, create, delete, resources, read, reload", is_error=True)
+            return ToolResult(
+                f"Error: Unknown action '{action}'. Valid: list, load, pin, "
+                f"deactivate, info, create, delete, resources, read, reload "
+                f"(activate kept as deprecated alias of pin).",
+                is_error=True,
+            )
 
     except Exception as e:
         return ToolResult(f"Error managing skills: {e}", is_error=True)

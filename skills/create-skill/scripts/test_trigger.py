@@ -138,7 +138,7 @@ def _route_query(catalog: list[dict], query: str, runtime_owner,
     should treat that as "no trigger".
     """
     catalog_text = "\n".join(
-        f"- {s['name']}: {s['description'][:200]}" for s in catalog
+        f"- {s['name']}: {s['description']}" for s in catalog
     )
     prompt = (
         "You are a skill router. Given a user query and a catalog of skills, "

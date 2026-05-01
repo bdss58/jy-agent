@@ -128,18 +128,33 @@ CORE_TOOLS = [
     # --- manage_skills ---
     {
         "name": "manage_skills",
-        "description": "Manage Agent Skills (agentskills.io). Actions: 'list' (show all skills), 'activate'/'deactivate' (control which skills are loaded into context), 'info' (show skill details), 'create' (create new skill), 'delete' (remove skill), 'resources' (list skill files), 'read' (read a skill resource file), 'reload' (re-scan skills directory).",
+        "description": (
+            "Manage Agent Skills (agentskills.io). PREFERRED model use: "
+            "'load' (one-shot — returns full SKILL.md body as the tool result; "
+            "instructions enter conversation history exactly once and persist "
+            "naturally until compaction). Use 'pin' ONLY when the user "
+            "explicitly asks to keep a skill on for the whole session — "
+            "pinned skills re-inject their full body on EVERY user message "
+            "and are token-expensive. Other actions: 'list', 'deactivate' "
+            "(un-pin; no name = un-pin all), 'info', 'create', 'delete', "
+            "'resources', 'read' (read a skill resource file), 'reload'. "
+            "'activate' is a deprecated alias of 'pin'."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action: list, activate, deactivate, info, create, delete, resources, read, reload",
-                    "enum": ["list", "activate", "deactivate", "info", "create", "delete", "resources", "read", "reload"]
+                    "description": (
+                        "Action: load (one-shot, PREFERRED), pin (session-long), "
+                        "list, deactivate, info, create, delete, resources, "
+                        "read, reload. 'activate' is a deprecated alias of 'pin'."
+                    ),
+                    "enum": ["list", "load", "pin", "activate", "deactivate", "info", "create", "delete", "resources", "read", "reload"]
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill name. REQUIRED for: activate, deactivate, info, create, delete, resources, read. Not needed for: list, reload."
+                    "description": "Skill name. REQUIRED for: load, pin, activate, info, create, delete, resources, read. OPTIONAL for: deactivate (no name = un-pin all). Not needed for: list, reload."
                 },
                 "description": {
                     "type": "string",

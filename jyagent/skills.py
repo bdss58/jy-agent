@@ -262,25 +262,36 @@ def _parse_yaml_kv(line: str) -> Optional[tuple]:
 class SkillManager:
     """
     Discovers, manages, and provides progressive disclosure for Agent Skills.
-    
+
+    Two ways a skill enters context:
+      * **load** (one-shot) — facade returns the SKILL.md body as a tool
+        result so it lives in conversation history exactly once. The manager
+        does NOT track load events; that channel is stateless.
+      * **pin** (session-long) — `pin(name)` adds the skill to `_pinned`.
+        `build_pinned_bodies_block()` then re-emits its body as a tail block
+        on every turn until `unpin(name)` (or `unpin_all()`).
+
     Usage:
         manager = SkillManager()
         manager.discover()                        # scan skills/ directory
         catalog = manager.get_catalog()           # advertise: name + description
-        manager.activate("web-research")          # load: full instructions
-        context = manager.build_prompt_context()  # inject into system prompt
+        manager.pin("web-search")                 # session-long pin
+        bodies = manager.build_pinned_bodies_block()  # injected per-turn
+
+    Back-compat: the old method names ``activate`` / ``deactivate`` /
+    ``deactivate_all`` / ``get_active_skills`` / ``build_active_bodies_block``
+    are kept as deprecated thin aliases pointing at the new names.
     """
 
     def __init__(self, skills_dir: str = DEFAULT_SKILLS_DIR):
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: dict[str, dict] = {}       # name → parsed skill
-        self._active: set[str] = set()            # currently loaded skill names
-        # NOTE: there is NO automatic skill router.  Skills are activated by
-        # the LLM (via ``manage_skills`` tool) or the user (via ``/skill``).
-        # The catalog (Stage 1) is always visible to the LLM in the system
-        # prompt, so the LLM can self-activate skills it deems relevant —
-        # same progressive-disclosure pattern Claude Code uses.  Eval
-        # tooling that needs "would query X trigger skill Y?" is in
+        self._pinned: set[str] = set()           # session-pinned skill names
+        # NOTE: there is NO automatic skill router.  The model sees the
+        # catalog (Stage 1) in the system prompt and self-disposes via
+        # ``manage_skills(action='load'|'pin', ...)``.  Load is one-shot
+        # (no manager state); pin is session-long (tracked in ``_pinned``).
+        # Eval tooling that needs "would query X trigger skill Y?" is in
         # skills/create-skill/scripts/test_trigger.py, which inlines its
         # own one-shot router rather than coupling to this class.
 
@@ -290,6 +301,11 @@ class SkillManager:
         Returns list of discovered skill names.
         """
         self._skills.clear()
+        # Drop stale pins from skills that no longer exist (e.g. after
+        # delete/rename). Re-population happens below; any names that
+        # remain pinned and still parse correctly stay pinned.
+        prev_pinned = set(self._pinned)
+        self._pinned.clear()
         discovered = []
 
         if not os.path.isdir(self.skills_dir):
@@ -309,6 +325,11 @@ class SkillManager:
             if skill and skill["name"] not in self._skills:
                 self._skills[skill["name"]] = skill
                 discovered.append(skill["name"])
+
+        # Restore pins for skills that survived the rediscovery.
+        for n in prev_pinned:
+            if n in self._skills:
+                self._pinned.add(n)
 
         return discovered
 
@@ -331,34 +352,56 @@ class SkillManager:
             catalog.append({
                 "name": skill["name"],
                 "description": skill["description"],
-                "active": name in self._active,
+                "pinned": name in self._pinned,
             })
         return catalog
 
-    def activate(self, name: str) -> bool:
+    def pin(self, name: str) -> bool:
         """
-        Stage 2: Load — mark a skill as active so its full instructions
-        are included in the system prompt.
+        Pin a skill for the whole session: its full SKILL.md body will be
+        prepended to every user message via ``build_pinned_bodies_block()``
+        until ``unpin(name)`` (or ``unpin_all()``).
         """
         if name in self._skills:
-            self._active.add(name)
+            self._pinned.add(name)
             return True
         return False
+
+    def unpin(self, name: str) -> bool:
+        """Stop session-pinning a skill."""
+        if name in self._pinned:
+            self._pinned.discard(name)
+            return True
+        return False
+
+    def unpin_all(self) -> None:
+        """Un-pin every currently-pinned skill."""
+        self._pinned.clear()
+
+    def get_pinned_skills(self) -> list[str]:
+        """Return names of currently pinned skills."""
+        return sorted(self._pinned)
+
+    # ── Deprecated aliases (kept for back-compat with external callers) ──
+    # New code should use pin/unpin/unpin_all/get_pinned_skills directly.
+    # These thin shims preserve the old naming used by /skill CLI handler
+    # historical and any saved sessions/tests written against the prior API.
+
+    def activate(self, name: str) -> bool:
+        """DEPRECATED alias of ``pin``."""
+        return self.pin(name)
 
     def deactivate(self, name: str) -> bool:
-        """Deactivate a skill (stop injecting its instructions)."""
-        if name in self._active:
-            self._active.discard(name)
-            return True
-        return False
+        """DEPRECATED alias of ``unpin``."""
+        return self.unpin(name)
 
-    def deactivate_all(self):
-        """Deactivate all skills."""
-        self._active.clear()
+    def deactivate_all(self) -> None:
+        """DEPRECATED alias of ``unpin_all``."""
+        self.unpin_all()
 
     def get_active_skills(self) -> list[str]:
-        """Return names of currently active skills."""
-        return sorted(self._active)
+        """DEPRECATED alias of ``get_pinned_skills``."""
+        return self.get_pinned_skills()
 
     def get_instructions(self, name: str) -> Optional[str]:
         """
@@ -431,32 +474,43 @@ class SkillManager:
 
         lines = ["<available_skills>"]
         lines.append(
-            "Use /skill <name> to manually activate, or call the manage_skills "
-            "tool with action='activate' to load a skill's full instructions."
+            "Use manage_skills(action='load', name=X) to bring skill X's full "
+            "instructions into context as a tool result. Do NOT call load again "
+            "for the same skill if its instructions are already visible above. "
+            "Use action='pin' instead only when the user explicitly asks to "
+            "keep a skill on for the whole session. Users can also pin via /skill <name>."
         )
         for name in sorted(self._skills.keys()):
             skill = self._skills[name]
             lines.append("<skill>")
             lines.append(f"<name>{html.escape(name)}</name>")
-            lines.append(f"<description>{html.escape(skill['description'][:200])}</description>")
+            # Description is already capped to 1024 chars at parse time
+            # (agentskills.io spec §description). Don't re-truncate here — the
+            # description IS the discovery signal for progressive disclosure,
+            # and a 200-char cap was clipping trigger keywords mid-sentence.
+            lines.append(f"<description>{html.escape(skill['description'])}</description>")
             lines.append("</skill>")
         lines.append("</available_skills>")
         return "\n".join(lines)
 
-    def build_active_bodies_block(self) -> str:
+    def build_pinned_bodies_block(self) -> str:
         """
-        Stage 2 — return full instruction bodies for currently active skills.
+        Stage 2 — return full instruction bodies for currently PINNED skills.
 
-        Empty string when no skill is active. Caller should attach this as a
+        Empty string when no skill is pinned. Caller should attach this as a
         TAIL message block (e.g. prepend to the last user message's content)
-        rather than concatenating into the system prompt — that way activation
+        rather than concatenating into the system prompt — that way pin
         changes do not invalidate the system-prompt prefix cache.
+
+        Note: skills brought in via ``manage_skills(action='load', ...)`` do
+        NOT appear here — those return their body as a tool result and live
+        in conversation history, not in the per-turn pin block.
         """
-        if not self._active:
+        if not self._pinned:
             return ""
 
         lines = []
-        for name in sorted(self._active):
+        for name in sorted(self._pinned):
             skill = self._skills.get(name)
             if not skill:
                 continue
@@ -466,7 +520,7 @@ class SkillManager:
 
             if lines:
                 lines.append("")
-            lines.append(f'<active_skill name="{html.escape(name)}">')
+            lines.append(f'<pinned_skill name="{html.escape(name)}">')
 
             if skill.get("allowed_tools"):
                 tools_str = ", ".join(skill["allowed_tools"])
@@ -479,24 +533,28 @@ class SkillManager:
             lines.append("<instructions>")
             lines.append(body[:MAX_INSTRUCTIONS_CHARS])
             lines.append("</instructions>")
-            lines.append("</active_skill>")
+            lines.append("</pinned_skill>")
 
         return "\n".join(lines)
 
+    def build_active_bodies_block(self) -> str:
+        """DEPRECATED alias of ``build_pinned_bodies_block``."""
+        return self.build_pinned_bodies_block()
+
     def build_prompt_context(self) -> str:
         """
-        Legacy combined renderer: catalog + active bodies in one string.
+        Legacy combined renderer: catalog + pinned bodies in one string.
 
         Kept for back-compat with callers that inject the whole thing into a
         single buffer (e.g. tests, ad-hoc tooling). The main agent loop now
-        uses ``build_catalog_block`` and ``build_active_bodies_block``
+        uses ``build_catalog_block`` and ``build_pinned_bodies_block``
         separately so they can be placed in cache-friendly positions.
         """
         if not self._skills:
             return ""
 
         catalog = self.build_catalog_block()
-        bodies = self.build_active_bodies_block()
+        bodies = self.build_pinned_bodies_block()
         if catalog and bodies:
             return catalog + "\n\n" + bodies
         return catalog or bodies
@@ -555,7 +613,7 @@ class SkillManager:
         skill_dir = self._skills[name]["skill_dir"]
         try:
             shutil.rmtree(skill_dir)
-            self._active.discard(name)
+            self._pinned.discard(name)
             del self._skills[name]
             return f"✅ Skill '{name}' deleted."
         except Exception as e:

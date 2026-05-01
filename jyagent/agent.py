@@ -70,15 +70,23 @@ CRITICAL BEHAVIORAL PRINCIPLES:
 
 5. SKILLS AWARENESS: You have an Agent Skills system (agentskills.io standard) that provides procedural knowledge.
    Skills are advertised in the `<available_skills>` block of your system prompt (progressive disclosure — the
-   catalog is visible but full bodies are NOT loaded until activated). There is NO automatic router — YOU must
-   self-activate a matching skill via `manage_skills(action='activate', name=...)` BEFORE executing the task,
-   whenever the user's request clearly matches a listed skill's TRIGGER clauses.
-   Skipping activation because "I already know how" defeats the skill's checklists (e.g. web-search Step 0 verifies
+   catalog is visible but full bodies are NOT loaded until requested). There is NO automatic router — YOU must
+   bring a matching skill into context BEFORE executing the task whenever the user's request clearly matches a
+   listed skill's TRIGGER clauses. Skipping that defeats the skill's checklists (e.g. web-search Step 0 verifies
    the date and would have prevented the 2025/2026 year bug on 2026-05-01).
+
+   Two ways to bring a skill into context:
+   - `manage_skills(action='load', name=X)` — PREFERRED. One-shot: returns the full SKILL.md body
+     as a tool result. Use this for normal task-scoped skill use. Do NOT call `load` again for the same
+     skill if its instructions are already visible above in the conversation.
+   - `manage_skills(action='pin', name=X)` — only when the user EXPLICITLY asks to keep a skill on
+     for the whole session. Pinned skills re-inject their full body on every user message and are
+     token-expensive.
+
    - /skills — list all available skills and their status
-   - /skill <name> — activate a specific skill
-   - manage_skills tool — full skill management (list, activate, deactivate, create, etc.)
-   Active skills inject their instructions into your context. Use them to follow best practices for specific tasks."""
+   - /skill <name> — user-driven pin (the user's explicit pin command)
+   - manage_skills tool — full skill management (load, pin, deactivate, list, create, …)
+   `activate` is a deprecated alias of `pin`; prefer `load` or `pin` explicitly."""
 
 
 
@@ -120,8 +128,8 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     conversation.clear()
     runtime_owner.set_session_id(conversation.session_id)
 
-    # Clear active skills
-    get_skill_manager().deactivate_all()
+    # Clear pinned skills
+    get_skill_manager().unpin_all()
 
     # Reset session stats
     stats = get_stats()
@@ -148,7 +156,7 @@ def _cmd_skills(cli, **_):
         return
     lines = ["📦 Agent Skills:"]
     for entry in catalog:
-        status = "✅" if entry["active"] else "📦"
+        status = "📌" if entry["pinned"] else "📦"
         lines.append(f"  {status} {entry['name']}: {entry['description'][:80]}")
     lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['active'])} active")
     lines.append("  Use '/skill <name>' to activate, '/skill -<name>' to deactivate")
@@ -167,14 +175,14 @@ def _cmd_skill(cli, user_input, **_):
     if name.startswith("-"):
         # Deactivate
         skill_name = name[1:]
-        if mgr.deactivate(skill_name):
-            cli.print_system(f"📦 Skill '{skill_name}' deactivated.")
+        if mgr.unpin(skill_name):
+            cli.print_system(f"📦 Skill '{skill_name}' un-pinned.")
         else:
-            cli.print_error(f"Skill '{skill_name}' is not active or not found.")
+            cli.print_error(f"Skill '{skill_name}' is not pinned or not found.")
     else:
-        # Activate
-        if mgr.activate(name):
-            cli.print_system(f"✅ Skill '{name}' activated — its instructions are now in context.")
+        # Pin
+        if mgr.pin(name):
+            cli.print_system(f"📌 Skill '{name}' pinned — its instructions are now in context.")
         else:
             cli.print_error(f"Skill '{name}' not found. Use /skills to list available skills.")
 
@@ -365,10 +373,10 @@ def _build_full_system_prompt(user_input: str, skill_mgr: SkillManager,
       - The skill catalog (Stage 1, name+description only) changes only when
         the on-disk skills/ directory changes.
 
-    Active skill bodies (Stage 2) are NOT part of the system prompt — the
+    Pinned skill bodies (Stage 2) are NOT part of the system prompt — the
     caller attaches them as a tail block on the last user message so that
-    activation diffs do not invalidate the prefix cache. See
-    ``SkillManager.build_active_bodies_block``.
+    pin diffs do not invalidate the prefix cache. See
+    ``SkillManager.build_pinned_bodies_block``.
     """
     global _cached_memory_context
 
@@ -514,21 +522,21 @@ def run(runtime_owner: LLMOwner) -> None:
                     force_rebuild=force_rebuild,
                 )
 
-                # Stage 2 — attach active skill bodies to the LAST user message
+                # Stage 2 — attach pinned skill bodies to the LAST user message
                 # as a prepended text block. ``get_history()`` returned a
                 # shallow list-copy, but the dicts inside are shared with the
                 # ConversationMemory store; clone the last dict before mutating
                 # its ``content`` so the persisted history stays clean.
-                active_bodies = skill_mgr.build_active_bodies_block()
-                if active_bodies and messages and messages[-1].get("role") == "user":
+                pinned_bodies = skill_mgr.build_pinned_bodies_block()
+                if pinned_bodies and messages and messages[-1].get("role") == "user":
                     last = dict(messages[-1])
                     orig_content = last.get("content", "")
                     if isinstance(orig_content, list):
                         last["content"] = (
-                            [{"type": "text", "text": active_bodies}] + list(orig_content)
+                            [{"type": "text", "text": pinned_bodies}] + list(orig_content)
                         )
                     else:
-                        last["content"] = active_bodies + "\n\n" + str(orig_content)
+                        last["content"] = pinned_bodies + "\n\n" + str(orig_content)
                     messages[-1] = last
 
                 cli.print_separator()
