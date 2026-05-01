@@ -36,6 +36,7 @@ import functools
 import inspect
 import logging
 import threading
+import time
 import traceback
 from typing import MutableSequence
 
@@ -273,11 +274,31 @@ def execute_tools(
     if not blocks:
         return []
 
+    def _timed(*args, **kwargs) -> ToolResult:
+        """Wrap ``execute_tool_with_timeout`` with wall-clock timing.
+
+        Stamps ``ToolResult.duration_ms`` on the returned result so the UI can
+        surface per-call timing in ``on_tool_end`` without re-measuring (a
+        UI-level measurement is meaningless for parallel batches whose
+        ``on_tool_end`` callbacks fire serially in submission order after the
+        whole batch has completed).  Kept as a nested closure so the 4
+        dispatch sites below don't each need to thread a timing block.
+        """
+        _t0 = time.perf_counter()
+        _r = execute_tool_with_timeout(*args, **kwargs)
+        try:
+            _r.duration_ms = (time.perf_counter() - _t0) * 1000.0
+        except AttributeError:
+            # Defensive: a custom ToolResult subclass without the slot
+            # should not break dispatch — timing is best-effort.
+            pass
+        return _r
+
     # Fast path: single tool or concurrency disabled
     if len(blocks) <= 1 or not concurrent_mode:
         results = []
         for block in blocks:
-            result = execute_tool_with_timeout(
+            result = _timed(
                 block.name, block.input, batch, timeout,
                 partial_side_effects=partial_side_effects,
                 cancel_event=cancel_event,
@@ -289,7 +310,7 @@ def execute_tools(
     if not any(batch.is_parallel_safe(b.name) for b in blocks):
         results = []
         for block in blocks:
-            result = execute_tool_with_timeout(
+            result = _timed(
                 block.name, block.input, batch, timeout,
                 partial_side_effects=partial_side_effects,
                 cancel_event=cancel_event,
@@ -321,7 +342,7 @@ def execute_tools(
             pool = executor or get_tool_dispatch_executor(max_workers)
             futures = {
                 pool.submit(
-                    execute_tool_with_timeout,
+                    _timed,
                     block.name, block.input, batch, timeout,
                     body_permits=body_permits,
                     partial_side_effects=partial_side_effects,
@@ -341,7 +362,7 @@ def execute_tools(
                     ))
         else:
             block = blocks[i]
-            result = execute_tool_with_timeout(
+            result = _timed(
                 block.name, block.input, batch, timeout,
                 partial_side_effects=partial_side_effects,
                 cancel_event=cancel_event,

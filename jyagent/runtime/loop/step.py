@@ -856,7 +856,7 @@ def _execute_tool_round(
                 "content": "Cancelled",
                 "is_error": True,
             })
-            loop._fire("on_tool_end", block.name, "Cancelled", True)
+            loop._fire("on_tool_end", block.name, "Cancelled", True, None)
         return StepBreak(reason="cancelled"), []
 
     tools_t0 = time.perf_counter()
@@ -881,7 +881,16 @@ def _execute_tool_round(
         content_str = _truncate_result(
             result.content, cfg.max_tool_result_chars, result.is_error,
         )
-        loop._fire("on_tool_end", block.name, content_str, result.is_error)
+        # ``duration_ms`` is stamped by ``tool_executor._timed`` at each
+        # dispatch site (sequential + parallel).  It will be ``None`` only if
+        # a custom ToolResult subclass rejected the attribute write or the
+        # caller bypassed ``execute_tools`` entirely (e.g. the cancel-shim
+        # path that synthesises a Cancelled ToolResult above).  The UI
+        # callback tolerates ``None``.
+        duration_ms = getattr(result, "duration_ms", None)
+        loop._fire(
+            "on_tool_end", block.name, content_str, result.is_error, duration_ms,
+        )
 
         if trace:
             trace.add_span(

@@ -17,7 +17,7 @@ class LoopCallbacks:
     on_thinking_start: Callable[[], None] | None = None
     on_thinking_stop: Callable[[], None] | None = None
     on_tool_start: Callable[[str, dict], None] | None = None
-    on_tool_end: Callable[[str, str, bool], None] | None = None  # (name, content, is_error)
+    on_tool_end: Callable[..., None] | None = None  # (name, content, is_error, duration_ms | None)
     on_retry: Callable[[int, Exception], None] | None = None  # (attempt, error)
     on_compaction: Callable[[int, int], None] | None = None  # (before_len, after_len)
     on_usage: Callable[[dict], None] | None = None  # raw Usage dict from response

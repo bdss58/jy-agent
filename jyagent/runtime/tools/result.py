@@ -13,11 +13,18 @@ class ToolResult:
     String-like interface: delegates common str methods to self.content so that
     existing code using ``"text" in result`` or ``result.startswith(...)`` keeps working.
     """
-    __slots__ = ('content', 'is_error')
+    __slots__ = ('content', 'is_error', 'duration_ms')
 
-    def __init__(self, content: str, is_error: bool = False):
+    def __init__(self, content: str, is_error: bool = False, duration_ms: float | None = None):
         self.content = content
         self.is_error = is_error
+        # Wall-clock duration of the tool call in milliseconds. Stamped by the
+        # tool executor at the 4 dispatch sites in ``execute_tools`` so the UI
+        # can surface per-call timings without re-measuring (which would be
+        # wrong for parallel batches whose UI ``on_tool_end`` callbacks fire
+        # serially in submission order after all bodies have completed).
+        # ``None`` = not measured (direct caller or legacy construction).
+        self.duration_ms = duration_ms
 
     def __str__(self):
         return self.content

@@ -146,7 +146,32 @@ def _format_tool_args(tool_name: str, tool_input: dict) -> str:
     return s[:120] + "..." if len(s) > 120 else s
 
 
-def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = False):
+def _format_duration(duration_ms: float | None) -> str:
+    """Format a ms duration as a compact, human-friendly string.
+
+    <1 ms  → "<1ms"       (don't bother)
+    <1 s   → "123ms"      (integer ms)
+    <10 s  → "1.23s"      (2 decimals)
+    <60 s  → "12.3s"      (1 decimal)
+    ≥60 s  → "1m23s"      (mm:ss rollup)
+    None   → ""           (silent — keeps cancel-shim and legacy callers clean)
+    """
+    if duration_ms is None:
+        return ""
+    if duration_ms < 1:
+        return "<1ms"
+    if duration_ms < 1000:
+        return f"{duration_ms:.0f}ms"
+    s = duration_ms / 1000.0
+    if s < 10:
+        return f"{s:.2f}s"
+    if s < 60:
+        return f"{s:.1f}s"
+    m, rem = divmod(int(s), 60)
+    return f"{m}m{rem:02d}s"
+
+
+def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = False, duration_ms: float | None = None):
     """Print a compact tool result summary with smart formatting."""
     from rich.text import Text
     # Flush raw stdout to maintain ordering with Rich output
@@ -156,18 +181,22 @@ def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = 
     n_lines = len(lines)
     n_chars = len(result_str)
 
+    dur_str = _format_duration(duration_ms)
+
     if is_error:
         # Errors: show full (they're usually short)
         preview = result_str[:300].replace('\n', ' ↵ ')
         if n_chars > 300:
             preview += "..."
         text = Text(f"  ✗ {preview}", style="bold red")
+        if dur_str:
+            text.append(f" ({dur_str})", style="dim red")
         console.print(text)
         return
 
     # Detect edit_file diffs and show them nicely
     if tool_name == "edit_file" and any(ln.strip().startswith(">") for ln in lines[:20]):
-        _render_edit_diff(result_str)
+        _render_edit_diff(result_str, duration_ms=duration_ms)
         return
 
     # Compact display: first line as summary + dims
@@ -176,6 +205,8 @@ def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = 
         first_line = first_line[:147] + "..."
 
     size_info = f"{n_chars} chars" if n_lines <= 1 else f"{n_lines} lines, {n_chars} chars"
+    if dur_str:
+        size_info = f"{size_info} · {dur_str}"
     text = Text()
     text.append("  ✓", style="green")
     text.append(f" {first_line}")
@@ -183,7 +214,7 @@ def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = 
     console.print(text)
 
 
-def _render_edit_diff(result_str: str):
+def _render_edit_diff(result_str: str, duration_ms: float | None = None):
     """Render edit_file output with color-coded diff lines using Rich Text."""
     from rich.text import Text
     # Flush raw stdout to maintain ordering with Rich output
@@ -192,7 +223,12 @@ def _render_edit_diff(result_str: str):
     lines = result_str.split('\n')
     # First line is the summary (e.g. "Edited foo.py: replaced 3 lines...")
     summary = lines[0] if lines else ""
-    console.print(Text(f"  ✓ {summary}", style="green"))
+    header = Text()
+    header.append(f"  ✓ {summary}", style="green")
+    dur_str = _format_duration(duration_ms)
+    if dur_str:
+        header.append(f" ({dur_str})", style="dim")
+    console.print(header)
 
     # Render context lines with diff coloring
     for line in lines[1:]:
@@ -251,9 +287,9 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
             stream_state.needs_newline = False
         _tool_call_header(name, tool_input)
 
-    def _on_tool_end(name: str, content: str, is_error: bool):
+    def _on_tool_end(name: str, content: str, is_error: bool, duration_ms: float | None = None):
         stats.record_tool_call()
-        _tool_result_preview(content, tool_name=name, is_error=is_error)
+        _tool_result_preview(content, tool_name=name, is_error=is_error, duration_ms=duration_ms)
 
     def _on_retry(attempt: int, error: Exception):
         sys.stdout.flush()
