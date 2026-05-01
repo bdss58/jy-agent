@@ -3,7 +3,7 @@
 #
 #   Fix #1: structural-boundary-aware /compact (no orphan tool_results)
 #   Fix #2: dehydration-aware tool-result clearing (spill-path preserved)
-#   Fix #3: SKILL_PRE_ROUTER wired to main loop via pre_route_for_turn()
+#   Fix #3: (REMOVED 2026-05) SKILL_PRE_ROUTER deleted — per-turn auto-router gone
 
 import os
 import tempfile
@@ -181,49 +181,11 @@ class TestDehydrationPlaceholder:
         assert "recover via run_shell" in early_tr
 
 
-# ─── Fix #3: SKILL_PRE_ROUTER actually runs ──────────────────────────────────
-
-class TestSkillPreRouterWiring:
-    """`pre_route_for_turn` must no-op when disabled and invoke the router
-    when enabled."""
-
-    def test_disabled_by_default_no_side_effect(self, tmp_path):
-        from jyagent.skills import SkillManager
-        mgr = SkillManager(skills_dir=str(tmp_path))
-        mgr._auto_activate = False
-        # Should return current active set (empty) without calling anything.
-        assert mgr.pre_router_enabled is False
-        with patch.object(mgr, "auto_activate_for_query") as spy:
-            result = mgr.pre_route_for_turn("do something")
-            spy.assert_not_called()
-        assert result == []
-
-    def test_enabled_calls_router(self, tmp_path):
-        from jyagent.skills import SkillManager
-        mgr = SkillManager(skills_dir=str(tmp_path))
-        mgr._auto_activate = True
-        # Need at least one skill for routing to trigger
-        mgr._skills = {"test-skill": {"name": "test-skill", "description": "x", "path": "/tmp/x"}}
-
-        assert mgr.pre_router_enabled is True
-        with patch.object(mgr, "auto_activate_for_query",
-                          return_value=["test-skill"]) as spy:
-            result = mgr.pre_route_for_turn("test it", runtime_owner=None,
-                                            recent_messages=[])
-            spy.assert_called_once()
-        assert result == ["test-skill"]
-
-    def test_empty_query_no_op_even_when_enabled(self, tmp_path):
-        """Router should not run on empty query (e.g. slash commands handled
-        upstream returning early)."""
-        from jyagent.skills import SkillManager
-        mgr = SkillManager(skills_dir=str(tmp_path))
-        mgr._auto_activate = True
-        mgr._skills = {"s": {"name": "s", "description": "x", "path": "/tmp/s"}}
-
-        with patch.object(mgr, "auto_activate_for_query") as spy:
-            mgr.pre_route_for_turn("")
-            spy.assert_not_called()
+# ─── Fix #3 (REMOVED): SKILL_PRE_ROUTER was removed 2026-05. See
+# data/memory/journal/ — per-turn auto-routing deleted because it was
+# off-by-default and unused; self-activation via manage_skills is the only
+# activation path now.  The eval-only `auto_activate_for_query` API is
+# covered by tests/test_skill_router.py.
 
 
 # ─── Fix #4: sub-agent memory scoping ────────────────────────────────────────

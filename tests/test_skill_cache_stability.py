@@ -16,7 +16,9 @@ These tests pin the post-refactor design (Design B, progressive disclosure):
   * Stage 2 active bodies (build_active_bodies_block) are emitted as a
     SEPARATE block that the agent attaches to the last user message, NOT
     to the system prompt.
-  * The pre-LLM router is OFF by default, controlled by SKILL_PRE_ROUTER.
+  * There is NO per-turn automatic skill router — skills are activated by
+    the LLM (via `manage_skills`) or the user (via `/skill`).  The previous
+    opt-in `SKILL_PRE_ROUTER` flag was removed 2026-05.
 
 Any future refactor that re-introduces activation-state into the catalog
 (or pulls active bodies back into the system prompt) will fail here.
@@ -210,55 +212,11 @@ class TestAgentSystemPromptIsStable:
 
 
 # ─── env var opt-in for pre-router ───────────────────────────────────────
-
-
-class TestPreRouterEnvVar:
-    """SKILL_PRE_ROUTER controls whether SkillManager auto-routes per turn.
-    Default is OFF; opt-in flips _auto_activate to True at construction."""
-
-    def _reload_with_env(self, monkeypatch, value):
-        """Re-import config + skills with SKILL_PRE_ROUTER set to `value`."""
-        if value is None:
-            monkeypatch.delenv("SKILL_PRE_ROUTER", raising=False)
-        else:
-            monkeypatch.setenv("SKILL_PRE_ROUTER", value)
-        import jyagent.config as cfg_mod
-        import jyagent.skills as skills_mod
-        importlib.reload(cfg_mod)
-        importlib.reload(skills_mod)
-        return skills_mod
-
-    def test_default_is_off(self, monkeypatch, tmp_path):
-        skills_mod = self._reload_with_env(monkeypatch, None)
-        mgr = skills_mod.SkillManager(_make_skills_dir(tmp_path, [("a", "x")]))
-        assert mgr._auto_activate is False
-
-    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
-    def test_truthy_values_enable(self, monkeypatch, tmp_path, value):
-        skills_mod = self._reload_with_env(monkeypatch, value)
-        mgr = skills_mod.SkillManager(_make_skills_dir(tmp_path, [("a", "x")]))
-        assert mgr._auto_activate is True
-
-    @pytest.mark.parametrize("value", ["0", "false", "no", "off", ""])
-    def test_falsy_values_disable(self, monkeypatch, tmp_path, value):
-        skills_mod = self._reload_with_env(monkeypatch, value)
-        mgr = skills_mod.SkillManager(_make_skills_dir(tmp_path, [("a", "x")]))
-        assert mgr._auto_activate is False
-
-    def test_explicit_router_call_works_regardless_of_flag(
-        self, monkeypatch, tmp_path
-    ):
-        """auto_activate_for_query() is an explicit API — it must not be
-        gated by the env var (only the implicit per-turn path is)."""
-        skills_mod = self._reload_with_env(monkeypatch, "0")
-        mgr = skills_mod.SkillManager(_make_skills_dir(tmp_path, [("a", "x")]))
-        mgr.discover()
-        assert mgr._auto_activate is False
-        # Explicit call still attempts routing (will fail-soft to keyword
-        # fallback or empty without a runtime — what matters is it does
-        # NOT short-circuit on the flag).
-        result = mgr.auto_activate_for_query("anything")
-        assert isinstance(result, list)
+#
+# TestPreRouterEnvVar was removed 2026-05 together with the SKILL_PRE_ROUTER
+# feature itself.  The explicit eval-only routing API
+# (``auto_activate_for_query``) remains and is covered by
+# tests/test_skill_router.py — it is independent of any env flag.
 
 
 # ─── teardown: restore the modules after env-var reload tests ───────────
@@ -266,9 +224,10 @@ class TestPreRouterEnvVar:
 
 @pytest.fixture(autouse=True, scope="module")
 def _reset_modules_after_module():
-    """The env-var tests reload jyagent.config and jyagent.skills. Reset
-    them to their on-disk state when this module finishes so other tests
-    aren't poisoned by leftover env settings."""
+    """Safety net: if any test here reloads jyagent.config or jyagent.skills
+    (the TestPreRouterEnvVar suite did), make sure we reset them to their
+    on-disk state when this module finishes so other tests aren't poisoned
+    by leftover env settings."""
     yield
     import jyagent.config as cfg_mod
     import jyagent.skills as skills_mod

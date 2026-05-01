@@ -28,7 +28,6 @@ from typing import Optional
 from .config import (
     MAX_INSTRUCTIONS_CHARS,
     MAX_RESOURCE_CHARS,
-    SKILL_PRE_ROUTER_ENABLED,
     SKILL_ROUTER_TIMEOUT,
     get_skill_router_model_spec,
 )
@@ -280,15 +279,14 @@ class SkillManager:
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: dict[str, dict] = {}       # name → parsed skill
         self._active: set[str] = set()            # currently loaded skill names
-        # Default OFF: skills are activated by the LLM (via manage_skills tool)
-        # or the user (via /skill). Pre-LLM routing is opt-in via the
-        # SKILL_PRE_ROUTER env var (see config.py) because:
-        #   1. it adds a router LLM call to every turn, and
-        #   2. an active-set diff invalidates the system-prompt prompt cache
-        #      when skill bodies are concatenated into the system prompt.
-        # The catalog (Stage 1) is always visible to the LLM in the system
-        # prompt, so the LLM can self-activate skills it deems relevant.
-        self._auto_activate: bool = SKILL_PRE_ROUTER_ENABLED
+        # NOTE: there is NO per-turn automatic skill router.  Skills are
+        # activated by the LLM (via ``manage_skills`` tool) or the user
+        # (via ``/skill``).  The catalog (Stage 1) is always visible to the
+        # LLM in the system prompt, so the LLM can self-activate skills it
+        # deems relevant — same progressive-disclosure pattern Claude Code
+        # uses.  ``auto_activate_for_query`` below is retained as an
+        # EVAL-ONLY API used by the create-skill skill's trigger-test
+        # tooling; it is never invoked automatically.
 
     def discover(self) -> list[str]:
         """
@@ -420,39 +418,13 @@ class SkillManager:
                         resources.append(rel)
         return sorted(resources)
 
-    # ── Diff-based skill routing (per-turn re-evaluation) ──────────────────
-
-    @property
-    def pre_router_enabled(self) -> bool:
-        """Whether the per-turn pre-routing path should run.
-
-        Driven by ``SKILL_PRE_ROUTER`` env var at construction.  Exposed as
-        a public predicate so the main agent loop doesn't need to reach into
-        ``_auto_activate`` — the flag controls a cost/latency trade-off
-        (extra LLM call per turn) that callers legitimately need to see.
-        """
-        return bool(self._auto_activate)
-
-    def pre_route_for_turn(self, query: str, runtime_owner=None,
-                           recent_messages: list | None = None) -> list[str]:
-        """Pre-route active skills for this turn if the router is enabled.
-
-        No-op when ``SKILL_PRE_ROUTER`` is off — returns the current active
-        set unchanged.  When enabled, evaluates the full catalog against the
-        user query + recent history and mutates the active set (diff-based
-        activation: skills can be added *and* removed).
-
-        This is the single entry point the main agent loop should call.
-        Back when the router lived only inside ``build_prompt_context`` but
-        the main loop called ``build_catalog_block`` / ``build_active_bodies_block``
-        directly, the SKILL_PRE_ROUTER flag was effectively dead.  Routing
-        it through this method closes that hole.
-        """
-        if not self._auto_activate or not self._skills or not query:
-            return list(self._active)
-        return self.auto_activate_for_query(
-            query, runtime_owner=runtime_owner, recent_messages=recent_messages,
-        )
+    # ── Diff-based skill routing (eval-only API) ───────────────────────────
+    #
+    # ``auto_activate_for_query`` is exposed as an EXPLICIT API used by the
+    # create-skill skill's ``scripts/test_trigger.py`` eval tooling — it is
+    # NOT called automatically from the main agent loop.  (A per-turn
+    # auto-router existed historically behind ``SKILL_PRE_ROUTER`` but was
+    # removed; see data/memory/journal/ for rationale.)
 
     def auto_activate_for_query(self, query: str, runtime_owner=None,
                                 recent_messages: list | None = None) -> list[str]:
@@ -747,17 +719,16 @@ class SkillManager:
         uses ``build_catalog_block`` and ``build_active_bodies_block``
         separately so they can be placed in cache-friendly positions.
 
-        If ``query`` is non-empty AND ``self._auto_activate`` is True, this
-        runs the diff-based router before rendering. Default is OFF.
+        ``query`` / ``runtime_owner`` / ``recent_messages`` are accepted for
+        back-compat but no longer trigger automatic routing — the per-turn
+        pre-router was removed.  Callers wanting explicit routing should call
+        ``auto_activate_for_query`` directly (used by the create-skill eval
+        tooling).
         """
         if not self._skills:
             return ""
 
-        if query and self._auto_activate:
-            self.auto_activate_for_query(
-                query, runtime_owner=runtime_owner,
-                recent_messages=recent_messages,
-            )
+        _ = query, runtime_owner, recent_messages  # kept for signature stability
 
         catalog = self.build_catalog_block()
         bodies = self.build_active_bodies_block()
