@@ -20,7 +20,7 @@ class LoopConfig:
     concurrent_tools: bool = True
     max_tool_workers: int = 4
     tool_timeout: int = 120
-    retry_attempts: int = 3
+    retry_attempts: int = 10
     retry_base_delay: float = 1.0
     # When True (default), the LLM retry loop retries ANY exception up to
     # ``retry_attempts``, not just errors classified transient by

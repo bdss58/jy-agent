@@ -325,7 +325,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         concurrent_tools=True,
         max_tool_workers=2,
         compact_messages=True,
-        retry_attempts=2,
+        retry_attempts=10,
         streaming=False,
     )
 

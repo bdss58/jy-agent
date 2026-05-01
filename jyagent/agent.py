@@ -542,7 +542,7 @@ def run(runtime_owner: LLMOwner) -> None:
                         concurrent_tools=True,
                         max_tool_workers=4,
                         tool_timeout=DEFAULT_TOOL_TIMEOUT,
-                        retry_attempts=2,
+                        retry_attempts=10,
                         retry_base_delay=2.0,
                         compact_messages=True,
                         max_working_tokens=MAX_WORKING_TOKENS,
