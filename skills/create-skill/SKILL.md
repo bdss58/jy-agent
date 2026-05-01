@@ -153,9 +153,10 @@ Run trigger tests to measure if the description activates correctly:
 python scripts/test_trigger.py <skill-dir> --verbose
 ```
 
-This uses the LLM skill router with all installed skills present
-(realistic routing scenario). It auto-generates test queries from
-the description, or you can provide a custom eval set:
+This runs a one-shot LLM routing call per query with all installed skills
+present as the catalog (realistic scenario — model sees every skill and picks
+which ones apply). It auto-generates test queries from the description, or
+you can provide a custom eval set:
 
 ```bash
 python scripts/test_trigger.py <skill-dir> --eval-set evals/trigger_evals.json -v

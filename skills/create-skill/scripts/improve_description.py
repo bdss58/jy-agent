@@ -35,7 +35,7 @@ def _call_llm(prompt: str, model: str = None) -> str:
     """Call Anthropic API to improve description."""
     import anthropic
 
-    model = model or os.environ.get("SKILL_ROUTER_MODEL", "claude-sonnet-4-20250514")
+    model = model or os.environ.get("SKILL_IMPROVE_MODEL", "claude-sonnet-4-20250514")
     client = anthropic.Anthropic()
 
     resp = client.messages.create(

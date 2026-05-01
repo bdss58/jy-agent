@@ -115,16 +115,13 @@ LATEST_SESSION_FILE = os.path.join(SESSIONS_DIR, "latest.json")
 
 MAX_INSTRUCTIONS_CHARS = int(os.environ.get("AGENT_MAX_SKILL_CHARS", "8000"))
 MAX_RESOURCE_CHARS = int(os.environ.get("AGENT_MAX_RESOURCE_CHARS", "10000"))
-SKILL_ROUTER_PROVIDER = os.environ.get("SKILL_ROUTER_PROVIDER", AGENT_PROVIDER)
-SKILL_ROUTER_MODEL = os.environ.get("SKILL_ROUTER_MODEL", AGENT_MODEL)
-# NOTE: SKILL_ROUTER_* vars below are retained for the eval-only routing
-# API (``SkillManager.auto_activate_for_query``) used by the create-skill
-# skill's trigger-test tooling. There is NO per-turn automatic skill router
-# — the main model sees the skill catalog in the system prompt and
-# self-activates via the manage_skills tool (progressive disclosure, same
-# pattern Claude Code uses). The per-turn SKILL_PRE_ROUTER flag was removed
-# in chore/remove-skill-pre-router; see data/memory/journal/ for rationale.
-SKILL_ROUTER_TIMEOUT = int(os.environ.get("SKILL_ROUTER_TIMEOUT", "5"))
+# NOTE: there is NO skill router — not per-turn, not elsewhere.  The main
+# model sees the skill catalog in the system prompt and self-activates via
+# the manage_skills tool (progressive disclosure, same pattern Claude Code
+# uses).  The former SKILL_PRE_ROUTER + SKILL_ROUTER_* surface was removed
+# 2026-05 (see data/memory/journal/).  Eval-only routing — "would query X
+# trigger skill Y?" — lives self-contained in
+# skills/create-skill/scripts/test_trigger.py.
 
 # ─── Web Fetch ────────────────────────────────────────────────────────────────
 
@@ -173,13 +170,6 @@ def build_model_spec(provider: str, model: str, *, source: str):
     from .llm.types import ModelSpec
 
     return ModelSpec(provider=validate_runtime_provider(provider, source=source), model=model)
-
-
-def get_skill_router_model_spec(active_spec=None):
-    active_spec = active_spec or get_active_model_spec()
-    provider = (os.environ.get("SKILL_ROUTER_PROVIDER") or active_spec.provider).strip() or active_spec.provider
-    model = (os.environ.get("SKILL_ROUTER_MODEL") or active_spec.model).strip() or active_spec.model
-    return build_model_spec(provider, model, source="SKILL_ROUTER_PROVIDER")
 
 
 def get_reasoning_config_for_provider(

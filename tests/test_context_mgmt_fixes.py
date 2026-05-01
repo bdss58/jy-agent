@@ -181,11 +181,11 @@ class TestDehydrationPlaceholder:
         assert "recover via run_shell" in early_tr
 
 
-# ─── Fix #3 (REMOVED): SKILL_PRE_ROUTER was removed 2026-05. See
-# data/memory/journal/ — per-turn auto-routing deleted because it was
-# off-by-default and unused; self-activation via manage_skills is the only
-# activation path now.  The eval-only `auto_activate_for_query` API is
-# covered by tests/test_skill_router.py.
+# ─── Fix #3 (REMOVED): SKILL_PRE_ROUTER + the whole routing mechanism were
+# removed 2026-05.  Per-turn auto-routing is gone; skills activate only via
+# manage_skills tool / `/skill` command.  Eval tooling for "would query X
+# trigger skill Y?" lives self-contained in
+# skills/create-skill/scripts/test_trigger.py.
 
 
 # ─── Fix #4: sub-agent memory scoping ────────────────────────────────────────

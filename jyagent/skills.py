@@ -20,16 +20,12 @@ import os
 import re
 import glob
 import html
-import json
 import sys
-import time
 from typing import Optional
 
 from .config import (
     MAX_INSTRUCTIONS_CHARS,
     MAX_RESOURCE_CHARS,
-    SKILL_ROUTER_TIMEOUT,
-    get_skill_router_model_spec,
 )
 
 
@@ -279,14 +275,14 @@ class SkillManager:
         self.skills_dir = os.path.abspath(skills_dir)
         self._skills: dict[str, dict] = {}       # name → parsed skill
         self._active: set[str] = set()            # currently loaded skill names
-        # NOTE: there is NO per-turn automatic skill router.  Skills are
-        # activated by the LLM (via ``manage_skills`` tool) or the user
-        # (via ``/skill``).  The catalog (Stage 1) is always visible to the
-        # LLM in the system prompt, so the LLM can self-activate skills it
-        # deems relevant — same progressive-disclosure pattern Claude Code
-        # uses.  ``auto_activate_for_query`` below is retained as an
-        # EVAL-ONLY API used by the create-skill skill's trigger-test
-        # tooling; it is never invoked automatically.
+        # NOTE: there is NO automatic skill router.  Skills are activated by
+        # the LLM (via ``manage_skills`` tool) or the user (via ``/skill``).
+        # The catalog (Stage 1) is always visible to the LLM in the system
+        # prompt, so the LLM can self-activate skills it deems relevant —
+        # same progressive-disclosure pattern Claude Code uses.  Eval
+        # tooling that needs "would query X trigger skill Y?" is in
+        # skills/create-skill/scripts/test_trigger.py, which inlines its
+        # own one-shot router rather than coupling to this class.
 
     def discover(self) -> list[str]:
         """
@@ -418,228 +414,6 @@ class SkillManager:
                         resources.append(rel)
         return sorted(resources)
 
-    # ── Diff-based skill routing (eval-only API) ───────────────────────────
-    #
-    # ``auto_activate_for_query`` is exposed as an EXPLICIT API used by the
-    # create-skill skill's ``scripts/test_trigger.py`` eval tooling — it is
-    # NOT called automatically from the main agent loop.  (A per-turn
-    # auto-router existed historically behind ``SKILL_PRE_ROUTER`` but was
-    # removed; see data/memory/journal/ for rationale.)
-
-    def auto_activate_for_query(self, query: str, runtime_owner=None,
-                                recent_messages: list | None = None) -> list[str]:
-        """
-        Re-evaluate which skills should be active for this turn.
-
-        Unlike the old additive approach, this considers the FULL catalog
-        every turn and produces a diff: skills can be added AND removed.
-        Recent conversation messages give the router context for follow-up
-        queries like "test it" or "now fix the description".
-
-        Strategy:
-          1. Try LLM diff-based routing (full catalog + recent history)
-          2. Fallback to keyword matching on full catalog if LLM fails
-          3. On fallback failure, keep current active set unchanged
-
-        Returns list of skill names in the new active set (not just newly added).
-        """
-        if not self._skills:
-            return []
-
-        prev_active = set(self._active)
-
-        # Try LLM routing first (evaluates full catalog)
-        result = self._route_llm(
-            query, recent_messages=recent_messages, runtime_owner=runtime_owner,
-        )
-        if result is not None:
-            return result
-
-        # Fallback: keyword matching on full catalog
-        result = self._route_keywords(query)
-        if result is not None:
-            return result
-
-        # Both failed — keep current set unchanged (graceful degrade)
-        return list(self._active)
-
-    def _route_llm(self, query: str, *, recent_messages: list | None = None,
-                   runtime_owner=None) -> Optional[list[str]]:
-        """
-        LLM diff-based router: decide the complete active skill set for this turn.
-
-        Sends the full skill catalog, currently active set, recent conversation
-        context, and current query. Returns the new active set, or None on failure.
-        """
-        if runtime_owner is None:
-            try:
-                from .llm import LLMOwner
-                runtime_owner = LLMOwner(get_skill_router_model_spec())
-            except Exception:
-                return None
-
-        # Build skill catalog
-        catalog_lines = []
-        for name, skill in sorted(self._skills.items()):
-            catalog_lines.append(f"- {name}: {skill['description'][:200]}")
-        catalog_text = "\n".join(catalog_lines)
-
-        # Build recent conversation context (prior turns for multi-turn continuity)
-        # Caller already filters to user/assistant and excludes current query.
-        history_text = ""
-        if recent_messages:
-            history_parts = []
-            for msg in recent_messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    # Extract text from content blocks
-                    content = " ".join(
-                        b.get("text", "") for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    )
-                if content and role in ("user", "assistant"):
-                    content = content[:200]  # truncate for token budget
-                    history_parts.append(f"  {role}: {content}")
-            if history_parts:
-                history_text = "Recent conversation:\n" + "\n".join(history_parts) + "\n\n"
-
-        # Current active set (so router knows what's loaded)
-        active_text = ""
-        if self._active:
-            active_text = f"Currently active skills: {sorted(self._active)}\n\n"
-
-        routing_prompt = (
-            "You are a skill router. Given a user query, conversation context, "
-            "and available skills, decide which skills should be active for this turn.\n\n"
-            "Skills can be ADDED (newly relevant) or REMOVED (no longer needed). "
-            "Evaluate the FULL catalog — don't just keep everything active.\n\n"
-            f"Available skills:\n{catalog_text}\n\n"
-            f"{active_text}"
-            f"{history_text}"
-            f"Current user query: {query}\n\n"
-            "Return a JSON array of skill names that should be active for this turn. "
-            "Return [] if no skills are needed. "
-            "ONLY output the JSON array, nothing else."
-        )
-
-        try:
-            t0 = time.time()
-            text = runtime_owner.complete_text(
-                routing_prompt,
-                max_output_tokens=100,
-                model_spec=get_skill_router_model_spec(runtime_owner.model_spec),
-                timeout=SKILL_ROUTER_TIMEOUT,
-                # Router is a cheap utility call — no extended thinking.
-                # This also avoids validate_anthropic_reasoning rejecting
-                # models < Claude 4.6 when adaptive thinking is configured
-                # via env for the main agent.
-                reasoning=None,
-            )
-            elapsed = time.time() - t0
-
-            # Parse response
-            text = text.strip()
-            if text.startswith("```"):
-                text = re.sub(r'^```\w*\n?', '', text)
-                text = re.sub(r'\n?```$', '', text)
-                text = text.strip()
-
-            selected = json.loads(text)
-            if not isinstance(selected, list):
-                return None
-
-            # Validate: only accept known skill names
-            new_active = set()
-            for name in selected:
-                if isinstance(name, str) and name in self._skills:
-                    new_active.add(name)
-
-            # Compute diff for logging
-            prev_active = set(self._active)
-            added = new_active - prev_active
-            removed = prev_active - new_active
-
-            # Apply the new active set
-            self._active = new_active
-
-            # Log the diff
-            parts = []
-            if added:
-                parts.append(f"+{sorted(added)}")
-            if removed:
-                parts.append(f"-{sorted(removed)}")
-            if not parts:
-                parts.append("no change")
-            diff_str = " ".join(parts)
-
-            print(f"\033[2m  ⚡ Skill router ({elapsed:.1f}s): "
-                  f"{sorted(new_active)} ({diff_str})\033[0m", file=sys.stderr)
-
-            return sorted(new_active)
-
-        except Exception as e:
-            # Surface router failures so silent keyword fallback isn't
-            # mistaken for "router is working". First-line-only, dim, to
-            # stderr so the UX stays calm but debuggable.
-            msg = str(e).split("\n", 1)[0][:240]
-            print(f"\033[2m  ⚡ Skill router failed ({type(e).__name__}): "
-                  f"{msg}\033[0m", file=sys.stderr)
-            return None
-
-    def _route_keywords(self, query: str) -> Optional[list[str]]:
-        """
-        Fallback: keyword matching on the full catalog.
-
-        Unlike the old version, this evaluates ALL skills (not just inactive)
-        and replaces the active set entirely — same diff semantics as LLM router.
-        """
-        query_lower = query.lower()
-
-        stopwords = {'the', 'a', 'an', 'is', 'are', 'to', 'for', 'of', 'in',
-                    'and', 'or', 'on', 'it', 'this', 'that', 'use', 'when',
-                    'with', 'from', 'by', 'at', 'be', 'as', 'do', 'if', 'so',
-                    'what', 'how', 'why', 'can', 'will', 'my', 'your', 'me'}
-        query_words = set(re.findall(r'[a-z]{2,}', query_lower))
-
-        # If query is very short (≤3 words), keyword matching is unreliable —
-        # keep current active set unchanged rather than guess wrong
-        if len(query_words) <= 3 and self._active:
-            print(f"\033[2m  ⚡ Skill keywords: query too short, keeping "
-                  f"{sorted(self._active)}\033[0m", file=sys.stderr)
-            return list(self._active)
-
-        new_active = set()
-        for name, skill in self._skills.items():
-            desc_lower = skill["description"].lower()
-            desc_words = set(re.findall(r'[a-z]{2,}', desc_lower))
-            meaningful_overlap = (desc_words & query_words) - stopwords
-
-            name_words = set(name.replace('-', ' ').split())
-            name_overlap = name_words & query_words
-
-            if len(meaningful_overlap) >= 2 or len(name_overlap) >= 1:
-                new_active.add(name)
-
-        prev_active = set(self._active)
-        added = new_active - prev_active
-        removed = prev_active - new_active
-        self._active = new_active
-
-        parts = []
-        if added:
-            parts.append(f"+{sorted(added)}")
-        if removed:
-            parts.append(f"-{sorted(removed)}")
-        if not parts:
-            parts.append("no change")
-        diff_str = " ".join(parts)
-
-        print(f"\033[2m  ⚡ Skill keywords: "
-              f"{sorted(new_active)} ({diff_str})\033[0m", file=sys.stderr)
-
-        return sorted(new_active)
-
     # ── 改进1: XML prompt format (agentskills.io spec) ────────────────────
 
     def build_catalog_block(self) -> str:
@@ -709,8 +483,7 @@ class SkillManager:
 
         return "\n".join(lines)
 
-    def build_prompt_context(self, query: str = "", runtime_owner=None,
-                             recent_messages: list | None = None) -> str:
+    def build_prompt_context(self) -> str:
         """
         Legacy combined renderer: catalog + active bodies in one string.
 
@@ -718,17 +491,9 @@ class SkillManager:
         single buffer (e.g. tests, ad-hoc tooling). The main agent loop now
         uses ``build_catalog_block`` and ``build_active_bodies_block``
         separately so they can be placed in cache-friendly positions.
-
-        ``query`` / ``runtime_owner`` / ``recent_messages`` are accepted for
-        back-compat but no longer trigger automatic routing — the per-turn
-        pre-router was removed.  Callers wanting explicit routing should call
-        ``auto_activate_for_query`` directly (used by the create-skill eval
-        tooling).
         """
         if not self._skills:
             return ""
-
-        _ = query, runtime_owner, recent_messages  # kept for signature stability
 
         catalog = self.build_catalog_block()
         bodies = self.build_active_bodies_block()

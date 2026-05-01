@@ -213,10 +213,11 @@ class TestAgentSystemPromptIsStable:
 
 # ─── env var opt-in for pre-router ───────────────────────────────────────
 #
-# TestPreRouterEnvVar was removed 2026-05 together with the SKILL_PRE_ROUTER
-# feature itself.  The explicit eval-only routing API
-# (``auto_activate_for_query``) remains and is covered by
-# tests/test_skill_router.py — it is independent of any env flag.
+# The whole skill routing mechanism (SKILL_PRE_ROUTER + SkillManager's
+# auto_activate_for_query / _route_llm / _route_keywords) was removed
+# 2026-05.  Skills activate via manage_skills tool or `/skill` command only.
+# Eval tooling for "would query X trigger skill Y?" is self-contained in
+# skills/create-skill/scripts/test_trigger.py.
 
 
 # ─── teardown: restore the modules after env-var reload tests ───────────

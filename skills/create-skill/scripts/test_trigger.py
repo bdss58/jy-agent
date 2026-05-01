@@ -5,8 +5,10 @@ Usage:
     python scripts/test_trigger.py <skill-directory> [--eval-set evals.json]
     python scripts/test_trigger.py --help
 
-Tests the skill router (LLM-based) to see if the skill triggers (activates)
-for queries it should handle, and doesn't trigger for queries it shouldn't.
+For each query, asks an LLM one-shot ("given this skill catalog, which skills
+should activate for this query?") and checks whether the target skill is
+selected.  Uses the active agent runtime by default; override with
+``SKILL_TRIGGER_EVAL_MODEL=<model>`` + ``SKILL_TRIGGER_EVAL_PROVIDER=<p>``.
 
 If no eval set is provided, generates default test queries from the description.
 
@@ -119,27 +121,104 @@ def _generate_default_evals(skill_name: str, description: str) -> list[dict]:
     return evals
 
 
+# ─── Inlined one-shot router ────────────────────────────────────────────────
+# jyagent/skills.py no longer ships an auto-router (removed 2026-05 together
+# with SKILL_PRE_ROUTER). Trigger-testing still needs "given this catalog +
+# query, which skills would the LLM pick?" so we inline a minimal one-shot
+# router here. Uses the active agent runtime by default; set
+# SKILL_TRIGGER_EVAL_MODEL=<model> to override.
+
+
+def _route_query(catalog: list[dict], query: str, runtime_owner,
+                 timeout: int = 8) -> list[str]:
+    """Ask the LLM which skills in the catalog should activate for ``query``.
+
+    Returns a list of skill names filtered to those present in ``catalog``.
+    Returns ``[]`` on LLM error, timeout, or malformed output — callers
+    should treat that as "no trigger".
+    """
+    catalog_text = "\n".join(
+        f"- {s['name']}: {s['description'][:200]}" for s in catalog
+    )
+    prompt = (
+        "You are a skill router. Given a user query and a catalog of skills, "
+        "decide which skills (if any) should activate for this query.\n\n"
+        f"Available skills:\n{catalog_text}\n\n"
+        f"User query: {query}\n\n"
+        "Return a JSON array of skill names that should activate. "
+        "Return [] if none apply. ONLY output the JSON array, nothing else."
+    )
+
+    try:
+        text = runtime_owner.complete_text(
+            prompt,
+            max_output_tokens=100,
+            timeout=timeout,
+            # Cheap utility call — no extended thinking (also avoids
+            # validate_anthropic_reasoning tripping on < Claude 4.6).
+            reasoning=None,
+        )
+    except Exception as e:
+        print(f"  [router error] {type(e).__name__}: {e}", file=sys.stderr)
+        return []
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```\w*\n?', '', text)
+        text = re.sub(r'\n?```$', '', text)
+        text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        print(f"  [router parse error] got: {text[:120]!r}", file=sys.stderr)
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    known = {s["name"] for s in catalog}
+    return [n for n in parsed if isinstance(n, str) and n in known]
+
+
 def test_trigger(skill_dir: str, eval_set: list[dict], runs_per_query: int = 1,
                  verbose: bool = False) -> dict:
     """
-    Test skill triggering using jyagent's SkillManager LLM router.
+    Test skill triggering by asking an LLM one-shot "would this skill activate?".
 
-    For each query, calls auto_activate_for_query() and checks if the target
-    skill gets activated.
+    For each query, routes against the full discovered-skill catalog and checks
+    if the target skill is in the result.  Uses the active agent runtime
+    (``config.get_active_model_spec()``); override with
+    ``SKILL_TRIGGER_EVAL_MODEL=<model>`` + ``SKILL_TRIGGER_EVAL_PROVIDER=<p>``.
 
     Returns results dict with per-query outcomes and summary.
     """
+    import os
     from jyagent.skills import SkillManager
+    from jyagent.llm import LLMOwner
+    from jyagent.config import build_model_spec, get_active_model_spec
 
     meta = _parse_skill_meta(skill_dir)
     target_name = meta["name"]
 
-    # Create a fresh SkillManager with ALL skills (realistic routing scenario)
+    # Discover the full skill catalog — matches the realistic routing scenario
+    # (LLM sees all skills, not just the target, so it can pick "no match").
     mgr = SkillManager()
     mgr.discover()
 
-    if target_name not in mgr._skills:
-        raise ValueError(f"Skill '{target_name}' not found. Available: {mgr.list_skills()}")
+    if target_name not in mgr.list_skills():
+        raise ValueError(
+            f"Skill '{target_name}' not found. Available: {mgr.list_skills()}"
+        )
+
+    catalog = mgr.get_catalog()
+
+    # Pick routing model: env overrides, else active agent runtime.
+    active = get_active_model_spec()
+    provider = os.environ.get("SKILL_TRIGGER_EVAL_PROVIDER") or active.provider
+    model = os.environ.get("SKILL_TRIGGER_EVAL_MODEL") or active.model
+    runtime_owner = LLMOwner(
+        build_model_spec(provider, model, source="SKILL_TRIGGER_EVAL_PROVIDER")
+    )
 
     results = []
 
@@ -149,11 +228,8 @@ def test_trigger(skill_dir: str, eval_set: list[dict], runs_per_query: int = 1,
         trigger_count = 0
 
         for run_idx in range(runs_per_query):
-            # Reset: deactivate all skills before each test
-            mgr.deactivate_all()
-
             start = time.time()
-            activated = mgr.auto_activate_for_query(query)
+            activated = _route_query(catalog, query, runtime_owner)
             elapsed = time.time() - start
 
             triggered = target_name in activated
