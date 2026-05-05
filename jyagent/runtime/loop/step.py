@@ -40,9 +40,9 @@ from .llm_types import LLMOptions
 from ..tools.registry import get_registry, ToolBatch
 
 if TYPE_CHECKING:
-    from .engine import AgentLoop
     from .config import LoopResult
     from .cost import CostTracker
+    from .run_context import RunContext
 
 
 # ─── Run-scoped mutable state ────────────────────────────────────────────────
@@ -142,7 +142,7 @@ class RunState:
     @classmethod
     def prepare_for_run(
         cls,
-        loop: "AgentLoop",
+        loop: "RunContext",
         system_prompt: str,
         messages: list,
         initial_todos: list | None = None,
@@ -303,7 +303,7 @@ StepOutcome = Union[StepContinue, StepTerminate, StepBreak]
 # ─── The per-step body ───────────────────────────────────────────────────────
 
 
-def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
+def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     """Execute one iteration of the agent loop.
 
     Thin orchestrator. Each phase is extracted into a private helper
@@ -520,7 +520,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
 # re-introducing the engine→step import cycle.
 
 
-def _prepare_step_batch(loop: "AgentLoop", state: RunState) -> ToolBatch:
+def _prepare_step_batch(loop: "RunContext", state: RunState) -> ToolBatch:
     """Refresh ``state.tools_batch`` and apply the ``write_todos`` overlay.
 
     When ``_tool_source`` is provided (e.g. MCP integration that builds
@@ -572,7 +572,7 @@ def _prepare_step_batch(loop: "AgentLoop", state: RunState) -> ToolBatch:
 
 
 def _compact_and_build_context(
-    loop: "AgentLoop",
+    loop: "RunContext",
     state: RunState,
     step_batch: ToolBatch,
 ) -> dict:
@@ -615,7 +615,7 @@ def _compact_and_build_context(
     return context
 
 
-def _build_step_options(loop: "AgentLoop", state: RunState) -> LLMOptions:
+def _build_step_options(loop: "RunContext", state: RunState) -> LLMOptions:
     """Build this step's ``LLMOptions``, applying phase-policy ``tool_choice``
     shaping if the loop config provides a policy.
 
@@ -668,7 +668,7 @@ def _build_step_options(loop: "AgentLoop", state: RunState) -> LLMOptions:
 
 
 def _record_llm_usage_and_cost(
-    loop: "AgentLoop",
+    loop: "RunContext",
     state: RunState,
     final_message: dict,
     llm_dur_ms: float,
@@ -769,7 +769,7 @@ def _record_llm_usage_and_cost(
 
 
 def _append_assistant_message(
-    loop: "AgentLoop",
+    loop: "RunContext",
     state: RunState,
     step_batch: ToolBatch,
     final_message: dict,
@@ -809,7 +809,7 @@ def _append_assistant_message(
 
 
 def _execute_tool_round(
-    loop: "AgentLoop",
+    loop: "RunContext",
     state: RunState,
     step_batch: ToolBatch,
     tool_call_blocks: list,
@@ -965,7 +965,7 @@ def _execute_tool_round(
 
 
 def _check_stuck_loop(
-    loop: "AgentLoop",
+    loop: "RunContext",
     state: RunState,
     tool_results_tuples: list,
 ) -> "StepOutcome | None":
@@ -1043,7 +1043,7 @@ def _check_stuck_loop(
 
 
 def _maybe_reflect(
-    loop: "AgentLoop",
+    loop: "RunContext",
     state: RunState,
     tool_results_tuples: list,
 ) -> None:
@@ -1081,7 +1081,7 @@ def _maybe_reflect(
         trace.add_span(step=step, event_type="reflection")
 
 
-def _maybe_checkpoint(loop: "AgentLoop", state: RunState) -> None:
+def _maybe_checkpoint(loop: "RunContext", state: RunState) -> None:
     """Persist a checkpoint at the configured cadence.  No-op when
     ``checkpoint_dir`` is unset or we're not on a cadence boundary.
     """
