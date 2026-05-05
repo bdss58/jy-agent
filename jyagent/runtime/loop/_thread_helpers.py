@@ -84,5 +84,30 @@ class LoopThreadHelper:
                     file=sys.stderr,
                 )
 
+    def _fire_with_return(self, name: str, *args: Any, default: Any = None) -> Any:
+        """Like ``_fire`` but returns the callback's return value.
+
+        Used by gate-style callbacks (e.g. ``on_tool_pre_execute``) where the
+        engine needs to act on what the UI returned.  Returns ``default`` if
+        the callbacks bundle is missing, the callback is unset, or the
+        callback raises.  Exceptions are still swallowed — the engine must
+        not crash because a UI gate threw.
+        """
+        cbs = getattr(self, self._helper_callbacks_attr, None)
+        if cbs is None:
+            return default
+        cb = getattr(cbs, name, None)
+        if cb is None:
+            return default
+        try:
+            return cb(*args)
+        except Exception:
+            print(
+                f"[warning] callback {name!r} raised:",
+                traceback.format_exc(),
+                file=sys.stderr,
+            )
+            return default
+
 
 __all__ = ["LoopThreadHelper"]

@@ -15,6 +15,7 @@ from .memory import (
 from .ui.terminal import build_streaming_callbacks, _interrupted_msg
 from .runtime.loop.engine import AgentLoop, LoopConfig, LoopResult
 from .ui.cli import CLI, console
+from .ui.commands import bind_handler, find_command, get_handler
 from .skills import SkillManager, get_skill_manager, init_skills
 from .llm import LLMOwner
 from .runtime.stats import get_stats
@@ -301,19 +302,21 @@ def _cmd_sessions(cli, **_):
 
 
 
-# Command dispatch table
-COMMAND_TABLE = {
-    "/help": _cmd_help,
-    "/multi": _cmd_multi,
-    "/markdown": _cmd_markdown,
-    "/history": _cmd_history,
-    "/new": _cmd_new,
-    "/continue": _cmd_continue,
-    "/sessions": _cmd_sessions,
-    "/tools": _cmd_tools,
-    "/skills": _cmd_skills,
-    "/stats": _cmd_stats,
-}
+# Command dispatch — handlers are registered into the central registry.
+# The registry (jyagent.ui.commands) is the single source of truth for both
+# dispatch (here) and help rendering (cli.print_help).
+bind_handler("/help",      _cmd_help)
+bind_handler("/multi",     _cmd_multi)
+bind_handler("/markdown",  _cmd_markdown)
+bind_handler("/history",   _cmd_history)
+bind_handler("/new",       _cmd_new)
+bind_handler("/continue",  _cmd_continue)
+bind_handler("/sessions",  _cmd_sessions)
+bind_handler("/tools",     _cmd_tools)
+bind_handler("/skills",    _cmd_skills)
+bind_handler("/skill",     _cmd_skill)
+bind_handler("/stats",     _cmd_stats)
+bind_handler("/model",     _cmd_model)
 
 
 # ─── Graceful exit helper ────────────────────────────────────────────────────
@@ -456,33 +459,18 @@ def run(runtime_owner: LLMOwner) -> None:
                 continue
 
             try:
-                # ─── Quit ─────────────────────────────
+                # ─── Quit (handled out-of-band: must break the loop) ──
                 if user_input == "/quit":
                     _graceful_exit(cli, conversation)
                     break
 
-                # ─── /skill <name> (prefix match) ─────
-                if user_input.startswith("/skill "):
-                    _cmd_skill(cli=cli, user_input=user_input)
-                    continue
-
-                if user_input.startswith("/model"):
-                    _cmd_model(cli=cli, runtime_owner=runtime_owner, user_input=user_input)
-                    continue
-
-                if user_input.startswith("/continue "):
-                    _cmd_continue(
-                        cli=cli,
-                        runtime_owner=runtime_owner,
-                        conversation=conversation,
-                        user_input=user_input,
-                    )
-                    continue
-
-
-                # ─── Dispatch table commands ──────────
-                handler = COMMAND_TABLE.get(user_input)
-                if handler:
+                # ─── Slash-command dispatch (registry-driven) ─────────
+                cmd = find_command(user_input)
+                if cmd is not None:
+                    handler = get_handler(cmd.name)
+                    if handler is None:
+                        cli.print_error(f"Command {cmd.name} has no handler bound.")
+                        continue
                     handler(
                         cli=cli,
                         runtime_owner=runtime_owner,
@@ -569,7 +557,12 @@ def run(runtime_owner: LLMOwner) -> None:
                     # Build streaming callbacks
                     stats = get_stats()
                     stats.new_turn()
-                    callbacks, spinner = build_streaming_callbacks(stats, runtime_owner)
+                    from .config import ASK_BEFORE_TOOLS
+                    streaming_ui = build_streaming_callbacks(
+                        stats, runtime_owner, ask=ASK_BEFORE_TOOLS,
+                    )
+                    callbacks = streaming_ui.callbacks
+                    spinner = streaming_ui.spinner
 
                     # Create tool source factory.
                     # ``freeze()`` returns a batch-atomic deep-copy
@@ -600,9 +593,7 @@ def run(runtime_owner: LLMOwner) -> None:
 
                     # Handle LoopResult status branches
                     if result.status == "completed":
-                        if callbacks._stream_state.needs_newline:
-                            sys.stdout.write("\n")
-                            sys.stdout.flush()
+                        streaming_ui.flush_trailing_newline()
                         response = result.text
                         final_text = result.final_text
                         planner_messages = result.messages
@@ -674,21 +665,8 @@ def run(runtime_owner: LLMOwner) -> None:
                         extract_and_remember(runtime_owner, user_input, asst_text)
 
                 # Render final LLM output (not intermediate tool-use text) with rich markdown
-                if state["use_markdown"] and final_text.strip() and not final_text.strip().startswith("["):
-                    try:
-                        from rich.markdown import Markdown
-                        from rich.panel import Panel
-                        md = Markdown(final_text, code_theme="monokai")
-                        console.print()
-                        console.print(Panel(
-                            md,
-                            title="[bold green]📝 Rendered[/bold green]",
-                            border_style="green",
-                            padding=(0, 1),
-                            subtitle="[dim]/markdown to toggle[/dim]",
-                        ))
-                    except Exception:
-                        pass
+                from .ui.terminal import render_final_text
+                render_final_text(final_text, markdown=state["use_markdown"])
 
                 # Show turn stats (tokens + cost)
                 cli.print_turn_summary()

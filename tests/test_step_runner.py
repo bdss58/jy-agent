@@ -90,6 +90,23 @@ class FakeLoop:
     def _fire(self, name: str, *args: Any) -> None:
         self.fired.append((name, args))
 
+    def _fire_with_return(self, name: str, *args: Any, default: Any = None) -> Any:
+        """Mirror of LoopThreadHelper._fire_with_return for FakeLoop.
+
+        Records the call in ``fired`` (same as _fire) and returns ``default``
+        unless the test wired up an ``on_tool_pre_execute`` callback on
+        ``self._callbacks``.  Tests that don't care about the gate get the
+        old behaviour for free (default=None → engine treats as allow).
+        """
+        self.fired.append((name, args))
+        cb = getattr(self._callbacks, name, None)
+        if cb is None:
+            return default
+        try:
+            return cb(*args)
+        except Exception:
+            return default
+
     def _call_llm_with_retry(self, context, opts, step):
         self.llm_options.append(opts)
         return self.llm_response

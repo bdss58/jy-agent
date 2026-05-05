@@ -17,6 +17,12 @@ class LoopCallbacks:
     on_thinking_start: Callable[[], None] | None = None
     on_thinking_stop: Callable[[], None] | None = None
     on_tool_start: Callable[[str, dict], None] | None = None
+    # Gate callback fired AFTER ``on_tool_start`` and BEFORE the tool actually
+    # runs.  Return ``"deny"`` to skip execution (the engine will synthesize a
+    # ``Denied by user`` ToolResult); return ``"allow"`` / ``None`` to proceed.
+    # Used by interactive UIs to implement an approval gate (Claude-Code-style
+    # ``--ask`` flag).  Sub-agent and silent runs leave this as None.
+    on_tool_pre_execute: Callable[[str, dict], str | None] | None = None
     on_tool_end: Callable[..., None] | None = None  # (name, content, is_error, duration_ms | None)
     on_retry: Callable[[int, Exception], None] | None = None  # (attempt, error)
     on_compaction: Callable[[int, int], None] | None = None  # (before_len, after_len)

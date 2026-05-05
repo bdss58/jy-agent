@@ -72,13 +72,12 @@ class ThinkingSpinner:
 
 
 # ─── Tool output formatting ─────────────────────────────────────────────────
-
-_TOOL_ICONS = {
-    "run_shell": "⚡", "read_file": "📄", "write_file": "📝",
-    "edit_file": "✏️", "list_directory": "📁", "glob_files": "🔍",
-    "grep_files": "🔎", "web_fetch": "🌐", "manage_memory": "🧠",
-    "manage_skills": "📦", "mcp": "🔌",
-}
+#
+# Per-tool icon + argument formatter live in ``jyagent.tools.display`` —
+# this module asks the tools package what to show, never embeds a per-tool
+# switch table here.  Adding a new tool with custom display only touches
+# that one module.
+from ..tools.display import get_icon, format_tool_args
 
 
 def _tool_info(msg: str):
@@ -90,9 +89,8 @@ def _tool_info(msg: str):
 
 def _tool_call_header(tool_name: str, tool_input: dict):
     """Print a compact, visually distinct tool call header."""
-    icon = _TOOL_ICONS.get(tool_name, "🔧")
-    # Build compact arg summary
-    args_preview = _format_tool_args(tool_name, tool_input)
+    icon = get_icon(tool_name)
+    args_preview = format_tool_args(tool_name, tool_input)
     # Flush raw stdout first to maintain ordering with Rich output
     sys.stdout.flush()
     from rich.text import Text
@@ -101,49 +99,6 @@ def _tool_call_header(tool_name: str, tool_input: dict):
     if args_preview:
         text.append(f" {args_preview}", style="dim")
     console.print(text)
-
-
-def _format_tool_args(tool_name: str, tool_input: dict) -> str:
-    """Format tool arguments for display — show key info, hide verbosity."""
-    if not tool_input:
-        return ""
-    # Special formatting per tool
-    if tool_name == "run_shell":
-        cmd = tool_input.get("command", "")
-        if len(cmd) > 120:
-            cmd = cmd[:117] + "..."
-        return f"$ {cmd}"
-    if tool_name in ("read_file", "write_file", "edit_file"):
-        path = tool_input.get("path", "")
-        extras = []
-        if tool_input.get("operation"):
-            extras.append(tool_input["operation"])
-        if tool_input.get("insert_at_line"):
-            extras.append(f"L{tool_input['insert_at_line']}")
-        if tool_input.get("dry_run"):
-            extras.append("dry-run")
-        suffix = f" ({', '.join(extras)})" if extras else ""
-        return f"{path}{suffix}"
-    if tool_name == "list_directory":
-        return tool_input.get("path", ".") or "."
-    if tool_name in ("glob_files", "grep_files"):
-        pattern = tool_input.get("pattern", "")
-        path = tool_input.get("path", "")
-        return f"'{pattern}'" + (f" in {path}" if path else "")
-    if tool_name == "web_fetch":
-        url = tool_input.get("url", "")
-        if len(url) > 100:
-            url = url[:97] + "..."
-        return url
-    if tool_name in ("manage_memory", "manage_skills"):
-        action = tool_input.get("action", "")
-        name = tool_input.get("name", "")
-        return f"{action}" + (f" {name}" if name else "")
-    if tool_name == "mcp":
-        return tool_input.get("action", "") + (" " + tool_input.get("server", "") if tool_input.get("server") else "")
-    # Generic: show first 120 chars of stringified input
-    s = str(tool_input)
-    return s[:120] + "..." if len(s) > 120 else s
 
 
 def _format_duration(duration_ms: float | None) -> str:
@@ -249,6 +204,40 @@ def _interrupted_msg():
     console.print("\n[bold yellow]⚠ Interrupted by Ctrl-C[/bold yellow]")
 
 
+def render_final_text(text: str, *, markdown: bool = True) -> None:
+    """Render the assistant's final text answer.
+
+    When ``markdown`` is True and the text doesn't look like a status marker
+    (e.g. ``[Response interrupted by user]``), wrap it in a Rich Markdown panel.
+    Otherwise this is a no-op — the streaming callbacks already wrote the
+    plain text to stdout, and we don't want to duplicate it.
+
+    Centralised here so the UI package owns all rendering decisions; callers
+    only need to pass the final text and a toggle.
+    """
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+
+    if not markdown:
+        return
+    stripped = text.strip() if text else ""
+    if not stripped or stripped.startswith("["):
+        return
+    try:
+        md = Markdown(text, code_theme="monokai")
+        console.print()
+        console.print(Panel(
+            md,
+            title="[bold green]📝 Rendered[/bold green]",
+            border_style="green",
+            padding=(0, 1),
+            subtitle="[dim]/markdown to toggle[/dim]",
+        ))
+    except Exception:
+        # Markdown rendering is best-effort — never crash the turn over it.
+        pass
+
+
 def _runtime_warning(msg: str):
     """Print a short runtime recovery warning without aborting the turn."""
     sys.stdout.flush()
@@ -259,14 +248,54 @@ def _runtime_warning(msg: str):
 
 # ─── Streaming callbacks factory ────────────────────────────────────────────
 
-def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, ThinkingSpinner]:
+@dataclass
+class StreamingUI:
+    """Typed bundle returned by ``build_streaming_callbacks``.
+
+    Replaces the old ``(callbacks, spinner)`` tuple plus the
+    ``callbacks._stream_state`` side-channel with a small, named API:
+
+      ui.callbacks  — wired LoopCallbacks for the AgentLoop
+      ui.spinner    — ThinkingSpinner; caller must stop() in finally
+      ui.flush_trailing_newline()  — write a stdout newline iff the last
+                                     thing emitted was a partial text line
+                                     (i.e. no terminator written yet).
+
+    Keeping ``flush_trailing_newline`` as a method (not a flag) hides the
+    state from callers and lets us change the heuristic later (e.g. switch
+    to an ``on_text_done`` engine event) without touching ``agent.py``.
+    """
+    callbacks: LoopCallbacks
+    spinner: "ThinkingSpinner"
+    _stream_state: StreamState
+
+    def flush_trailing_newline(self) -> None:
+        if self._stream_state.needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._stream_state.needs_newline = False
+
+
+def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> StreamingUI:
     """
     Build LoopCallbacks for streaming AgentLoop with terminal UX.
-    Returns (callbacks, spinner) tuple.
+
+    Returns a :class:`StreamingUI` bundle.  Use ``ui.callbacks`` to pass to
+    ``AgentLoop``, ``ui.spinner`` to ensure stop() in a ``finally``, and
+    ``ui.flush_trailing_newline()`` after the loop finishes to terminate
+    the streamed text line cleanly.
+
+    Set ``ask=True`` to enable the per-call approval gate: every *mutating*
+    tool call (run_shell, write_file, edit_file, mcp, dispatch_agent, ...)
+    pauses for [y/N/a] before running.  Read-only tools auto-approve.
+    Choosing ``a`` (allow-all) disables the gate for the rest of the
+    session.
     """
     # Mutable state shared by callbacks
     spinner = ThinkingSpinner()
     stream_state = StreamState()
+    # Closure-mutable so the "a" answer can latch for the session.
+    allow_all = [False]
 
     def _on_text_delta(text: str):
         spinner.stop()
@@ -323,11 +352,55 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
     def _on_tool_batch(n_tools: int):
         _tool_info(f"Executing {n_tools} tool calls...")
 
+    def _on_tool_pre_execute(name: str, tool_input: dict) -> str:
+        """Approval gate.  Auto-allow read-only tools; prompt on mutating ones."""
+        if not ask or allow_all[0]:
+            return "allow"
+        # Auto-allow non-mutating tools.  We import the metadata table
+        # lazily to avoid a hard dependency between ui/terminal.py and
+        # tools/__init__.py at import time.
+        try:
+            from ..tools import _TOOL_METADATA
+            if not _TOOL_METADATA.get(name, {}).get("mutating", False):
+                return "allow"
+        except Exception:
+            pass  # If metadata is unreachable, fall through to ask.
+
+        # Make sure the streamed text line has a terminator before our prompt.
+        if stream_state.needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            stream_state.needs_newline = False
+
+        from rich.text import Text
+        args_preview = format_tool_args(name, tool_input)
+        prompt = Text()
+        prompt.append("  ❓ Approve ", style="bold yellow")
+        prompt.append(name, style="bold")
+        if args_preview:
+            prompt.append(f"  {args_preview}", style="dim")
+        prompt.append("  [y/N/a]: ", style="bold yellow")
+        console.print(prompt, end="")
+        try:
+            answer = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[bold red]  ✗ Denied (input aborted)[/bold red]")
+            return "deny"
+        if answer in ("y", "yes"):
+            return "allow"
+        if answer in ("a", "all"):
+            allow_all[0] = True
+            console.print("[dim]  (allow-all enabled for this session)[/dim]")
+            return "allow"
+        console.print("[bold red]  ✗ Denied[/bold red]")
+        return "deny"
+
     callbacks = LoopCallbacks(
         on_text_delta=_on_text_delta,
         on_thinking_start=_on_thinking_start,
         on_thinking_stop=_on_thinking_stop,
         on_tool_start=_on_tool_start,
+        on_tool_pre_execute=_on_tool_pre_execute,
         on_tool_end=_on_tool_end,
         on_retry=_on_retry,
         on_usage=_on_usage,
@@ -338,7 +411,4 @@ def build_streaming_callbacks(stats, runtime_owner) -> tuple[LoopCallbacks, Thin
         on_tool_batch=_on_tool_batch,
     )
 
-    # Attach the stream state to the callbacks object for access by caller
-    callbacks._stream_state = stream_state
-
-    return callbacks, spinner
+    return StreamingUI(callbacks=callbacks, spinner=spinner, _stream_state=stream_state)

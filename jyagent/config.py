@@ -85,6 +85,14 @@ STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
 OBSERVATION_MASK_DISTANCE = int(os.environ.get("AGENT_OBSERVATION_MASK_DISTANCE", "5"))  # fully clear tool results older than N messages from the end
 
+# ─── Tool approval gate ──────────────────────────────────────────────────────
+# When True, the CLI prompts before executing any *mutating* tool call.
+# Read-only / idempotent tools (read_file, list_directory, grep_files,
+# glob_files, web_search, web_fetch, manage_memory query, etc.) are still
+# auto-approved — same policy as the ``mutating`` flag in tools/__init__.py.
+# Toggled by the ``--ask`` CLI flag (see __main__.py) or the env var below.
+ASK_BEFORE_TOOLS = (os.environ.get("JYAGENT_ASK", "0").lower() in ("1", "true", "yes"))
+
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
 MEMORY_DIR = os.path.join(PROJECT_ROOT, "data", "memory")

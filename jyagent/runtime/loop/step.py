@@ -843,6 +843,23 @@ def _execute_tool_round(
     for block in tool_call_blocks:
         loop._fire("on_tool_start", block.name, block.input)
 
+    # Approval gate — fires ``on_tool_pre_execute`` per block; callbacks
+    # returning ``"deny"`` cause the engine to synthesize a denial
+    # ToolResult *in place of* the real call, keeping tool_start / tool_end
+    # pairs balanced for UIs that count them.  Denies are common enough
+    # (interactive --ask flows) that we split the blocks into two lists
+    # here rather than branching inside the executor.
+    denied_blocks: list = []
+    allowed_blocks: list = []
+    for block in tool_call_blocks:
+        decision = loop._fire_with_return(
+            "on_tool_pre_execute", block.name, block.input, default=None,
+        )
+        if decision == "deny":
+            denied_blocks.append(block)
+        else:
+            allowed_blocks.append(block)
+
     # Cooperative cancellation check (before tools).  Fire on_tool_end for
     # each pending call so callbacks see the matching close event for the
     # on_tool_start fired above (without this, UIs that count starts vs.
@@ -859,9 +876,35 @@ def _execute_tool_round(
             loop._fire("on_tool_end", block.name, "Cancelled", True, None)
         return StepBreak(reason="cancelled"), []
 
+    # Synthesize denial results (no executor dispatch needed).
+    for block in denied_blocks:
+        denial_msg = "Denied by user (on_tool_pre_execute gate)."
+        messages.append({
+            "role": "tool_result",
+            "tool_call_id": block.id,
+            "tool_name": block.name,
+            "content": denial_msg,
+            "is_error": True,
+        })
+        loop._fire("on_tool_end", block.name, denial_msg, True, 0.0)
+        if trace:
+            trace.add_span(
+                step=step,
+                event_type="tool_call",
+                tool_name=block.name,
+                tool_args=block.input,
+                success=False,
+                error=denial_msg,
+            )
+
+    if not allowed_blocks:
+        # Everything denied — still return cleanly so the planner gets the
+        # tool_results and can decide how to respond.
+        return None, []
+
     tools_t0 = time.perf_counter()
     tool_results_tuples = _execute_tools(
-        tool_call_blocks,
+        allowed_blocks,
         step_batch,
         cfg.concurrent_tools,
         cfg.max_tool_workers,
