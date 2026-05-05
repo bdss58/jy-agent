@@ -214,6 +214,9 @@ class AgentLoop(LoopThreadHelper):
         total_output_tokens: int,
         tool_calls_count: int,
         status: str,
+        total_cache_creation_tokens: int = 0,
+        total_cache_read_tokens: int = 0,
+        api_calls: int = 0,
         error: str | None = None,
     ) -> None:
         """Persist a LoopCheckpoint if checkpointing is enabled.
@@ -221,6 +224,15 @@ class AgentLoop(LoopThreadHelper):
         ``step`` may be an int (regular step boundary) or ``"final"``
         (terminal exit).  Errors are logged via ``on_warning`` — never
         propagated, checkpointing must never break a run.
+
+        ``total_cache_creation_tokens`` / ``total_cache_read_tokens`` /
+        ``api_calls`` were added 2026-05 to match the cadence call site
+        in ``runtime/loop/step.py::_maybe_checkpoint``, which had been
+        passing them since the cache-token plumbing landed.  They are
+        keyword-only with default 0 so every existing engine call site
+        keeps working unchanged; missing values just record zero in the
+        checkpoint.  Codex review caught the latent ``TypeError`` that
+        any user enabling ``checkpoint_every_n_steps`` would have hit.
         """
         cfg = self._config
         if not cfg.checkpoint_dir:
@@ -240,6 +252,9 @@ class AgentLoop(LoopThreadHelper):
                 total_input_tokens=total_input_tokens,
                 total_output_tokens=total_output_tokens,
                 tool_calls_count=tool_calls_count,
+                total_cache_creation_tokens=total_cache_creation_tokens,
+                total_cache_read_tokens=total_cache_read_tokens,
+                api_calls=api_calls,
                 todos=[_t_as_dict(t) for t in self._todos] if cfg.todos_enabled else [],
                 provider=effective_spec.provider,
                 model=effective_spec.model,

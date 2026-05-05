@@ -43,6 +43,14 @@ class LoopCheckpoint:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     tool_calls_count: int = 0
+    # Cache-token accounting (Anthropic prompt cache).  Default 0 so older
+    # checkpoints lacking these fields still load cleanly (see
+    # ``from_json`` below — unknown keys drop, missing keys take defaults).
+    total_cache_creation_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    # Discrete LLM API calls made during the run.  Mirrors ``LoopResult.api_calls``
+    # — plumbed here so a resumed run can reconcile parent-stats accounting.
+    api_calls: int = 0
     todos: list = field(default_factory=list)
     # Optional metadata so the checkpoint is self-describing when found
     # loose on disk.

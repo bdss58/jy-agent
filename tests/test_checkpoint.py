@@ -312,6 +312,40 @@ class TestWriteCheckpointEnabled:
             f"expected checkpoint warning; got {warnings}"
         )
 
+    def test_accepts_cache_and_api_call_kwargs(self, tmp_path):
+        """Regression: the cadence call site in step.py::_maybe_checkpoint
+        passes ``total_cache_creation_tokens``, ``total_cache_read_tokens``,
+        and ``api_calls``.  ``AgentLoop._write_checkpoint`` used to omit
+        those kwargs, so any user enabling ``checkpoint_every_n_steps``
+        would hit a ``TypeError`` — latent because tests mock the method.
+
+        Lock the signature + ensure the values round-trip to LoopCheckpoint.
+        Codex review 2026-05 exposed this when building RunContext."""
+        loop = _make_bare_loop(le.LoopConfig(
+            checkpoint_dir=str(tmp_path),
+            checkpoint_every_n_steps=1,
+        ))
+        loop._run_id = "cache-run"
+        # Must not raise TypeError.
+        loop._write_checkpoint(
+            step=3,
+            messages=[{"role": "user", "content": "x"}],
+            total_input_tokens=100,
+            total_output_tokens=50,
+            tool_calls_count=2,
+            total_cache_creation_tokens=7,
+            total_cache_read_tokens=13,
+            api_calls=4,
+            status="in_progress",
+        )
+        path = tmp_path / "cache-run" / "step_0003.json"
+        assert path.exists()
+        loaded = LoopCheckpoint.load(str(path))
+        # All three cache/api_call fields must round-trip to the JSON.
+        assert loaded.total_cache_creation_tokens == 7
+        assert loaded.total_cache_read_tokens == 13
+        assert loaded.api_calls == 4
+
 
 class TestAgentLoopSetRunId:
     def test_override_persists(self, tmp_path):

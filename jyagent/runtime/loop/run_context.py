@@ -134,12 +134,19 @@ class RunContext(Protocol):
         total_output_tokens: int,
         tool_calls_count: int,
         status: str,
+        total_cache_creation_tokens: int = 0,
+        total_cache_read_tokens: int = 0,
+        api_calls: int = 0,
         error: "str | None" = None,
     ) -> None:
         """Persist a LoopCheckpoint when checkpointing is enabled.
 
         No-op when ``_config.checkpoint_dir`` is None.  Errors logged via
         ``on_warning`` and swallowed — checkpointing must never break a run.
+
+        The cache-token / api_calls fields default to 0 and are kw-only so
+        ``RunContext`` callers may omit them; when present, they are
+        recorded in ``LoopCheckpoint`` for resume-time stats reconciliation.
         """
         ...
 
