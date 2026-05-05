@@ -352,9 +352,11 @@ def test_extract_topic_description_no_heading():
 
 
 def test_extract_topic_description_long_line():
-    long_line = "A" * 100
+    # Cap was raised from 80 → 120 chars on 2026-05-05 to match the
+    # _MAX_TOPIC_DESC_CHARS constant after sanitisation hardening.
+    long_line = "A" * 200
     desc = _extract_topic_description(long_line)
-    assert len(desc) <= 81 + 1  # 80 chars + "…"
+    assert len(desc) <= 120 + 1  # 120 chars + "…"
     assert desc.endswith("…"), f"Should truncate with ellipsis: {desc}"
     print("  ✅ _extract_topic_description truncates long lines")
 

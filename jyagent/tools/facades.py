@@ -31,7 +31,11 @@ def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult
                     "Error: 'text' parameter required for 'search' action (query string)",
                     is_error=True,
                 )
-            hits = search_memory(text, top_k=5)
+            # Default to recent journal months only — full-history search is
+            # an O(N_months × tokens) cost that grows with project lifetime.
+            # Pass `category="all"` to opt into searching every journal month.
+            jmonths = None if category.strip().lower() == "all" else 6
+            hits = search_memory(text, top_k=5, journal_months=jmonths)
             return ToolResult(render_hits(hits))
 
         elif action == "show":

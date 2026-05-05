@@ -685,6 +685,216 @@ def test_facade_topic_write_returns_error_for_bad_name():
     assert "invalid topic name" in res.content.lower() or "error" in res.content.lower()
 
 
+# ─── 2026-05-05 post-review hardening tests ──────────────────────────────────
+# These target the bugs Codex flagged on 2026-05-05:
+#   CRIT  — _replace_line called forget_from_memory_md() which did a blind
+#           substring delete and could wipe lines under protected sections
+#           when the keyword happened to appear in both an eligible line and
+#           a protected line.
+#   HIGH  — manual forget had no protection or min-keyword guard.
+#   HIGH  — _extract_topic_description had no length cap / sanitisation.
+# All tests follow the existing per-file tmpdir pattern.
+
+
+def test_replace_line_does_not_delete_protected_sibling_on_shared_keyword():
+    """CRITICAL: when the UPDATE keyword matches BOTH an eligible line and a
+    line inside a protected section, the previous impl called forget_from_memory_md
+    which substring-deleted everything, wiping the protected line. After the
+    fix, deletion is by matched-line index and protected lines are preserved
+    even when they share the keyword."""
+    setup()
+    from jyagent.memory.operations import write_memory_md, read_memory_md
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## Behavioral Rules (CRITICAL)\n"
+        "- Never fabricate command results about cache token accounting\n"
+        "\n"
+        "## Random Tips\n"
+        "[tip] Stale cache token count reporting is broken in v1\n"
+    )
+    status, msg = extraction._replace_line(
+        "cache token",
+        "Cache token accounting is fixed in v2",
+        "tip",
+    )
+    assert status == "update", msg
+    content = read_memory_md()
+    # The protected Behavioral Rules line — which ALSO contains 'cache token' —
+    # must survive. This was the bug.
+    assert "Never fabricate command results about cache token accounting" in content, (
+        "Protected Behavioral Rules line was wiped by substring-delete bug"
+    )
+    # The eligible line is gone
+    assert "Stale cache token count reporting is broken in v1" not in content
+    # The new line landed
+    assert "Cache token accounting is fixed in v2" in content
+
+
+def test_forget_rejects_short_keyword():
+    """HIGH: manual forget must refuse keywords shorter than 6 chars — a
+    2-char substring like 'py' would mass-delete every Python rule."""
+    setup()
+    from jyagent.memory.operations import forget, write_memory_md, read_memory_md
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "[tip] Something about Python here\n"
+        "[tip] And another Python-ish rule\n"
+    )
+    before = read_memory_md()
+    msg = forget("py")
+    assert "refused" in msg.lower() or "too short" in msg.lower(), msg
+    # Nothing was deleted
+    assert read_memory_md() == before
+
+
+def test_forget_protects_behavioral_rules():
+    """HIGH: manual forget must never delete lines under protected sections,
+    even if the keyword matches."""
+    setup()
+    from jyagent.memory.operations import forget, write_memory_md, read_memory_md
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## Behavioral Rules (CRITICAL)\n"
+        "- Never fabricate prompt cache hit rates\n"
+        "\n"
+        "## Durable Tips\n"
+        "[tip] prompt cache hint: check ANTHROPIC_PROMPT_CACHE env\n"
+    )
+    msg = forget("prompt cache")
+    content = read_memory_md()
+    # Behavioral rule survives
+    assert "Never fabricate prompt cache hit rates" in content
+    # The [tip] line is gone
+    assert "ANTHROPIC_PROMPT_CACHE" not in content
+    # Message mentions protection
+    assert "protected" in msg.lower() or "removed 1" in msg.lower()
+
+
+def test_forget_only_protected_matches_removes_nothing():
+    """HIGH: when every match is protected, forget is a no-op and says so."""
+    setup()
+    from jyagent.memory.operations import forget, write_memory_md, read_memory_md
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## Behavioral Rules (CRITICAL)\n"
+        "- This very unique protected sentence\n"
+    )
+    before = read_memory_md()
+    msg = forget("unique protected sentence")
+    assert read_memory_md() == before
+    assert "protected" in msg.lower()
+
+
+def test_forget_returns_preview_of_removed_lines():
+    """The hardened forget surfaces a preview of what was lost so the user
+    can immediately notice accidental mass-deletes."""
+    setup()
+    from jyagent.memory.operations import forget, write_memory_md
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## Durable Tips\n"
+        "[tip] rareword line one that should be previewed\n"
+        "[tip] rareword line two that should be previewed\n"
+    )
+    msg = forget("rareword")
+    assert "Removed 2" in msg
+    assert "line one" in msg and "line two" in msg
+
+
+def test_extract_topic_description_caps_at_120_chars():
+    """HIGH: an unbounded first heading in a topic body was being written
+    into MEMORY.md as an always-loaded index line. Cap + sanitise it."""
+    from jyagent.memory.operations import _extract_topic_description
+    very_long_heading = "# " + ("attack payload text " * 20)
+    desc = _extract_topic_description(very_long_heading)
+    assert len(desc) <= 120 + 1  # +1 for the ellipsis char
+    assert desc.endswith("…")
+    # No leading '#' leaked
+    assert not desc.startswith("#")
+
+
+def test_extract_topic_description_strips_control_chars():
+    """Control chars in a topic heading must not be written into MEMORY.md."""
+    from jyagent.memory.operations import _extract_topic_description
+    body = "# hello\x00\x01\x07 world\x7f"
+    desc = _extract_topic_description(body)
+    # No control chars survived
+    for ch in desc:
+        code = ord(ch)
+        assert code >= 0x20 and code != 0x7f, f"control char {hex(code)} leaked into index"
+
+
+def test_facade_search_defaults_to_recent_journal_months():
+    """Default manage_memory search should NOT read every journal month —
+    it should cap to the recent window. We verify the call wiring by
+    monkey-patching search_memory and checking the journal_months kwarg."""
+    setup()
+    from jyagent import memory as _mem_pkg
+    import jyagent.memory.search as _search_mod
+
+    seen: dict = {}
+
+    def fake_search_memory(query, top_k=5, **kwargs):
+        seen["query"] = query
+        seen["kwargs"] = kwargs
+        return []
+
+    original = _search_mod.search_memory
+    # The facade imports search_memory locally with `from ..memory.search import search_memory`
+    # so patching the module attribute is sufficient if the facade's import is late-bound.
+    # The facade re-imports inside the function body, so this works.
+    try:
+        _search_mod.search_memory = fake_search_memory
+        manage_memory("search", text="anything")
+        assert seen["kwargs"].get("journal_months") == 6, (
+            f"Expected journal_months=6 default, got {seen['kwargs']}"
+        )
+        # Opt-in to full history via category='all'
+        seen.clear()
+        manage_memory("search", text="anything", category="all")
+        assert seen["kwargs"].get("journal_months") is None, (
+            f"Expected journal_months=None when category='all', got {seen['kwargs']}"
+        )
+    finally:
+        _search_mod.search_memory = original
+
+
+def test_write_topic_is_atomic_on_crash():
+    """HIGH: write_topic now uses atomic_write so a crashed/partial write
+    leaves the previous topic content intact rather than an empty / truncated
+    file. We simulate this by making the index-update step raise AFTER the
+    file is written: the topic file must still be whole."""
+    setup()
+    from jyagent.memory import operations as _ops
+    _ops.write_topic("atomic_test", "# First version\nbody v1\n")
+    original = read_topic("atomic_test")
+    assert "body v1" in original
+
+    # Now force _upsert_topic_index_entry to raise mid-write. Atomic_write
+    # completes BEFORE the index upsert, so the topic file should contain
+    # the new content even though the index write blew up.
+    boom = RuntimeError("simulated index failure")
+    original_upsert = _ops._upsert_topic_index_entry
+    _ops._upsert_topic_index_entry = lambda *a, **kw: (_ for _ in ()).throw(boom)
+    try:
+        try:
+            _ops.write_topic("atomic_test", "# Second version\nbody v2\n")
+        except RuntimeError as e:
+            assert "simulated" in str(e)
+    finally:
+        _ops._upsert_topic_index_entry = original_upsert
+
+    # Topic body was atomically updated to v2 (not half-written)
+    final = read_topic("atomic_test")
+    assert "body v2" in final, f"expected v2 body after atomic write, got: {final!r}"
+    # And crucially — no .tmp_*.write debris lingering
+    import os as _os
+    import glob as _glob
+    tmp_debris = _glob.glob(_os.path.join(config.TOPICS_DIR, ".tmp_*.write"))
+    assert not tmp_debris, f"atomic_write left temp file behind: {tmp_debris}"
+
+
+
 # ─── runner ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -726,6 +936,19 @@ if __name__ == "__main__":
         ("write_topic_refuses_traversal", test_write_topic_refuses_traversal),
         ("delete_topic_refuses_traversal", test_delete_topic_refuses_traversal),
         ("facade_topic_write_returns_error_for_bad_name", test_facade_topic_write_returns_error_for_bad_name),
+        # 2026-05-05 post-review hardening
+        ("replace_line_does_not_delete_protected_sibling_on_shared_keyword", test_replace_line_does_not_delete_protected_sibling_on_shared_keyword),
+        ("forget_rejects_short_keyword", test_forget_rejects_short_keyword),
+        ("forget_protects_behavioral_rules", test_forget_protects_behavioral_rules),
+        ("forget_only_protected_matches_removes_nothing", test_forget_only_protected_matches_removes_nothing),
+        ("forget_returns_preview_of_removed_lines", test_forget_returns_preview_of_removed_lines),
+        ("forget_internal_min_keyword_len_zero_bypass", test_forget_internal_min_keyword_len_zero_bypass),
+        ("topic_description_caps_long_first_line", test_topic_description_caps_long_first_line),
+        ("topic_description_strips_control_chars_and_markdown", test_topic_description_strips_control_chars_and_markdown),
+        ("topic_description_collapses_whitespace", test_topic_description_collapses_whitespace),
+        ("facade_search_default_limits_journal_months", test_facade_search_default_limits_journal_months),
+        ("facade_search_all_keyword_disables_journal_cap", test_facade_search_all_keyword_disables_journal_cap),
+        ("write_topic_is_atomic_on_concurrent_rewrite", test_write_topic_is_atomic_on_concurrent_rewrite),
     ]
     passed = failed = 0
     for name, fn in tests:

@@ -17,8 +17,9 @@ from typing import Optional
 
 from ..config import CHARS_PER_TOKEN
 from .operations import (
-    append_journal, forget_from_memory_md, read_memory_md, remember,
-    _MEMORY_MD_LOCK,
+    append_journal, read_memory_md, remember,
+    write_memory_md, _MEMORY_MD_LOCK,
+    _PROTECTED_SECTION_HEADERS, _compute_protected_indices,
 )
 
 
@@ -165,15 +166,11 @@ _NOOP_RE = re.compile(r"^\s*NOOP::", re.IGNORECASE)
 _MIN_UPDATE_KEYWORD_LEN = 6
 
 # Section headers and lines under them are protected from UPDATE-driven
-# replacement. The LLM extraction pipeline is a prompt-injection lever; we
-# don't let it rewrite Behavioral Rules, User Preferences, or User Profile
-# from a single conversation turn.
-_PROTECTED_SECTION_HEADERS = {
-    "behavioral rules (critical)",
-    "behavioral rules",
-    "user preferences",
-    "user profile",
-}
+# replacement. The set itself now lives in operations.py so that the manual
+# `forget` primitive shares the same protection rail — see
+# operations._PROTECTED_SECTION_HEADERS / _compute_protected_indices. The
+# import above re-exports them locally for backward-compatibility with any
+# external caller that referenced extraction._PROTECTED_SECTION_HEADERS.
 
 
 def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, str]:
@@ -208,23 +205,14 @@ def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, 
         if not content:
             return ("skip", f"No entries matched '{old_keyword}' — MEMORY.md empty")
 
-        # Identify protected line indices (headers + lines inside protected
-        # sections). Keep this logic local to extraction.py — it's only
-        # needed by this code path now that supersede is gone.
+        # Identify protected line indices via the shared helper. Headers +
+        # lines inside Behavioral Rules / User Profile / User Preferences are
+        # never eligible for replacement.
         lines = content.split("\n")
-        protected: set[int] = set()
-        inside_protected_section = False
-        for i, line in enumerate(lines):
-            stripped_line = line.lstrip()
-            if stripped_line.startswith("#"):
-                protected.add(i)
-                heading = stripped_line.lstrip("#").strip().lower()
-                inside_protected_section = heading in _PROTECTED_SECTION_HEADERS
-                continue
-            if inside_protected_section:
-                protected.add(i)
+        protected = _compute_protected_indices(lines)
 
         keyword_lower = old_keyword.lower()
+        matched_indices: list[int] = []
         matched_lines: list[str] = []
         skipped_protected = 0
         for i, line in enumerate(lines):
@@ -233,6 +221,7 @@ def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, 
             if i in protected:
                 skipped_protected += 1
                 continue
+            matched_indices.append(i)
             matched_lines.append(line)
 
         if not matched_lines:
@@ -255,9 +244,13 @@ def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, 
             category="memory_revision",
         )
 
-        # Now remove the old line(s) and append the new one. forget() runs
-        # its own write under the same RLock — safe.
-        forget_from_memory_md(old_keyword)
+        # Delete ONLY the eligible matched indices in-place. The previous
+        # implementation called `forget_from_memory_md(old_keyword)` here,
+        # which was a substring delete with no protection list — a keyword
+        # appearing in both an eligible line and a protected line would have
+        # wiped the protected line too (Codex review 2026-05-05, CRITICAL).
+        kept = [ln for i, ln in enumerate(lines) if i not in set(matched_indices)]
+        write_memory_md("\n".join(kept))
         remember(new_text, category, suppress_warning=True)
 
         skipped_note = (

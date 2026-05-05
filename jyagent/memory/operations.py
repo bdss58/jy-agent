@@ -149,22 +149,110 @@ def _validate_memory_entry(text: str, category: str = "") -> tuple[str, str]:
     return entry, cat
 
 
-def forget_from_memory_md(keyword: str) -> int:
-    """Remove lines containing keyword from MEMORY.md. Returns count removed.
+# ─── Protected sections (shared with extraction.py UPDATE pipeline) ──────────
+#
+# Lines under these sections cannot be deleted by substring `forget` and
+# cannot be replaced by the LLM-driven UPDATE directive. They encode hard
+# agent rules / user identity / preferences that should only ever be edited
+# by the human, never by the model from a single conversation turn.
+#
+# Match key is the heading text lowercased and stripped of leading "#"s.
 
-    Read-modify-write sequence — guarded by the MEMORY.md lock.
+_PROTECTED_SECTION_HEADERS = frozenset({
+    "behavioral rules (critical)",
+    "behavioral rules",
+    "user preferences",
+    "user profile",
+})
+
+# Default minimum length for the manual `forget` keyword. Shorter keywords
+# match too many lines (e.g. "py" hits every Python rule). Override only
+# from internal callers that have already validated uniqueness.
+MIN_FORGET_KEYWORD_LEN = 6
+
+
+def _compute_protected_indices(lines: list[str]) -> set[int]:
+    """Return the set of line indices that belong to a protected section.
+
+    A line is protected when:
+      - it is itself a markdown ``#`` / ``##`` / ``###`` heading, OR
+      - it sits under a section whose heading text (lowercased, ``#``-stripped)
+        is in ``_PROTECTED_SECTION_HEADERS``.
+
+    Used by ``forget_from_memory_md`` and ``extraction._replace_line`` so a
+    keyword-driven delete can never wipe a Behavioral Rule, the User Profile,
+    or section headings.
     """
+    protected: set[int] = set()
+    inside_protected = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            protected.add(i)
+            heading = stripped.lstrip("#").strip().lower()
+            inside_protected = heading in _PROTECTED_SECTION_HEADERS
+            continue
+        if inside_protected:
+            protected.add(i)
+    return protected
+
+
+def forget_from_memory_md(
+    keyword: str,
+    *,
+    min_keyword_len: int = MIN_FORGET_KEYWORD_LEN,
+    protect_sections: bool = True,
+) -> tuple[int, list[str], int]:
+    """Remove lines containing ``keyword`` from MEMORY.md.
+
+    Returns ``(removed_count, removed_lines_preview, protected_skipped_count)``
+    so the caller can render a useful preview.
+
+    Default safeties (a keyword-substring delete is destructive):
+      - ``min_keyword_len`` rejects short keywords (e.g. "py" would match
+        every Python-related rule). Pass ``min_keyword_len=0`` only from
+        internal call sites that have already proven uniqueness.
+      - ``protect_sections=True`` skips ``#`` headings and lines under
+        Behavioral Rules / User Profile / User Preferences. There is no
+        legitimate use case for substring-deleting a behavioral rule.
+
+    Read-modify-write — guarded by ``_MEMORY_MD_LOCK``.
+
+    Raises ``ValueError`` on empty or too-short keyword.
+    """
+    if not keyword or not keyword.strip():
+        raise ValueError("forget keyword must be non-empty")
+    if len(keyword) < min_keyword_len:
+        raise ValueError(
+            f"forget keyword too short ({len(keyword)} < {min_keyword_len}); "
+            f"use a more specific substring to avoid mass deletes"
+        )
+
     with _MEMORY_MD_LOCK:
         content = read_memory_md()
         if not content:
-            return 0
+            return (0, [], 0)
         lines = content.split("\n")
         keyword_lower = keyword.lower()
-        new_lines = [line for line in lines if keyword_lower not in line.lower()]
-        removed = len(lines) - len(new_lines)
-        if removed > 0:
+
+        protected_idx = _compute_protected_indices(lines) if protect_sections else set()
+
+        new_lines: list[str] = []
+        removed_preview: list[str] = []
+        protected_skipped = 0
+        for i, line in enumerate(lines):
+            if keyword_lower in line.lower():
+                if i in protected_idx:
+                    protected_skipped += 1
+                    new_lines.append(line)
+                    continue
+                removed_preview.append(line)
+                continue  # drop this line
+            new_lines.append(line)
+
+        if removed_preview:
             write_memory_md("\n".join(new_lines))
-        return removed
+        return (len(removed_preview), removed_preview, protected_skipped)
 
 
 # ─── Topic file operations ────────────────────────────────────────────────────
@@ -355,23 +443,49 @@ def list_topic_sections(name: str) -> list[str]:
 _TOPIC_INDEX_HEADING = "## Topic Files Index"
 
 
+_MAX_TOPIC_DESC_CHARS = 120
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_topic_description(raw: str) -> str:
+    """Sanitize topic description text before writing into Tier 1 (MEMORY.md).
+
+    Topic bodies are arbitrary markdown, but the topic *index entry* in
+    MEMORY.md is always-loaded prompt text. A long or hostile first heading
+    would inject unbounded text into the system prompt on every turn.
+
+    Rules:
+      - strip whitespace and ASCII control chars
+      - strip leading ``#``/``~`` (so a heading body doesn't render as a new
+        markdown heading inside the index)
+      - collapse internal whitespace to single spaces
+      - truncate to ``_MAX_TOPIC_DESC_CHARS`` with an ellipsis
+    """
+    s = _CONTROL_CHARS_RE.sub("", raw or "")
+    s = s.strip()
+    s = s.lstrip("#").lstrip("~").strip()
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return "(no description)"
+    if len(s) > _MAX_TOPIC_DESC_CHARS:
+        s = s[: _MAX_TOPIC_DESC_CHARS - 1].rstrip() + "…"
+    return s
+
+
 def _extract_topic_description(body: str) -> str:
     """Extract a short description from topic body for the MEMORY.md index.
 
-    Uses the first ``#`` heading (stripped of ``#`` prefix).  Falls back to
-    the first non-empty line, truncated to 80 chars.
+    Uses the first ``#`` heading text. Falls back to the first non-empty
+    non-frontmatter line. Always passed through ``_sanitize_topic_description``
+    so the index entry can never inject markdown control chars or unbounded
+    text into the always-loaded prompt.
     """
     for line in body.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
-            # Use heading text, remove leading #s
-            return stripped.lstrip("#").strip()
+            return _sanitize_topic_description(stripped)
         if stripped and not stripped.startswith("---"):
-            # First non-empty, non-frontmatter line
-            desc = stripped[:80]
-            if len(stripped) > 80:
-                desc += "…"
-            return desc
+            return _sanitize_topic_description(stripped)
     return "(no description)"
 
 
@@ -535,11 +649,16 @@ def write_topic(name: str, content: str) -> None:
     # Build final metadata: caller keys + timestamps (timestamps win on conflict)
     final_meta = {**caller_meta, "created": created, "updated": now}
 
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(_build_frontmatter(final_meta))
-        f.write(body)
-        if body and not body.endswith("\n"):
-            f.write("\n")
+    # Atomic write: topic body + frontmatter go to a temp file first, then
+    # os.replace() onto the final path. Without this, `write_topic` can leave
+    # a half-written file on crash or race with a concurrent writer. The
+    # topic-name regex serialises partitions at the path level — atomicity
+    # is the per-partition guarantee.
+    serialized = _build_frontmatter(final_meta) + body
+    if body and not body.endswith("\n"):
+        serialized += "\n"
+    from ..tools.core import atomic_write as _atomic_write
+    _atomic_write(filepath, serialized)
 
     # Keep the always-loaded topic index current for both new and rewritten
     # topics. The helper is idempotent and locked against concurrent writers.
@@ -880,11 +999,39 @@ def remember(text: str, category: str = "", *, suppress_warning: bool = False) -
 
 
 def forget(keyword: str) -> str:
-    """Forget memories matching a keyword."""
-    removed = forget_from_memory_md(keyword)
-    if removed > 0:
-        return f"Removed {removed} entries matching '{keyword}'"
-    return f"No entries found matching '{keyword}'"
+    """Forget memories matching a keyword.
+
+    Wraps ``forget_from_memory_md`` with default safeties (≥6-char keyword,
+    skips lines under Behavioral Rules / User Profile / User Preferences and
+    ``#`` headings). Returns a human-readable preview of what was removed
+    plus a count of protected lines that were preserved.
+    """
+    try:
+        removed, preview, protected_skipped = forget_from_memory_md(keyword)
+    except ValueError as e:
+        return f"Refused to forget: {e}"
+
+    suffix = ""
+    if protected_skipped:
+        suffix = (
+            f" ({protected_skipped} protected line(s) preserved — Behavioral "
+            f"Rules / User Profile / User Preferences are never deleted by keyword)"
+        )
+
+    if removed == 0:
+        if protected_skipped:
+            return (
+                f"No entries removed — all {protected_skipped} match(es) were in "
+                "protected sections (Behavioral Rules / User Profile / User Preferences)"
+            )
+        return f"No entries found matching '{keyword}'"
+
+    # Show up to 3 removed lines so the user can see what was lost.
+    sample = "\n".join(f"  - {ln.strip()[:120]}" for ln in preview[:3])
+    more = f"\n  …and {removed - 3} more" if removed > 3 else ""
+    return (
+        f"Removed {removed} entries matching '{keyword}'{suffix}:\n{sample}{more}"
+    )
 
 
 
