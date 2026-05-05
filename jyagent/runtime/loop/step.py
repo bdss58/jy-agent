@@ -335,7 +335,7 @@ def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     """
     # Lazy imports break the engine→step→engine cycle without polluting
     # module-load order. Cost: one dict lookup per step (negligible).
-    from .engine import _finalize_run, _is_truncated
+    from .finalize import finalize_run as _finalize_run, is_truncated as _is_truncated
     from .llm_runner import extract_text as _extract_text
     from .compaction import truncate_tool_call_blocks as _truncate_tool_call_blocks
     from .verification import should_verify, build_verification_prompt
@@ -679,7 +679,7 @@ def _record_llm_usage_and_cost(
 
     Accumulates ``state.total_input_tokens`` / ``state.total_output_tokens``.
     """
-    from .engine import _finalize_run
+    from .finalize import finalize_run as _finalize_run
 
     cfg = loop._config
     step = state.step
@@ -990,7 +990,7 @@ def _check_stuck_loop(
     Returns ``StepTerminate(...)`` when a stuck-loop pattern is detected,
     else ``None``.
     """
-    from .engine import _finalize_run
+    from .finalize import finalize_run as _finalize_run
     from .stuck_loop import StuckLoopDetector
 
     step = state.step
