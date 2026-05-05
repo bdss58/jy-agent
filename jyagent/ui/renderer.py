@@ -7,6 +7,16 @@ Rich-on-stdout implementation.
 
 This is a `typing.Protocol` (structural), so any class with the right
 methods satisfies it — no registration needed.
+
+Scope (deliberate):
+    This protocol covers ONLY *rendering*.  Input concerns (``get_input``,
+    ``toggle_multiline``, prompt_toolkit session) are intentionally
+    excluded — they belong to the ``CLI`` class, which composes a renderer
+    with an input source.  ``agent.py`` consumes both via a ``CLI``
+    instance (see :class:`jyagent.ui.cli.CLI`); a future Textual / Web
+    front-end would provide its own input layer alongside a renderer that
+    satisfies *this* protocol.  Keeping the two surfaces separate makes
+    the renderer reusable across multiple input layouts.
 """
 from __future__ import annotations
 

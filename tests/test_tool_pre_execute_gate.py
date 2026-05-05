@@ -236,11 +236,17 @@ class TestPreExecuteGate:
         # Two tool_result messages: one denial (writer), one success (reader).
         results = [m for m in state.messages if m.get("role") == "tool_result"]
         assert len(results) == 2
-        by_name = {r["tool_name"]: r for r in results}
-        assert "Denied" in by_name["writer"]["content"]
-        assert by_name["writer"]["is_error"] is True
-        assert "read-ok" in by_name["reader"]["content"]
-        assert by_name["reader"]["is_error"] is False
+
+        # Bug-fix 2026-05 (codex review): tool_results MUST appear in the
+        # original tool_call_blocks order — reader (c1) before writer (c2) —
+        # not denied-first-then-allowed (which was the pre-fix bug).
+        assert [r["tool_call_id"] for r in results] == ["c1", "c2"]
+        assert results[0]["tool_name"] == "reader"
+        assert results[0]["is_error"] is False
+        assert "read-ok" in results[0]["content"]
+        assert results[1]["tool_name"] == "writer"
+        assert results[1]["is_error"] is True
+        assert "Denied" in results[1]["content"]
 
     def test_raising_callback_treated_as_allow(self):
         """A buggy gate must not crash the engine — default to allow."""
@@ -261,3 +267,35 @@ class TestPreExecuteGate:
         assert mock_exec.call_count == 1
         results = [m for m in state.messages if m.get("role") == "tool_result"]
         assert "still-ran" in results[0]["content"]
+
+    def test_repeatedly_denied_calls_visible_to_stuck_loop(self):
+        """Bug-fix 2026-05 (codex review): denied tool calls MUST appear in
+        the returned tool_results_tuples so ``_check_stuck_loop`` can see
+        repeated denials and trip the dedup detector.  Before the fix,
+        ``_execute_tool_round`` returned ``[]`` when all tools were denied
+        and a model that kept retrying the same denied call could loop
+        forever.
+        """
+        from jyagent.runtime.loop.step import _execute_tool_round
+        from jyagent.runtime.loop.engine import ToolCallRequest
+
+        cbs = LoopCallbacks(on_tool_pre_execute=lambda n, i: "deny")
+        # Use a real (allowed) llm_response shape just to satisfy FakeLoop;
+        # we call _execute_tool_round directly so the LLM stage doesn't run.
+        loop = FakeLoop(callbacks=cbs, llm_response=_one_tool_call("writer"))
+        state = _build_state(loop)
+        block = ToolCallRequest(id="c1", name="writer", input={"path": "/x"})
+
+        # Build a minimal step_batch — None is acceptable since the executor
+        # path is never reached when all blocks are denied.
+        outcome, tuples = _execute_tool_round(
+            loop, state, step_batch=None, tool_call_blocks=[block],
+        )
+
+        assert outcome is None
+        # The denied block IS in the returned tuples (was [] before the fix).
+        assert len(tuples) == 1
+        b, r = tuples[0]
+        assert b.id == "c1"
+        assert r.is_error is True
+        assert "Denied" in r.content

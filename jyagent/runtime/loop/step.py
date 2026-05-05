@@ -829,6 +829,7 @@ def _execute_tool_round(
     """
     from .compaction import truncate_result as _truncate_result
     from .tool_executor import execute_tools as _execute_tools
+    from ..tools.result import ToolResult
 
     cfg = loop._config
     messages = state.messages
@@ -846,9 +847,11 @@ def _execute_tool_round(
     # Approval gate — fires ``on_tool_pre_execute`` per block; callbacks
     # returning ``"deny"`` cause the engine to synthesize a denial
     # ToolResult *in place of* the real call, keeping tool_start / tool_end
-    # pairs balanced for UIs that count them.  Denies are common enough
-    # (interactive --ask flows) that we split the blocks into two lists
-    # here rather than branching inside the executor.
+    # pairs balanced for UIs that count them.  We split the blocks into
+    # two lists here so the executor only sees the allowed ones, then emit
+    # results in the ORIGINAL ``tool_call_blocks`` order (Bug-fix 2026-05:
+    # the previous denied-first-then-allowed ordering broke positional
+    # consumers and made ``/history`` unreadable).
     denied_blocks: list = []
     allowed_blocks: list = []
     for block in tool_call_blocks:
@@ -876,50 +879,54 @@ def _execute_tool_round(
             loop._fire("on_tool_end", block.name, "Cancelled", True, None)
         return StepBreak(reason="cancelled"), []
 
-    # Synthesize denial results (no executor dispatch needed).
-    for block in denied_blocks:
-        denial_msg = "Denied by user (on_tool_pre_execute gate)."
-        messages.append({
-            "role": "tool_result",
-            "tool_call_id": block.id,
-            "tool_name": block.name,
-            "content": denial_msg,
-            "is_error": True,
-        })
-        loop._fire("on_tool_end", block.name, denial_msg, True, 0.0)
-        if trace:
-            trace.add_span(
-                step=step,
-                event_type="tool_call",
-                tool_name=block.name,
-                tool_args=block.input,
-                success=False,
-                error=denial_msg,
-            )
+    # Phase 1: dispatch the allowed blocks (if any).
+    executed_results: list = []
+    if allowed_blocks:
+        tools_t0 = time.perf_counter()
+        executed_results = _execute_tools(
+            allowed_blocks,
+            step_batch,
+            cfg.concurrent_tools,
+            cfg.max_tool_workers,
+            cfg.tool_timeout,
+            executor=loop._executor,
+            partial_side_effects=loop._partial_side_effects,
+            cancel_event=loop._cancel_event,
+        )
+        # Batch duration is measured but not recorded — per-call durations are
+        # traced at dispatch time inside execute_tool_with_timeout, and keeping
+        # the clock read here preserves the option to add a batch-level span
+        # later without reshaping the call site. Intentional no-op.
+        _ = (time.perf_counter() - tools_t0) * 1000
 
-    if not allowed_blocks:
-        # Everything denied — still return cleanly so the planner gets the
-        # tool_results and can decide how to respond.
-        return None, []
+    # Phase 2: synthesize denial results so stuck-loop detection sees them.
+    # Bug-fix 2026-05 (codex review): without this, repeatedly-denied tool
+    # calls bypassed _check_stuck_loop entirely (it iterates over the
+    # returned tuples), so a model that kept retrying the same denied call
+    # could loop forever.  By including denial results — which all share
+    # the same fixed content — the dedup detector trips on the second or
+    # third repeat just like a normal stuck loop.
+    denial_msg = "Denied by user (on_tool_pre_execute gate)."
+    denied_ids = {b.id for b in denied_blocks}
+    results_by_id = {b.id: r for (b, r) in executed_results}
 
-    tools_t0 = time.perf_counter()
-    tool_results_tuples = _execute_tools(
-        allowed_blocks,
-        step_batch,
-        cfg.concurrent_tools,
-        cfg.max_tool_workers,
-        cfg.tool_timeout,
-        executor=loop._executor,
-        partial_side_effects=loop._partial_side_effects,
-        cancel_event=loop._cancel_event,
-    )
-    # Batch duration is measured but not recorded — per-call durations are
-    # traced at dispatch time inside execute_tool_with_timeout, and keeping
-    # the clock read here preserves the option to add a batch-level span
-    # later without reshaping the call site. Intentional no-op.
-    _ = (time.perf_counter() - tools_t0) * 1000
+    # Phase 3: emit messages + fire on_tool_end + trace, IN ORIGINAL
+    # tool_call_blocks ORDER.  Returns a ``tool_results_tuples`` list that
+    # mirrors the input order so downstream consumers (stuck-loop detection,
+    # /history rendering, positional pairing) see what they expect.
+    tool_results_tuples: list = []
+    for block in tool_call_blocks:
+        if block.id in denied_ids:
+            result = ToolResult(content=denial_msg, is_error=True)
+            # Stamp duration_ms=0 for parity with executed tools (the
+            # ``on_tool_end`` callback and trace pipeline both read this).
+            try:
+                result.duration_ms = 0.0  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        else:
+            result = results_by_id[block.id]
 
-    for block, result in tool_results_tuples:
         state.tool_calls_count += 1
         content_str = _truncate_result(
             result.content, cfg.max_tool_result_chars, result.is_error,
@@ -952,6 +959,7 @@ def _execute_tool_round(
             "content": content_str,
             "is_error": result.is_error,
         })
+        tool_results_tuples.append((block, result))
 
     return None, tool_results_tuples
 
