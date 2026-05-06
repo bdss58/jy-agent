@@ -352,3 +352,76 @@ def test_legacy_latest_json_seeds_latest_pointer(tmp_sessions_dir):
     # And the legacy file was renamed.
     assert not os.path.isfile(os.path.join(tmp_sessions_dir, "latest.json"))
     assert os.path.isfile(os.path.join(tmp_sessions_dir, "latest.json.legacy"))
+
+
+def test_metadata_dedup_is_O1_per_checkpoint(tmp_sessions_dir):
+    """Repeated checkpoints with unchanged metadata must NOT re-emit
+    session_meta events, and the dedup must not require re-reading the log
+    on every call (perf regression guard).
+    """
+    c = ConversationMemory()
+    md = {"provider": "anthropic", "model": "claude-x"}
+    c.add_message("user", "hi")
+    checkpoint_session(c, metadata=md)
+
+    log = c._event_log
+    base_len = len(log)
+
+    # 50 more checkpoints with the same metadata — none should emit session_meta.
+    for i in range(50):
+        c.add_message("assistant" if i % 2 == 0 else "user", f"m{i}")
+        checkpoint_session(c, metadata=md)
+
+    # Final log: base events + 50 message events. Zero new session_meta events.
+    assert len(log) == base_len + 50
+    kinds = [e["kind"] for e in log.get_events()]
+    assert kinds.count("session_meta") == 0
+    assert kinds.count("session_start") == 1
+
+
+def test_metadata_change_emits_session_meta(tmp_sessions_dir):
+    """When metadata actually changes (e.g. /model switch), emit session_meta."""
+    c = ConversationMemory()
+    c.add_message("user", "hi")
+    checkpoint_session(c, metadata={"provider": "a", "model": "x"})
+    c.add_message("user", "again")
+    checkpoint_session(c, metadata={"provider": "a", "model": "y"})  # model changed
+
+    events = c._event_log.get_events()
+    kinds = [e["kind"] for e in events]
+    assert kinds.count("session_meta") == 1
+    meta_evt = next(e for e in events if e["kind"] == "session_meta")
+    assert meta_evt["metadata"]["model"] == "y"
+
+
+def test_synthesis_failure_does_not_lose_legacy_data(tmp_sessions_dir, monkeypatch):
+    """If _synthesize_log_from_snapshot fails, the .json must NOT be renamed.
+
+    Otherwise a transient I/O error would silently lose the only on-disk copy.
+    """
+    import jyagent.memory.session as session_mod
+
+    legacy_sid = "fail-migration-sid"
+    snapshot = {
+        "version": 1,
+        "session_id": legacy_sid,
+        "saved_at": "2026-01-02T00:00:00+08:00",
+        "message_count": 1,
+        "metadata": {},
+        "messages": [{"role": "user", "content": "x"}],
+    }
+    legacy_path = os.path.join(tmp_sessions_dir, "latest.json")
+    with open(legacy_path, "w") as f:
+        json.dump(snapshot, f)
+
+    # Force synthesis to fail.
+    def _boom(*args, **kwargs):
+        return False
+    monkeypatch.setattr(session_mod, "_synthesize_log_from_snapshot", _boom)
+
+    # Trigger migration.
+    session_mod.list_sessions()
+
+    # Original .json must still be on disk for retry next run.
+    assert os.path.isfile(legacy_path)
+    assert not os.path.isfile(legacy_path + ".legacy")

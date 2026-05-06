@@ -44,6 +44,10 @@ ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 # beyond a single newline). Atomic write via temp + rename + fsync.
 _LATEST_POINTER_BASENAME = "latest.txt"
 
+# Sentinel for the per-log metadata cache (distinguishes "never queried"
+# from "queried, found no metadata").
+_META_CACHE_UNSET = object()
+
 
 # ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -338,7 +342,7 @@ def replay_from_events(session_id: str) -> ConversationMemory:
             if isinstance(msg, dict):
                 view.append(msg)
         elif kind == "compaction":
-            drop = int(evt.get("drop_count", 0))
+            drop = max(0, int(evt.get("drop_count", 0)))
             replacement = evt.get("replacement_messages") or []
             kept = view[drop:]
             view = list(replacement) + list(kept)
@@ -366,22 +370,34 @@ def _ensure_log_attached(
     log = open_event_log(conversation.session_id, config.SESSIONS_DIR)
     # Ensure seq 0 is a session_start event for brand-new logs.
     if len(log) == 0:
+        snapshot = _copy_metadata(metadata)
         log.emit({
             "kind": "session_start",
-            "metadata": _copy_metadata(metadata),
+            "metadata": snapshot,
         })
+        # Seed the meta cache so the next checkpoint doesn't re-scan.
+        setattr(log, "_session_meta_cache", snapshot)
     conversation.attach_event_log(log, recorded_seq=0)
     return log
 
 
 def _maybe_emit_meta_change(log: EventLog, metadata: dict) -> None:
-    """If metadata differs from the most recent start/meta event, emit session_meta."""
+    """If metadata differs from the most recent start/meta event, emit session_meta.
+
+    Caches the last known metadata on the log instance to avoid an O(N) scan
+    of every event on every checkpoint. The cache is seeded by a one-shot
+    reverse scan on first call after attach.
+    """
     if not metadata:
         return
-    last = _last_metadata_event(log)
-    if last is not None and _metadata_equal(last, metadata):
+    cached = getattr(log, "_session_meta_cache", _META_CACHE_UNSET)
+    if cached is _META_CACHE_UNSET:
+        cached = _last_metadata_event(log) or {}
+    if _metadata_equal(cached, metadata):
         return
-    log.emit({"kind": "session_meta", "metadata": _copy_metadata(metadata)})
+    snapshot = _copy_metadata(metadata)
+    log.emit({"kind": "session_meta", "metadata": snapshot})
+    setattr(log, "_session_meta_cache", snapshot)
 
 
 def _flush_pending_messages(conversation: ConversationMemory) -> None:
@@ -456,7 +472,7 @@ def _summarize_log(session_id: str) -> dict:
                 if kind == "message":
                     message_count += 1
                 elif kind == "compaction":
-                    drop = int(evt.get("drop_count", 0))
+                    drop = max(0, int(evt.get("drop_count", 0)))
                     repl = evt.get("replacement_messages") or []
                     message_count = max(0, message_count - drop) + len(repl)
                 elif kind in ("session_start", "session_meta"):
@@ -649,16 +665,21 @@ def _run_legacy_migration() -> None:
             continue
 
         log_path = event_log_path(sid, sessions_dir)
+        synthesized_ok = True
         if not os.path.isfile(log_path):
-            _synthesize_log_from_snapshot(sid, payload)
+            synthesized_ok = _synthesize_log_from_snapshot(sid, payload)
 
         saved_at = payload.get("saved_at") or ""
         is_latest = os.path.basename(path) == "latest.json"
-        if is_latest and (not best_sid or saved_at > best_ts):
+        if is_latest and synthesized_ok and (not best_sid or saved_at > best_ts):
             best_sid = sid
             best_ts = saved_at
 
-        _rename_legacy(path)
+        # Only rename the legacy file if the synthesis succeeded — otherwise
+        # leave it on disk so the next run can retry. Renaming a failed
+        # synthesis would silently lose the only on-disk copy.
+        if synthesized_ok:
+            _rename_legacy(path)
 
     # Seed latest.txt if the user had a latest.json but no latest.txt yet.
     if best_sid and not _read_latest_pointer():
@@ -673,21 +694,27 @@ def _rename_legacy(path: str) -> None:
         pass
 
 
-def _synthesize_log_from_snapshot(session_id: str, payload: dict) -> None:
+def _synthesize_log_from_snapshot(session_id: str, payload: dict) -> bool:
     """Write a minimal event log from a legacy snapshot.
 
     Emits:
       seq 0: session_start with the snapshot's metadata
       seq 1..N: one ``message`` event per message in the snapshot
+
+    Returns True on success, False on any I/O failure (caller should NOT
+    rename the legacy file in that case — leave it for the next run to
+    retry, otherwise we'd silently lose the only on-disk copy of the data).
     """
     messages = payload.get("messages") or []
     if not messages:
-        return
+        # Nothing to migrate; treat as success so caller renames the file.
+        return True
     try:
         log = open_event_log(session_id, config.SESSIONS_DIR)
         # If someone raced us and populated the log already, skip.
         if len(log) > 0:
-            return
+            log.close()
+            return True
         log.emit({
             "kind": "session_start",
             "metadata": _copy_metadata(payload.get("metadata") or {}),
@@ -698,5 +725,6 @@ def _synthesize_log_from_snapshot(session_id: str, payload: dict) -> None:
             if isinstance(m, dict)
         ])
         log.close()
+        return True
     except OSError:
-        pass
+        return False
