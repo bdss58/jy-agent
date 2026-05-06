@@ -10,7 +10,13 @@ import collections
 import logging
 import random
 import threading
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    # Normalized message TypedDict — used only as a type annotation on
+    # ``AgentLoop.run`` and ``_run_impl``.  Kept under TYPE_CHECKING to
+    # avoid a runtime import cycle (llm.types -> runtime.loop.llm_types).
+    from ...llm.types import Message
 
 # Behavioural dependency: the runtime engine consumes an `LLMClient`
 # (Protocol).  Concrete provider classes such as `jyagent.llm.LLMOwner`
@@ -278,7 +284,7 @@ class AgentLoop(LoopThreadHelper):
     def run(
         self,
         system_prompt: str,
-        messages: list,
+        messages: "list[Message]",
         initial_todos: list | None = None,
     ) -> LoopResult:
         """Run the agentic tool-use loop.  *messages* is mutated in-place.
@@ -340,7 +346,7 @@ class AgentLoop(LoopThreadHelper):
     def _run_impl(
         self,
         system_prompt: str,
-        messages: list,
+        messages: "list[Message]",
         initial_todos: list | None = None,
     ) -> LoopResult:
         """Core run loop.  Public entry point is ``run()`` which also

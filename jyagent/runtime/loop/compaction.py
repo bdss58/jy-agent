@@ -35,6 +35,7 @@ from ...memory.conversation import estimate_conversation_tokens
 
 if TYPE_CHECKING:
     from ..tools.registry import ToolBatch
+    from ...llm.types import Message
 
 
 # ── Dehydration — preserve recovery pointers when clearing tool results ────
@@ -185,11 +186,11 @@ def truncate_result(content: str, max_chars: int, is_error: bool = False) -> str
 
 
 def compact_messages(
-    messages: list,
+    messages: "list[Message]",
     max_tokens: int,
     compact_chars: int,
     batch: "ToolBatch",
-) -> list:
+) -> "list[Message]":
     """Multi-tier context compaction for messages sent to the LLM.
 
     Applied in order of aggressiveness:

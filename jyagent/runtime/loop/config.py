@@ -6,6 +6,14 @@ without paying the engine import cost.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Normalized message TypedDict — used only as a type annotation on
+    # ``LoopResult.messages``.  Kept under TYPE_CHECKING to avoid a
+    # runtime import cycle (llm.types -> runtime.loop.llm_types).
+    from ...llm.types import Message
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -97,7 +105,7 @@ class LoopResult:
     status: str  # "completed" | "max_steps" | "error" | "interrupted" | "cost_limit" | "dedup_break"
     text: str
     final_text: str
-    messages: list
+    messages: "list[Message]"
     steps: int
     total_input_tokens: int = 0
     total_output_tokens: int = 0

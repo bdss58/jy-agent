@@ -34,10 +34,13 @@ unchanged.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import LoopResult
 from .llm_types import ToolCallRequest
+
+if TYPE_CHECKING:
+    from ...llm.types import Message
 
 _logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ def is_truncated(stop_reason: str, tool_calls: list[ToolCallRequest]) -> bool:
     return stop_reason == "length" and bool(tool_calls)
 
 
-def strip_dangling_verification(messages: list) -> None:
+def strip_dangling_verification(messages: "list[Message]") -> None:
     """Remove a trailing unanswered ``[VERIFICATION]`` user message in-place.
 
     The verification gate appends a user prompt asking the model to self-
@@ -78,7 +81,7 @@ def finalize_run(
     status: str,
     text: str,
     final_text: str,
-    messages: list,
+    messages: "list[Message]",
     steps: int,
     total_input_tokens: int,
     total_output_tokens: int,
