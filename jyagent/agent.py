@@ -7,7 +7,8 @@ import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, summarize_if_needed,
     build_memory_context,
-    save_session, load_session, has_saved_session, archive_session,
+    save_session, checkpoint_session, load_session, has_saved_session, archive_session,
+    delete_session,
     list_sessions, find_session,
     should_extract, extract_and_remember,
     record_file_access,
@@ -128,6 +129,16 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     # Clear conversation history
     conversation.clear()
     runtime_owner.set_session_id(conversation.session_id)
+
+    # Drop the stale `latest.json` resume pointer.  Without this, /continue
+    # right after /new would restore the just-archived session — surprising
+    # behavior since the user explicitly asked to start fresh.  The
+    # timestamped archive (written above) keeps the old session resumable
+    # by ID via /sessions + /continue <id>.
+    try:
+        delete_session()
+    except Exception:
+        pass
 
     # Clear pinned skills
     get_skill_manager().unpin_all()
@@ -271,6 +282,12 @@ def _cmd_continue(cli, conversation, runtime_owner, user_input: str = "/continue
             f"✅ Resumed session {sid_short} from {result['saved_at']} "
             f"({result['message_count']} messages, ~{conversation.estimated_tokens()} tokens)"
         )
+        if result.get("log_ahead_recovered"):
+            cli.print_system(
+                "ℹ️  Event log was ahead of snapshot — recovered "
+                f"{result['message_count']} messages by replaying events "
+                "(prior crash between log flush and snapshot write)."
+            )
     else:
         cli.print_system(f"Failed to load session: {result.get('error', 'unknown error')}")
 
@@ -331,6 +348,25 @@ def _print_unexpected_error(cli, error: Exception):
             console.print(f"✖ {message}", style="error", markup=False)
     except Exception:
         print(message, file=sys.stderr)
+
+
+def _checkpoint_turn(conversation) -> None:
+    """Per-turn durability: write ``latest.json`` after every message boundary.
+
+    Cheap (one atomic JSON write, no archive, no prune) and silent on failure
+    — never block the user's turn on a disk hiccup.
+    """
+    if not conversation or not conversation.messages:
+        return
+    try:
+        from .runtime.stats import get_stats
+        stats = get_stats()
+        checkpoint_session(conversation, metadata={
+            "provider": stats.provider or "",
+            "model": stats.model or "",
+        })
+    except Exception:
+        pass
 
 
 def _graceful_exit(cli, conversation=None):
@@ -431,6 +467,13 @@ def run(runtime_owner: LLMOwner) -> None:
         from .tools.subagent import set_runtime_owner
         set_runtime_owner(runtime_owner)
 
+        # Belt-and-braces: even if the process dies via uncaught exception,
+        # SIGTERM, or sys.exit, the most recent turn is still on disk because
+        # _checkpoint_turn() runs after every message. atexit catches the
+        # rare case where a turn finishes but graceful_exit never runs.
+        import atexit
+        atexit.register(_checkpoint_turn, conversation)
+
         # Notify if a previous session can be resumed
         if has_saved_session():
             cli.print_system("💾 Previous session available. Type /continue to resume.")
@@ -482,6 +525,7 @@ def run(runtime_owner: LLMOwner) -> None:
 
                 # ─── Regular interaction ──────────────
                 conversation.add_message("user", user_input)
+                _checkpoint_turn(conversation)  # durability: persist user input before engine runs
 
                 # Auto-compact check (token-based, with memory re-injection callback)
                 def _on_compacted():
@@ -656,6 +700,7 @@ def run(runtime_owner: LLMOwner) -> None:
                     conversation.messages.extend(new_messages)
                 else:
                     conversation.add_message("assistant", response)
+                _checkpoint_turn(conversation)  # durability: persist after assistant turn
 
                 # Proactive memory extraction (background, non-blocking)
                 if should_extract(user_input):

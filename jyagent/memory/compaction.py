@@ -17,7 +17,7 @@ from ..config import (
     FILE_REINJECTION_COUNT, FILE_REINJECTION_MAX_TOKENS,
     CHARS_PER_TOKEN,
 )
-from .conversation import ConversationMemory, estimate_tokens
+from .conversation import ConversationMemory, estimate_tokens, estimate_conversation_tokens
 
 
 # ─── 9-section structured summary prompt ─────────────────────────────────────
@@ -356,7 +356,45 @@ def compact_conversation(
                 ),
             })
 
-        conversation.messages = new_messages + recent_messages
+        # ── Emit a "compaction" event to the durable log BEFORE swapping ──
+        # The compaction event records (a) the synthetic replacement_messages
+        # — summary + file-reinjection — which are NOT reconstructible from
+        # earlier "message" events, and (b) drop_count so replay can drop
+        # the right number of head messages.  Pre-compaction message events
+        # already exist on disk (from prior _checkpoint_turn calls), so we
+        # do NOT duplicate them here.
+        new_view = new_messages + recent_messages
+        new_after_tokens = estimate_conversation_tokens(new_view)
+        log = getattr(conversation, "_event_log", None)
+        if log is not None:
+            try:
+                # Flush any not-yet-recorded message events first so the
+                # log is current up to the swap boundary.
+                pending = conversation.pending_message_events()
+                if pending:
+                    log.emit_many(pending)
+                    conversation.mark_recorded()
+                log.emit({
+                    "kind": "compaction",
+                    "drop_count": split,
+                    "replacement_messages": list(new_messages),
+                    "summary": summary,
+                    "before_tokens": before_tokens,
+                    "after_tokens": new_after_tokens,
+                })
+            except OSError:
+                # Log write failed — proceed with swap anyway (compaction
+                # is best-effort durable; the in-memory view is what the
+                # next turn needs).  The next checkpoint will re-attempt
+                # log writes.
+                pass
+
+        conversation.messages = new_view
+
+        # Reset the recorded cursor: the new view is fully accounted for in
+        # the log (via "message" events for recent_messages and the
+        # "compaction" event for new_messages).  Future appends start fresh.
+        conversation.mark_recorded()
 
         after_tokens = conversation.estimated_tokens()
 

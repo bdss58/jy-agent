@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from .. import config
 from .conversation import ConversationMemory, _new_session_id
+from .event_log import EventLog, event_log_path, open_event_log
 
 
 ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -21,9 +22,31 @@ def ensure_session_dir() -> None:
     os.makedirs(config.SESSIONS_DIR, exist_ok=True)
 
 
+def _flush_log_pending(conversation: ConversationMemory) -> Optional[int]:
+    """Flush any unrecorded messages to the attached event log.
+
+    Returns the seq of the last event in the log after flushing (or
+    ``None`` if no log is attached).  Raises on log I/O failure — callers
+    must NOT proceed to write the snapshot if this raises (snapshot ahead
+    of log violates the source-of-truth invariant).
+    """
+    log = conversation._event_log
+    if log is None:
+        return None
+    pending = conversation.pending_message_events()
+    if pending:
+        log.emit_many(pending)
+        conversation.mark_recorded()
+    return (len(log) - 1) if len(log) > 0 else None
+
+
 def _build_payload(conversation: ConversationMemory, metadata: Optional[dict] = None) -> dict:
     """Build the JSON-serialisable session payload."""
     now = datetime.now(ASIA_SHANGHAI_TZ)
+    last_seq: Optional[int] = None
+    log = getattr(conversation, "_event_log", None)
+    if log is not None and len(log) > 0:
+        last_seq = len(log) - 1
     return {
         "version": 1,
         "session_id": conversation.session_id,
@@ -31,7 +54,48 @@ def _build_payload(conversation: ConversationMemory, metadata: Optional[dict] = 
         "message_count": len(conversation.messages),
         "metadata": metadata or {},
         "messages": conversation.messages,
+        # Source-of-truth pointer into the event log.  Old loaders that
+        # don't know this field will safely ignore it.
+        "last_event_seq": last_seq,
     }
+
+
+def checkpoint_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
+    """Lightweight per-turn durability write. Overwrites ``latest.json`` only.
+
+    Unlike :func:`save_session` this does NOT create a timestamped archive and
+    does NOT prune. It is meant to be called after every turn boundary so that
+    a crash between user input and graceful exit does not lose the conversation.
+
+    **Order matters**: we flush pending events to the source-of-truth log
+    FIRST, then write the snapshot.  If the log flush raises, we propagate
+    (caller wraps in try/except) — writing a snapshot ahead of the log would
+    violate the "log is truth" invariant.
+
+    Returns the file path written, or ``""`` if the conversation is empty.
+    """
+    ensure_session_dir()
+
+    if not conversation.messages:
+        return ""
+
+    # 1. Lazy-attach a log if none yet — first checkpoint of a fresh session.
+    if conversation._event_log is None:
+        log = open_event_log(conversation.session_id, config.SESSIONS_DIR)
+        # Cursor = current view length: messages already in self.messages
+        # at attach time are assumed covered (true for fresh sessions where
+        # nothing's been recorded yet AND the messages list is empty here is
+        # excluded above; for snapshot-resume the loader attaches with
+        # cursor = len(messages) explicitly).
+        conversation.attach_event_log(log, recorded_seq=0)
+
+    # 2. Flush log first (source of truth).  If this raises, NO snapshot.
+    _flush_log_pending(conversation)
+
+    # 3. Snapshot (the view cache).
+    payload = _build_payload(conversation, metadata)
+    _atomic_write(config.LATEST_SESSION_FILE, payload)
+    return config.LATEST_SESSION_FILE
 
 
 def save_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
@@ -45,6 +109,14 @@ def save_session(conversation: ConversationMemory, metadata: Optional[dict] = No
 
     if not conversation.messages:
         return ""
+
+    # Log first, then snapshot (same invariant as checkpoint_session).
+    if conversation._event_log is None:
+        conversation.attach_event_log(
+            open_event_log(conversation.session_id, config.SESSIONS_DIR),
+            recorded_seq=0,
+        )
+    _flush_log_pending(conversation)
 
     payload = _build_payload(conversation, metadata)
 
@@ -74,6 +146,14 @@ def archive_session(conversation: ConversationMemory, metadata: Optional[dict] =
 
     if not conversation.messages:
         return ""
+
+    # Log first, then archive snapshot.
+    if conversation._event_log is None:
+        conversation.attach_event_log(
+            open_event_log(conversation.session_id, config.SESSIONS_DIR),
+            recorded_seq=0,
+        )
+    _flush_log_pending(conversation)
 
     payload = _build_payload(conversation, metadata)
 
@@ -113,18 +193,56 @@ def load_session(conversation: ConversationMemory, path: Optional[str] = None) -
 
     session_id = payload.get("session_id") or _new_session_id()
 
-    # Clear and reload
+    # Clear and reload (clear() also detaches any prior event log).
     conversation.clear()
     conversation.session_id = session_id
     for msg in messages:
         conversation.messages.append(msg)
 
+    # Attach the per-session event log if one exists on disk.  Cursor =
+    # len(messages) because every message in the snapshot is presumed
+    # already represented in the log (either as "message" events or rolled
+    # into an earlier "compaction" event).
+    log_path = event_log_path(session_id, config.SESSIONS_DIR)
+    log_status = "absent"
+    log_ahead_recovered = False
+    if os.path.isfile(log_path):
+        log = open_event_log(session_id, config.SESSIONS_DIR)
+        snap_seq = payload.get("last_event_seq")
+
+        # Detect log-ahead-of-snapshot: a crash between log flush and
+        # snapshot write left the log with events the snapshot doesn't
+        # know about.  Recover by replaying the log — those events are
+        # the source of truth, and silently keeping the stale snapshot
+        # would orphan them forever (next checkpoint would re-mark
+        # `last_event_seq` to current log tail, hiding the gap).
+        if snap_seq is not None and len(log) > snap_seq + 1:
+            recovered = replay_from_events(session_id)
+            conversation.messages = list(recovered.messages)
+            # replay_from_events opened its own log handle; reuse that.
+            conversation.attach_event_log(
+                recovered._event_log,
+                recorded_seq=len(conversation.messages),
+            )
+            log_status = "log_ahead_recovered"
+            log_ahead_recovered = True
+        else:
+            conversation.attach_event_log(log, recorded_seq=len(messages))
+            log_status = "synced"
+    # else: leave log unattached.  First checkpoint will create one
+    # transparently for future appends to be durable.
+
     return {
         "loaded": True,
         "session_id": session_id,
         "saved_at": payload.get("saved_at", "unknown"),
-        "message_count": len(messages),
+        "message_count": len(conversation.messages),
         "metadata": payload.get("metadata", {}),
+        "event_log_status": log_status,
+        "event_log_seq": len(conversation._event_log) - 1
+            if conversation._event_log is not None and len(conversation._event_log) > 0
+            else None,
+        "log_ahead_recovered": log_ahead_recovered,
     }
 
 
@@ -272,14 +390,68 @@ def delete_session(path: Optional[str] = None) -> bool:
         return False
 
 
+# ─── Replay from event log ────────────────────────────────────────────────────
+
+def replay_from_events(session_id: str) -> ConversationMemory:
+    """Reconstruct a :class:`ConversationMemory` view from the event log alone.
+
+    Walks every event in ``data/sessions/events/<session_id>.jsonl`` and
+    rebuilds the live view, applying each compaction event in sequence:
+      - ``"kind": "message"`` → append ``event["message"]`` to view.
+      - ``"kind": "compaction"`` → drop the first ``drop_count`` view
+        messages, replace them with ``event["replacement_messages"]``.
+
+    The result has its event log attached at ``recorded_seq=len(view)``
+    so future appends pick up cleanly.
+
+    Raises ``FileNotFoundError`` if no log exists.  Useful for recovery
+    after a snapshot loss or a "log ahead of snapshot" diagnosis.
+    """
+    path = event_log_path(session_id, config.SESSIONS_DIR)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"No event log for session {session_id}: {path}")
+
+    log = open_event_log(session_id, config.SESSIONS_DIR)
+    view: list = []
+    for evt in log.get_events():
+        kind = evt.get("kind")
+        if kind == "message":
+            msg = evt.get("message")
+            if isinstance(msg, dict):
+                view.append(msg)
+        elif kind == "compaction":
+            drop = int(evt.get("drop_count", 0))
+            replacement = evt.get("replacement_messages") or []
+            kept = view[drop:]
+            view = list(replacement) + list(kept)
+        # Unknown kinds: ignore (forward-compatibility).
+
+    c = ConversationMemory()
+    c.session_id = session_id
+    c.messages = view
+    c.attach_event_log(log, recorded_seq=len(view))
+    return c
+
+
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 def _atomic_write(path: str, payload: dict) -> None:
-    """Write JSON atomically via temp file + rename."""
+    """Write JSON atomically via temp file + rename, with fsync.
+
+    Symmetry with the event log: both sides flush+fsync at the boundary so
+    "snapshot ahead of log" or "log ahead of snapshot" can only happen
+    across a process crash between the two writes, never from a buffered-
+    but-unflushed write surviving in cache.
+    """
     tmp_path = path + ".tmp"
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=None)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass  # tmpfs / non-syncable FS — best-effort
         os.replace(tmp_path, path)
     except Exception:
         try:

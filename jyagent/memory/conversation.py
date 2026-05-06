@@ -1,6 +1,6 @@
 # In-memory conversation history and token estimation helpers.
 
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 from ..config import CHARS_PER_TOKEN
@@ -61,11 +61,28 @@ def _new_session_id() -> str:
 
 
 class ConversationMemory:
-    """In-memory conversation history."""
+    """In-memory conversation history (the live "view" fed to the LLM).
+
+    The durable source of truth is the per-session :class:`EventLog`
+    (jyagent/memory/event_log.py).  This object is just the working view:
+    compaction may rewrite ``self.messages`` in place, but the underlying
+    event log is append-only and preserves pre-compaction context.
+
+    Lifecycle is managed externally (jyagent/agent.py + memory/session.py):
+    ``ConversationMemory`` does NOT auto-create or attach an event log.
+    See :meth:`attach_event_log`.
+    """
 
     def __init__(self):
         self.session_id = _new_session_id()
         self.messages = []
+        # Event-log binding — set by attach_event_log().  Optional.
+        self._event_log = None  # type: ignore[assignment]
+        # How many of self.messages have already been recorded as
+        # "kind":"message" events in self._event_log.  Compaction resets
+        # this to len(self.messages) after emitting a "kind":"compaction"
+        # event with the synthetic replacement_messages.
+        self._recorded_seq: int = 0
 
     def add_message(self, role: str, content: Any) -> None:
         self.messages.append({"role": role, "content": content})
@@ -77,8 +94,12 @@ class ConversationMemory:
         return self.messages[-n:]
 
     def clear(self) -> None:
+        # Detach (don't close — caller owns the lifecycle).  A new log will
+        # be attached by the next checkpoint or by /continue.
         self.session_id = _new_session_id()
         self.messages = []
+        self._event_log = None
+        self._recorded_seq = 0
 
     def estimated_tokens(self) -> int:
         """Estimate total tokens in current conversation."""
@@ -86,3 +107,37 @@ class ConversationMemory:
 
     def __len__(self) -> int:
         return len(self.messages)
+
+    # ─── event-log binding ────────────────────────────────────────────────
+
+    def attach_event_log(self, log, recorded_seq: Optional[int] = None) -> None:
+        """Bind an :class:`EventLog` so future checkpoints flush new messages.
+
+        ``recorded_seq`` is how many messages in ``self.messages`` are
+        already represented in the log (either as "message" events or
+        rolled into a prior "compaction" event's ``replacement_messages``).
+        Defaults to ``len(self.messages)`` — i.e. assume the current view
+        is fully covered by the log so far (correct for both fresh
+        sessions and snapshot-resumed sessions).
+        """
+        self._event_log = log
+        self._recorded_seq = (
+            len(self.messages) if recorded_seq is None else recorded_seq
+        )
+
+    def detach_event_log(self) -> None:
+        self._event_log = None
+        self._recorded_seq = 0
+
+    def pending_message_events(self) -> list[dict]:
+        """Return event dicts for messages not yet in the log."""
+        if self._event_log is None:
+            return []
+        pending = self.messages[self._recorded_seq:]
+        return [{"kind": "message", "message": m} for m in pending]
+
+    def mark_recorded(self, count: Optional[int] = None) -> None:
+        """Advance the recorded cursor to len(messages) (or explicit count)."""
+        self._recorded_seq = (
+            len(self.messages) if count is None else count
+        )
