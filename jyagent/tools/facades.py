@@ -163,7 +163,7 @@ def manage_skills(action: str, name: str = "", description: str = "",
             for entry in catalog:
                 status = "📌 PINNED" if entry["pinned"] else "  📦"
                 lines.append(f"  {status} {entry['name']}: {entry['description'][:100]}")
-            lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['active'])} pinned")
+            lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['pinned'])} pinned")
             return ToolResult("\n".join(lines))
 
         elif action == "load":

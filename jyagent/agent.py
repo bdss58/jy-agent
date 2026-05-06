@@ -164,7 +164,7 @@ def _cmd_skills(cli, **_):
     for entry in catalog:
         status = "📌" if entry["pinned"] else "📦"
         lines.append(f"  {status} {entry['name']}: {entry['description'][:80]}")
-    lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['active'])} active")
+    lines.append(f"\n  Total: {len(catalog)} skills, {sum(1 for e in catalog if e['pinned'])} pinned")
     lines.append("  Use '/skill <name>' to activate, '/skill -<name>' to deactivate")
     cli.print_system("\n".join(lines))
 

@@ -295,6 +295,16 @@ class SkillManager:
         """
         Scan the skills directory for SKILL.md files.
         Returns list of discovered skill names.
+
+        Spec rules enforced (agentskills.io):
+          * For ``skills/<dir>/SKILL.md``, the frontmatter ``name`` must equal
+            ``basename(<dir>)``. Mismatched skills are rejected with a stderr
+            warning so the model never sees a skill whose folder name lies
+            about its identity (this would also break ``read_resource`` paths).
+          * Duplicate ``name`` across two on-disk skills is rejected — the
+            second occurrence is dropped with a stderr warning instead of
+            silent last-writer-wins, which used to depend on unsorted
+            ``glob.glob()`` order.
         """
         self._skills.clear()
         # Drop stale pins from skills that no longer exist (e.g. after
@@ -308,13 +318,34 @@ class SkillManager:
             return discovered
 
         # Pattern 1: skills/<name>/SKILL.md
-        for skill_md in glob.glob(os.path.join(self.skills_dir, "*", SKILL_FILENAME)):
+        # Sort the glob result so duplicate-name conflicts and discovery order
+        # are deterministic across filesystems / Python builds.
+        for skill_md in sorted(glob.glob(os.path.join(self.skills_dir, "*", SKILL_FILENAME))):
             skill = parse_skill_md(skill_md)
-            if skill:
-                self._skills[skill["name"]] = skill
-                discovered.append(skill["name"])
+            if not skill:
+                continue
+            dir_name = os.path.basename(skill["skill_dir"])
+            if skill["name"] != dir_name:
+                print(
+                    f"⚠️  skill rejected: {skill_md} declares name='{skill['name']}' "
+                    f"but lives in folder '{dir_name}/' (agentskills.io requires they match)",
+                    file=sys.stderr,
+                )
+                continue
+            if skill["name"] in self._skills:
+                prior = self._skills[skill["name"]]["path"]
+                print(
+                    f"⚠️  skill rejected: duplicate name '{skill['name']}' at {skill_md} "
+                    f"(already loaded from {prior})",
+                    file=sys.stderr,
+                )
+                continue
+            self._skills[skill["name"]] = skill
+            discovered.append(skill["name"])
 
         # Pattern 2: skills/SKILL.md (single-skill, no subdirectory)
+        # The parent-dir match check does not apply here — by convention the
+        # repo-root single-skill layout uses the frontmatter name verbatim.
         root_skill = os.path.join(self.skills_dir, SKILL_FILENAME)
         if os.path.isfile(root_skill):
             skill = parse_skill_md(root_skill)
