@@ -80,10 +80,10 @@ class _ExplodingTrace:
 
 class TestTraceFinalizeNonFatal:
     def test_tracing_failure_does_not_raise(self, caplog):
-        """_finalize_run must return a LoopResult even if trace.finish() raises."""
+        """finalize_run must return a LoopResult even if trace.finish() raises."""
         caplog.set_level(logging.WARNING, logger=loop_engine.__name__)
         trace = _ExplodingTrace()
-        result = loop_engine._finalize_run(
+        result = loop_engine.finalize_run(
             status="completed",
             text="hi",
             final_text="hi",
@@ -104,7 +104,7 @@ class TestTraceFinalizeNonFatal:
     def test_tracing_disabled_is_quiet(self, caplog):
         """No trace → no warning, no exception."""
         caplog.set_level(logging.WARNING, logger=loop_engine.__name__)
-        result = loop_engine._finalize_run(
+        result = loop_engine.finalize_run(
             status="completed",
             text="hi",
             final_text="hi",

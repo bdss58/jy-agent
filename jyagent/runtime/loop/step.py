@@ -292,7 +292,7 @@ class StepBreak:
     """Step requests outer-loop break (cooperative cancellation).
 
     The engine's post-loop cancelled-exit handler runs after this — it
-    funnels through ``_finalize_run`` with status='interrupted'.
+    funnels through ``finalize_run`` with status='interrupted'.
     """
     reason: Literal["cancelled"]
 
@@ -335,7 +335,7 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     """
     # Lazy imports break the engine→step→engine cycle without polluting
     # module-load order. Cost: one dict lookup per step (negligible).
-    from .finalize import finalize_run as _finalize_run, is_truncated as _is_truncated
+    from .finalize import finalize_run, is_truncated
     from .llm_runner import extract_text as _extract_text
     from .compaction import truncate_tool_call_blocks as _truncate_tool_call_blocks
     from .verification import should_verify, build_verification_prompt
@@ -425,7 +425,7 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
         result_text = state.all_text if state.all_text else "I processed your request but had no text response to return."
 
         cost = cost_tracker.cost if cost_tracker else 0.0
-        return StepTerminate(_finalize_run(
+        return StepTerminate(finalize_run(
             status="completed",
             text=result_text,
             final_text=state.final_text,
@@ -444,11 +444,11 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     # ── 7. Truncation detection → scale up and retry step (may terminate) ─
     #
     # Kept inline per codex's review — another behavioural branch point.
-    if cfg.auto_scale_on_truncation and _is_truncated(stop_reason, tool_call_blocks):
+    if cfg.auto_scale_on_truncation and is_truncated(stop_reason, tool_call_blocks):
         state.consecutive_truncations += 1
         if state.consecutive_truncations > state.max_truncation_retries:
             cost = cost_tracker.cost if cost_tracker else 0.0
-            return StepTerminate(_finalize_run(
+            return StepTerminate(finalize_run(
                 status="error",
                 text=state.all_text or "",
                 final_text="",
@@ -679,7 +679,7 @@ def _record_llm_usage_and_cost(
 
     Accumulates ``state.total_input_tokens`` / ``state.total_output_tokens``.
     """
-    from .finalize import finalize_run as _finalize_run
+    from .finalize import finalize_run
 
     cfg = loop._config
     step = state.step
@@ -748,7 +748,7 @@ def _record_llm_usage_and_cost(
         if trace:
             trace.add_span(step=step, event_type="cost_check", success=False,
                            error=f"budget ${cfg.max_cost_usd} exceeded")
-        return StepTerminate(_finalize_run(
+        return StepTerminate(finalize_run(
             status="cost_limit",
             text=state.all_text or "",
             final_text=state.final_text,
@@ -990,7 +990,7 @@ def _check_stuck_loop(
     Returns ``StepTerminate(...)`` when a stuck-loop pattern is detected,
     else ``None``.
     """
-    from .finalize import finalize_run as _finalize_run
+    from .finalize import finalize_run
     from .stuck_loop import StuckLoopDetector
 
     step = state.step
@@ -1024,7 +1024,7 @@ def _check_stuck_loop(
     if trace:
         trace.add_span(step=step, event_type="dedup_break", success=False,
                        error=stuck_feedback)
-    return StepTerminate(_finalize_run(
+    return StepTerminate(finalize_run(
         status="dedup_break",
         text=state.all_text or "",
         final_text=state.final_text,

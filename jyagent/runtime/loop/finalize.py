@@ -3,9 +3,9 @@
 Extracted from ``engine.py`` so that ``step.py`` (and any future
 sub-module that needs to terminate a run) can import these without
 reaching back into ``engine.py``.  Before this split, ``step.py``
-imported ``_finalize_run`` and ``_is_truncated`` from ``.engine`` —
-that closed a circular conceptual dependency (engine owns step, step
-reaches back into engine for terminal helpers).
+imported helpers from ``.engine`` — that closed a circular conceptual
+dependency (engine owns step, step reaches back into engine for
+terminal helpers).
 
 Three helpers live here:
 
@@ -24,11 +24,10 @@ Three helpers live here:
     strips dangling verification, finishes + flushes the trace span
     (best-effort), and returns a populated ``LoopResult``.
 
-These were ``_``-prefixed in ``engine.py`` because they were treated as
-module-private.  Now that they are shared across two modules, the
-public names drop the underscore — but the engine and step modules
-both alias the old names for back-compat so test imports keep working
-unchanged.
+These used to carry ``_``-prefixed names in ``engine.py`` while they
+were module-private.  Both the extraction and the subsequent rename
+landed in one branch — no alias bridge, no dual-name surface.  Engine
+and step both import the public names directly.
 """
 
 from __future__ import annotations

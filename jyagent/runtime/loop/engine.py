@@ -105,17 +105,14 @@ from .llm_runner import (
 )
 
 
-# Terminal-path helpers (``finalize_run``, ``is_truncated``,
-# ``strip_dangling_verification``) live in ``runtime/loop/finalize.py``.
-# They are imported there so ``step.py`` can import them directly without
-# reaching back into ``engine`` — breaking the historical
-# step→engine→step cyclic conceptual dependency.  The ``_``-prefixed
-# aliases below preserve backward compatibility for any
-# out-of-tree/test code that previously imported them from this module.
+# Terminal-path helpers live in ``runtime/loop/finalize.py``.  step.py
+# imports them directly from there too (breaking the historical
+# step→engine→step cyclic conceptual dependency).  No underscore alias
+# layer — both modules use the same public names.
 from .finalize import (  # noqa: E402
-    finalize_run as _finalize_run,
-    is_truncated as _is_truncated,
-    strip_dangling_verification as _strip_dangling_verification,
+    finalize_run,
+    is_truncated,
+    strip_dangling_verification,
 )
 
 
@@ -321,7 +318,7 @@ class AgentLoop(LoopThreadHelper):
             # Mirror the todos pattern — snapshot
             # the mutating-timeout accumulator onto the result so every exit
             # path benefits without having to thread the list through every
-            # _finalize_run() call site.  Copy defensively so a caller that
+            # finalize_run() call site.  Copy defensively so a caller that
             # retains the returned list can't mutate the AgentLoop's internal
             # state on the next run.
             result.partial_side_effects = list(self._partial_side_effects)
@@ -363,7 +360,7 @@ class AgentLoop(LoopThreadHelper):
         cfg = self._config
         state = RunState.prepare_for_run(self, system_prompt, messages, initial_todos)
         # Aliases for the post-loop terminal handlers below.  ``trace`` is
-        # threaded into 5 ``_finalize_run`` calls and ``cost_tracker`` into
+        # threaded into 5 ``finalize_run`` calls and ``cost_tracker`` into
         # 7 lexical sites, so the locals earn their keep on readability.
         # ``effective_spec`` is read inline from ``state`` at its single
         # use site.
@@ -391,7 +388,7 @@ class AgentLoop(LoopThreadHelper):
 
             # ── Cooperative cancellation — early exit ────────────────
             if self._is_cancelled():
-                return _finalize_run(
+                return finalize_run(
                     status="interrupted",
                     text=state.all_text or "",
                     final_text=state.final_text,
@@ -413,11 +410,11 @@ class AgentLoop(LoopThreadHelper):
             # (Old condition `not final_text` was wrong — `final_text` is
             # written on every step including ones that also had tool calls.)
             #
-            # Defense-in-depth: the canonical _finalize_run() path always
+            # Defense-in-depth: the canonical finalize_run() path always
             # strips dangling [VERIFICATION] (idempotently), so we no longer
             # need a guarded pre-strip here.  The boundary guard at the
             # gate (step + 1 < cfg.max_steps) should already prevent the
-            # leak, but _finalize_run cleans up unconditionally as belt-
+            # leak, but finalize_run cleans up unconditionally as belt-
             # and-suspenders.
 
             if cfg.fallback_on_max_steps:
@@ -522,7 +519,7 @@ class AgentLoop(LoopThreadHelper):
                     # Note: previously this path skipped trace.finish() — the
                     # max_steps trace block below was unreachable on success.
                     cost = cost_tracker.cost if cost_tracker else 0.0
-                    return _finalize_run(
+                    return finalize_run(
                         status="completed",
                         text=fallback_text or state.all_text,
                         final_text=fallback_text,
@@ -545,7 +542,7 @@ class AgentLoop(LoopThreadHelper):
 
             # ── max_steps exit ─────────────────────────────────────────
             cost = cost_tracker.cost if cost_tracker else 0.0
-            return _finalize_run(
+            return finalize_run(
                 status="max_steps",
                 text=state.all_text or "",
                 final_text=state.final_text,
@@ -562,7 +559,7 @@ class AgentLoop(LoopThreadHelper):
             )
 
         except KeyboardInterrupt:
-            return _finalize_run(
+            return finalize_run(
                 status="interrupted",
                 text=state.all_text + "\n\n[Interrupted by user]" if state.all_text else "[Interrupted by user]",
                 final_text="",
@@ -577,7 +574,7 @@ class AgentLoop(LoopThreadHelper):
                 trace=trace,
             )
         except Exception as e:
-            return _finalize_run(
+            return finalize_run(
                 status="error",
                 text=state.all_text or "",
                 final_text="",
