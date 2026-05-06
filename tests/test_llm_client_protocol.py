@@ -81,7 +81,14 @@ class _FakeOneShotClient:
         return {
             "role": "assistant",
             "content": [{"type": "text", "text": self._reply_text}],
-            "stop_reason": "end_turn",
+            # Use the engine's normalized stop_reason ('stop'), not the
+            # Anthropic wire-format value 'end_turn'.  Real adapters
+            # translate end_turn -> stop at the decode boundary; the runtime
+            # only ever sees the normalized value (see
+            # jyagent.llm.types.StopReason).  Sticking 'end_turn' here
+            # made this fake incompatible with the provider-output
+            # validator — caught by Codex review commit 2026-05.
+            "stop_reason": "stop",
             "usage": {"input_tokens": 5, "output_tokens": 7},
         }
 

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import threading
 from typing import TYPE_CHECKING
@@ -204,6 +205,58 @@ class LLMRunner(LoopThreadHelper):
         self.cancel_event = cancel_event
         self.model_spec = model_spec
 
+    # ── provider-output validation gate ──────────────────────────────────────
+
+    def _should_validate_provider_output(self) -> bool:
+        """Return True iff provider output should be runtime-validated.
+
+        Two equally-weighted triggers (boolean OR):
+          * ``LoopConfig.validate_provider_output = True`` — caller-set per
+            loop instance (e.g. test harness, dev sessions).
+          * ``JYAGENT_VALIDATE_PROVIDER_OUTPUT`` env var set to a truthy
+            value — global override that doesn't require touching every
+            test fixture.  Truthy: ``1``, ``true``, ``yes``, ``on``
+            (case-insensitive).
+
+        Resolved on every call so a test can flip the env var inside one
+        case without rebuilding the runner.  Microsecond-cheap; no caching.
+        """
+        if self.config.validate_provider_output:
+            return True
+        env_val = os.environ.get("JYAGENT_VALIDATE_PROVIDER_OUTPUT", "").strip().lower()
+        return env_val in {"1", "true", "yes", "on"}
+
+    def _validate_assistant_message_or_warn(self, msg: dict, *, source: str) -> None:
+        """Validate ``msg`` as an ``AssistantMessage``; raise on failure.
+
+        ``source`` is a short human-readable label that disambiguates
+        which boundary failed in the error path: ``"complete"`` for
+        ``LLMClient.complete`` returns, ``"stream:done"`` /
+        ``"stream:error"`` for terminal stream events.
+
+        Failures raise ``MessageValidationError`` (TypeError subclass) so
+        the loop's existing retry/finalize machinery gets a structured
+        signal — the validator path never silently logs-and-continues
+        because that defeats the purpose (catching adapter drift before
+        it corrupts loop state).
+        """
+        # Lazy import: keeps the runtime engine import-graph free of the
+        # llm.validation module unless the gate is on.  Validators are
+        # pure-Python and depend only on jyagent.llm.types, so the import
+        # is cheap when it does happen.
+        from ...llm.validation import (
+            MessageValidationError,
+            validate_assistant_message,
+        )
+        try:
+            validate_assistant_message(msg, path=f"provider({source}).message")
+        except MessageValidationError:
+            # Re-raise unchanged — the path already names the boundary.
+            # Caller's existing exception handlers (retry layer in
+            # call_with_retry) will surface this as
+            # "non-transient_error" and end the run with a precise error.
+            raise
+
     # ── cancellation + callback helpers from LoopThreadHelper ───────────────
     # ``_is_cancelled``, ``_cancellable_sleep``, ``_fire`` live on the
     # ``LoopThreadHelper`` mixin (see ``_thread_helpers.py``).  Class-var
@@ -279,6 +332,13 @@ class LLMRunner(LoopThreadHelper):
             assert final_holder[0] is not None
             final_message = final_holder[0]
 
+        # Provider boundary: validate the assistant message shape before
+        # the loop trusts ``stop_reason`` / ``usage`` / ``content`` fields.
+        # Gated by ``LoopConfig.validate_provider_output`` (or
+        # ``JYAGENT_VALIDATE_PROVIDER_OUTPUT`` env var) — off by default.
+        if self._should_validate_provider_output():
+            self._validate_assistant_message_or_warn(final_message, source="complete")
+
         stop_reason = final_message.get("stop_reason", "stop")
 
         if stop_reason == "error":
@@ -324,6 +384,14 @@ class LLMRunner(LoopThreadHelper):
         # reporting on error.
         emitted_len = 0
         final_message: dict | None = None
+        # Track which terminal event produced ``final_message`` so the
+        # provider-output validator can name the exact stream boundary
+        # ("stream:done" vs "stream:error" vs "stream:fallback") in any
+        # error message.  The previous heuristic of inferring from
+        # ``final_message["stop_reason"] == "error"`` failed when the
+        # adapter handed us a malformed error event (no stop_reason at
+        # all) — exactly the case we want to catch.
+        final_message_source: str = "stream:fallback"
         thinking_active = False
         stream = None
 
@@ -425,6 +493,7 @@ class LLMRunner(LoopThreadHelper):
 
                 elif etype == "done":
                     final_message = event["message"]
+                    final_message_source = "stream:done"
                     # Buffered mode: flush the accumulated text now that we
                     # know the stream completed cleanly.
                     if cfg.buffered_streaming:
@@ -432,9 +501,21 @@ class LLMRunner(LoopThreadHelper):
 
                 elif etype == "error":
                     final_message = event["message"]
+                    final_message_source = "stream:error"
 
             if final_message is None:
                 final_message = stream.get_final_message()
+                # ``final_message_source`` stays at its initial "stream:fallback"
+                # value so the validator labels this path correctly.
+
+            # Provider boundary: validate the terminal stream message shape
+            # before the loop trusts ``stop_reason`` / ``usage`` / ``content``
+            # fields.  Gated by ``LoopConfig.validate_provider_output`` (or
+            # ``JYAGENT_VALIDATE_PROVIDER_OUTPUT`` env var) — off by default.
+            if self._should_validate_provider_output():
+                self._validate_assistant_message_or_warn(
+                    final_message, source=final_message_source,
+                )
 
             stop_reason = final_message.get("stop_reason", "stop")
             if stop_reason == "error":

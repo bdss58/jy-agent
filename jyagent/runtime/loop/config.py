@@ -72,6 +72,24 @@ class LoopConfig:
     # Harness controls
     max_cost_usd: float | None = None       # cost budget per turn — None = unlimited
     dedup_threshold: int = 3                 # same tool+args+response N times → break loop
+    # Runtime validation of provider output (Codex review #3 / 2026-05).
+    # When True, every assistant message returned by ``LLMClient.complete``
+    # and every terminal stream event from ``LLMClient.stream`` is checked
+    # against the canonical TypedDict shapes in jyagent.llm.types via
+    # jyagent.llm.validation.  Adapter drift (renamed key, missing field,
+    # wrong-type usage counter) raises ``MessageValidationError`` with a
+    # precise pointer-style path *at the boundary* — instead of silently
+    # corrupting loop state and surfacing as a token-count regression three
+    # steps later.
+    #
+    # Off by default: the validator is microsecond-cheap but every
+    # production message runs through provider SDKs that we can't fully
+    # type-check, and this is a defense-in-depth check primarily useful
+    # in dev / CI.  Tests force it on via the ``JYAGENT_VALIDATE_PROVIDER_OUTPUT``
+    # env var (``conftest.py`` sets it for the whole pytest session) so
+    # adapter changes that violate the contract fail loudly during test
+    # runs without having to thread the flag through every fixture.
+    validate_provider_output: bool = False
 
 
 @dataclass
