@@ -233,14 +233,16 @@ def validate_tool_result_message(value: Any, path: str = "message") -> ToolResul
     _check_str(tc_id, f"{path}.tool_call_id", allow_empty=False)
     name = _check_required(d, "tool_name", path)
     _check_str(name, f"{path}.tool_name")
-    # `content` may legally be a string or a list of content parts (some
-    # providers return structured tool_result payloads).  Accept either.
+    # ``content`` must be a str — matches the ``ToolResultMessage`` TypedDict
+    # and the actual runtime construction sites (step.py cancellation path,
+    # llm.messages.inject_missing_tool_results).  The validator previously
+    # accepted ``str | list`` too, but no runtime code produces a list
+    # content for this role, and accepting it hid a validator/type drift
+    # Codex review flagged 2026-05.  If a future provider genuinely
+    # returns structured tool_result content, expand both TypedDict AND
+    # validator together.
     content = _check_required(d, "content", path)
-    if not isinstance(content, (str, list)):
-        raise MessageValidationError(
-            f"{path}.content",
-            f"expected str or list, got {type(content).__name__}",
-        )
+    _check_str(content, f"{path}.content")
     is_error = _check_required(d, "is_error", path)
     _check_bool(is_error, f"{path}.is_error")
     return cast(ToolResultMessage, d)

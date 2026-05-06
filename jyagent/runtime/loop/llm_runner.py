@@ -492,16 +492,24 @@ class LLMRunner(LoopThreadHelper):
                         self._fire("on_thinking_stop")
 
                 elif etype == "done":
-                    final_message = event["message"]
-                    final_message_source = "stream:done"
+                    # Defensive: a malformed adapter event missing 'message'
+                    # used to crash with a raw KeyError here, surfacing as
+                    # a generic loop error rather than a structured boundary
+                    # validation failure.  Pull with .get() and let the
+                    # downstream validation path (or the get_final_message
+                    # fallback) handle the absence.
+                    final_message = event.get("message")
+                    if final_message is not None:
+                        final_message_source = "stream:done"
                     # Buffered mode: flush the accumulated text now that we
                     # know the stream completed cleanly.
                     if cfg.buffered_streaming:
                         _flush_pending()
 
                 elif etype == "error":
-                    final_message = event["message"]
-                    final_message_source = "stream:error"
+                    final_message = event.get("message")
+                    if final_message is not None:
+                        final_message_source = "stream:error"
 
             if final_message is None:
                 final_message = stream.get_final_message()

@@ -46,7 +46,12 @@ class _FakeClient:
             def get_final_message(self):
                 for ev in reversed(events):
                     if ev.get("type") in {"done", "error"}:
-                        return ev["message"]
+                        # Use .get so a malformed event missing 'message'
+                        # still returns a well-formed fallback (matching the
+                        # new resilience in llm_runner.py).
+                        msg = ev.get("message")
+                        if msg is not None:
+                            return msg
                 return {"role": "assistant", "content": []}
             def close(self): pass
             def __enter__(self): return self
@@ -179,6 +184,32 @@ class TestCallStreamingValidationGate:
         with pytest.raises(MessageValidationError) as exc_info:
             runner.call_streaming({}, LLMOptions())
         assert "stream:error" in exc_info.value.path
+    def test_streaming_done_event_missing_message_key_falls_through(self):
+        """Regression (Codex review round 2): a malformed 'done' event
+        missing the 'message' key used to raise a raw KeyError at
+        event['message'] access.  Now falls through to
+        stream.get_final_message() so the validator (or downstream loop)
+        sees a well-formed message from the stream's accumulator instead
+        of a crash.  This is graceful degradation, not silent drop —
+        validation remains available at the terminal boundary."""
+        client = _FakeClient(ModelSpec(provider="anthropic", model="x"))
+        # Adapter sends a done event with no inner message payload
+        # (simulating adapter drift).  The fake stream's get_final_message()
+        # returns the canonical empty assistant fallback.
+        client._stream_events = [{"type": "done"}]
+        runner = _make_runner(client, validate=False)
+        # Should NOT raise — fallback to get_final_message() path.
+        text, tool_calls, stop_reason, msg = runner.call_streaming({}, LLMOptions())
+        # stream.get_final_message on the fake returns the empty canonical shape
+        assert msg.get("role") == "assistant"
+
+    def test_streaming_error_event_missing_message_key_falls_through(self):
+        """Same as above, but for 'error' events."""
+        client = _FakeClient(ModelSpec(provider="anthropic", model="x"))
+        client._stream_events = [{"type": "error"}]  # no 'message' key
+        runner = _make_runner(client, validate=False)
+        text, tool_calls, stop_reason, msg = runner.call_streaming({}, LLMOptions())
+        assert msg.get("role") == "assistant"
 
     def test_streaming_good_message_passes(self):
         client = _FakeClient(ModelSpec(provider="anthropic", model="x"))

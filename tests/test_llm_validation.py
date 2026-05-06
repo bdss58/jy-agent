@@ -74,14 +74,21 @@ class TestHappyPath:
         })
         assert msg["content"] == "ok"
 
-    def test_tool_result_with_list_content(self):
-        # Some providers return structured tool_result content.
-        msg = validate_tool_result_message({
-            "role": "tool_result", "tool_call_id": "tc1",
-            "tool_name": "read", "content": [{"type": "text", "text": "ok"}],
-            "is_error": False,
-        })
-        assert isinstance(msg["content"], list)
+    def test_tool_result_with_list_content_now_rejected(self):
+        # The validator was tightened 2026-05 (Codex review #3 round 2): it
+        # now requires `content: str`, matching ToolResultMessage's TypedDict
+        # and the actual runtime construction sites.  No runtime code path
+        # produces a list content for tool_result; accepting it hid a
+        # validator/type drift.
+        with pytest.raises(MessageValidationError) as exc_info:
+            validate_tool_result_message({
+                "role": "tool_result", "tool_call_id": "tc1",
+                "tool_name": "read",
+                "content": [{"type": "text", "text": "ok"}],
+                "is_error": False,
+            })
+        assert "content" in exc_info.value.path
+        assert "expected str" in exc_info.value.reason
 
     def test_validate_message_dispatch(self):
         """validate_message routes by role."""
