@@ -31,9 +31,6 @@ from jyagent.memory.event_log import event_log_path
 def tmp_sessions_dir(monkeypatch):
     td = tempfile.mkdtemp(prefix="jyagent_session_test_")
     monkeypatch.setattr(config, "SESSIONS_DIR", td)
-    # Bypass the once-per-process migration latch so each test starts clean.
-    import jyagent.memory.session as session_mod
-    monkeypatch.setattr(session_mod, "_MIGRATION_DONE", False)
     yield td
 
 

@@ -74,7 +74,6 @@ def checkpoint_session(
     Returns the session_id on success, or ``""`` if the conversation is empty.
     Raises on log I/O failure — the caller decides whether to swallow.
     """
-    _run_legacy_migration()
     ensure_session_dir()
 
     if not conversation.messages:
@@ -139,7 +138,6 @@ def load_session(
             "error": str,                 # only when loaded is False
         }
     """
-    _run_legacy_migration()
     ensure_session_dir()
 
     target_sid = _resolve_query_to_sid(query)
@@ -183,7 +181,6 @@ def load_session(
 
 def has_saved_session() -> bool:
     """True iff latest.txt points at an existing, non-ended log."""
-    _run_legacy_migration()
     sid = _read_latest_pointer()
     if not sid:
         return False
@@ -200,7 +197,6 @@ def list_sessions(limit: Optional[int] = None) -> list[dict]:
 
     Bad / unreadable files are silently skipped.
     """
-    _run_legacy_migration()
     ensure_session_dir()
 
     events_dir = os.path.join(config.SESSIONS_DIR, "events")
@@ -593,138 +589,5 @@ def _clear_latest_pointer() -> bool:
         return True
     except FileNotFoundError:
         return False
-    except OSError:
-        return False
-
-
-# ─── Legacy migration (one-shot, idempotent) ─────────────────────────────────
-#
-# Old layout (pre-2026-05):
-#   data/sessions/latest.json                  — current session snapshot
-#   data/sessions/<timestamp>.json             — timestamped archives
-#   data/sessions/events/<session_id>.jsonl    — event log (may or may not exist)
-#
-# New layout:
-#   data/sessions/events/<session_id>.jsonl    — the only persistent file
-#   data/sessions/latest.txt                   — pointer
-#
-# Strategy: for each legacy *.json snapshot, if its session_id has NO
-# events/<sid>.jsonl on disk, synthesize one (session_start + message events)
-# from the snapshot. Then rename the snapshot to *.json.legacy so subsequent
-# runs skip it. If events/<sid>.jsonl DOES exist, just rename (the log is
-# authoritative; the snapshot is redundant).
-#
-# Runs on the first module-level API call per process. Safe to retry.
-
-_MIGRATION_DONE: bool = False
-
-
-def _run_legacy_migration() -> None:
-    global _MIGRATION_DONE
-    if _MIGRATION_DONE:
-        return
-    _MIGRATION_DONE = True
-
-    sessions_dir = config.SESSIONS_DIR
-    if not os.path.isdir(sessions_dir):
-        return
-
-    try:
-        names = os.listdir(sessions_dir)
-    except OSError:
-        return
-
-    # Identify legacy snapshot files (anything ending in .json at the top level,
-    # including latest.json). Never touch the events/ subdir.
-    legacy_paths = [
-        os.path.join(sessions_dir, n)
-        for n in names
-        if n.endswith(".json") and os.path.isfile(os.path.join(sessions_dir, n))
-    ]
-    if not legacy_paths:
-        return
-
-    os.makedirs(os.path.join(sessions_dir, "events"), exist_ok=True)
-
-    # Find the most-recent snapshot (by saved_at) that was the "latest" so we
-    # can seed latest.txt if the user has no latest.txt yet.
-    best_sid: Optional[str] = None
-    best_ts: str = ""
-
-    for path in legacy_paths:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            continue
-
-        sid = payload.get("session_id") or ""
-        if not sid:
-            # Pre-session-id legacy — skip; not recoverable.
-            _rename_legacy(path)
-            continue
-
-        log_path = event_log_path(sid, sessions_dir)
-        synthesized_ok = True
-        if not os.path.isfile(log_path):
-            synthesized_ok = _synthesize_log_from_snapshot(sid, payload)
-
-        saved_at = payload.get("saved_at") or ""
-        is_latest = os.path.basename(path) == "latest.json"
-        if is_latest and synthesized_ok and (not best_sid or saved_at > best_ts):
-            best_sid = sid
-            best_ts = saved_at
-
-        # Only rename the legacy file if the synthesis succeeded — otherwise
-        # leave it on disk so the next run can retry. Renaming a failed
-        # synthesis would silently lose the only on-disk copy.
-        if synthesized_ok:
-            _rename_legacy(path)
-
-    # Seed latest.txt if the user had a latest.json but no latest.txt yet.
-    if best_sid and not _read_latest_pointer():
-        _write_latest_pointer(best_sid)
-
-
-def _rename_legacy(path: str) -> None:
-    """Rename *.json → *.json.legacy so we don't re-process on next run."""
-    try:
-        os.replace(path, path + ".legacy")
-    except OSError:
-        pass
-
-
-def _synthesize_log_from_snapshot(session_id: str, payload: dict) -> bool:
-    """Write a minimal event log from a legacy snapshot.
-
-    Emits:
-      seq 0: session_start with the snapshot's metadata
-      seq 1..N: one ``message`` event per message in the snapshot
-
-    Returns True on success, False on any I/O failure (caller should NOT
-    rename the legacy file in that case — leave it for the next run to
-    retry, otherwise we'd silently lose the only on-disk copy of the data).
-    """
-    messages = payload.get("messages") or []
-    if not messages:
-        # Nothing to migrate; treat as success so caller renames the file.
-        return True
-    try:
-        log = open_event_log(session_id, config.SESSIONS_DIR)
-        # If someone raced us and populated the log already, skip.
-        if len(log) > 0:
-            log.close()
-            return True
-        log.emit({
-            "kind": "session_start",
-            "metadata": _copy_metadata(payload.get("metadata") or {}),
-        })
-        log.emit_many([
-            {"kind": "message", "message": m}
-            for m in messages
-            if isinstance(m, dict)
-        ])
-        log.close()
-        return True
     except OSError:
         return False

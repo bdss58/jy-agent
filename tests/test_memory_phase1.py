@@ -125,15 +125,9 @@ def test_show_memory_includes_timestamps():
 
 # ─── Test 2: Session Persistence ─────────────────────────────────────────────
 
-def _reset_migration_latch():
-    """Each test resets SESSIONS_DIR; also reset the once-per-process migration flag."""
-    import jyagent.memory.session as session_mod
-    session_mod._MIGRATION_DONE = False
-
 
 def test_checkpoint_and_load_session():
     setup()
-    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
     conv.add_message("assistant", "Hi there!")
@@ -160,7 +154,6 @@ def test_checkpoint_and_load_session():
 
 def test_has_saved_session():
     setup()
-    _reset_migration_latch()
     assert not has_saved_session(), "Should not find session before checkpoint"
     conv = ConversationMemory()
     conv.add_message("user", "test")
@@ -171,7 +164,6 @@ def test_has_saved_session():
 
 def test_delete_session_clears_pointer():
     setup()
-    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "test")
     checkpoint_session(conv)
@@ -187,7 +179,6 @@ def test_delete_session_clears_pointer():
 
 def test_checkpoint_empty_conversation():
     setup()
-    _reset_migration_latch()
     conv = ConversationMemory()
     result = checkpoint_session(conv)
     assert result == "", "Should return empty for empty conversation"
@@ -196,7 +187,6 @@ def test_checkpoint_empty_conversation():
 
 def test_load_nonexistent_session():
     setup()
-    _reset_migration_latch()
     conv = ConversationMemory()
     result = load_session(conv, query="does-not-exist-9999")
     assert result["loaded"] is False
@@ -206,7 +196,6 @@ def test_load_nonexistent_session():
 
 def test_end_session_marks_ended_but_keeps_log():
     setup()
-    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
     checkpoint_session(conv)
@@ -225,7 +214,6 @@ def test_end_session_marks_ended_but_keeps_log():
 
 def test_event_log_structure():
     setup()
-    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
     conv.add_message("assistant", "World")
@@ -244,47 +232,6 @@ def test_event_log_structure():
     # Session id is a valid UUID.
     UUID(conv.session_id)
     print("  ✅ event log structure: session_start + messages")
-
-
-def test_legacy_snapshot_migrates_on_first_call():
-    setup()
-    _reset_migration_latch()
-    # Drop a legacy latest.json + a timestamped archive on disk.
-    legacy_sid_a = "legacy-aaaa-bbbb-cccc-dddd-eeeeffff0011"
-    legacy_sid_b = "legacy-aaaa-bbbb-cccc-dddd-eeeeffff0022"
-    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
-    with open(os.path.join(config.SESSIONS_DIR, "latest.json"), "w") as f:
-        json.dump({
-            "version": 1, "session_id": legacy_sid_a,
-            "saved_at": "2026-04-29T12:00:00+08:00", "message_count": 1,
-            "metadata": {"provider": "anthropic", "model": "legacy-model"},
-            "messages": [{"role": "user", "content": "legacy-a"}],
-        }, f)
-    with open(os.path.join(config.SESSIONS_DIR, "20260428_120000.json"), "w") as f:
-        json.dump({
-            "version": 1, "session_id": legacy_sid_b,
-            "saved_at": "2026-04-28T12:00:00+08:00", "message_count": 1,
-            "metadata": {},
-            "messages": [{"role": "user", "content": "legacy-b"}],
-        }, f)
-
-    # Any API call triggers migration.
-    entries = list_sessions()
-    sids = {e["session_id"] for e in entries}
-    assert legacy_sid_a in sids
-    assert legacy_sid_b in sids
-    # Legacy files were renamed.
-    assert not os.path.isfile(os.path.join(config.SESSIONS_DIR, "latest.json"))
-    assert os.path.isfile(os.path.join(config.SESSIONS_DIR, "latest.json.legacy"))
-    # Pointer was seeded from latest.json → points at legacy_sid_a.
-    with open(os.path.join(config.SESSIONS_DIR, "latest.txt")) as f:
-        assert f.read().strip() == legacy_sid_a
-    # Replay works on the migrated log.
-    conv = ConversationMemory()
-    result = load_session(conv, query=legacy_sid_b)
-    assert result["loaded"]
-    assert conv.messages[0]["content"] == "legacy-b"
-    print("  ✅ legacy snapshots migrate to event log + pointer on first call")
 
 
 def test_conversation_clear_rotates_session_id():
@@ -462,7 +409,6 @@ if __name__ == "__main__":
         test_load_nonexistent_session,
         test_end_session_marks_ended_but_keeps_log,
         test_event_log_structure,
-        test_legacy_snapshot_migrates_on_first_call,
         test_conversation_clear_rotates_session_id,
         # 3. Config
         test_max_memory_prompt_chars,

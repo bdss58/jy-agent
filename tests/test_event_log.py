@@ -28,8 +28,6 @@ from jyagent.memory import (
 def tmp_sessions_dir(monkeypatch):
     td = tempfile.mkdtemp(prefix="jyagent_evlog_test_")
     monkeypatch.setattr(config, "SESSIONS_DIR", td)
-    import jyagent.memory.session as session_mod
-    monkeypatch.setattr(session_mod, "_MIGRATION_DONE", False)
     yield td
 
 
@@ -284,75 +282,7 @@ def test_clear_detaches_event_log(tmp_sessions_dir):
     assert os.path.isfile(event_log_path(new_sid, tmp_sessions_dir))
 
 
-# ─── Legacy migration ─────────────────────────────────────────────────────────
-
-def test_legacy_snapshot_is_migrated_into_event_log(tmp_sessions_dir):
-    """A legacy data/sessions/<ts>.json with no events/<sid>.jsonl gets
-    synthesized into the log on first session-API call, then renamed
-    .legacy so we don't re-process."""
-    legacy_sid = "legacy-session-xyz"
-    snapshot = {
-        "version": 1,
-        "session_id": legacy_sid,
-        "saved_at": "2026-01-01T00:00:00+08:00",
-        "message_count": 2,
-        "metadata": {"provider": "anthropic", "model": "old"},
-        "messages": [
-            {"role": "user", "content": "legacy q"},
-            {"role": "assistant", "content": "legacy a"},
-        ],
-    }
-    legacy_path = os.path.join(tmp_sessions_dir, "20260101_000000+0800.json")
-    with open(legacy_path, "w") as f:
-        json.dump(snapshot, f)
-
-    # Trigger migration.
-    c = ConversationMemory()
-    result = load_session(c, query=legacy_sid)
-    assert result["loaded"]
-    assert c.messages == snapshot["messages"]
-    assert c.session_id == legacy_sid
-
-    # The legacy file is renamed.
-    assert not os.path.isfile(legacy_path)
-    assert os.path.isfile(legacy_path + ".legacy")
-
-    # The synthesized log has session_start + 2 messages.
-    log_file = event_log_path(legacy_sid, tmp_sessions_dir)
-    assert os.path.isfile(log_file)
-    with open(log_file) as f:
-        events = [json.loads(l) for l in f]
-    assert events[0]["kind"] == "session_start"
-    assert events[0]["metadata"]["model"] == "old"
-    assert events[1]["kind"] == "message"
-    assert events[2]["kind"] == "message"
-
-
-def test_legacy_latest_json_seeds_latest_pointer(tmp_sessions_dir):
-    """A legacy latest.json that arrives without latest.txt seeds the pointer."""
-    from jyagent.memory.session import has_saved_session
-
-    legacy_sid = "legacy-pointer-sid"
-    snapshot = {
-        "version": 1,
-        "session_id": legacy_sid,
-        "saved_at": "2026-01-02T00:00:00+08:00",
-        "message_count": 1,
-        "metadata": {},
-        "messages": [{"role": "user", "content": "x"}],
-    }
-    with open(os.path.join(tmp_sessions_dir, "latest.json"), "w") as f:
-        json.dump(snapshot, f)
-
-    # Trigger migration via any session API call.
-    assert has_saved_session() is True
-    # Pointer now exists.
-    with open(os.path.join(tmp_sessions_dir, "latest.txt")) as f:
-        assert f.read().strip() == legacy_sid
-    # And the legacy file was renamed.
-    assert not os.path.isfile(os.path.join(tmp_sessions_dir, "latest.json"))
-    assert os.path.isfile(os.path.join(tmp_sessions_dir, "latest.json.legacy"))
-
+# ─── Metadata dedup ──────────────────────────────────────────────────────────
 
 def test_metadata_dedup_is_O1_per_checkpoint(tmp_sessions_dir):
     """Repeated checkpoints with unchanged metadata must NOT re-emit
@@ -393,35 +323,3 @@ def test_metadata_change_emits_session_meta(tmp_sessions_dir):
     meta_evt = next(e for e in events if e["kind"] == "session_meta")
     assert meta_evt["metadata"]["model"] == "y"
 
-
-def test_synthesis_failure_does_not_lose_legacy_data(tmp_sessions_dir, monkeypatch):
-    """If _synthesize_log_from_snapshot fails, the .json must NOT be renamed.
-
-    Otherwise a transient I/O error would silently lose the only on-disk copy.
-    """
-    import jyagent.memory.session as session_mod
-
-    legacy_sid = "fail-migration-sid"
-    snapshot = {
-        "version": 1,
-        "session_id": legacy_sid,
-        "saved_at": "2026-01-02T00:00:00+08:00",
-        "message_count": 1,
-        "metadata": {},
-        "messages": [{"role": "user", "content": "x"}],
-    }
-    legacy_path = os.path.join(tmp_sessions_dir, "latest.json")
-    with open(legacy_path, "w") as f:
-        json.dump(snapshot, f)
-
-    # Force synthesis to fail.
-    def _boom(*args, **kwargs):
-        return False
-    monkeypatch.setattr(session_mod, "_synthesize_log_from_snapshot", _boom)
-
-    # Trigger migration.
-    session_mod.list_sessions()
-
-    # Original .json must still be on disk for retry next run.
-    assert os.path.isfile(legacy_path)
-    assert not os.path.isfile(legacy_path + ".legacy")
