@@ -1,13 +1,36 @@
-# Session persistence — save/load conversation state across sessions.
+# Session persistence — event-log-only.
 #
-# Stores the conversation as JSON so the user can resume where they left off
-# with /continue.  Sessions are saved on every graceful exit and can be loaded
-# on startup.
+# The per-session append-only event log (``data/sessions/events/<sid>.jsonl``)
+# is the ONE source of truth. There are no snapshots, no archives. A tiny
+# ``data/sessions/latest.txt`` pointer records which session ``/continue``
+# resumes by default.
+#
+# History: an earlier design wrote ``latest.json`` + timestamped archives
+# alongside the log. The dual-writer created a "log first, then snapshot"
+# invariant that had to be defended with ``last_event_seq`` bookkeeping and
+# a log-ahead-of-snapshot recovery branch. Simplification (2026-05): the log
+# is enough; list/resume walk the log directly.
+#
+# Event kinds (grown from the original message + compaction pair):
+#   {"kind": "session_start", "metadata": {...}}    # first event of every new log
+#   {"kind": "session_meta",  "metadata": {...}}    # emitted when metadata changes
+#   {"kind": "message",       "message": {...}}     # one per view message
+#   {"kind": "compaction",    "drop_count": N,
+#                             "replacement_messages": [...],
+#                             "summary": "...",
+#                             "before_tokens": N, "after_tokens": N}
+#   {"kind": "session_end",   "reason": "new"}      # emitted when user runs /new
+#
+# All event records also carry auto-stamped ``seq`` and ``ts`` from event_log.py.
+#
+# Concurrency: single-CLI assumption. ``EventLog`` is process-local; two
+# concurrent jyagent processes writing to the same session will race on seq
+# numbers and on latest.txt. Not a supported configuration.
 
 import json
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from .. import config
@@ -17,302 +40,192 @@ from .event_log import EventLog, event_log_path, open_event_log
 
 ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
+# Plain-text pointer: contents are the session_id (no trailing whitespace
+# beyond a single newline). Atomic write via temp + rename + fsync.
+_LATEST_POINTER_BASENAME = "latest.txt"
+
+
+# ─── Public API ──────────────────────────────────────────────────────────────
 
 def ensure_session_dir() -> None:
-    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
+    """Create the sessions dir (and the events/ subdir) if missing."""
+    os.makedirs(os.path.join(config.SESSIONS_DIR, "events"), exist_ok=True)
 
 
-def _flush_log_pending(conversation: ConversationMemory) -> Optional[int]:
-    """Flush any unrecorded messages to the attached event log.
+def checkpoint_session(
+    conversation: ConversationMemory,
+    metadata: Optional[dict] = None,
+) -> str:
+    """Per-turn durability: flush pending message events to the log.
 
-    Returns the seq of the last event in the log after flushing (or
-    ``None`` if no log is attached).  Raises on log I/O failure — callers
-    must NOT proceed to write the snapshot if this raises (snapshot ahead
-    of log violates the source-of-truth invariant).
+    Side effects:
+      1. Lazy-creates the log on first call (emits a ``session_start`` event
+         with ``metadata``).
+      2. Emits a ``session_meta`` event if ``metadata`` differs from the
+         most recent session_start/session_meta.
+      3. Flushes any pending ``message`` events (the log handler does the
+         fsync).
+      4. Atomically updates ``latest.txt`` to point at this session.
+
+    Returns the session_id on success, or ``""`` if the conversation is empty.
+    Raises on log I/O failure — the caller decides whether to swallow.
     """
+    _run_legacy_migration()
+    ensure_session_dir()
+
+    if not conversation.messages:
+        return ""
+
+    log = _ensure_log_attached(conversation, metadata or {})
+    _maybe_emit_meta_change(log, metadata or {})
+    _flush_pending_messages(conversation)
+    _write_latest_pointer(conversation.session_id)
+    return conversation.session_id
+
+
+def end_session(conversation: ConversationMemory, reason: str = "new") -> str:
+    """Emit a ``session_end`` event and clear the latest pointer.
+
+    Called by ``/new`` so the just-finished session stays discoverable via
+    ``/sessions`` / ``/continue <id>`` but is NOT resumed by bare
+    ``/continue``.
+
+    Returns the session_id ended, or ``""`` if there was nothing to end.
+    """
+    if not conversation.messages:
+        return ""
+
     log = conversation._event_log
     if log is None:
-        return None
-    pending = conversation.pending_message_events()
-    if pending:
-        log.emit_many(pending)
-        conversation.mark_recorded()
-    return (len(log) - 1) if len(log) > 0 else None
-
-
-def _build_payload(conversation: ConversationMemory, metadata: Optional[dict] = None) -> dict:
-    """Build the JSON-serialisable session payload."""
-    now = datetime.now(ASIA_SHANGHAI_TZ)
-    last_seq: Optional[int] = None
-    log = getattr(conversation, "_event_log", None)
-    if log is not None and len(log) > 0:
-        last_seq = len(log) - 1
-    return {
-        "version": 1,
-        "session_id": conversation.session_id,
-        "saved_at": now.isoformat(timespec="seconds"),
-        "message_count": len(conversation.messages),
-        "metadata": metadata or {},
-        "messages": conversation.messages,
-        # Source-of-truth pointer into the event log.  Old loaders that
-        # don't know this field will safely ignore it.
-        "last_event_seq": last_seq,
-    }
-
-
-def checkpoint_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
-    """Lightweight per-turn durability write. Overwrites ``latest.json`` only.
-
-    Unlike :func:`save_session` this does NOT create a timestamped archive and
-    does NOT prune. It is meant to be called after every turn boundary so that
-    a crash between user input and graceful exit does not lose the conversation.
-
-    **Order matters**: we flush pending events to the source-of-truth log
-    FIRST, then write the snapshot.  If the log flush raises, we propagate
-    (caller wraps in try/except) — writing a snapshot ahead of the log would
-    violate the "log is truth" invariant.
-
-    Returns the file path written, or ``""`` if the conversation is empty.
-    """
-    ensure_session_dir()
-
-    if not conversation.messages:
+        # No log was ever written (very short session) — nothing to do.
+        _clear_latest_pointer()
         return ""
 
-    # 1. Lazy-attach a log if none yet — first checkpoint of a fresh session.
-    if conversation._event_log is None:
-        log = open_event_log(conversation.session_id, config.SESSIONS_DIR)
-        # Cursor = current view length: messages already in self.messages
-        # at attach time are assumed covered (true for fresh sessions where
-        # nothing's been recorded yet AND the messages list is empty here is
-        # excluded above; for snapshot-resume the loader attaches with
-        # cursor = len(messages) explicitly).
-        conversation.attach_event_log(log, recorded_seq=0)
-
-    # 2. Flush log first (source of truth).  If this raises, NO snapshot.
-    _flush_log_pending(conversation)
-
-    # 3. Snapshot (the view cache).
-    payload = _build_payload(conversation, metadata)
-    _atomic_write(config.LATEST_SESSION_FILE, payload)
-    return config.LATEST_SESSION_FILE
+    # Flush any last-minute pending events BEFORE writing the end marker so
+    # the tail of the log is the session_end event.
+    try:
+        _flush_pending_messages(conversation)
+        log.emit({"kind": "session_end", "reason": reason})
+    except OSError:
+        # Best-effort — /new clearing should never fail user-visibly.
+        pass
+    _clear_latest_pointer()
+    return conversation.session_id
 
 
-def save_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
-    """Save conversation to disk. Returns the file path written.
-
-    Saves to two locations:
-      1. ``data/sessions/latest.json`` — always overwritten (for /continue)
-      2. ``data/sessions/<timestamp>.json`` — archived copy
-    """
-    ensure_session_dir()
-
-    if not conversation.messages:
-        return ""
-
-    # Log first, then snapshot (same invariant as checkpoint_session).
-    if conversation._event_log is None:
-        conversation.attach_event_log(
-            open_event_log(conversation.session_id, config.SESSIONS_DIR),
-            recorded_seq=0,
-        )
-    _flush_log_pending(conversation)
-
-    payload = _build_payload(conversation, metadata)
-
-    # Write latest (always)
-    _atomic_write(config.LATEST_SESSION_FILE, payload)
-
-    # Write timestamped archive
-    ts_name = payload["saved_at"].replace("-", "").replace(":", "").replace("T", "_").rstrip("Z")
-    archive_path = os.path.join(config.SESSIONS_DIR, f"{ts_name}.json")
-    _atomic_write(archive_path, payload)
-
-    # Prune old archives (keep most recent 20)
-    _prune_archives(keep=20)
-
-    return config.LATEST_SESSION_FILE
-
-
-def archive_session(conversation: ConversationMemory, metadata: Optional[dict] = None) -> str:
-    """Archive conversation to a timestamped file WITHOUT updating latest.json.
-
-    Use this when the user explicitly starts a new conversation (/new) — the old
-    session should be recoverable but /continue should NOT resume it.
-
-    Returns the archive file path, or "" if there was nothing to save.
-    """
-    ensure_session_dir()
-
-    if not conversation.messages:
-        return ""
-
-    # Log first, then archive snapshot.
-    if conversation._event_log is None:
-        conversation.attach_event_log(
-            open_event_log(conversation.session_id, config.SESSIONS_DIR),
-            recorded_seq=0,
-        )
-    _flush_log_pending(conversation)
-
-    payload = _build_payload(conversation, metadata)
-
-    ts_name = payload["saved_at"].replace("-", "").replace(":", "").replace("T", "_").rstrip("Z")
-    archive_path = os.path.join(config.SESSIONS_DIR, f"{ts_name}.json")
-    _atomic_write(archive_path, payload)
-
-    _prune_archives(keep=20)
-
-    return archive_path
-
-
-def load_session(conversation: ConversationMemory, path: Optional[str] = None) -> dict:
-    """Load a saved session into the conversation.
+def load_session(
+    conversation: ConversationMemory,
+    query: Optional[str] = None,
+) -> dict:
+    """Load a session via the event log.
 
     Args:
-        conversation: The ConversationMemory to populate.
-        path: File path to load. Defaults to latest.json.
+        conversation: ConversationMemory to populate.
+        query: session_id / prefix / saved_at prefix / "latest" / None.
+               None means "use latest.txt" (equivalent to query="latest").
 
-    Returns:
-        Metadata dict with saved_at, message_count, session_id, loaded (bool).
+    Returns a metadata dict:
+        {
+            "loaded": bool,
+            "session_id": str,
+            "saved_at": iso-str,
+            "message_count": int,
+            "metadata": dict,
+            "event_log_seq": int | None,  # last seq after load
+            "error": str,                 # only when loaded is False
+        }
     """
-    path = path or config.LATEST_SESSION_FILE
+    _run_legacy_migration()
+    ensure_session_dir()
+
+    target_sid = _resolve_query_to_sid(query)
+    if target_sid is None:
+        return {"loaded": False, "error": f"No session matched {query!r}"}
+
+    log_path = event_log_path(target_sid, config.SESSIONS_DIR)
+    if not os.path.isfile(log_path):
+        return {"loaded": False, "error": f"No event log for session {target_sid}"}
+
+    # Replay into a fresh ConversationMemory, then splice into the caller's.
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            payload = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        return {"loaded": False, "error": str(e)}
+        replayed = replay_from_events(target_sid)
+    except Exception as e:
+        return {"loaded": False, "error": f"Replay failed: {e}"}
 
-    version = payload.get("version", 0)
-    if version != 1:
-        return {"loaded": False, "error": f"Unknown session version: {version}"}
+    if not replayed.messages:
+        return {"loaded": False, "error": "Session has no visible messages"}
 
-    messages = payload.get("messages", [])
-    if not messages:
-        return {"loaded": False, "error": "Session file has no messages"}
-
-    session_id = payload.get("session_id") or _new_session_id()
-
-    # Clear and reload (clear() also detaches any prior event log).
     conversation.clear()
-    conversation.session_id = session_id
-    for msg in messages:
-        conversation.messages.append(msg)
+    conversation.session_id = replayed.session_id
+    conversation.messages = list(replayed.messages)
+    # Reuse the log handle opened during replay — no double-open.
+    conversation.attach_event_log(
+        replayed._event_log,
+        recorded_seq=len(conversation.messages),
+    )
 
-    # Attach the per-session event log if one exists on disk.  Cursor =
-    # len(messages) because every message in the snapshot is presumed
-    # already represented in the log (either as "message" events or rolled
-    # into an earlier "compaction" event).
-    log_path = event_log_path(session_id, config.SESSIONS_DIR)
-    log_status = "absent"
-    log_ahead_recovered = False
-    if os.path.isfile(log_path):
-        log = open_event_log(session_id, config.SESSIONS_DIR)
-        snap_seq = payload.get("last_event_seq")
-
-        # Detect log-ahead-of-snapshot: a crash between log flush and
-        # snapshot write left the log with events the snapshot doesn't
-        # know about.  Recover by replaying the log — those events are
-        # the source of truth, and silently keeping the stale snapshot
-        # would orphan them forever (next checkpoint would re-mark
-        # `last_event_seq` to current log tail, hiding the gap).
-        if snap_seq is not None and len(log) > snap_seq + 1:
-            recovered = replay_from_events(session_id)
-            conversation.messages = list(recovered.messages)
-            # replay_from_events opened its own log handle; reuse that.
-            conversation.attach_event_log(
-                recovered._event_log,
-                recorded_seq=len(conversation.messages),
-            )
-            log_status = "log_ahead_recovered"
-            log_ahead_recovered = True
-        else:
-            conversation.attach_event_log(log, recorded_seq=len(messages))
-            log_status = "synced"
-    # else: leave log unattached.  First checkpoint will create one
-    # transparently for future appends to be durable.
-
+    summary = _summarize_log(target_sid)
     return {
         "loaded": True,
-        "session_id": session_id,
-        "saved_at": payload.get("saved_at", "unknown"),
+        "session_id": target_sid,
+        "saved_at": summary["saved_at"],
         "message_count": len(conversation.messages),
-        "metadata": payload.get("metadata", {}),
-        "event_log_status": log_status,
+        "metadata": summary["metadata"],
         "event_log_seq": len(conversation._event_log) - 1
             if conversation._event_log is not None and len(conversation._event_log) > 0
             else None,
-        "log_ahead_recovered": log_ahead_recovered,
     }
 
 
-def has_saved_session(path: Optional[str] = None) -> bool:
-    """Check if a saved session file exists."""
-    path = path or config.LATEST_SESSION_FILE
-    return os.path.isfile(path)
+def has_saved_session() -> bool:
+    """True iff latest.txt points at an existing, non-ended log."""
+    _run_legacy_migration()
+    sid = _read_latest_pointer()
+    if not sid:
+        return False
+    log_path = event_log_path(sid, config.SESSIONS_DIR)
+    return os.path.isfile(log_path)
 
 
 def list_sessions(limit: Optional[int] = None) -> list[dict]:
-    """List saved sessions sorted by saved_at (newest first).
+    """List all sessions (newest first) by walking ``events/``.
 
-    Returns a list of dicts with keys:
-      ``path``, ``filename``, ``session_id``, ``saved_at``,
-      ``message_count``, ``metadata``, ``is_latest``.
+    Each entry has:
+        path (log file), filename, session_id, saved_at, message_count,
+        metadata, is_latest, ended (bool — saw a session_end event).
 
-    Bad / unreadable session files are silently skipped.
+    Bad / unreadable files are silently skipped.
     """
+    _run_legacy_migration()
     ensure_session_dir()
-    latest_real_path = ""
+
+    events_dir = os.path.join(config.SESSIONS_DIR, "events")
     try:
-        # latest.json may be a regular file (atomic rename); resolve to detect dupes
-        if os.path.isfile(config.LATEST_SESSION_FILE):
-            latest_real_path = os.path.realpath(config.LATEST_SESSION_FILE)
+        names = os.listdir(events_dir)
     except OSError:
-        latest_real_path = ""
+        return []
+
+    latest_sid = _read_latest_pointer()
 
     out: list[dict] = []
-    seen_paths: set[str] = set()
-    try:
-        names = os.listdir(config.SESSIONS_DIR)
-    except OSError:
-        return out
-
-    # Always include latest.json first if present
-    candidates: list[str] = []
-    if os.path.isfile(config.LATEST_SESSION_FILE):
-        candidates.append(config.LATEST_SESSION_FILE)
     for name in names:
-        if not name.endswith(".json") or name == "latest.json":
+        if not name.endswith(".jsonl"):
             continue
-        candidates.append(os.path.join(config.SESSIONS_DIR, name))
-
-    for full in candidates:
+        sid = name[:-len(".jsonl")]
+        full = os.path.join(events_dir, name)
         try:
-            with open(full, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            continue
-        # Dedupe latest.json against its archive twin (same content, different name)
-        try:
-            real = os.path.realpath(full)
+            info = _summarize_log(sid)
         except OSError:
-            real = full
-        sid = payload.get("session_id") or ""
-        saved_at = payload.get("saved_at") or ""
-        # If the latest file and an archive both have the same session_id +
-        # saved_at, prefer the latest entry (already added) and skip the dup.
-        dup_key = (sid, saved_at)
-        if dup_key in seen_paths:
             continue
-        seen_paths.add(dup_key)
         out.append({
             "path": full,
-            "filename": os.path.basename(full),
+            "filename": name,
             "session_id": sid,
-            "saved_at": saved_at,
-            "message_count": payload.get("message_count", len(payload.get("messages", []))),
-            "metadata": payload.get("metadata", {}),
-            "is_latest": (real == latest_real_path) or (full == config.LATEST_SESSION_FILE),
+            "saved_at": info["saved_at"],
+            "message_count": info["message_count"],
+            "metadata": info["metadata"],
+            "is_latest": (sid == latest_sid),
+            "ended": info["ended"],
         })
 
     out.sort(key=lambda e: e["saved_at"], reverse=True)
@@ -324,15 +237,14 @@ def list_sessions(limit: Optional[int] = None) -> list[dict]:
 def find_session(query: str) -> Optional[dict]:
     """Resolve a user-supplied query to a session entry.
 
-    Accepted query forms (in order of precedence):
-      * ``"latest"`` → latest.json (if it exists)
-      * exact ``session_id`` match
-      * unique session_id prefix match (≥4 chars)
-      * exact filename match (with or without .json extension)
-      * unique filename / saved_at prefix match (e.g. ``20260430``)
+    Accepted forms (first match wins):
+      * ``"latest"`` → the latest.txt pointer target.
+      * exact session_id.
+      * unique session_id prefix (≥4 chars).
+      * unique saved_at prefix (e.g. ``20260430`` — matches normalized
+        ``YYYYMMDD_HHMMSS`` of the last event ts).
 
-    Returns the session entry dict (same shape as ``list_sessions``) or
-    ``None`` if no unambiguous match is found.
+    Returns the entry dict (same shape as ``list_sessions``) or ``None``.
     """
     if not query:
         return None
@@ -340,72 +252,78 @@ def find_session(query: str) -> Optional[dict]:
     if not q:
         return None
 
-    if q.lower() == "latest":
-        if has_saved_session():
-            entries = list_sessions()
-            for e in entries:
-                if e["is_latest"]:
-                    return e
-            return entries[0] if entries else None
-        return None
-
     entries = list_sessions()
     if not entries:
         return None
+
+    if q.lower() == "latest":
+        for e in entries:
+            if e["is_latest"]:
+                return e
+        return None  # no latest pointer set
 
     # Exact session_id
     for e in entries:
         if e["session_id"] == q:
             return e
 
-    # Exact filename (with or without .json)
-    q_fn = q if q.endswith(".json") else q + ".json"
-    for e in entries:
-        if e["filename"] == q_fn or e["filename"] == q:
-            return e
-
-    # Prefix matches — require ≥4 chars to avoid accidental hits
+    # Prefix matches — require ≥4 chars to avoid accidents
     if len(q) >= 4:
         sid_matches = [e for e in entries if e["session_id"].startswith(q)]
         if len(sid_matches) == 1:
             return sid_matches[0]
-        # Filename / saved_at prefix (timestamp like "20260430")
-        fn_matches = [
+        # saved_at prefix (normalized "20260430_215012" / "20260430" etc.)
+        ts_matches = [
             e for e in entries
-            if e["filename"].startswith(q) or e["saved_at"].replace("-", "").replace(":", "").startswith(q)
+            if _normalize_ts(e["saved_at"]).startswith(q)
         ]
-        if len(fn_matches) == 1:
-            return fn_matches[0]
+        if len(ts_matches) == 1:
+            return ts_matches[0]
 
     return None
 
 
-def delete_session(path: Optional[str] = None) -> bool:
-    """Delete a saved session file."""
-    path = path or config.LATEST_SESSION_FILE
+def delete_session(query: Optional[str] = None) -> bool:
+    """Delete a session.
+
+    - ``query=None``: just clear the latest.txt pointer (do NOT delete any
+      log file). This is the backward-compatible behavior used by ``/new``
+      in the old design. ``end_session`` is now preferred.
+    - Otherwise: resolve ``query`` to a session_id; delete its log file and,
+      if it was the latest pointer target, clear the pointer.
+
+    Returns True if something was removed.
+    """
+    if query is None:
+        return _clear_latest_pointer()
+
+    entry = find_session(query)
+    if entry is None:
+        return False
     try:
-        os.remove(path)
-        return True
+        os.remove(entry["path"])
     except FileNotFoundError:
         return False
+    if entry["is_latest"]:
+        _clear_latest_pointer()
+    return True
 
-
-# ─── Replay from event log ────────────────────────────────────────────────────
 
 def replay_from_events(session_id: str) -> ConversationMemory:
-    """Reconstruct a :class:`ConversationMemory` view from the event log alone.
+    """Reconstruct a ConversationMemory view from the event log alone.
 
     Walks every event in ``data/sessions/events/<session_id>.jsonl`` and
-    rebuilds the live view, applying each compaction event in sequence:
-      - ``"kind": "message"`` → append ``event["message"]`` to view.
-      - ``"kind": "compaction"`` → drop the first ``drop_count`` view
-        messages, replace them with ``event["replacement_messages"]``.
+    rebuilds the live view:
+      - ``session_start`` / ``session_meta`` / ``session_end`` → metadata
+        only, don't touch the view.
+      - ``message`` → append ``event["message"]`` to view.
+      - ``compaction`` → drop ``drop_count`` head messages, prepend
+        ``replacement_messages``.
 
-    The result has its event log attached at ``recorded_seq=len(view)``
-    so future appends pick up cleanly.
+    The returned object has its event log attached at
+    ``recorded_seq=len(view)`` so future appends pick up cleanly.
 
-    Raises ``FileNotFoundError`` if no log exists.  Useful for recovery
-    after a snapshot loss or a "log ahead of snapshot" diagnosis.
+    Raises ``FileNotFoundError`` if no log exists.
     """
     path = event_log_path(session_id, config.SESSIONS_DIR)
     if not os.path.isfile(path):
@@ -424,7 +342,8 @@ def replay_from_events(session_id: str) -> ConversationMemory:
             replacement = evt.get("replacement_messages") or []
             kept = view[drop:]
             view = list(replacement) + list(kept)
-        # Unknown kinds: ignore (forward-compatibility).
+        # session_start / session_meta / session_end / unknown → ignore
+        # for view reconstruction.
 
     c = ConversationMemory()
     c.session_id = session_id
@@ -433,47 +352,351 @@ def replay_from_events(session_id: str) -> ConversationMemory:
     return c
 
 
-# ─── Internal helpers ─────────────────────────────────────────────────────────
+# ─── Log attach / emit helpers ───────────────────────────────────────────────
 
-def _atomic_write(path: str, payload: dict) -> None:
-    """Write JSON atomically via temp file + rename, with fsync.
+def _ensure_log_attached(
+    conversation: ConversationMemory,
+    metadata: dict,
+) -> EventLog:
+    """Attach an EventLog if not already, emitting session_start on creation."""
+    log = conversation._event_log
+    if log is not None:
+        return log
 
-    Symmetry with the event log: both sides flush+fsync at the boundary so
-    "snapshot ahead of log" or "log ahead of snapshot" can only happen
-    across a process crash between the two writes, never from a buffered-
-    but-unflushed write surviving in cache.
+    log = open_event_log(conversation.session_id, config.SESSIONS_DIR)
+    # Ensure seq 0 is a session_start event for brand-new logs.
+    if len(log) == 0:
+        log.emit({
+            "kind": "session_start",
+            "metadata": _copy_metadata(metadata),
+        })
+    conversation.attach_event_log(log, recorded_seq=0)
+    return log
+
+
+def _maybe_emit_meta_change(log: EventLog, metadata: dict) -> None:
+    """If metadata differs from the most recent start/meta event, emit session_meta."""
+    if not metadata:
+        return
+    last = _last_metadata_event(log)
+    if last is not None and _metadata_equal(last, metadata):
+        return
+    log.emit({"kind": "session_meta", "metadata": _copy_metadata(metadata)})
+
+
+def _flush_pending_messages(conversation: ConversationMemory) -> None:
+    """Flush any message events the conversation hasn't recorded yet."""
+    log = conversation._event_log
+    if log is None:
+        return
+    pending = conversation.pending_message_events()
+    if pending:
+        log.emit_many(pending)
+        conversation.mark_recorded()
+
+
+def _last_metadata_event(log: EventLog) -> Optional[dict]:
+    """Return the metadata dict of the newest session_start/session_meta event."""
+    for evt in reversed(log.get_events()):
+        if evt.get("kind") in ("session_start", "session_meta"):
+            md = evt.get("metadata")
+            return md if isinstance(md, dict) else {}
+    return None
+
+
+def _metadata_equal(a: dict, b: dict) -> bool:
+    """Shallow equality on the metadata keys we care about."""
+    keys = set(a.keys()) | set(b.keys())
+    return all(a.get(k) == b.get(k) for k in keys)
+
+
+def _copy_metadata(md: dict) -> dict:
+    """Shallow-copy metadata, coercing non-JSON-safe values to str."""
+    out: dict[str, Any] = {}
+    for k, v in (md or {}).items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
+
+
+# ─── Summaries (for /list) ───────────────────────────────────────────────────
+
+def _summarize_log(session_id: str) -> dict:
+    """Walk a session log once and produce a /list-ready summary.
+
+    Returns:
+        {"saved_at": iso-str, "message_count": int,
+         "metadata": dict, "ended": bool}
+
+    Scans the file a single time — counts cost one JSON parse per line, which
+    for typical sessions (≤few thousand events) is sub-millisecond.
     """
-    tmp_path = path + ".tmp"
+    path = event_log_path(session_id, config.SESSIONS_DIR)
+    saved_at = ""
+    metadata: dict = {}
+    message_count = 0
+    ended = False
+
     try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, ensure_ascii=False, indent=None)
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = evt.get("kind")
+                ts = evt.get("ts")
+                if ts:
+                    saved_at = ts
+                if kind == "message":
+                    message_count += 1
+                elif kind == "compaction":
+                    drop = int(evt.get("drop_count", 0))
+                    repl = evt.get("replacement_messages") or []
+                    message_count = max(0, message_count - drop) + len(repl)
+                elif kind in ("session_start", "session_meta"):
+                    md = evt.get("metadata")
+                    if isinstance(md, dict):
+                        metadata = md
+                elif kind == "session_end":
+                    ended = True
+    except OSError:
+        pass
+
+    # Fallback saved_at if the log has no ts (shouldn't happen — event_log
+    # stamps ts on every emit) — use mtime.
+    if not saved_at:
+        try:
+            mtime = os.path.getmtime(path)
+            saved_at = datetime.fromtimestamp(
+                mtime, tz=ASIA_SHANGHAI_TZ,
+            ).isoformat(timespec="seconds")
+        except OSError:
+            saved_at = ""
+
+    return {
+        "saved_at": saved_at,
+        "message_count": message_count,
+        "metadata": metadata,
+        "ended": ended,
+    }
+
+
+# ─── Query resolution ────────────────────────────────────────────────────────
+
+def _resolve_query_to_sid(query: Optional[str]) -> Optional[str]:
+    """Resolve a user query to a concrete session_id on disk.
+
+    None / "" / "latest" → latest.txt target (if it exists).
+    Otherwise try find_session.
+    """
+    if query is None or not query.strip() or query.strip().lower() == "latest":
+        sid = _read_latest_pointer()
+        if sid:
+            log_path = event_log_path(sid, config.SESSIONS_DIR)
+            if os.path.isfile(log_path):
+                return sid
+        # Fallback: newest non-ended session by saved_at (recovery path when
+        # latest.txt is missing or stale).
+        for entry in list_sessions():
+            if not entry["ended"]:
+                return entry["session_id"]
+        return None
+
+    entry = find_session(query.strip())
+    return entry["session_id"] if entry else None
+
+
+def _normalize_ts(iso_ts: str) -> str:
+    """'2026-04-30T21:50:12+08:00' → '20260430_215012' for prefix matching."""
+    if not iso_ts:
+        return ""
+    out = iso_ts
+    # Drop timezone suffix (+0800 / -0500 / Z) first.
+    for sep in ("+", "Z"):
+        if sep in out[1:]:  # skip a leading '-' on negative years (n/a here)
+            out = out.split(sep)[0]
+    # Drop the '-' / ':' separators and turn 'T' into '_'.
+    for ch in ("-", ":"):
+        out = out.replace(ch, "")
+    out = out.replace("T", "_")
+    return out
+
+
+# ─── latest.txt pointer ──────────────────────────────────────────────────────
+
+def _latest_pointer_path() -> str:
+    return os.path.join(config.SESSIONS_DIR, _LATEST_POINTER_BASENAME)
+
+
+def _read_latest_pointer() -> str:
+    """Return the session_id in latest.txt, or '' if missing/invalid."""
+    try:
+        with open(_latest_pointer_path(), "r", encoding="utf-8") as f:
+            sid = f.read().strip()
+        # Defensive: sanity-check it looks like a UUID-ish token.
+        if sid and all(c.isalnum() or c == "-" for c in sid) and len(sid) <= 64:
+            return sid
+        return ""
+    except OSError:
+        return ""
+
+
+def _write_latest_pointer(session_id: str) -> None:
+    """Atomic write of latest.txt — tmp file + fsync + rename."""
+    if not session_id:
+        return
+    ensure_session_dir()
+    path = _latest_pointer_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(session_id + "\n")
             f.flush()
             try:
                 os.fsync(f.fileno())
             except OSError:
-                pass  # tmpfs / non-syncable FS — best-effort
-        os.replace(tmp_path, path)
-    except Exception:
+                pass
+        os.replace(tmp, path)
+    except OSError:
         try:
-            os.remove(tmp_path)
+            os.remove(tmp)
         except OSError:
             pass
-        raise
 
 
-def _prune_archives(keep: int = 20) -> None:
-    """Remove old session archives, keeping the most recent ones."""
+def _clear_latest_pointer() -> bool:
+    """Remove latest.txt. Returns True if something was removed."""
     try:
-        files = []
-        for f in os.listdir(config.SESSIONS_DIR):
-            if f.endswith('.json') and f != "latest.json":
-                full = os.path.join(config.SESSIONS_DIR, f)
-                files.append((os.path.getmtime(full), full))
-        files.sort(reverse=True)
-        for _, path in files[keep:]:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        os.remove(_latest_pointer_path())
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+# ─── Legacy migration (one-shot, idempotent) ─────────────────────────────────
+#
+# Old layout (pre-2026-05):
+#   data/sessions/latest.json                  — current session snapshot
+#   data/sessions/<timestamp>.json             — timestamped archives
+#   data/sessions/events/<session_id>.jsonl    — event log (may or may not exist)
+#
+# New layout:
+#   data/sessions/events/<session_id>.jsonl    — the only persistent file
+#   data/sessions/latest.txt                   — pointer
+#
+# Strategy: for each legacy *.json snapshot, if its session_id has NO
+# events/<sid>.jsonl on disk, synthesize one (session_start + message events)
+# from the snapshot. Then rename the snapshot to *.json.legacy so subsequent
+# runs skip it. If events/<sid>.jsonl DOES exist, just rename (the log is
+# authoritative; the snapshot is redundant).
+#
+# Runs on the first module-level API call per process. Safe to retry.
+
+_MIGRATION_DONE: bool = False
+
+
+def _run_legacy_migration() -> None:
+    global _MIGRATION_DONE
+    if _MIGRATION_DONE:
+        return
+    _MIGRATION_DONE = True
+
+    sessions_dir = config.SESSIONS_DIR
+    if not os.path.isdir(sessions_dir):
+        return
+
+    try:
+        names = os.listdir(sessions_dir)
+    except OSError:
+        return
+
+    # Identify legacy snapshot files (anything ending in .json at the top level,
+    # including latest.json). Never touch the events/ subdir.
+    legacy_paths = [
+        os.path.join(sessions_dir, n)
+        for n in names
+        if n.endswith(".json") and os.path.isfile(os.path.join(sessions_dir, n))
+    ]
+    if not legacy_paths:
+        return
+
+    os.makedirs(os.path.join(sessions_dir, "events"), exist_ok=True)
+
+    # Find the most-recent snapshot (by saved_at) that was the "latest" so we
+    # can seed latest.txt if the user has no latest.txt yet.
+    best_sid: Optional[str] = None
+    best_ts: str = ""
+
+    for path in legacy_paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        sid = payload.get("session_id") or ""
+        if not sid:
+            # Pre-session-id legacy — skip; not recoverable.
+            _rename_legacy(path)
+            continue
+
+        log_path = event_log_path(sid, sessions_dir)
+        if not os.path.isfile(log_path):
+            _synthesize_log_from_snapshot(sid, payload)
+
+        saved_at = payload.get("saved_at") or ""
+        is_latest = os.path.basename(path) == "latest.json"
+        if is_latest and (not best_sid or saved_at > best_ts):
+            best_sid = sid
+            best_ts = saved_at
+
+        _rename_legacy(path)
+
+    # Seed latest.txt if the user had a latest.json but no latest.txt yet.
+    if best_sid and not _read_latest_pointer():
+        _write_latest_pointer(best_sid)
+
+
+def _rename_legacy(path: str) -> None:
+    """Rename *.json → *.json.legacy so we don't re-process on next run."""
+    try:
+        os.replace(path, path + ".legacy")
+    except OSError:
+        pass
+
+
+def _synthesize_log_from_snapshot(session_id: str, payload: dict) -> None:
+    """Write a minimal event log from a legacy snapshot.
+
+    Emits:
+      seq 0: session_start with the snapshot's metadata
+      seq 1..N: one ``message`` event per message in the snapshot
+    """
+    messages = payload.get("messages") or []
+    if not messages:
+        return
+    try:
+        log = open_event_log(session_id, config.SESSIONS_DIR)
+        # If someone raced us and populated the log already, skip.
+        if len(log) > 0:
+            return
+        log.emit({
+            "kind": "session_start",
+            "metadata": _copy_metadata(payload.get("metadata") or {}),
+        })
+        log.emit_many([
+            {"kind": "message", "message": m}
+            for m in messages
+            if isinstance(m, dict)
+        ])
+        log.close()
     except OSError:
         pass

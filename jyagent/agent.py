@@ -7,7 +7,7 @@ import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
     ConversationMemory, summarize_if_needed,
     build_memory_context,
-    save_session, checkpoint_session, load_session, has_saved_session, archive_session,
+    checkpoint_session, load_session, has_saved_session, end_session,
     delete_session,
     list_sessions, find_session,
     should_extract, extract_and_remember,
@@ -112,33 +112,27 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     """Clear current conversation state and start fresh."""
     global _cached_memory_context
 
-    # Archive current conversation before clearing (recoverable, but /continue
-    # still points to the last *exited* session, not this one).
+    # End the current session (emit session_end into its log + clear the
+    # latest pointer). Past sessions stay discoverable via /sessions and
+    # resumable by id; bare /continue won't auto-resume them.
     if conversation.messages:
         try:
             from .runtime.stats import get_stats
             stats = get_stats()
-            archive_session(conversation, metadata={
+            # Flush pending events so the session_end event sits on top of
+            # them in the log.
+            checkpoint_session(conversation, metadata={
                 "provider": stats.provider or "",
                 "model": stats.model or "",
                 "reason": "new",
             })
+            end_session(conversation, reason="new")
         except Exception:
-            pass  # Don't let archive failure block /new
+            pass  # Don't let session-end failure block /new
 
     # Clear conversation history
     conversation.clear()
     runtime_owner.set_session_id(conversation.session_id)
-
-    # Drop the stale `latest.json` resume pointer.  Without this, /continue
-    # right after /new would restore the just-archived session — surprising
-    # behavior since the user explicitly asked to start fresh.  The
-    # timestamped archive (written above) keeps the old session resumable
-    # by ID via /sessions + /continue <id>.
-    try:
-        delete_session()
-    except Exception:
-        pass
 
     # Clear pinned skills
     get_skill_manager().unpin_all()
@@ -246,11 +240,10 @@ def _cmd_continue(cli, conversation, runtime_owner, user_input: str = "/continue
     """Load a saved session and continue where we left off.
 
     Usage:
-        /continue                  resume latest.json (default)
-        /continue latest           resume latest.json (explicit)
+        /continue                  resume the latest session (default)
+        /continue latest           resume the latest session (explicit)
         /continue <session_id>     resume by session id (full or unique prefix)
-        /continue <timestamp>      resume by archive filename / saved_at prefix
-                                   (e.g. 20260430_215012)
+        /continue <timestamp>      resume by saved_at prefix (e.g. 20260430_215012)
     """
     parts = user_input.split(None, 1)
     arg = parts[1].strip() if len(parts) > 1 else ""
@@ -259,7 +252,6 @@ def _cmd_continue(cli, conversation, runtime_owner, user_input: str = "/continue
         cli.print_system("⚠ Current conversation is not empty. Use /new first to clear, then /continue.")
         return
 
-    target_path = None
     if arg:
         entry = find_session(arg)
         if entry is None:
@@ -267,13 +259,14 @@ def _cmd_continue(cli, conversation, runtime_owner, user_input: str = "/continue
                 f"No session matched '{arg}'. Use /sessions to list available sessions."
             )
             return
-        target_path = entry["path"]
+        query: str | None = entry["session_id"]
     else:
         if not has_saved_session():
             cli.print_system("No saved session found. Start a new conversation.")
             return
+        query = None  # use latest pointer
 
-    result = load_session(conversation, path=target_path)
+    result = load_session(conversation, query=query)
     if result.get("loaded"):
         runtime_owner.set_session_id(conversation.session_id)
         sid = result.get("session_id", "")
@@ -282,12 +275,6 @@ def _cmd_continue(cli, conversation, runtime_owner, user_input: str = "/continue
             f"✅ Resumed session {sid_short} from {result['saved_at']} "
             f"({result['message_count']} messages, ~{conversation.estimated_tokens()} tokens)"
         )
-        if result.get("log_ahead_recovered"):
-            cli.print_system(
-                "ℹ️  Event log was ahead of snapshot — recovered "
-                f"{result['message_count']} messages by replaying events "
-                "(prior crash between log flush and snapshot write)."
-            )
     else:
         cli.print_system(f"Failed to load session: {result.get('error', 'unknown error')}")
 
@@ -351,10 +338,10 @@ def _print_unexpected_error(cli, error: Exception):
 
 
 def _checkpoint_turn(conversation) -> None:
-    """Per-turn durability: write ``latest.json`` after every message boundary.
+    """Per-turn durability: flush pending events to the session log.
 
-    Cheap (one atomic JSON write, no archive, no prune) and silent on failure
-    — never block the user's turn on a disk hiccup.
+    Cheap (append + fsync batched at turn boundary) and silent on failure —
+    never block the user's turn on a disk hiccup.
     """
     if not conversation or not conversation.messages:
         return
@@ -371,12 +358,14 @@ def _checkpoint_turn(conversation) -> None:
 
 def _graceful_exit(cli, conversation=None):
     """Print goodbye, save session, and disconnect background services."""
-    # Save session before saying goodbye (fast, silent)
+    # Flush any pending events before goodbye (fast, silent). Same call as
+    # _checkpoint_turn — the log is the only persistence, no separate
+    # archive step is needed.
     if conversation and conversation.messages:
         try:
             from .runtime.stats import get_stats
             stats = get_stats()
-            save_session(conversation, metadata={
+            checkpoint_session(conversation, metadata={
                 "provider": stats.provider or "",
                 "model": stats.model or "",
             })

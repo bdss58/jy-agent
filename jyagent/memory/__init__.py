@@ -17,7 +17,16 @@ from .operations import (
 )
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
-from .session import save_session, checkpoint_session, archive_session, load_session, has_saved_session, delete_session, list_sessions, find_session, replay_from_events
+from .session import (
+    checkpoint_session,
+    end_session,
+    load_session,
+    has_saved_session,
+    delete_session,
+    list_sessions,
+    find_session,
+    replay_from_events,
+)
 from .event_log import EventLog, open_event_log, event_log_path
 from .extraction import should_extract, extract_and_remember
 from .search import search_memory, render_hits, SearchHit, SearchChunk

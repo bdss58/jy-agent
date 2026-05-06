@@ -117,7 +117,6 @@ CHARS_PER_TOKEN = 4
 
 # Session persistence
 SESSIONS_DIR = os.path.join(PROJECT_ROOT, "data", "sessions")
-LATEST_SESSION_FILE = os.path.join(SESSIONS_DIR, "latest.json")
 
 # ─── Skills ───────────────────────────────────────────────────────────────────
 

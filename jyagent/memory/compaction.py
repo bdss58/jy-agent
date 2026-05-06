@@ -363,6 +363,11 @@ def compact_conversation(
         # the right number of head messages.  Pre-compaction message events
         # already exist on disk (from prior _checkpoint_turn calls), so we
         # do NOT duplicate them here.
+        #
+        # CRITICAL: the event log is the only persistence. If we swap the
+        # in-memory view without emitting the compaction event, replay can
+        # never reconstruct the post-compaction view. So if the log write
+        # fails, we ABORT the swap — the next turn will retry compaction.
         new_view = new_messages + recent_messages
         new_after_tokens = estimate_conversation_tokens(new_view)
         log = getattr(conversation, "_event_log", None)
@@ -382,12 +387,18 @@ def compact_conversation(
                     "before_tokens": before_tokens,
                     "after_tokens": new_after_tokens,
                 })
-            except OSError:
-                # Log write failed — proceed with swap anyway (compaction
-                # is best-effort durable; the in-memory view is what the
-                # next turn needs).  The next checkpoint will re-attempt
-                # log writes.
-                pass
+            except OSError as e:
+                # Log write failed — DO NOT swap. Returning a not-compacted
+                # result lets the loop continue with the existing view; next
+                # turn will retry. Compaction without a durable boundary
+                # would silently lose pre-compaction context on /continue.
+                return {
+                    "compacted": False,
+                    "skipped_reason": f"compaction event log write failed: {e}",
+                    "before_tokens": before_tokens,
+                    "after_tokens": before_tokens,
+                    "summary": "",
+                }
 
         conversation.messages = new_view
 

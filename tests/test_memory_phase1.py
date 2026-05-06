@@ -26,7 +26,6 @@ config.MEMORY_DIR = os.path.join(_tmpdir, "memory")
 config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
 config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
 config.SESSIONS_DIR = os.path.join(_tmpdir, "sessions")
-config.LATEST_SESSION_FILE = os.path.join(_tmpdir, "sessions", "latest.json")
 
 from jyagent.memory.operations import (
     write_topic, read_topic, read_topic_body, read_topic_meta,
@@ -36,9 +35,10 @@ from jyagent.memory.operations import (
     _extract_topic_description, _add_topic_index_entry, _remove_topic_index_entry,
 )
 from jyagent.memory.session import (
-    save_session, load_session, has_saved_session, delete_session,
-    _prune_archives,
+    checkpoint_session, load_session, has_saved_session, delete_session,
+    end_session, list_sessions,
 )
+from jyagent.memory.event_log import event_log_path
 from jyagent.memory.conversation import ConversationMemory
 from jyagent.memory.extraction import should_extract, _extract_text
 
@@ -125,18 +125,27 @@ def test_show_memory_includes_timestamps():
 
 # ─── Test 2: Session Persistence ─────────────────────────────────────────────
 
-def test_save_and_load_session():
+def _reset_migration_latch():
+    """Each test resets SESSIONS_DIR; also reset the once-per-process migration flag."""
+    import jyagent.memory.session as session_mod
+    session_mod._MIGRATION_DONE = False
+
+
+def test_checkpoint_and_load_session():
     setup()
+    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
     conv.add_message("assistant", "Hi there!")
     session_id = conv.session_id
 
-    path = save_session(conv)
-    assert path, "save_session returned empty path"
-    assert os.path.isfile(config.LATEST_SESSION_FILE), "latest.json not created"
+    sid = checkpoint_session(conv)
+    assert sid == session_id, "checkpoint_session returned wrong id"
+    # Event log file exists.
+    assert os.path.isfile(event_log_path(session_id, config.SESSIONS_DIR))
+    # Pointer exists.
+    assert os.path.isfile(os.path.join(config.SESSIONS_DIR, "latest.txt"))
 
-    # Load into fresh conversation
     conv2 = ConversationMemory()
     result = load_session(conv2)
     assert result["loaded"] is True, f"Load failed: {result}"
@@ -146,132 +155,136 @@ def test_save_and_load_session():
     assert len(conv2.messages) == 2
     assert conv2.messages[0]["content"] == "Hello"
     assert conv2.messages[1]["content"] == "Hi there!"
-    print("  ✅ save_session + load_session roundtrip works")
+    print("  ✅ checkpoint_session + load_session roundtrip works")
 
 
 def test_has_saved_session():
     setup()
-    assert not has_saved_session(), "Should not find session before save"
+    _reset_migration_latch()
+    assert not has_saved_session(), "Should not find session before checkpoint"
     conv = ConversationMemory()
     conv.add_message("user", "test")
-    save_session(conv)
-    assert has_saved_session(), "Should find session after save"
+    checkpoint_session(conv)
+    assert has_saved_session(), "Should find session after checkpoint"
     print("  ✅ has_saved_session works correctly")
 
 
-def test_delete_session():
+def test_delete_session_clears_pointer():
     setup()
+    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "test")
-    save_session(conv)
+    checkpoint_session(conv)
     assert has_saved_session()
+    # delete_session() with no args clears only the pointer (log survives).
     deleted = delete_session()
     assert deleted
     assert not has_saved_session()
-    print("  ✅ delete_session removes latest.json")
+    # The log is still on disk (for manual recovery via /continue <id>).
+    assert os.path.isfile(event_log_path(conv.session_id, config.SESSIONS_DIR))
+    print("  ✅ delete_session() clears latest.txt but preserves the log")
 
 
-def test_load_empty_conversation():
+def test_checkpoint_empty_conversation():
     setup()
+    _reset_migration_latch()
     conv = ConversationMemory()
-    result = save_session(conv)
+    result = checkpoint_session(conv)
     assert result == "", "Should return empty for empty conversation"
-    print("  ✅ save_session skips empty conversation")
+    print("  ✅ checkpoint_session skips empty conversation")
 
 
 def test_load_nonexistent_session():
     setup()
+    _reset_migration_latch()
     conv = ConversationMemory()
-    result = load_session(conv, path="/nonexistent/path.json")
+    result = load_session(conv, query="does-not-exist-9999")
     assert result["loaded"] is False
     assert "error" in result
-    print("  ✅ load_session handles missing file gracefully")
+    print("  ✅ load_session handles missing session gracefully")
 
 
-def test_session_archive_created():
+def test_end_session_marks_ended_but_keeps_log():
     setup()
+    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
-    save_session(conv)
+    checkpoint_session(conv)
+    sid = conv.session_id
 
-    archive_files = [f for f in os.listdir(config.SESSIONS_DIR) if f != "latest.json"]
-    assert len(archive_files) >= 1, f"No archive created. Files: {os.listdir(config.SESSIONS_DIR)}"
-    print("  ✅ save_session creates timestamped archive")
+    end_session(conv, reason="new")
+
+    # Pointer cleared → bare /continue should not pick this session.
+    assert not has_saved_session()
+    # But log file remains, discoverable + resumable by id.
+    assert os.path.isfile(event_log_path(sid, config.SESSIONS_DIR))
+    entries = list_sessions()
+    assert any(e["session_id"] == sid and e["ended"] for e in entries)
+    print("  ✅ end_session clears pointer but preserves log")
 
 
-def test_session_prune():
+def test_event_log_structure():
     setup()
-    # Create many archives
-    for i in range(25):
-        conv = ConversationMemory()
-        conv.add_message("user", f"msg {i}")
-        save_session(conv)
-
-    all_files = [f for f in os.listdir(config.SESSIONS_DIR) if f.endswith('.json') and f != "latest.json"]
-    assert len(all_files) <= 20, f"Prune failed, {len(all_files)} archives remain"
-    print("  ✅ session archive pruning works (keeps <= 20)")
-
-
-def test_session_json_structure():
-    setup()
+    _reset_migration_latch()
     conv = ConversationMemory()
     conv.add_message("user", "Hello")
     conv.add_message("assistant", "World")
-    save_session(conv, metadata={"provider": "anthropic", "model": "claude-sonnet-4-6"})
+    checkpoint_session(conv, metadata={"provider": "anthropic", "model": "claude-sonnet-4-6"})
 
-    with open(config.LATEST_SESSION_FILE) as f:
-        data = json.load(f)
-    assert data["version"] == 1
-    assert data["session_id"] == conv.session_id
-    UUID(data["session_id"])
-    assert data["message_count"] == 2
-    assert data["metadata"]["provider"] == "anthropic"
-    assert len(data["messages"]) == 2
-    print("  ✅ session JSON structure is correct")
+    # Log: session_start + 2 messages.
+    log_file = event_log_path(conv.session_id, config.SESSIONS_DIR)
+    with open(log_file) as f:
+        events = [json.loads(l) for l in f]
+    assert len(events) == 3
+    assert events[0]["kind"] == "session_start"
+    assert events[0]["metadata"]["provider"] == "anthropic"
+    assert events[0]["metadata"]["model"] == "claude-sonnet-4-6"
+    assert events[1]["kind"] == "message"
+    assert events[2]["kind"] == "message"
+    # Session id is a valid UUID.
+    UUID(conv.session_id)
+    print("  ✅ event log structure: session_start + messages")
 
 
-def test_session_archive_preserves_session_id():
+def test_legacy_snapshot_migrates_on_first_call():
     setup()
-    conv = ConversationMemory()
-    conv.add_message("user", "Hello")
-    save_session(conv)
-
-    with open(config.LATEST_SESSION_FILE) as f:
-        latest = json.load(f)
-
-    archive_files = [
-        f for f in os.listdir(config.SESSIONS_DIR)
-        if f.endswith(".json") and f != "latest.json"
-    ]
-    assert len(archive_files) == 1, f"Expected one archive, got: {archive_files}"
-    with open(os.path.join(config.SESSIONS_DIR, archive_files[0])) as f:
-        archived = json.load(f)
-
-    assert latest["session_id"] == conv.session_id
-    assert archived["session_id"] == conv.session_id
-    print("  ✅ session archives preserve session_id")
-
-
-def test_load_legacy_session_without_session_id():
-    setup()
-    legacy_path = os.path.join(config.SESSIONS_DIR, "legacy.json")
-    with open(legacy_path, "w", encoding="utf-8") as f:
+    _reset_migration_latch()
+    # Drop a legacy latest.json + a timestamped archive on disk.
+    legacy_sid_a = "legacy-aaaa-bbbb-cccc-dddd-eeeeffff0011"
+    legacy_sid_b = "legacy-aaaa-bbbb-cccc-dddd-eeeeffff0022"
+    os.makedirs(config.SESSIONS_DIR, exist_ok=True)
+    with open(os.path.join(config.SESSIONS_DIR, "latest.json"), "w") as f:
         json.dump({
-            "version": 1,
-            "saved_at": "2026-04-29T12:00:00+08:00",
-            "message_count": 1,
+            "version": 1, "session_id": legacy_sid_a,
+            "saved_at": "2026-04-29T12:00:00+08:00", "message_count": 1,
+            "metadata": {"provider": "anthropic", "model": "legacy-model"},
+            "messages": [{"role": "user", "content": "legacy-a"}],
+        }, f)
+    with open(os.path.join(config.SESSIONS_DIR, "20260428_120000.json"), "w") as f:
+        json.dump({
+            "version": 1, "session_id": legacy_sid_b,
+            "saved_at": "2026-04-28T12:00:00+08:00", "message_count": 1,
             "metadata": {},
-            "messages": [{"role": "user", "content": "legacy"}],
+            "messages": [{"role": "user", "content": "legacy-b"}],
         }, f)
 
+    # Any API call triggers migration.
+    entries = list_sessions()
+    sids = {e["session_id"] for e in entries}
+    assert legacy_sid_a in sids
+    assert legacy_sid_b in sids
+    # Legacy files were renamed.
+    assert not os.path.isfile(os.path.join(config.SESSIONS_DIR, "latest.json"))
+    assert os.path.isfile(os.path.join(config.SESSIONS_DIR, "latest.json.legacy"))
+    # Pointer was seeded from latest.json → points at legacy_sid_a.
+    with open(os.path.join(config.SESSIONS_DIR, "latest.txt")) as f:
+        assert f.read().strip() == legacy_sid_a
+    # Replay works on the migrated log.
     conv = ConversationMemory()
-    result = load_session(conv, path=legacy_path)
-
-    assert result["loaded"] is True, f"Load failed: {result}"
-    assert result["session_id"] == conv.session_id
-    UUID(result["session_id"])
-    assert conv.messages[0]["content"] == "legacy"
-    print("  ✅ legacy sessions without session_id still load")
+    result = load_session(conv, query=legacy_sid_b)
+    assert result["loaded"]
+    assert conv.messages[0]["content"] == "legacy-b"
+    print("  ✅ legacy snapshots migrate to event log + pointer on first call")
 
 
 def test_conversation_clear_rotates_session_id():
@@ -442,16 +455,14 @@ if __name__ == "__main__":
         test_parse_frontmatter_with_fm,
         test_show_memory_includes_timestamps,
         # 2. Session persistence
-        test_save_and_load_session,
+        test_checkpoint_and_load_session,
         test_has_saved_session,
-        test_delete_session,
-        test_load_empty_conversation,
+        test_delete_session_clears_pointer,
+        test_checkpoint_empty_conversation,
         test_load_nonexistent_session,
-        test_session_archive_created,
-        test_session_prune,
-        test_session_json_structure,
-        test_session_archive_preserves_session_id,
-        test_load_legacy_session_without_session_id,
+        test_end_session_marks_ended_but_keeps_log,
+        test_event_log_structure,
+        test_legacy_snapshot_migrates_on_first_call,
         test_conversation_clear_rotates_session_id,
         # 3. Config
         test_max_memory_prompt_chars,
