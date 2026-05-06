@@ -735,11 +735,42 @@ def read_journal(month: str | None = None) -> str:
         return ""
 
 
+# Journal categories live in markdown headers ("## YYYY-MM-DD HH:MM [cat]")
+# so a category containing "[", "]", "\n", or other markdown control chars
+# breaks the journal structure (and the `## ` header parser used by
+# search.py::_split_sections). Validate against a permissive identifier
+# regex — more relaxed than _ALLOWED_MEMORY_CATEGORIES because journal
+# categories are freeform tags ("ship", "debug", "refactor", "session",
+# "memory_revision", "codex_review", ...). Invalid input falls back to
+# "note" silently — journal writes are best-effort and we don't want a
+# malformed tag to lose the actual entry body.
+_JOURNAL_CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
+
+
+def _sanitize_journal_category(raw: str | None) -> str:
+    """Normalize a journal category for safe use in a markdown header.
+
+    Returns "note" for any input that fails validation. Lowercases the
+    input and strips surrounding whitespace before checking the pattern.
+    """
+    if not raw:
+        return "note"
+    cat = raw.strip().lower()
+    if not cat or not _JOURNAL_CATEGORY_RE.match(cat):
+        return "note"
+    return cat
+
+
 def append_journal(text: str, category: str = "note") -> str:
     """Append a dated entry to the current month's journal file.
 
     Returns the journal-relative path that was written, so callers (and the
     agent) know where the note lives without having to guess.
+
+    The ``category`` is sanitized (``_sanitize_journal_category``) before
+    being interpolated into the markdown header — a malformed tag from a
+    user-supplied facade call would otherwise break the journal section
+    structure that ``search.py::_split_sections`` relies on.
 
     Concurrency: local threads serialize the header+body append under
     ``_JOURNAL_LOCK``. The header still uses O_CREAT|O_EXCL so a separate
@@ -747,6 +778,7 @@ def append_journal(text: str, category: str = "note") -> str:
     duplicate ``# Journal —`` heading.
     """
     ensure_dirs()
+    safe_category = _sanitize_journal_category(category)
     now = datetime.now(ASIA_SHANGHAI_TZ)
     month = now.strftime("%Y-%m")
     timestamp = now.strftime("%Y-%m-%d %H:%M")
@@ -772,7 +804,7 @@ def append_journal(text: str, category: str = "note") -> str:
             pass  # another writer already installed the header — safe to append
 
         with open(path, "a", encoding="utf-8") as f:
-            f.write(f"## {timestamp} [{category}]\n{text.rstrip()}\n\n")
+            f.write(f"## {timestamp} [{safe_category}]\n{text.rstrip()}\n\n")
 
     return f"data/memory/journal/{month}.md"
 

@@ -1086,6 +1086,172 @@ def test_update_directive_also_injection_filtered():
     assert "dump secrets" not in content
 
 
+# ─── 2026-05-06 build_memory_context cap + topic-listing dedup (MEDIUM) ──────
+
+
+def test_build_memory_context_respects_cap_with_topic_listing():
+    """MEDIUM: the cap must apply to the FULL body including topic listing.
+    Before the fix, full_text was truncated first and the listing was appended
+    afterward, letting topics bypass the budget."""
+    setup()
+    from jyagent.memory.context import build_memory_context
+    from jyagent.memory.operations import write_memory_md, write_topic
+    import jyagent.memory.context as _ctx
+
+    # Fill MEMORY.md with content but NO "## Topic Files Index" heading so
+    # the standalone listing path runs.
+    write_memory_md("# Agent Memory\n\n" + "[tip] a fact line\n" * 50)
+
+    # Add many topics so the listing itself is non-trivial.
+    for i in range(30):
+        write_topic(f"t{i:02d}", f"# Topic {i}\nbody {i}\n")
+
+    # Artificially shrink the cap so we can verify the combined body is
+    # capped. Original cap is much larger.
+    original_cap = _ctx.MAX_MEMORY_PROMPT_CHARS
+    _ctx.MAX_MEMORY_PROMPT_CHARS = 500
+    try:
+        out = build_memory_context()
+    finally:
+        _ctx.MAX_MEMORY_PROMPT_CHARS = original_cap
+
+    # Extract just the body between the delimiters to measure what was
+    # actually injected (ignore the fixed trailing legend lines).
+    import re as _re
+    match = _re.search(
+        r"═══ SELF-USE MEMORY.*?═══\n(.*?)\n═══ END MEMORY ═══",
+        out,
+        _re.DOTALL,
+    )
+    assert match is not None, f"output missing memory delimiters: {out[:500]}"
+    body = match.group(1)
+    # Body must not exceed the cap + the truncation marker overhead.
+    assert len(body) <= 500 + len("\n... (memory truncated)"), (
+        f"body exceeds cap: {len(body)} chars. First 200: {body[:200]!r}"
+    )
+    assert "(memory truncated)" in body, "cap was not hit → test setup is wrong"
+
+
+def test_build_memory_context_skips_listing_when_index_already_present():
+    """MEDIUM: don't duplicate the topic list when MEMORY.md already contains
+    a ## Topic Files Index section."""
+    setup()
+    from jyagent.memory.context import build_memory_context
+    from jyagent.memory.operations import write_memory_md, write_topic
+
+    write_memory_md(
+        "# Agent Memory\n\n"
+        "## Topic Files Index\n"
+        "- **foo.md** — handwritten description\n"
+    )
+    write_topic("foo", "# Foo Topic\nbody\n")
+
+    out = build_memory_context()
+    # The standalone "Topic files available:" line must NOT appear because
+    # MEMORY.md already provides the listing.
+    assert "Topic files available (read with" not in out, (
+        "standalone listing duplicated content already in MEMORY.md"
+    )
+    # But the MEMORY.md-embedded listing is still there.
+    assert "## Topic Files Index" in out
+
+
+def test_build_memory_context_emits_listing_when_index_absent():
+    """MEDIUM: when MEMORY.md lacks ## Topic Files Index, the standalone
+    listing is the only discovery mechanism — must still fire."""
+    setup()
+    from jyagent.memory.context import build_memory_context
+    from jyagent.memory.operations import write_memory_md, write_topic
+
+    # Use write_memory_md WITHOUT a topic index. Note: write_topic will
+    # auto-upsert a ## Topic Files Index section — so we need to overwrite
+    # MEMORY.md AFTER the topic is created to simulate the "user hand-edited
+    # MEMORY.md and removed the section" state.
+    write_topic("bar", "# Bar Topic\nbody\n")
+    write_memory_md("# Agent Memory\n\n[tip] no topic index here\n")
+
+    out = build_memory_context()
+    assert "Topic files available (read with" in out
+    assert "data/memory/topics/bar.md" in out
+
+
+# ─── 2026-05-06 append_journal category sanitisation (LOW) ───────────────────
+
+
+def test_append_journal_sanitises_brackets_in_category():
+    """LOW: a category containing ']' would break the '## YYYY-MM-DD [cat]'
+    header format (search.py splits on '## '). The sanitiser must fall back
+    to 'note' for malformed categories rather than corrupt the journal."""
+    setup()
+    from jyagent.memory.operations import append_journal, read_journal
+
+    path = append_journal("hello", category="bad]cat[evil")
+    content = read_journal()
+    # Header landed with the safe fallback category, not the corrupted one.
+    assert "[note]" in content
+    assert "[bad]cat[evil]" not in content
+    # The body still made it.
+    assert "hello" in content
+
+
+def test_append_journal_sanitises_newlines_and_controls():
+    """LOW: embedded newlines or markdown control chars in category would
+    break the header line. Fall back to 'note'."""
+    setup()
+    from jyagent.memory.operations import append_journal, read_journal
+
+    append_journal("body1", category="cat\nwith\nnewlines")
+    append_journal("body2", category="## heading-shaped")
+    append_journal("body3", category="")
+    append_journal("body4", category="   ")
+
+    content = read_journal()
+    # All four fell back to [note]
+    assert content.count("[note]") == 4
+    # Body preserved for all
+    for b in ("body1", "body2", "body3", "body4"):
+        assert b in content
+    # No corrupt headers leaked through
+    assert "## heading-shaped" not in content
+    assert "cat\nwith" not in content
+
+
+def test_append_journal_accepts_real_world_categories():
+    """LOW: the legitimate categories actually used in the codebase
+    (ship, debug, refactor, session, memory_revision, codex_review, note)
+    must all pass validation — this is the false-positive guard for the
+    sanitiser."""
+    setup()
+    from jyagent.memory.operations import append_journal, read_journal
+
+    legit = [
+        "note", "ship", "debug", "refactor", "session",
+        "memory_revision", "codex_review", "research", "correction",
+    ]
+    for cat in legit:
+        append_journal(f"entry for {cat}", category=cat)
+
+    content = read_journal()
+    for cat in legit:
+        assert f"[{cat}]" in content, f"legitimate category {cat} was rejected"
+        assert f"entry for {cat}" in content
+
+
+def test_append_journal_category_case_normalized():
+    """LOW: categories are case-normalized to lowercase for consistency
+    (matches the convention the codebase already follows)."""
+    setup()
+    from jyagent.memory.operations import append_journal, read_journal
+
+    append_journal("mixed", category="Ship")
+    append_journal("upper", category="DEBUG")
+    content = read_journal()
+    assert "[ship]" in content
+    assert "[debug]" in content
+    assert "[Ship]" not in content
+    assert "[DEBUG]" not in content
+
+
 # ─── runner ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1146,6 +1312,15 @@ if __name__ == "__main__":
         ("injection_filter_rejects_urls_html_and_code_fences", test_injection_filter_rejects_urls_html_and_code_fences),
         ("injection_filter_preserves_legitimate_facts", test_injection_filter_preserves_legitimate_facts),
         ("injection_filter_blocks_update_directive_too", test_injection_filter_blocks_update_directive_too),
+        # 2026-05-06 MEDIUM: build_memory_context cap + dedup
+        ("build_memory_context_respects_cap_with_topic_listing", test_build_memory_context_respects_cap_with_topic_listing),
+        ("build_memory_context_skips_listing_when_index_already_present", test_build_memory_context_skips_listing_when_index_already_present),
+        ("build_memory_context_emits_listing_when_index_absent", test_build_memory_context_emits_listing_when_index_absent),
+        # 2026-05-06 LOW: journal category sanitisation
+        ("append_journal_sanitises_brackets_in_category", test_append_journal_sanitises_brackets_in_category),
+        ("append_journal_sanitises_newlines_and_controls", test_append_journal_sanitises_newlines_and_controls),
+        ("append_journal_accepts_real_world_categories", test_append_journal_accepts_real_world_categories),
+        ("append_journal_category_case_normalized", test_append_journal_category_case_normalized),
     ]
     passed = failed = 0
     for name, fn in tests:

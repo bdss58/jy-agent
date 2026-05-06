@@ -4,38 +4,53 @@ from ..config import MAX_MEMORY_PROMPT_CHARS
 from .operations import read_memory_index, list_topics
 
 
+# Heading MEMORY.md uses for its own topic index. When present, we skip the
+# standalone "Topic files available:" listing below to avoid duplicating the
+# same information twice in the always-loaded system prompt.
+_TOPIC_INDEX_HEADING = "## Topic Files Index"
+
+
 def build_memory_context(query: str = "") -> str:
     """Build a memory context string to inject into the system prompt.
 
     Layout:
       1. MEMORY.md index (always, first 200 lines / 25KB) — includes user profile section
+      2. Topic-file discovery hint — ONLY when MEMORY.md lacks its own
+         ``## Topic Files Index`` section, so we never duplicate the same
+         listing twice in the always-loaded prompt.
 
-    Topic files are NOT injected here — agent reads them on-demand via read_file.
+    The combined body is capped by ``MAX_MEMORY_PROMPT_CHARS`` AFTER all
+    sections have been assembled (fixed 2026-05-06; previously the cap was
+    applied before the topic listing, letting the listing bypass it).
+
+    Topic file BODIES are not injected here — the agent reads them on-demand
+    via ``read_file`` or ``manage_memory(action='search')``.
     """
-    sections = []
-
-    # 1. MEMORY.md index (with Claude Code limits) — includes user profile
     memory_index = read_memory_index()
-    if memory_index:
-        sections.append(f"## Agent Memory (MEMORY.md)\n{memory_index}")
-
-    if not sections:
+    if not memory_index:
         return ""
 
-    full_text = "\n\n".join(sections)
-    if len(full_text) > MAX_MEMORY_PROMPT_CHARS:
-        full_text = full_text[:MAX_MEMORY_PROMPT_CHARS] + "\n... (memory truncated)"
+    # Assemble the full body first: MEMORY.md index, then the topic-file
+    # discovery hint (only if MEMORY.md doesn't already list them).
+    body_parts: list[str] = [f"## Agent Memory (MEMORY.md)\n{memory_index}"]
 
-    # Build topic file listing for agent awareness
     topics = list_topics()
-    topic_listing = ""
-    if topics:
-        topic_listing = "\n\nTopic files available (read with `read_file`): " + \
-            ", ".join(f"data/memory/topics/{t}.md" for t in topics)
+    if topics and _TOPIC_INDEX_HEADING not in memory_index:
+        listing = "Topic files available (read with `read_file`): " + ", ".join(
+            f"data/memory/topics/{t}.md" for t in topics
+        )
+        body_parts.append(listing)
+
+    full_body = "\n\n".join(body_parts)
+
+    # Cap AFTER assembly so the standalone topic listing (if present) counts
+    # toward the budget rather than bypassing it.
+    if len(full_body) > MAX_MEMORY_PROMPT_CHARS:
+        full_body = full_body[:MAX_MEMORY_PROMPT_CHARS] + "\n... (memory truncated)"
 
     return f"""
 ═══ SELF-USE MEMORY (automatically maintained) ═══
-{full_text}{topic_listing}
+{full_body}
 ═══ END MEMORY ═══
 
 Memory tier model (do not violate):
