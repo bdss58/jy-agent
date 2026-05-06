@@ -36,6 +36,10 @@ if TYPE_CHECKING:
     # supply the real classes at runtime; the Protocol just describes the
     # shape.
     from .llm_types import LLMOptions, ModelSpec
+    # Normalized message / context / stream types live in jyagent.llm.types
+    # (TypedDicts — see jyagent/llm/validation.py for the runtime validators).
+    # Imported under TYPE_CHECKING to keep the Protocol import cheap.
+    from ...llm.types import AssistantMessage, Context, StreamEvent
 
 
 @runtime_checkable
@@ -174,20 +178,20 @@ class LLMClient(Protocol):
 
     def complete(
         self,
-        context: dict,
+        context: "Context",
         *,
         options: "LLMOptions",
         model_spec: "ModelSpec | None" = None,
-    ) -> dict:
+    ) -> "AssistantMessage":
         ...
 
     def stream(
         self,
-        context: dict,
+        context: "Context",
         *,
         options: "LLMOptions",
         model_spec: "ModelSpec | None" = None,
-    ) -> Iterator[Any]:
+    ) -> "Iterator[StreamEvent]":
         ...
 
 
