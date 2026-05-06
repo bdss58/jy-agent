@@ -145,7 +145,6 @@ def manage_skills(action: str, name: str = "", description: str = "",
     """Manage Agent Skills (agentskills.io). Actions:
     'load' (one-shot: return full SKILL.md body as tool result — PREFERRED for model use),
     'pin' (session-long: keep instructions injected on every turn — use only when user asks),
-    'activate' (deprecated alias of 'pin'),
     'list' (show all skills), 'deactivate' (un-pin; no name = un-pin all),
     'info' (show skill details), 'create' (create new skill), 'delete' (remove skill),
     'resources' (list skill files), 'read' (read a skill resource file),
@@ -214,17 +213,13 @@ def manage_skills(action: str, name: str = "", description: str = "",
             parts.append("</skill>")
             return ToolResult("\n".join(parts))
 
-        elif action in ("pin", "activate"):
-            # 'pin' is the new name; 'activate' is a deprecated alias kept
-            # for back-compat. Both call mgr.pin() (the CLI /skill handler
-            # in agent.py also calls mgr.pin() directly).
+        elif action == "pin":
             if not name:
                 return ToolResult("Error: 'name' parameter required", is_error=True)
             success = mgr.pin(name)
             if success:
-                verb = "pinned" if action == "pin" else "pinned (action='activate' is deprecated; prefer 'pin')"
                 return ToolResult(
-                    f"📌 Skill '{name}' {verb}. Its full instructions will be "
+                    f"📌 Skill '{name}' pinned. Its full instructions will be "
                     f"prepended to every user message until deactivated. For one-shot "
                     f"use prefer manage_skills(action='load', name='{name}')."
                 )
@@ -313,8 +308,7 @@ def manage_skills(action: str, name: str = "", description: str = "",
         else:
             return ToolResult(
                 f"Error: Unknown action '{action}'. Valid: list, load, pin, "
-                f"deactivate, info, create, delete, resources, read, reload "
-                f"(activate kept as deprecated alias of pin).",
+                f"deactivate, info, create, delete, resources, read, reload.",
                 is_error=True,
             )
 

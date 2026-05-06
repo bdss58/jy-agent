@@ -23,10 +23,6 @@ These tests pin the post-refactor design (Design B, progressive disclosure):
 
 Any future refactor that re-introduces pin-state into the catalog (or
 pulls pinned bodies back into the system prompt) will fail here.
-
-Note: the SkillManager keeps deprecated aliases ``activate`` / ``deactivate``
-/ ``deactivate_all`` / ``get_active_skills`` / ``build_active_bodies_block``
-for back-compat; new tests should use the canonical pin/unpin/... names.
 """
 
 from __future__ import annotations
@@ -204,53 +200,7 @@ class TestAgentSystemPromptIsStable:
         )
 
 
-# ─── deprecated-alias back-compat ────────────────────────────────────────
-
-
-class TestDeprecatedAliasesStillWork:
-    """The old method names are kept as thin aliases so persisted code
-    paths and external callers don't break. If you ever drop them, this
-    test must be updated and a deprecation cycle announced."""
-
-    def test_activate_aliases_pin(self, tmp_path):
-        skills_dir = _make_skills_dir(tmp_path, [("alpha", "x")])
-        mgr = SkillManager(skills_dir)
-        mgr.discover()
-        assert mgr.activate("alpha") is True
-        assert "alpha" in mgr.get_pinned_skills()
-
-    def test_deactivate_aliases_unpin(self, tmp_path):
-        skills_dir = _make_skills_dir(tmp_path, [("alpha", "x")])
-        mgr = SkillManager(skills_dir)
-        mgr.discover()
-        mgr.pin("alpha")
-        assert mgr.deactivate("alpha") is True
-        assert mgr.get_pinned_skills() == []
-
-    def test_deactivate_all_aliases_unpin_all(self, tmp_path):
-        skills_dir = _make_skills_dir(tmp_path, [("alpha", "x"), ("beta", "y")])
-        mgr = SkillManager(skills_dir)
-        mgr.discover()
-        mgr.pin("alpha")
-        mgr.pin("beta")
-        mgr.deactivate_all()
-        assert mgr.get_pinned_skills() == []
-
-    def test_get_active_skills_aliases_get_pinned_skills(self, tmp_path):
-        skills_dir = _make_skills_dir(tmp_path, [("alpha", "x")])
-        mgr = SkillManager(skills_dir)
-        mgr.discover()
-        mgr.pin("alpha")
-        assert mgr.get_active_skills() == mgr.get_pinned_skills() == ["alpha"]
-
-    def test_build_active_bodies_block_aliases_build_pinned_bodies_block(
-        self, tmp_path
-    ):
-        skills_dir = _make_skills_dir(tmp_path, [("alpha", "x")])
-        mgr = SkillManager(skills_dir)
-        mgr.discover()
-        mgr.pin("alpha")
-        assert mgr.build_active_bodies_block() == mgr.build_pinned_bodies_block()
+# ─── no-router invariant ─────────────────────────────────────────────────
 
 
 # Note: there is no automatic per-turn skill router by design.  Skills

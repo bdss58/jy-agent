@@ -277,10 +277,6 @@ class SkillManager:
         catalog = manager.get_catalog()           # advertise: name + description
         manager.pin("web-search")                 # session-long pin
         bodies = manager.build_pinned_bodies_block()  # injected per-turn
-
-    Back-compat: the old method names ``activate`` / ``deactivate`` /
-    ``deactivate_all`` / ``get_active_skills`` / ``build_active_bodies_block``
-    are kept as deprecated thin aliases pointing at the new names.
     """
 
     def __init__(self, skills_dir: str = DEFAULT_SKILLS_DIR):
@@ -381,27 +377,6 @@ class SkillManager:
     def get_pinned_skills(self) -> list[str]:
         """Return names of currently pinned skills."""
         return sorted(self._pinned)
-
-    # ── Deprecated aliases (kept for back-compat with external callers) ──
-    # New code should use pin/unpin/unpin_all/get_pinned_skills directly.
-    # These thin shims preserve the old naming used by /skill CLI handler
-    # historical and any saved sessions/tests written against the prior API.
-
-    def activate(self, name: str) -> bool:
-        """DEPRECATED alias of ``pin``."""
-        return self.pin(name)
-
-    def deactivate(self, name: str) -> bool:
-        """DEPRECATED alias of ``unpin``."""
-        return self.unpin(name)
-
-    def deactivate_all(self) -> None:
-        """DEPRECATED alias of ``unpin_all``."""
-        self.unpin_all()
-
-    def get_active_skills(self) -> list[str]:
-        """DEPRECATED alias of ``get_pinned_skills``."""
-        return self.get_pinned_skills()
 
     def get_instructions(self, name: str) -> Optional[str]:
         """
@@ -536,28 +511,6 @@ class SkillManager:
             lines.append("</pinned_skill>")
 
         return "\n".join(lines)
-
-    def build_active_bodies_block(self) -> str:
-        """DEPRECATED alias of ``build_pinned_bodies_block``."""
-        return self.build_pinned_bodies_block()
-
-    def build_prompt_context(self) -> str:
-        """
-        Legacy combined renderer: catalog + pinned bodies in one string.
-
-        Kept for back-compat with callers that inject the whole thing into a
-        single buffer (e.g. tests, ad-hoc tooling). The main agent loop now
-        uses ``build_catalog_block`` and ``build_pinned_bodies_block``
-        separately so they can be placed in cache-friendly positions.
-        """
-        if not self._skills:
-            return ""
-
-        catalog = self.build_catalog_block()
-        bodies = self.build_pinned_bodies_block()
-        if catalog and bodies:
-            return catalog + "\n\n" + bodies
-        return catalog or bodies
 
     def create_skill(self, name: str, description: str, instructions: str,
                      metadata: Optional[dict] = None) -> str:

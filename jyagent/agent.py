@@ -88,7 +88,7 @@ CRITICAL BEHAVIORAL PRINCIPLES:
    - /skills — list all available skills and their status
    - /skill <name> — user-driven pin (the user's explicit pin command)
    - manage_skills tool — full skill management (load, pin, deactivate, list, create, …)
-   `activate` is a deprecated alias of `pin`; prefer `load` or `pin` explicitly."""
+"""
 
 
 

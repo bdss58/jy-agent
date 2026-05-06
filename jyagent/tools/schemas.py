@@ -137,8 +137,7 @@ CORE_TOOLS = [
             "pinned skills re-inject their full body on EVERY user message "
             "and are token-expensive. Other actions: 'list', 'deactivate' "
             "(un-pin; no name = un-pin all), 'info', 'create', 'delete', "
-            "'resources', 'read' (read a skill resource file), 'reload'. "
-            "'activate' is a deprecated alias of 'pin'."
+            "'resources', 'read' (read a skill resource file), 'reload'."
         ),
         "input_schema": {
             "type": "object",
@@ -148,13 +147,13 @@ CORE_TOOLS = [
                     "description": (
                         "Action: load (one-shot, PREFERRED), pin (session-long), "
                         "list, deactivate, info, create, delete, resources, "
-                        "read, reload. 'activate' is a deprecated alias of 'pin'."
+                        "read, reload."
                     ),
-                    "enum": ["list", "load", "pin", "activate", "deactivate", "info", "create", "delete", "resources", "read", "reload"]
+                    "enum": ["list", "load", "pin", "deactivate", "info", "create", "delete", "resources", "read", "reload"]
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill name. REQUIRED for: load, pin, activate, info, create, delete, resources, read. OPTIONAL for: deactivate (no name = un-pin all). Not needed for: list, reload."
+                    "description": "Skill name. REQUIRED for: load, pin, info, create, delete, resources, read. OPTIONAL for: deactivate (no name = un-pin all). Not needed for: list, reload."
                 },
                 "description": {
                     "type": "string",
