@@ -15,8 +15,8 @@ import time
 
 import pytest
 
-from jyagent.tools import core as bg_core
-from jyagent.tools.core import (
+from jyagent.tools import background as bg_core
+from jyagent.tools.background import (
     _BG_MAX_CONCURRENT,
     _BG_OUTPUT_MAX_BYTES,
     _BG_WAIT_MAX_SECONDS,
