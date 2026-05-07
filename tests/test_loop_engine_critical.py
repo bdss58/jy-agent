@@ -1190,29 +1190,34 @@ class TestVerificationCleanupParity:
 
     def test_helper_strips_only_trailing_verification(self):
         """Direct test of the helper: idempotent, guards non-dict tail."""
+        # ``strip_dangling_verification`` lives in the leaf ``finalize``
+        # module — engine.py no longer re-exports it (dead alias removed
+        # 2026-05-06).  Import from the leaf where the helper actually lives.
+        from jyagent.runtime.loop.finalize import strip_dangling_verification
+
         # Positive: trailing VERIFICATION user message is popped.
         msgs = [
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
             {"role": "user", "content": "[VERIFICATION] please self-check"},
         ]
-        le.strip_dangling_verification(msgs)
+        strip_dangling_verification(msgs)
         assert len(msgs) == 2
         assert msgs[-1]["role"] == "assistant"
 
         # Negative: non-VERIFICATION tail is left alone.
         msgs2 = [{"role": "user", "content": "normal"}]
-        le.strip_dangling_verification(msgs2)
+        strip_dangling_verification(msgs2)
         assert len(msgs2) == 1
 
         # Empty list is a no-op.
         empty: list = []
-        le.strip_dangling_verification(empty)
+        strip_dangling_verification(empty)
         assert empty == []
 
         # Non-dict tail is a no-op (guard against malformed input).
         mixed = [{"role": "user", "content": "hi"}, "not-a-dict"]
-        le.strip_dangling_verification(mixed)
+        strip_dangling_verification(mixed)
         assert mixed == [{"role": "user", "content": "hi"}, "not-a-dict"]
 
     def test_source_calls_helper_in_max_steps_path(self):
