@@ -118,11 +118,10 @@ dmypy.json
 .agent_history
 mcp_stderr.log
 
-# Data directory — runtime artifacts excluded, memory tracked
-# data/memory/ is tracked (small, curated, needed across devices)
-data/sessions/
-data/traces/
-data/logs/
+# Data directory — track only curated memory
+data/*
+!data/memory/
+!data/memory/**
 
 # Package backups from evolution
 jyagent/backups/
