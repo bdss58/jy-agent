@@ -17,6 +17,7 @@ import tempfile
 
 from ..config import SKIP_DIRS, BINARY_EXTS
 from ..runtime.tools.result import ToolResult
+from ..utils.files import atomic_write
 
 
 def _track_file(path: str) -> None:
@@ -44,44 +45,9 @@ def resolve_path(path: str, root: str | None = None) -> str:
     return os.path.abspath(path)
 
 
-def atomic_write(path: str, content: str, encoding: str = "utf-8") -> None:
-    """Write content to a temp file, then atomically replace the target."""
-    dirname = os.path.dirname(path) or "."
-    os.makedirs(dirname, exist_ok=True)
-
-    # Preserve original file permissions (mkstemp defaults to 0o600)
-    import stat as _stat
-    original_mode = None
-    try:
-        original_mode = os.stat(path).st_mode
-    except FileNotFoundError:
-        pass
-
-    fd = None
-    tmp_path = None
-    try:
-        fd_int, tmp_path = tempfile.mkstemp(dir=dirname, prefix=".tmp_", suffix=".write")
-        fd = os.fdopen(fd_int, "w", encoding=encoding)
-        fd.write(content)
-        fd.flush()
-        os.fsync(fd.fileno())
-        fd.close()
-        fd = None
-        if original_mode is not None:
-            os.chmod(tmp_path, _stat.S_IMODE(original_mode))
-        os.replace(tmp_path, path)
-        tmp_path = None
-    finally:
-        if fd is not None:
-            try:
-                fd.close()
-            except OSError:
-                pass
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+# ``atomic_write`` is re-exported above (``from ..utils.files import atomic_write``)
+# so legacy ``from jyagent.tools.core import atomic_write`` callers keep working.
+# New code should import directly from ``jyagent.utils.files``.
 
 
 def should_skip_dir(dirname: str) -> bool:

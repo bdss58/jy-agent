@@ -356,15 +356,17 @@ def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> Str
         """Approval gate.  Auto-allow read-only tools; prompt on mutating ones."""
         if not ask or allow_all[0]:
             return "allow"
-        # Auto-allow non-mutating tools.  We import the metadata table
-        # lazily to avoid a hard dependency between ui/terminal.py and
-        # tools/__init__.py at import time.
+        # Auto-allow non-mutating tools.  Use the public ToolRegistry/ToolBatch
+        # API rather than reaching into ``tools.__init__._TOOL_METADATA``
+        # (which is a registration-time private — subject to change).  Lazy
+        # import avoids a hard dependency between ui/terminal.py and the
+        # runtime tool registry at module-load time.
         try:
-            from ..tools import _TOOL_METADATA
-            if not _TOOL_METADATA.get(name, {}).get("mutating", False):
+            from ..runtime.tools.registry import get_registry
+            if not get_registry().freeze().is_mutating(name):
                 return "allow"
         except Exception:
-            pass  # If metadata is unreachable, fall through to ask.
+            pass  # If registry is unreachable, fall through to ask.
 
         # Make sure the streamed text line has a terminator before our prompt.
         if stream_state.needs_newline:

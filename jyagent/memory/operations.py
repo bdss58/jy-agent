@@ -657,7 +657,7 @@ def write_topic(name: str, content: str) -> None:
     serialized = _build_frontmatter(final_meta) + body
     if body and not body.endswith("\n"):
         serialized += "\n"
-    from ..tools.core import atomic_write as _atomic_write
+    from ..utils.files import atomic_write as _atomic_write
     _atomic_write(filepath, serialized)
 
     # Keep the always-loaded topic index current for both new and rewritten
