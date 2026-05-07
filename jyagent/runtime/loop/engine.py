@@ -72,54 +72,30 @@ def _t_as_dict(t: Any) -> dict:
 # ─── Shared dispatch executor ────────────────────────────────────────────────
 # The shared tool-dispatch pool, its lazy-grow helper, and the
 # tool-execution helpers live in ``runtime/loop/tool_executor.py``.
-# Engine imports the public names directly — the per-step body in
+# Engine imports only what its own body uses.  Other call sites import
+# directly from the leaf module (``tool_executor``, ``cost``, ``stuck_loop``,
+# ``finalize``, ``compaction``).  Re-exports from this module are no longer
+# offered for back-compat — the per-step body in
 # ``runtime/loop/step.py::run_step`` calls ``tool_executor.execute_tools``
-# directly, so any patching/monkeypatching for tests should target
-# ``jyagent.runtime.loop.tool_executor`` (not ``engine``).
-from .tool_executor import (  # noqa: E402
-    execute_tool_with_timeout,
-    get_tool_dispatch_executor,
-)
+# directly, so any patching/monkeypatching for tests must target the leaf
+# module, not ``engine``.
+from .tool_executor import get_tool_dispatch_executor  # noqa: E402
 
-
-# ─── Private helpers ─────────────────────────────────────────────────────────
-
-
-# ─── Harness helpers ─────────────────────────────────────────────────────────
-
-# Cost-accounting helpers live in runtime/loop/cost.py.
-from .cost import CostTracker  # noqa: E402
-
-
-# Stuck-loop detector lives in runtime/loop/stuck_loop.py.
-from .stuck_loop import StuckLoopDetector  # noqa: E402
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# LLM extraction helpers live in runtime/loop/llm_runner.py.
-from .llm_runner import (
+# LLM retry helpers used inside ``_call_llm_with_retry`` below.  Tests that
+# patch retry behavior must rebind BOTH ``llm_runner.is_transient_error`` and
+# ``engine.is_transient_error`` (engine binds the name at module-load time).
+from .llm_runner import (  # noqa: E402
     is_transient_error,
     build_runtime_options,
 )
 
+# Terminal-path helper used by ``AgentLoop.run()``.  ``step.py`` imports
+# ``finalize_run`` directly from ``.finalize`` — both call sites use the same
+# public name, no alias layer.
+from .finalize import finalize_run  # noqa: E402
 
-# Terminal-path helpers live in ``runtime/loop/finalize.py``.  step.py
-# imports them directly from there too (breaking the historical
-# step→engine→step cyclic conceptual dependency).  No underscore alias
-# layer — both modules use the same public names.
-from .finalize import (  # noqa: E402
-    finalize_run,
-    is_truncated,
-    strip_dangling_verification,
-)
-
-
-# Compaction helpers live in runtime/loop/compaction.py.
-from .compaction import (  # noqa: E402
-    truncate_tool_call_blocks,
-)
+# Compaction helper used inside ``AgentLoop`` to trim oversized tool blocks.
+from .compaction import truncate_tool_call_blocks  # noqa: E402
 
 
 # ─── AgentLoop ───────────────────────────────────────────────────────────────
