@@ -127,14 +127,15 @@ class TestDispatchExecutorGrowsWithConfig:
         """Requesting more workers than current cap grows the pool."""
         # Snapshot + reset module state so the test is independent.
         # The canonical home for this state is now
-        # runtime/loop/tool_executor.py.  Restoring by writing through
-        # ``loop_engine_te.tool_dispatch_executor`` would create a STATIC
-        # attribute that shadows the PEP-562 ``__getattr__`` passthrough,
-        # breaking later tests (e.g. test_backcompat_alias_points_to_dispatch)
-        # that expect the back-compat names to mirror the live pool.
-        from jyagent.runtime.loop import tool_executor as _te
-        original_executor = _te.tool_dispatch_executor
-        original_cap = _te.tool_dispatch_cap
+        # runtime/loop/tool_pool.py.  Writing through the facade
+        # (``loop_engine_te.tool_dispatch_executor = ...``) creates a
+        # STATIC attribute that shadows the PEP-562 ``__getattr__``
+        # passthrough, breaking later tests that expect the back-compat
+        # names to mirror the live pool.  Restore by assigning to
+        # ``tool_pool`` directly.
+        from jyagent.runtime.loop import tool_pool as _pool
+        original_executor = _pool.tool_dispatch_executor
+        original_cap = _pool.tool_dispatch_cap
         try:
             exe_small = loop_engine_te.get_tool_dispatch_executor(8)
             cap_small = loop_engine_te.tool_dispatch_cap
@@ -148,8 +149,8 @@ class TestDispatchExecutorGrowsWithConfig:
             # Growth must have replaced the executor.
             assert exe_big is not exe_small
         finally:
-            _te.tool_dispatch_executor = original_executor
-            _te.tool_dispatch_cap = original_cap
+            _pool.tool_dispatch_executor = original_executor
+            _pool.tool_dispatch_cap = original_cap
 
     def test_get_executor_reuses_when_already_big_enough(self):
         """Asking for a smaller size than current cap returns the same pool."""
