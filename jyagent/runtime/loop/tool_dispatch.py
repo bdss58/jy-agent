@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import collections
 import concurrent.futures
+import contextvars
 import threading
 import time
 import traceback
@@ -172,8 +173,25 @@ def execute_tools(
             # `get_tool_dispatch_executor` is idempotent and grows in
             # place, so this is cheap.
             pool = executor or get_tool_dispatch_executor(max_workers)
+            # ContextVar propagation: ``ThreadPoolExecutor.submit``
+            # does NOT auto-inherit the parent's context (Python
+            # 3.14.3 — see jyagent MEMORY.md).  Snapshot the calling
+            # context PER submission and route the worker through
+            # ``ctx.run`` so each parallel tool body starts with the
+            # same CV state as if it had run inline on the dispatch
+            # thread.  We copy per-submit (not once for the whole
+            # batch) because a single ``contextvars.Context`` cannot
+            # be entered concurrently — ``ctx.run`` raises
+            # ``RuntimeError`` if a second thread tries to enter the
+            # same context while another is already inside it.  Each
+            # fresh copy is independently enterable, and CV mutations
+            # inside one worker stay local to that worker (matches the
+            # sequential path where ``execute_tool_with_timeout`` also
+            # copies per-call).  ``copy_context()`` is a C-level dict
+            # copy; the per-tool overhead is negligible.
             futures = {
                 pool.submit(
+                    contextvars.copy_context().run,
                     _timed,
                     block.name, block.input, batch, timeout,
                     body_permits=body_permits,
