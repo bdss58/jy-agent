@@ -24,7 +24,8 @@ import re
 from dataclasses import dataclass
 
 from .. import config as _cfg
-from .operations import list_topics, list_journals, read_topic, read_journal
+from ._topics import list_topics, read_topic
+from ._journal import list_journals, read_journal
 
 
 # ─── Tokenization ─────────────────────────────────────────────────────────────

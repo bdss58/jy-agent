@@ -27,10 +27,12 @@ config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
 config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
 config.SESSIONS_DIR = os.path.join(_tmpdir, "sessions")
 
-from jyagent.memory.operations import (
+from jyagent.memory import (
     write_topic, read_topic, read_topic_body, read_topic_meta,
     list_topics, delete_topic, remember, show_memory,
     read_memory_md, write_memory_md,
+)
+from jyagent.memory._topics import (
     _parse_frontmatter, _build_frontmatter,
     _extract_topic_description, _add_topic_index_entry, _remove_topic_index_entry,
 )

@@ -6,7 +6,7 @@ from ..runtime.tools.result import ToolResult
 
 def manage_memory(action: str, text: str = "", category: str = "") -> ToolResult:
     """Manage the agent's self-use memory system. Actions: 'remember' (save a DURABLE learning/fact to MEMORY.md — use sparingly, data-independent rules only), 'forget' (remove memories by keyword), 'show' (display all memories), 'search' (BM25 over topic+journal bodies), 'topic' (manage curated topic files: list/read/write/delete/sections), 'goal' (add/complete a goal), 'journal' (append a dated session note to data/memory/journal/YYYY-MM.md — never auto-loaded, for 'what I did today' style entries), 'consolidate' (analyze MEMORY.md for dedup / bloat candidates — read-only). Three tiers: always-loaded index (MEMORY.md) / curated on-demand (topics/) / chronological on-demand (journal/). To revise an existing rule: write a 'journal' entry recording the change, then 'forget' the old keyword and 'remember' the new fact — keeps Tier 1 lean while preserving audit history in Tier 3."""
-    from ..memory.operations import (
+    from ..memory import (
         remember, forget, show_memory,
         list_topics, read_topic, write_topic, delete_topic,
         read_topic_section, list_topic_sections,

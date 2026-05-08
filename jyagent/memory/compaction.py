@@ -456,7 +456,7 @@ def _run_reflection_pass(
     # the module-level imports of compaction.py minimal so test suites can
     # patch operations.* late.
     try:
-        from .operations import append_journal
+        from ._journal import append_journal
     except Exception:
         return 0
 
