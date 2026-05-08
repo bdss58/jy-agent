@@ -1,20 +1,50 @@
 # memory/ package — Self-use memory system (conversation, MEMORY.md, topics, compaction, sessions).
+#
+# Tier-aligned implementation (see data/memory/topics/memory-design.md):
+#   _index.py         — Tier 1: MEMORY.md (always-loaded index)
+#   _topics.py        — Tier 2: curated topic files (on-demand)
+#   _journal.py       — Tier 3: chronological journal (on-demand)
+#   _consolidation.py — read-only dedup/size analysis
+#   operations.py     — cross-tier verbs (remember / forget / show_memory)
+#
+# This package surface re-exports the public API. Importers should use
+# ``from jyagent.memory import …`` rather than reaching into submodules,
+# except for tests / advanced callers that need module-private helpers
+# (those should import from the owning ``_index`` / ``_topics`` / ``_journal``).
 
-# Re-export the live memory API.
 from .conversation import ConversationMemory
 from .compaction import (
     compact_conversation, summarize_if_needed,
     record_file_access, get_file_tracker, FileAccessTracker,
 )
-from .operations import (
-    read_memory_md, read_memory_index, write_memory_md, append_memory_md,
+
+# Tier 1 — MEMORY.md (always-loaded index)
+from ._index import (
+    ensure_dirs,
+    read_memory_md, read_memory_index,
+    write_memory_md, append_memory_md,
     forget_from_memory_md,
-    list_topics, read_topic, read_topic_body, read_topic_meta, write_topic, delete_topic,
-    read_topic_section, list_topic_sections,
-    list_journals, read_journal, append_journal,
-    memory_index_size_warning, consolidate_memory,
-    remember, forget, show_memory,
+    memory_index_size_warning,
 )
+
+# Tier 2 — topic files (on-demand)
+from ._topics import (
+    list_topics, read_topic, read_topic_body, read_topic_meta,
+    read_topic_section, list_topic_sections,
+    write_topic, delete_topic,
+)
+
+# Tier 3 — journal (on-demand)
+from ._journal import (
+    list_journals, read_journal, append_journal,
+)
+
+# Read-only analyzer
+from ._consolidation import consolidate_memory
+
+# Cross-tier verbs (used by manage_memory tool)
+from .operations import remember, forget, show_memory
+
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
 from .session import (

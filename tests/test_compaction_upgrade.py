@@ -201,7 +201,7 @@ def test_compaction_system_prompt_includes_base_and_memory(monkeypatch):
     import shutil
     import jyagent.config as config
     import jyagent.agent as agent
-    from jyagent.memory.operations import ensure_dirs, write_memory_md
+    from jyagent.memory import ensure_dirs, write_memory_md
 
     tmpdir = tempfile.mkdtemp(prefix="jy_compact_prompt_test_")
     monkeypatch.setattr(config, "MEMORY_DIR", os.path.join(tmpdir, "memory"))

@@ -16,11 +16,12 @@ import threading
 from typing import Optional
 
 from ..config import CHARS_PER_TOKEN
-from .operations import (
-    append_journal, read_memory_md, remember,
-    write_memory_md, _MEMORY_MD_LOCK,
-    _PROTECTED_SECTION_HEADERS, _compute_protected_indices,
+from ._index import (
+    read_memory_md, write_memory_md,
+    _MEMORY_MD_LOCK, _PROTECTED_SECTION_HEADERS, _compute_protected_indices,
 )
+from ._journal import append_journal
+from .operations import remember
 
 
 # Minimum user message length to trigger extraction (skip short commands)

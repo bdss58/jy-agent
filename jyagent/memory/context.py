@@ -1,7 +1,8 @@
 # System prompt injection — build memory context for the system prompt.
 
 from ..config import MAX_MEMORY_PROMPT_CHARS
-from .operations import read_memory_index, list_topics
+from ._index import read_memory_index
+from ._topics import list_topics
 
 
 # Heading MEMORY.md uses for its own topic index. When present, we skip the

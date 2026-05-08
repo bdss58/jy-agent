@@ -27,7 +27,7 @@ config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
 config.JOURNAL_DIR = os.path.join(_tmpdir, "memory", "journal")
 config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
 
-from jyagent.memory.operations import (
+from jyagent.memory import (
     write_memory_md, read_memory_md,
     append_journal, list_journals, read_journal,
     memory_index_size_warning, consolidate_memory,

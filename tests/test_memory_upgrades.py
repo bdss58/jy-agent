@@ -25,7 +25,7 @@ config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
 config.JOURNAL_DIR = os.path.join(_tmpdir, "memory", "journal")
 config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
 
-from jyagent.memory.operations import (
+from jyagent.memory import (
     write_memory_md, read_memory_md,
     write_topic, read_topic,
     read_topic_section, list_topic_sections,
@@ -373,7 +373,7 @@ def test_reflection_writes_journal_candidates():
     assert months, "journal month should exist after reflection"
     journal_text = ""
     for m in months:
-        from jyagent.memory.operations import read_journal
+        from jyagent.memory import read_journal
         journal_text += read_journal(m)
     assert "[reflection]" in journal_text
     assert "httpx defaults to verify=True" in journal_text
@@ -492,7 +492,7 @@ def test_append_memory_md_heals_missing_trailing_newline():
     """A hand-edited MEMORY.md without a trailing newline must not glue
     two unrelated entries onto one line on the next append."""
     setup()
-    from jyagent.memory.operations import append_memory_md
+    from jyagent.memory import append_memory_md
     # Write WITHOUT trailing newline directly, simulating a hand edit.
     with open(config.MEMORY_MD_FILE, "w") as f:
         f.write("# Agent Memory\n\nLAST LINE NO NEWLINE")
@@ -584,7 +584,8 @@ def test_apply_directive_rejects_overlong_body():
 
 def test_topic_path_rejects_traversal():
     """../escape, absolute paths, and special chars must be refused."""
-    from jyagent.memory.operations import _topic_path, write_topic, delete_topic
+    from jyagent.memory import write_topic, delete_topic
+    from jyagent.memory._topics import _topic_path
     assert _topic_path("../escape") is None
     assert _topic_path("/abs/path") is None
     assert _topic_path("foo/bar") is None
@@ -661,7 +662,7 @@ def test_write_topic_refuses_traversal():
 
 def test_delete_topic_refuses_traversal():
     """Bad names return False without removing anything."""
-    from jyagent.memory.operations import delete_topic
+    from jyagent.memory import delete_topic
     setup()
     write_topic("real", "body")
     # Create a sentinel sibling: write_topic auto-creates MEMORY.md (one
@@ -703,7 +704,7 @@ def test_replace_line_does_not_delete_protected_sibling_on_shared_keyword():
     fix, deletion is by matched-line index and protected lines are preserved
     even when they share the keyword."""
     setup()
-    from jyagent.memory.operations import write_memory_md, read_memory_md
+    from jyagent.memory import write_memory_md, read_memory_md
     write_memory_md(
         "# Agent Memory\n\n"
         "## Behavioral Rules (CRITICAL)\n"
@@ -734,7 +735,7 @@ def test_forget_rejects_short_keyword():
     """HIGH: manual forget must refuse keywords shorter than 6 chars — a
     2-char substring like 'py' would mass-delete every Python rule."""
     setup()
-    from jyagent.memory.operations import forget, write_memory_md, read_memory_md
+    from jyagent.memory import forget, write_memory_md, read_memory_md
     write_memory_md(
         "# Agent Memory\n\n"
         "[tip] Something about Python here\n"
@@ -751,7 +752,7 @@ def test_forget_protects_behavioral_rules():
     """HIGH: manual forget must never delete lines under protected sections,
     even if the keyword matches."""
     setup()
-    from jyagent.memory.operations import forget, write_memory_md, read_memory_md
+    from jyagent.memory import forget, write_memory_md, read_memory_md
     write_memory_md(
         "# Agent Memory\n\n"
         "## Behavioral Rules (CRITICAL)\n"
@@ -773,7 +774,7 @@ def test_forget_protects_behavioral_rules():
 def test_forget_only_protected_matches_removes_nothing():
     """HIGH: when every match is protected, forget is a no-op and says so."""
     setup()
-    from jyagent.memory.operations import forget, write_memory_md, read_memory_md
+    from jyagent.memory import forget, write_memory_md, read_memory_md
     write_memory_md(
         "# Agent Memory\n\n"
         "## Behavioral Rules (CRITICAL)\n"
@@ -789,7 +790,7 @@ def test_forget_returns_preview_of_removed_lines():
     """The hardened forget surfaces a preview of what was lost so the user
     can immediately notice accidental mass-deletes."""
     setup()
-    from jyagent.memory.operations import forget, write_memory_md
+    from jyagent.memory import forget, write_memory_md
     write_memory_md(
         "# Agent Memory\n\n"
         "## Durable Tips\n"
@@ -804,7 +805,7 @@ def test_forget_returns_preview_of_removed_lines():
 def test_extract_topic_description_caps_at_120_chars():
     """HIGH: an unbounded first heading in a topic body was being written
     into MEMORY.md as an always-loaded index line. Cap + sanitise it."""
-    from jyagent.memory.operations import _extract_topic_description
+    from jyagent.memory._topics import _extract_topic_description
     very_long_heading = "# " + ("attack payload text " * 20)
     desc = _extract_topic_description(very_long_heading)
     assert len(desc) <= 120 + 1  # +1 for the ellipsis char
@@ -815,7 +816,7 @@ def test_extract_topic_description_caps_at_120_chars():
 
 def test_extract_topic_description_strips_control_chars():
     """Control chars in a topic heading must not be written into MEMORY.md."""
-    from jyagent.memory.operations import _extract_topic_description
+    from jyagent.memory._topics import _extract_topic_description
     body = "# hello\x00\x01\x07 world\x7f"
     desc = _extract_topic_description(body)
     # No control chars survived
@@ -865,7 +866,7 @@ def test_write_topic_is_atomic_on_crash():
     file. We simulate this by making the index-update step raise AFTER the
     file is written: the topic file must still be whole."""
     setup()
-    from jyagent.memory import operations as _ops
+    from jyagent.memory import _topics as _ops
     _ops.write_topic("atomic_test", "# First version\nbody v1\n")
     original = read_topic("atomic_test")
     assert "body v1" in original
@@ -905,7 +906,7 @@ def test_injection_filter_rejects_prompt_reset_phrases():
     and variants — must be rejected even if the reconciler LLM is fooled into
     emitting them as an ADD directive."""
     setup()
-    from jyagent.memory.operations import read_memory_md, write_memory_md
+    from jyagent.memory import read_memory_md, write_memory_md
     write_memory_md("# Agent Memory\n\n")
 
     payloads = [
@@ -936,7 +937,7 @@ def test_injection_filter_rejects_embedded_role_tags():
     """Role markers (system:, <system>, [INST], ChatML) inside a candidate
     body are a clear injection shape and must never reach MEMORY.md."""
     setup()
-    from jyagent.memory.operations import write_memory_md, read_memory_md
+    from jyagent.memory import write_memory_md, read_memory_md
     write_memory_md("# Agent Memory\n\n")
 
     payloads = [
@@ -961,7 +962,7 @@ def test_injection_filter_rejects_urls_html_and_code_fences():
     rules. Auto-extraction rejects them; user can still `remember` them
     manually if they really want."""
     setup()
-    from jyagent.memory.operations import write_memory_md, read_memory_md
+    from jyagent.memory import write_memory_md, read_memory_md
     write_memory_md("# Agent Memory\n\n")
 
     payloads = [
@@ -985,7 +986,7 @@ def test_injection_filter_preserves_legitimate_facts():
     """The filter must not reject ordinary facts. This is the false-positive
     guard — if this starts failing, the regex has over-blocked."""
     setup()
-    from jyagent.memory.operations import read_memory_md, write_memory_md
+    from jyagent.memory import read_memory_md, write_memory_md
     write_memory_md("# Agent Memory\n\n")
 
     legit = [
@@ -1016,7 +1017,7 @@ def test_injection_filter_case_insensitive():
     """Attackers will mix case. Verify IgNoRe, IGNORE, ignore all route the
     same."""
     setup()
-    from jyagent.memory.operations import write_memory_md
+    from jyagent.memory import write_memory_md
     write_memory_md("# Agent Memory\n\n")
 
     for variant in [
@@ -1071,7 +1072,7 @@ def test_update_directive_also_injection_filtered():
     replacement text. An attacker shouldn't be able to smuggle via UPDATE
     either."""
     setup()
-    from jyagent.memory.operations import write_memory_md, read_memory_md
+    from jyagent.memory import write_memory_md, read_memory_md
     write_memory_md(
         "# Agent Memory\n\n"
         "[tip] Harmless existing rule about caching\n"
@@ -1095,7 +1096,7 @@ def test_build_memory_context_respects_cap_with_topic_listing():
     afterward, letting topics bypass the budget."""
     setup()
     from jyagent.memory.context import build_memory_context
-    from jyagent.memory.operations import write_memory_md, write_topic
+    from jyagent.memory import write_memory_md, write_topic
     import jyagent.memory.context as _ctx
 
     # Fill MEMORY.md with content but NO "## Topic Files Index" heading so
@@ -1137,7 +1138,7 @@ def test_build_memory_context_skips_listing_when_index_already_present():
     a ## Topic Files Index section."""
     setup()
     from jyagent.memory.context import build_memory_context
-    from jyagent.memory.operations import write_memory_md, write_topic
+    from jyagent.memory import write_memory_md, write_topic
 
     write_memory_md(
         "# Agent Memory\n\n"
@@ -1161,7 +1162,7 @@ def test_build_memory_context_emits_listing_when_index_absent():
     listing is the only discovery mechanism — must still fire."""
     setup()
     from jyagent.memory.context import build_memory_context
-    from jyagent.memory.operations import write_memory_md, write_topic
+    from jyagent.memory import write_memory_md, write_topic
 
     # Use write_memory_md WITHOUT a topic index. Note: write_topic will
     # auto-upsert a ## Topic Files Index section — so we need to overwrite
@@ -1183,7 +1184,7 @@ def test_append_journal_sanitises_brackets_in_category():
     header format (search.py splits on '## '). The sanitiser must fall back
     to 'note' for malformed categories rather than corrupt the journal."""
     setup()
-    from jyagent.memory.operations import append_journal, read_journal
+    from jyagent.memory import append_journal, read_journal
 
     path = append_journal("hello", category="bad]cat[evil")
     content = read_journal()
@@ -1198,7 +1199,7 @@ def test_append_journal_sanitises_newlines_and_controls():
     """LOW: embedded newlines or markdown control chars in category would
     break the header line. Fall back to 'note'."""
     setup()
-    from jyagent.memory.operations import append_journal, read_journal
+    from jyagent.memory import append_journal, read_journal
 
     append_journal("body1", category="cat\nwith\nnewlines")
     append_journal("body2", category="## heading-shaped")
@@ -1222,7 +1223,7 @@ def test_append_journal_accepts_real_world_categories():
     must all pass validation — this is the false-positive guard for the
     sanitiser."""
     setup()
-    from jyagent.memory.operations import append_journal, read_journal
+    from jyagent.memory import append_journal, read_journal
 
     legit = [
         "note", "ship", "debug", "refactor", "session",
@@ -1241,7 +1242,7 @@ def test_append_journal_category_case_normalized():
     """LOW: categories are case-normalized to lowercase for consistency
     (matches the convention the codebase already follows)."""
     setup()
-    from jyagent.memory.operations import append_journal, read_journal
+    from jyagent.memory import append_journal, read_journal
 
     append_journal("mixed", category="Ship")
     append_journal("upper", category="DEBUG")
