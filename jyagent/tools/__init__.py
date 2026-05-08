@@ -4,7 +4,8 @@ from ..runtime.tools.registry import get_registry
 
 # Bring tool function impls into module scope so ``_TOOL_FN_MAP`` below
 # can wire them up at registry-init time.
-from .core import run_shell, read_file, write_file, list_directory, edit_file, run_background, check_background
+from .core import run_shell, read_file, write_file, list_directory, edit_file
+from .background import run_background, check_background
 from .search import glob_files, grep_files
 from .facades import manage_memory, manage_skills
 from .schemas import CORE_TOOLS

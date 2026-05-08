@@ -5,10 +5,10 @@ in ``step.py`` can focus on the loop coordinator and helpers can import
 ``RunState`` / ``StepOutcome`` from a single low-level module without
 risking import cycles back through ``step.py``.
 
-The original module-level definitions are also re-exported from
-``step.py`` for back-compat — every existing
-``from jyagent.runtime.loop.step import RunState, StepBreak, ...`` import
-keeps working unchanged.
+``step.py`` itself re-imports ``RunState`` and the outcome union for use
+in ``run_step``'s signature and return statements; that import also
+makes the names reachable as ``step.RunState`` etc. for callers and
+tests that still address them via the coordinator module.
 
 Layering: helper modules (step_setup, step_tools, step_bookkeeping)
 import from this module, never from ``step.py``.

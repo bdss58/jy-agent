@@ -11,9 +11,8 @@ management.  This module owns:
   * the ``run_background`` and ``check_background`` tool entrypoints
 
 Self-contained: depends only on stdlib + ``ToolResult``.  Tool registration
-still happens in ``tools/__init__.py`` (which imports from here).  ``core.py``
-re-exports ``run_background``/``check_background`` for any legacy
-``from jyagent.tools.core import run_background`` callers.
+happens in ``tools/__init__.py`` which imports ``run_background`` /
+``check_background`` directly from this module.
 """
 from __future__ import annotations
 

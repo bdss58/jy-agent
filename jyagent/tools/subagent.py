@@ -291,9 +291,10 @@ def _make_subagent_outcome(
 
     ``cache_creation_tokens`` / ``cache_read_tokens`` / ``api_calls`` are
     plumbed through from ``LoopResult`` so parent stats can record the
-    sub-agent's real cache activity and LLM call count instead of the
-    legacy "1 API call, no cache" roll-up.  Default to 0 so call sites
-    that don't yet propagate them (e.g. external tests) keep working.
+    sub-agent's real cache activity and LLM call count.  Default to 0
+    for callers that don't yet propagate them (e.g. external tests);
+    ``stats.add_subagent_usage`` falls back to a +1 floor on the
+    api_calls path so the dispatch still shows up in session counts.
     """
     outcome = {
         "status": status,

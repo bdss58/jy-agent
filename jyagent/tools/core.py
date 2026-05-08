@@ -1045,9 +1045,7 @@ def _diagnose_multi_match(path: str, content: str, old_text: str, count: int) ->
 
 # ─── Background process management ──────────────────────────────────────────
 #
-# Moved to ``jyagent/tools/background.py`` (2026-05-06) so this module can
-# focus on shell + file/edit primitives.  Re-exported here so existing
-# ``from jyagent.tools.core import run_background, check_background`` callers
-# (notably ``tools/__init__.py`` registration and tests) keep working.  New
-# code should import directly from ``.background``.
-from .background import run_background, check_background  # noqa: F401,E402
+# Lives in ``jyagent/tools/background.py`` (extracted 2026-05-06 so this
+# module can focus on shell + file/edit primitives).  Tool registration
+# pulls run_background/check_background directly from there in
+# tools/__init__.py.
