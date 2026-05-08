@@ -1263,12 +1263,8 @@ def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
 
     Output format: structured Markdown envelope (see ``_format_subagent_envelope``)
     so the parent model sees status + cost + response as distinct sections,
-    rather than having to infer them from free-form text.  Set
-    ``JY_SUBAGENT_FLAT_RESULT=1`` in the environment to opt out and get
-    the legacy raw-answer string (mainly for backwards compatibility).
+    rather than having to infer them from free-form text.
     """
-    import os as _os
-
     status = outcome.get("status", _SUBAGENT_STATUS_COMPLETED)
     answer = outcome.get("content", "")
     steps = outcome.get("steps", 0)
@@ -1302,11 +1298,6 @@ def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
         )
     except Exception:
         pass  # stats recording is best-effort
-
-    # Structured envelope is the new default; `JY_SUBAGENT_FLAT_RESULT=1`
-    # opts out for callers that rely on the legacy raw-answer string.
-    if _os.environ.get("JY_SUBAGENT_FLAT_RESULT", "").lower() in ("1", "true", "yes"):
-        return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
 
     envelope = _format_subagent_envelope(
         status=status,

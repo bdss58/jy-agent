@@ -4,12 +4,9 @@
 # answer in a structured Markdown envelope (per P1 item 5 from the
 # 2026-04-18 joint review) so the parent model can see status + cost
 # metadata at a glance rather than having to parse free-form text.
-#
-# Back-compat: `JY_SUBAGENT_FLAT_RESULT=1` restores the legacy behavior.
 
 from __future__ import annotations
 
-import os
 from unittest.mock import patch
 
 import pytest
@@ -159,37 +156,6 @@ class TestFinalizeOutcomeDefaultStructured:
         assert "max_steps" in result.content
         assert "50 step(s)" in result.content
         assert "best-effort answer here" in result.content
-
-
-class TestFinalizeOutcomeFlatOptOut:
-    """JY_SUBAGENT_FLAT_RESULT=1 restores legacy raw-answer behavior."""
-
-    def test_flat_mode_returns_bare_answer(self):
-        out = _completed_outcome("just the answer text")
-        with (
-            patch("jyagent.tools.subagent.get_stats") as gs,
-            patch.dict(os.environ, {"JY_SUBAGENT_FLAT_RESULT": "1"}),
-        ):
-            gs.return_value.record_subagent_usage = lambda *a, **k: None
-            result = _finalize_outcome(out, elapsed=1.0, model_spec=_FakeSpec(),
-                                       task_preview="t")
-        assert not result.is_error
-        # Legacy: bare answer, no envelope.
-        assert result.content == "just the answer text"
-        assert "## Sub-agent Result" not in result.content
-
-    def test_envelope_mode_when_flag_unset(self):
-        out = _completed_outcome("just the answer text")
-        # Make sure the env var isn't accidentally set from another test.
-        env = {k: v for k, v in os.environ.items() if k != "JY_SUBAGENT_FLAT_RESULT"}
-        with (
-            patch("jyagent.tools.subagent.get_stats") as gs,
-            patch.dict(os.environ, env, clear=True),
-        ):
-            gs.return_value.record_subagent_usage = lambda *a, **k: None
-            result = _finalize_outcome(out, elapsed=1.0, model_spec=_FakeSpec(),
-                                       task_preview="t")
-        assert "## Sub-agent Result" in result.content
 
 
 class TestEnvelopeBackwardsCompatWithExistingTests:
