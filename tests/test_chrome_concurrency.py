@@ -1,14 +1,14 @@
 """Tests for Chrome MCP concurrency fixes.
 
 Verifies:
-1. Reference-counted Chrome connection (_chrome_acquire / _chrome_release)
+1. Reference-counted Chrome connection (``ChromeBrowser.acquire`` / ``release``)
 2. Page-level lock prevents interleaving
-3. chrome_fetch_page delegates correctly and serializes operations
+3. ``ChromeBrowser.fetch_page`` delegates correctly and serializes operations
 """
 
 import threading
 import time
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -32,66 +32,66 @@ def _make_tool_result(content="", is_error=False):
 # ─── Tests: Reference counting ─────────────────────────────────────────────
 
 class TestChromeRefcount:
-    """_chrome_acquire / _chrome_release reference counting."""
+    """ChromeBrowser.acquire / release reference counting."""
 
     def test_acquire_increments_refcount(self):
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()  # Don't actually connect
+        mgr._chrome.ensure_connected = MagicMock()  # Don't actually connect
 
-        mgr._chrome_acquire()
-        assert mgr._chrome_refcount == 1
-        mgr._chrome_acquire()
-        assert mgr._chrome_refcount == 2
+        mgr._chrome.acquire()
+        assert mgr._chrome._refcount == 1
+        mgr._chrome.acquire()
+        assert mgr._chrome._refcount == 2
 
     def test_release_decrements_refcount(self):
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()
-        mgr._chrome_refcount = 2
+        mgr._chrome.ensure_connected = MagicMock()
+        mgr._chrome._refcount = 2
 
-        mgr._chrome_release()
-        assert mgr._chrome_refcount == 1
-        mgr._chrome_release()
-        assert mgr._chrome_refcount == 0
+        mgr._chrome.release()
+        assert mgr._chrome._refcount == 1
+        mgr._chrome.release()
+        assert mgr._chrome._refcount == 0
 
     def test_release_never_goes_negative(self):
         mgr = _make_manager()
-        mgr._chrome_release()
-        assert mgr._chrome_refcount == 0
+        mgr._chrome.release()
+        assert mgr._chrome._refcount == 0
 
     def test_connect_only_on_first_acquire(self):
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()
+        mgr._chrome.ensure_connected = MagicMock()
 
-        mgr._chrome_acquire()
-        mgr._chrome_acquire()
-        mgr._chrome_acquire()
+        mgr._chrome.acquire()
+        mgr._chrome.acquire()
+        mgr._chrome.acquire()
 
-        # chrome_ensure_connected called only once (on 0→1 transition)
-        assert mgr.chrome_ensure_connected.call_count == 1
+        # ensure_connected called only once (on 0→1 transition)
+        assert mgr._chrome.ensure_connected.call_count == 1
 
     def test_disconnect_only_on_last_release(self):
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()
+        mgr._chrome.ensure_connected = MagicMock()
         mgr.disconnect = MagicMock()
         mgr.is_connected = MagicMock(return_value=True)
 
-        mgr._chrome_acquire()
-        mgr._chrome_acquire()
+        mgr._chrome.acquire()
+        mgr._chrome.acquire()
 
-        mgr._chrome_release()  # 2→1, should NOT disconnect
+        mgr._chrome.release()  # 2→1, should NOT disconnect
         mgr.disconnect.assert_not_called()
 
-        mgr._chrome_release()  # 1→0, should disconnect
+        mgr._chrome.release()  # 1→0, should disconnect
         mgr.disconnect.assert_called_once_with("chrome")
 
     def test_no_disconnect_if_not_connected(self):
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()
+        mgr._chrome.ensure_connected = MagicMock()
         mgr.disconnect = MagicMock()
         mgr.is_connected = MagicMock(return_value=False)
 
-        mgr._chrome_acquire()
-        mgr._chrome_release()  # refcount 1→0, but not connected
+        mgr._chrome.acquire()
+        mgr._chrome.release()  # refcount 1→0, but not connected
         mgr.disconnect.assert_not_called()
 
 
@@ -100,7 +100,7 @@ class TestChromeRefcountThreadSafety:
 
     def test_concurrent_acquire_release(self):
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()
+        mgr._chrome.ensure_connected = MagicMock()
         mgr.disconnect = MagicMock()
         mgr.is_connected = MagicMock(return_value=True)
 
@@ -109,9 +109,9 @@ class TestChromeRefcountThreadSafety:
 
         def worker():
             barrier.wait()
-            mgr._chrome_acquire()
+            mgr._chrome.acquire()
             time.sleep(0.01)
-            mgr._chrome_release()
+            mgr._chrome.release()
 
         threads = [threading.Thread(target=worker) for _ in range(N)]
         for t in threads:
@@ -120,16 +120,16 @@ class TestChromeRefcountThreadSafety:
             t.join(timeout=10)
 
         # After all workers done, refcount must be exactly 0
-        assert mgr._chrome_refcount == 0
+        assert mgr._chrome._refcount == 0
 
 
 # ─── Tests: Page lock serialization ────────────────────────────────────────
 
 class TestChromePageLock:
-    """_chrome_page_lock prevents concurrent page operations."""
+    """ChromeBrowser._page_lock prevents concurrent page operations."""
 
     def test_fetch_page_inner_holds_lock(self):
-        """Verify that _chrome_fetch_page_inner acquires the page lock."""
+        """Verify that ``_fetch_page_inner`` acquires the page lock."""
         mgr = _make_manager()
 
         # Track when the lock is held
@@ -144,7 +144,7 @@ class TestChromePageLock:
                 return _make_tool_result("OK")
             elif tool == "evaluate_script":
                 # Check if lock is held (it should be)
-                lock_held = mgr._chrome_page_lock.locked()
+                lock_held = mgr._chrome._page_lock.locked()
                 lock_was_held.append(lock_held)
                 return _make_tool_result('Script ran on page and returned:\n```json\n"Hello World from the page content that is long enough to pass threshold"\n```')
             elif tool == "close_page":
@@ -153,7 +153,7 @@ class TestChromePageLock:
 
         mgr._call_mcp_tool = mock_call
 
-        result = mgr._chrome_fetch_page_inner(
+        result = mgr._chrome._fetch_page_inner(
             "http://example.com", timeout=10,
             js_function="() => document.body.innerText"
         )
@@ -162,7 +162,7 @@ class TestChromePageLock:
         assert "Hello World" in result
 
     def test_concurrent_fetches_are_serialized(self):
-        """Two concurrent _chrome_fetch_page_inner calls must not overlap."""
+        """Two concurrent ``_fetch_page_inner`` calls must not overlap."""
         mgr = _make_manager()
 
         execution_log = []  # [(thread_name, event, time), ...]
@@ -193,7 +193,7 @@ class TestChromePageLock:
 
         def fetch(name):
             threading.current_thread().name = name
-            mgr._chrome_fetch_page_inner(
+            mgr._chrome._fetch_page_inner(
                 "http://test.com", timeout=10,
                 js_function="() => 'test'"
             )
@@ -226,70 +226,69 @@ class TestChromePageLock:
             )
 
 
-# ─── Tests: chrome_fetch_page integration ──────────────────────────────────
+# ─── Tests: fetch_page integration ─────────────────────────────────────────
 
 class TestChromeFetchPage:
-    """chrome_fetch_page uses refcount and delegates to inner."""
+    """ChromeBrowser.fetch_page uses refcount and delegates to inner."""
 
     def test_acquire_release_bracketing(self):
-        """chrome_fetch_page calls _chrome_acquire before and _chrome_release after."""
+        """fetch_page calls acquire before and release after."""
         mgr = _make_manager()
 
         call_log = []
 
-        original_acquire = mgr._chrome_acquire
-        original_release = mgr._chrome_release
+        original_acquire = mgr._chrome.acquire
+        original_release = mgr._chrome.release
 
         def mock_acquire():
             call_log.append("acquire")
-            mgr.chrome_ensure_connected = MagicMock()
+            mgr._chrome.ensure_connected = MagicMock()
             original_acquire()
 
         def mock_release():
             call_log.append("release")
             # Don't actually disconnect
-            with mgr._chrome_refcount_lock:
-                mgr._chrome_refcount = max(0, mgr._chrome_refcount - 1)
+            with mgr._chrome._refcount_lock:
+                mgr._chrome._refcount = max(0, mgr._chrome._refcount - 1)
 
-        mgr._chrome_acquire = mock_acquire
-        mgr._chrome_release = mock_release
+        mgr._chrome.acquire = mock_acquire
+        mgr._chrome.release = mock_release
 
         # Mock inner to succeed
-        mgr._chrome_fetch_page_inner = MagicMock(return_value="page content")
+        mgr._chrome._fetch_page_inner = MagicMock(return_value="page content")
 
-        result = mgr.chrome_fetch_page("http://example.com")
+        result = mgr._chrome.fetch_page("http://example.com")
         assert result == "page content"
         assert call_log == ["acquire", "release"]
 
     def test_release_called_on_error(self):
-        """chrome_fetch_page calls _chrome_release even if inner raises."""
+        """fetch_page calls release even if inner raises."""
         mgr = _make_manager()
-        mgr.chrome_ensure_connected = MagicMock()
+        mgr._chrome.ensure_connected = MagicMock()
         release_called = []
 
-        original_release = mgr._chrome_release
         def mock_release():
             release_called.append(True)
-            with mgr._chrome_refcount_lock:
-                mgr._chrome_refcount = max(0, mgr._chrome_refcount - 1)
+            with mgr._chrome._refcount_lock:
+                mgr._chrome._refcount = max(0, mgr._chrome._refcount - 1)
 
-        mgr._chrome_release = mock_release
-        mgr._chrome_fetch_page_inner = MagicMock(side_effect=RuntimeError("boom"))
+        mgr._chrome.release = mock_release
+        mgr._chrome._fetch_page_inner = MagicMock(side_effect=RuntimeError("boom"))
 
         with pytest.raises(RuntimeError, match="boom"):
-            mgr.chrome_fetch_page("http://example.com")
+            mgr._chrome.fetch_page("http://example.com")
 
-        assert len(release_called) == 1, "_chrome_release must be called on error"
+        assert len(release_called) == 1, "release must be called on error"
 
 
 # ─── Tests: web_fetch _fetch_chrome delegation ─────────────────────────────
 
 class TestFetchChromeDelgation:
-    """web_fetch._fetch_chrome delegates to MCPManager.chrome_fetch_page."""
+    """web_fetch._fetch_chrome delegates to ``mgr._chrome.fetch_page``."""
 
     def test_delegates_to_manager(self):
         mock_mgr = MagicMock()
-        mock_mgr.chrome_fetch_page.return_value = "page content here"
+        mock_mgr._chrome.fetch_page.return_value = "page content here"
 
         with patch("jyagent.mcp.get_manager", return_value=mock_mgr):
             from jyagent.tools.web_fetch import _fetch_chrome
@@ -297,10 +296,10 @@ class TestFetchChromeDelgation:
 
         assert status == 200
         assert content == "page content here"
-        mock_mgr.chrome_fetch_page.assert_called_once()
+        mock_mgr._chrome.fetch_page.assert_called_once()
 
         # Verify js_function was passed
-        call_kwargs = mock_mgr.chrome_fetch_page.call_args
+        call_kwargs = mock_mgr._chrome.fetch_page.call_args
         assert call_kwargs.kwargs.get("timeout") == 15
         assert "js_function" in call_kwargs.kwargs
 
@@ -311,23 +310,23 @@ class TestFetchChromeDelgation:
         multi-engine cascade, not by web_fetch+Chrome.
         """
         mock_mgr = MagicMock()
-        mock_mgr.chrome_fetch_page.return_value = "search results"
+        mock_mgr._chrome.fetch_page.return_value = "search results"
 
         with patch("jyagent.mcp.get_manager", return_value=mock_mgr):
             from jyagent.tools.web_fetch import _fetch_chrome, _CHROME_EXTRACT_JS
             _fetch_chrome("https://www.google.com/search?q=test")
 
-        call_kwargs = mock_mgr.chrome_fetch_page.call_args
+        call_kwargs = mock_mgr._chrome.fetch_page.call_args
         assert call_kwargs.kwargs["js_function"] == _CHROME_EXTRACT_JS
 
     def test_non_search_url_uses_default_js(self):
         """Non-search URLs should use the default JS extractor."""
         mock_mgr = MagicMock()
-        mock_mgr.chrome_fetch_page.return_value = "page content"
+        mock_mgr._chrome.fetch_page.return_value = "page content"
 
         with patch("jyagent.mcp.get_manager", return_value=mock_mgr):
             from jyagent.tools.web_fetch import _fetch_chrome, _CHROME_EXTRACT_JS
             _fetch_chrome("https://example.com/article")
 
-        call_kwargs = mock_mgr.chrome_fetch_page.call_args
+        call_kwargs = mock_mgr._chrome.fetch_page.call_args
         assert call_kwargs.kwargs["js_function"] == _CHROME_EXTRACT_JS

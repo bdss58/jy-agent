@@ -359,7 +359,7 @@ _CHROME_EXTRACT_JS = """() => {
 def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
     """Tier 4: Fetch via Chrome DevTools MCP — direct tool calls, no LLM.
 
-    Delegates to MCPManager.chrome_fetch_page() which handles:
+    Delegates to ``MCPManager._chrome.fetch_page()`` which handles:
     - Reference-counted Chrome connection (no premature disconnect)
     - Page-level locking (no interleaving between concurrent callers)
     - Explicit select_page before evaluate_script / take_snapshot
@@ -373,7 +373,7 @@ def _fetch_chrome(url: str, timeout: int = 30) -> tuple:
     from ..mcp import get_manager
 
     manager = get_manager()
-    content = manager.chrome_fetch_page(
+    content = manager._chrome.fetch_page(
         url, timeout=timeout, js_function=_CHROME_EXTRACT_JS,
     )
     return 200, content

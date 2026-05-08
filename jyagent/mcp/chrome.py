@@ -18,11 +18,10 @@ The manager owns the MCP connection lifecycle (``connect``, ``disconnect``,
 ``ChromeBrowser`` instance composes those primitives into refcounted +
 page-locked browser operations.
 
-Backwards compatibility: ``MCPManager`` exposes the previously-public
-attribute / method names (``_chrome_acquire``, ``chrome_fetch_page``,
-``_chrome_refcount``, etc.) as thin proxies/properties to its
-``self._chrome`` instance — so existing call sites and tests keep working
-without source changes.
+Callers should reach into ``mgr._chrome`` directly (see
+``tools/web_fetch.py`` for the canonical usage pattern).  The legacy
+``mgr.chrome_*`` / ``mgr._chrome_*`` proxy surface that briefly bridged
+the extraction was removed in 2026-05.
 """
 from __future__ import annotations
 
@@ -85,17 +84,14 @@ class ChromeBrowser:
     def acquire(self) -> None:
         """Increment Chrome connection refcount; connect on 0 → 1 transition.
 
-        Must be paired with ``_chrome_release()`` in a ``try/finally`` block.
+        Must be paired with ``release()`` in a ``try/finally`` block.
         Thread-safe — multiple callers can hold a reference simultaneously.
         """
         with self._refcount_lock:
             self._refcount += 1
             need_connect = (self._refcount == 1)
         if need_connect:
-            # Route through the manager's public method so external callers
-            # (and tests) can patch ``mgr.chrome_ensure_connected`` and have
-            # it intercept the refcount-driven connect path too.
-            self._mgr.chrome_ensure_connected()
+            self.ensure_connected()
 
     def release(self) -> None:
         """Decrement Chrome connection refcount; disconnect on 1 → 0 transition.
@@ -156,7 +152,7 @@ class ChromeBrowser:
 
         Uses reference-counted Chrome connection management so concurrent
         callers (parallel subagents) don't prematurely kill the browser.
-        All page operations are serialized via ``_chrome_page_lock``.
+        All page operations are serialized via ``self._page_lock``.
 
         Args:
             url: The URL to fetch.
@@ -171,23 +167,19 @@ class ChromeBrowser:
         Raises:
             RuntimeError: If any step fails (connection, navigation, extraction).
         """
-        # Route refcount + inner-fetch through the manager's public/private
-        # delegators so tests can patch ``mgr._chrome_acquire`` /
-        # ``mgr._chrome_release`` / ``mgr._chrome_fetch_page_inner`` and have
-        # the patches take effect (the historical test surface).
-        self._mgr._chrome_acquire()
+        self.acquire()
         try:
-            return self._mgr._chrome_fetch_page_inner(
+            return self._fetch_page_inner(
                 url, timeout=timeout, js_function=js_function,
             )
         finally:
-            self._mgr._chrome_release()
+            self.release()
 
     def _fetch_page_inner(self, url: str, *, timeout: int = 30,
                                  js_function: str = "") -> str:
-        """Core fetch logic — runs under ``_chrome_page_lock``.
+        """Core fetch logic — runs under ``self._page_lock``.
 
-        Caller must have already called ``_chrome_acquire()`` (refcount).
+        Caller must have already called ``acquire()`` (refcount).
         The page lock is acquired here so the entire new_page → select_page →
         evaluate/snapshot → close_page sequence is atomic w.r.t. other threads.
 

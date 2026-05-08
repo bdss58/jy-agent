@@ -155,10 +155,9 @@ class MCPManager:
         self._tools_lock = threading.Lock()
 
         # Browser-specific helper.  See ``mcp/chrome.py``.  All Chrome ops
-        # (refcounted connection, page-lock serialisation, fetch_page) are
-        # delegated to this object.  Backwards-compat shims further below
-        # forward the legacy ``_chrome_*`` / ``chrome_*`` names so existing
-        # tests and callers (notably ``tools/web_fetch.py``) keep working.
+        # (refcounted connection, page-lock serialisation, fetch_page) live
+        # on this object; reach for ``manager._chrome`` directly when you
+        # need them (e.g. ``tools/web_fetch.py``).
         self._chrome = ChromeBrowser(self)
 
         # Module version for debugging reload issues
@@ -497,66 +496,6 @@ class MCPManager:
                 except Exception:
                     failures = self._ping_failures.get(server_name, 0) + 1
                     self._ping_failures[server_name] = failures
-
-    # ─── Chrome delegation + back-compat shims ────────────────────────────────
-    #
-    # All Chrome implementation lives in ``mcp/chrome.py``.  ``MCPManager``
-    # exposes the previously-public attribute / method names below as thin
-    # forwarders so legacy callers (notably ``tools/web_fetch.py`` and
-    # ``tests/test_chrome_concurrency.py``) keep working unchanged.
-    # New code should reach into ``self._chrome`` (a ``ChromeBrowser``) directly.
-
-    # Public delegators (kept stable for ``tools/web_fetch.py``).
-    def chrome_fetch_page(self, url: str, *, timeout: int = 30,
-                          js_function: str = "") -> str:
-        return self._chrome.fetch_page(
-            url, timeout=timeout, js_function=js_function,
-        )
-
-    def chrome_ensure_connected(self) -> None:
-        return self._chrome.ensure_connected()
-
-    # Private back-compat shims used by ``tests/test_chrome_concurrency.py``.
-    def _chrome_acquire(self) -> None:
-        return self._chrome.acquire()
-
-    def _chrome_release(self) -> None:
-        return self._chrome.release()
-
-    def _chrome_fetch_page_inner(self, url: str, *, timeout: int = 30,
-                                 js_function: str = "") -> str:
-        return self._chrome._fetch_page_inner(
-            url, timeout=timeout, js_function=js_function,
-        )
-
-    @staticmethod
-    def _extract_js_result(evaluate_output: str) -> str:
-        # Preserve the static-method import path used by tests / external code.
-        return ChromeBrowser._extract_js_result(evaluate_output)
-
-    @staticmethod
-    def _parse_chrome_page_id(text: str, selected: bool = False):
-        return ChromeBrowser._parse_page_id(text, selected=selected)
-
-    # Attribute-level back-compat: the page lock and refcount state lived on
-    # ``MCPManager`` historically; tests both read and WRITE these
-    # (``mgr._chrome_refcount = 2`` to seed concurrency tests), so we expose
-    # them as properties that proxy to ``self._chrome``.
-    @property
-    def _chrome_page_lock(self):
-        return self._chrome._page_lock
-
-    @property
-    def _chrome_refcount(self) -> int:
-        return self._chrome._refcount
-
-    @_chrome_refcount.setter
-    def _chrome_refcount(self, value: int) -> None:
-        self._chrome._refcount = value
-
-    @property
-    def _chrome_refcount_lock(self):
-        return self._chrome._refcount_lock
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
