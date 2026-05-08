@@ -134,7 +134,24 @@ class AgentLoop(LoopThreadHelper):
         # wide as the configured ``max_tool_workers`` (the historical
         # singleton was hard-capped at 8, silently throttling configs
         # that asked for more dispatch parallelism).
-        self._executor = get_tool_dispatch_executor(config.max_tool_workers)
+        #
+        # We deliberately do NOT cache the executor on ``self``.  When a
+        # later AgentLoop with a larger ``max_tool_workers`` triggers
+        # ``get_tool_dispatch_executor`` to grow the shared pool, the
+        # growth path shuts the old pool down (``shutdown(wait=False)``)
+        # and replaces it.  A cached reference would then point at a
+        # dead pool and the next ``executor.submit`` would raise
+        # ``RuntimeError: cannot schedule new futures after shutdown``.
+        # Resolving the executor lazily via the ``_executor`` property
+        # below (which always returns the *current* shared pool) makes
+        # the growth path safe for older still-running AgentLoop
+        # instances.  The fast path inside
+        # ``get_tool_dispatch_executor`` is a single attribute check, so
+        # the per-step cost is negligible.
+        # Warm the pool now so the first tool dispatch doesn't pay
+        # creation latency, but discard the return value — readers go
+        # through the property.
+        get_tool_dispatch_executor(config.max_tool_workers)
         # Task-plan scratchpad (see jyagent/todos.py).  Populated via the
         # `write_todos` tool and seeded optionally via run(initial_todos=...)
         # so outer layers can carry the plan across turns.
@@ -178,6 +195,36 @@ class AgentLoop(LoopThreadHelper):
         """Override the run id used by checkpoint paths.  Must be called
         before ``run()``.  Empty string clears the run id (resets to ``''``)."""
         self._run_id = run_id or ""
+
+    @property
+    def _executor(self):
+        """Live reference to the shared tool-dispatch executor.
+
+        Resolved on every access (not cached on ``self``) so a parallel
+        AgentLoop that grew the shared pool — which shuts the old pool
+        down — cannot leave THIS loop holding a dead reference.  The
+        fast path inside ``get_tool_dispatch_executor`` is a single
+        attribute check, so per-dispatch cost is negligible.
+
+        Satisfies the ``_executor: ThreadPoolExecutor`` member of the
+        ``RunContext`` protocol used by ``runtime/loop/step_tools.py``.
+
+        Test escape hatch: assigning ``loop._executor = X`` records X
+        as an override (via the setter below) and the property returns
+        it on subsequent reads.  Production code never assigns
+        ``_executor`` — it didn't before this property landed either —
+        so this only matters for tests that build loops with ``__new__``
+        and want a hand-picked executor.
+        """
+        override = self.__dict__.get("_executor_override")
+        if override is not None:
+            return override
+        return get_tool_dispatch_executor(self._config.max_tool_workers)
+
+    @_executor.setter
+    def _executor(self, value) -> None:
+        """Test-only override — see the property docstring."""
+        self.__dict__["_executor_override"] = value
 
     # ``_is_cancelled``, ``_cancellable_sleep``, and ``_fire`` are inherited
     # from ``LoopThreadHelper`` (see ``_thread_helpers.py``), shared with
@@ -299,12 +346,21 @@ class AgentLoop(LoopThreadHelper):
             result.partial_side_effects = list(self._partial_side_effects)
             if self._config.checkpoint_dir:
                 # Terminal ("final") checkpoint — includes status + error.
+                # Forward cache-token / api-call counters so ``final.json``
+                # matches ``LoopResult``; the periodic checkpoint already
+                # passes them (see ``step_bookkeeping._maybe_checkpoint``)
+                # and omitting them here silently zeroed those fields in
+                # the persisted record despite the in-memory result
+                # having the correct values.
                 self._write_checkpoint(
                     step="final",
                     messages=result.messages,
                     total_input_tokens=result.total_input_tokens,
                     total_output_tokens=result.total_output_tokens,
                     tool_calls_count=result.tool_calls_count,
+                    total_cache_creation_tokens=result.total_cache_creation_tokens,
+                    total_cache_read_tokens=result.total_cache_read_tokens,
+                    api_calls=result.api_calls,
                     status=result.status,
                     error=result.error,
                 )
@@ -403,6 +459,15 @@ class AgentLoop(LoopThreadHelper):
                 # The previous implementation concatenated the directive into
                 # ``system_prompt``, which broke the cached prefix on this
                 # terminal turn (~12× cost penalty on the cached portion).
+                #
+                # Order-of-operations contract: every call that can raise
+                # (``_call_streaming`` / ``_call_complete`` /
+                # ``truncate_tool_call_blocks``) runs BEFORE any state
+                # mutation.  All ``state.*``, ``cost_tracker.record``, and
+                # ``messages.append`` writes are deferred to the commit
+                # block at the bottom, so a fallback failure cannot leave
+                # poisoned counters on the max_steps result that the
+                # ``except Exception`` handler then silently reports.
                 try:
                     finalize_directive = {
                         "role": "user",
@@ -440,12 +505,24 @@ class AgentLoop(LoopThreadHelper):
                         tool_choice={"type": "none"},
                     )
 
+                    # ── Phase 1: can-fail work (LLM call + truncation) ──
+                    # Anything that raises here unwinds cleanly because no
+                    # state mutation has happened yet.
                     if cfg.streaming:
                         fallback_text, _, _, fallback_message = self._call_streaming(fallback_context, fallback_opts)
                     else:
                         fallback_text, _, _, fallback_message = self._call_complete(fallback_context, fallback_opts)
 
-                    # Accumulate usage
+                    # Apply truncation if enabled — uses the last step_batch
+                    # built by run_step (threaded via state.last_step_batch).
+                    # Done before commit so a malformed fallback message
+                    # cannot land in the transcript with poisoned counters.
+                    if cfg.truncate_large_inputs:
+                        content = fallback_message.get("content", [])
+                        fallback_message = dict(fallback_message)
+                        fallback_message["content"] = truncate_tool_call_blocks(content, state.last_step_batch)
+
+                    # ── Phase 2: commit (no can-fail calls below this line) ──
                     usage = fallback_message.get("usage", {})
                     state.total_input_tokens += usage.get("input_tokens", 0)
                     state.total_output_tokens += usage.get("output_tokens", 0)
@@ -476,13 +553,6 @@ class AgentLoop(LoopThreadHelper):
                                 "budget enforcement uses the priced subtotal only",
                             )
 
-                    # Apply truncation if enabled — uses the last step_batch
-                    # built by run_step (threaded via state.last_step_batch).
-                    if cfg.truncate_large_inputs:
-                        content = fallback_message.get("content", [])
-                        fallback_message = dict(fallback_message)
-                        fallback_message["content"] = truncate_tool_call_blocks(content, state.last_step_batch)
-
                     # Append fallback turn — directive first, then the
                     # assistant reply — so the persisted transcript stays
                     # symmetric (every assistant message answers a real
@@ -511,9 +581,21 @@ class AgentLoop(LoopThreadHelper):
                     )
                 except KeyboardInterrupt:
                     raise
-                except Exception:
-                    # If fallback fails, fall through to normal max_steps handling
-                    pass
+                except Exception as fb_exc:
+                    # Surface the failure on the warning channel so it's
+                    # visible to outer layers — the previous bare ``pass``
+                    # silently turned a fallback crash into a plain
+                    # max_steps result with no breadcrumb.  No state
+                    # rollback is needed: the order-of-operations contract
+                    # above guarantees that any pre-commit failure left
+                    # ``state.*`` / ``cost_tracker`` / ``messages``
+                    # untouched.
+                    self._fire(
+                        "on_warning",
+                        f"max_steps fallback failed; reporting max_steps "
+                        f"without final answer: "
+                        f"{type(fb_exc).__name__}: {fb_exc}",
+                    )
 
             # ── max_steps exit ─────────────────────────────────────────
             cost = cost_tracker.cost if cost_tracker else 0.0
