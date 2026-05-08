@@ -83,9 +83,10 @@ class RunState:
     # them to sub-agent stats without the parent losing visibility.
     total_cache_creation_tokens: int = 0
     total_cache_read_tokens: int = 0
-    # Discrete LLM API calls made during the run.  Used by the sub-agent
-    # accounting path so parent stats.api_calls reflects the child's
-    # actual call count instead of the legacy "1 per dispatch".
+    # Discrete LLM API calls made during the run.  Plumbed through to the
+    # sub-agent accounting path so parent stats.api_calls reflects the
+    # child's actual call count rather than the +1-per-dispatch defensive
+    # floor in stats.add_subagent_usage.
     api_calls: int = 0
 
     # Tool / reflection counters

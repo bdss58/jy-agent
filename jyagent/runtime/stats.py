@@ -368,13 +368,14 @@ class SessionStats:
         The provider/model are used ONLY for cost calculation — the parent's
         active model label (self._provider / self._model) is never overwritten.
 
-        ``api_calls``: defaults to 0 so the legacy "+1 per dispatch" fallback
-        fires only when the caller didn't plumb through the child's real
-        count.  Callers that pass a real count (the LoopResult path) get
-        accurate accounting; callers that don't (external tests, future
-        callers that forget) still see the sub-agent recorded as at least
-        one unit of API activity — safer default than "+0" which would
-        silently hide sub-agents from session counts.
+        ``api_calls`` defaults to 0 as a defensive guard: in production,
+        every call site (foreground LoopResult path, background ``outcome``
+        path in ``_finalize_outcome``) plumbs through the child's real
+        api_calls count, so the +1 floor below normally never fires.  It
+        does fire if a bg outcome dict is malformed (e.g. crashed before
+        ``_make_subagent_outcome`` populated it), in which case we still
+        record the dispatch as one unit of API activity rather than
+        silently zero-counting it.
 
         ``cache_creation_tokens`` / ``cache_read_tokens``: plumbed through
         from LoopResult so the parent's cache-savings meter reflects the
@@ -387,10 +388,9 @@ class SessionStats:
             self.turn_output_tokens += output_tokens
             self.total_cache_creation_tokens += cache_creation_tokens
             self.total_cache_read_tokens += cache_read_tokens
-            # Count the child's real API-call count when provided, else
-            # fall back to the legacy "1 per dispatch" behaviour.  Never
-            # double-count: if the caller passes 0, we still want a
-            # sub-agent dispatch to show up somewhere.
+            # +1 floor protects against silent zero-counting on malformed
+            # bg outcomes (see method docstring).  Never double-counts:
+            # when the real count is provided, we use it as-is.
             self.api_calls += api_calls if api_calls > 0 else 1
 
             # Use the subagent's own provider/model for cost, not the parent's

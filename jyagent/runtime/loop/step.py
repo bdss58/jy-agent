@@ -40,21 +40,17 @@ if TYPE_CHECKING:
 
 # ─── Run-scoped mutable state + outcome types ────────────────────────────────
 #
-# The ``RunState`` dataclass and the ``StepContinue`` / ``StepTerminate`` /
-# ``StepBreak`` outcome union were extracted to ``step_state.py`` (2026-05-06)
-# so helper modules can import them without risking cycles back through
-# this file.  Re-exported here so legacy imports keep working unchanged:
+# ``RunState`` and the ``StepContinue`` / ``StepTerminate`` / ``StepBreak``
+# outcome union live in ``step_state.py`` (extracted 2026-05-06 so helper
+# modules can import them without risking cycles back through this file).
+# ``run_step`` below uses all four in its signature / return statements,
+# so this is a normal load-bearing import, not a re-export shim.
 #
-#     from jyagent.runtime.loop.step import RunState, StepBreak, ...
-#
-# Tests that use ``inspect.getsource(step.RunState.prepare_for_run)`` (etc.)
-# still work — the re-export resolves to the real defining function/class
-# in ``step_state.py``, which inspect tracks via the function object's
-# ``__module__`` attribute (it will report ``step_state`` as the source
-# module — see test_loop_engine_critical for the source-text assertions
-# that explicitly look for ``RunState.prepare_for_run`` body strings).
+# Side effect: tests that introspect with ``inspect.getsource(step.RunState
+# .prepare_for_run)`` or import ``RunState`` from ``step`` keep working
+# because the names are reachable on this module.
 
-from .step_state import (  # noqa: F401
+from .step_state import (
     RunState,
     StepContinue,
     StepTerminate,
@@ -278,27 +274,29 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
 #   step_tools.py        — tool-round semantics (execute, stuck-loop)
 #   step_bookkeeping.py  — post-LLM-call effects (cost, message, reflect, checkpoint)
 #
-# They are re-exported here so existing
-# ``from jyagent.runtime.loop.step import _<helper>`` imports keep working
-# unchanged.  Tests that use ``inspect.getsource(step._<helper>)`` also keep
-# working — the re-exported function objects carry their real ``__module__``
-# pointing at the leaf module, which is what ``inspect`` follows to read the
-# source bytes.
+# ``run_step`` (the only function defined in this file now) calls each
+# helper directly, so the imports below are normal load-bearing imports.
+#
+# Side effect: tests that import ``from jyagent.runtime.loop.step import
+# _<helper>`` or use ``inspect.getsource(step._<helper>)`` keep working
+# because the function objects are reachable on this module — inspect
+# follows ``__module__`` to read the source bytes from the leaf module
+# where the helper is defined.
 #
 # Layering invariant: the leaf modules import from ``step_state`` (RunState +
 # outcome types) but NEVER from ``step.py``.  ``run_step`` is the only thing
 # that lives here now; everything else is composition.
 
-from .step_setup import (  # noqa: F401
+from .step_setup import (
     _prepare_step_batch,
     _compact_and_build_context,
     _build_step_options,
 )
-from .step_tools import (  # noqa: F401
+from .step_tools import (
     _execute_tool_round,
     _check_stuck_loop,
 )
-from .step_bookkeeping import (  # noqa: F401
+from .step_bookkeeping import (
     _record_llm_usage_and_cost,
     _append_assistant_message,
     _maybe_reflect,
