@@ -36,7 +36,7 @@ import logging
 import os
 import random
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 from .callbacks import LoopCallbacks
 from .config import LoopConfig
@@ -47,6 +47,12 @@ from ...config import get_reasoning_config_for_provider, STREAM_TIMEOUT
 
 
 _logger = logging.getLogger(__name__)
+
+
+# Type alias for the (text, tool_calls, stop_reason, message) tuple every
+# LLM call returns.  Used by the retry helper below and the public-ish
+# call sites on ``AgentLoop`` and ``LLMRunner``.
+_LLMResult = "tuple[str, list[ToolCallRequest], str, dict]"
 
 
 # ─── Free-function helpers ──────────────────────────────────────────────────
@@ -156,6 +162,101 @@ def build_runtime_options(
         ),
         metadata=merged_metadata,
     )
+
+
+# ─── Shared retry helper ────────────────────────────────────────────────────
+
+
+def _retry_llm_call(
+    *,
+    config: LoopConfig,
+    context: dict,
+    options: LLMOptions,
+    call_streaming: Callable[[dict, LLMOptions], Any],
+    call_complete: Callable[[dict, LLMOptions], Any],
+    fire: Callable[..., None],
+    is_cancelled: Callable[[], bool],
+    cancellable_sleep: Callable[[float], bool],
+    is_transient: Callable[[BaseException], bool] | None = None,
+):
+    """Shared retry loop with cancel-aware backoff + on_stream_retry signaling.
+
+    The retry-loop body was previously duplicated byte-for-byte between
+    ``AgentLoop._call_llm_with_retry`` and ``LLMRunner.call_with_retry``;
+    only the dispatch callables and helper hooks differed:
+
+    +----------+-------------------------+------------------------+--------------------+
+    | Caller   | streaming arg           | complete arg           | helper hooks       |
+    +==========+=========================+========================+====================+
+    | AgentLoop| self._call_streaming    | self._call_complete    | self._fire / etc.  |
+    +----------+-------------------------+------------------------+--------------------+
+    | LLMRunner| self.call_streaming     | self.call_complete     | self._fire / etc.  |
+    +----------+-------------------------+------------------------+--------------------+
+
+    AgentLoop's variant routes through ``self._call_streaming`` /
+    ``self._call_complete`` (NOT ``LLMRunner.call_*`` directly) so subclass
+    overrides + per-instance monkeypatches for transient-failure injection
+    stay in effect.  See ``tests/test_loop_edge_cases.py::test_retry_loop_
+    invokes_subclass_overrides`` for the exact contract.
+
+    ``is_transient`` lets each shim pass its own module's
+    ``is_transient_error`` reference so existing tests that monkeypatch
+    ``engine.is_transient_error`` (or ``llm_runner.is_transient_error``)
+    continue to work — the patched alias is resolved at call time, not
+    captured here.  Defaults to ``llm_runner.is_transient_error``.
+
+    Returns whatever the underlying call returns — by convention an
+    ``(text, tool_calls, stop_reason, final_message)`` tuple.
+
+    Backoff is "equal jitter" (AWS architecture recommendation): half the
+    delay is deterministic exponential, half is uniform random in
+    ``[0, base * 2^attempt / 2]``.  This avoids a thundering-herd retry
+    when many parallel sub-agents all hit the same 529 simultaneously.
+
+    Cancellation: ``is_cancelled()`` is checked before each retry sleep,
+    and ``cancellable_sleep(delay)`` returns ``True`` if cancel fired
+    during the sleep — both paths raise ``KeyboardInterrupt`` so the
+    outer engine path runs the cancelled-exit handler.
+    """
+    if is_transient is None:
+        is_transient = is_transient_error
+    last_error: BaseException | None = None
+    for attempt in range(config.retry_attempts + 1):
+        try:
+            if config.streaming:
+                return call_streaming(context, options)
+            return call_complete(context, options)
+        except KeyboardInterrupt:
+            raise
+        except Exception as err:
+            last_error = err
+            transient = is_transient(err)
+            should_retry = (
+                (transient or config.retry_on_all_errors)
+                and attempt < config.retry_attempts
+            )
+            if not should_retry:
+                raise
+            if is_cancelled():
+                raise
+            base = config.retry_base_delay * (2 ** attempt)
+            delay = base / 2 + random.uniform(0, base / 2)
+            fire("on_retry", attempt + 1, err)
+            # ``partial_stream_text`` is stashed on the exception by
+            # ``LLMRunner.call_streaming`` so the UI can replace any
+            # partially-emitted text before the retry attempt re-issues
+            # it.  Missing on the non-streaming path; default to "".
+            partial_text = getattr(err, "partial_stream_text", "")
+            reason = "transient_error" if transient else "error"
+            fire("on_stream_retry", reason, partial_text)
+            # Cancel-aware backoff: wake immediately on Ctrl-C so we don't
+            # burn through a long retry window after cancel.
+            if cancellable_sleep(delay):
+                raise KeyboardInterrupt("cancelled during retry backoff")
+            continue
+
+    # Unreachable — the loop either returns or raises every iteration.
+    raise last_error  # type: ignore[misc]
 
 
 # ─── LLMRunner ──────────────────────────────────────────────────────────────
@@ -586,58 +687,30 @@ class LLMRunner(LoopThreadHelper):
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
 
-        Returns (step_text, tool_call_blocks, stop_reason, final_message).
+        Thin shim over the shared ``_retry_llm_call`` helper, which owns
+        the actual retry-loop body.  The shim binds the dispatch
+        callables to ``self.call_streaming`` / ``self.call_complete`` —
+        ``LLMRunner`` callers never override those, so the binding is
+        equivalent to direct method calls.  ``AgentLoop`` has its own
+        shim (``_call_llm_with_retry``) that binds to its overridable
+        ``_call_streaming`` / ``_call_complete`` thin delegates instead.
 
-        ``step`` is accepted for signature compatibility with the old
-        ``AgentLoop._call_llm_with_retry`` but is currently unused; kept
-        so callers that pass it positionally don't break.
+        Returns ``(step_text, tool_call_blocks, stop_reason, final_message)``.
+
+        ``step`` is accepted for signature compatibility with the
+        ``AgentLoop._call_llm_with_retry`` form but is currently unused;
+        kept so callers that pass it positionally don't break.
         """
-        cfg = self.config
-        last_error: BaseException | None = None
-
-        for attempt in range(cfg.retry_attempts + 1):
-            try:
-                if cfg.streaming:
-                    return self.call_streaming(context, options)
-                else:
-                    return self.call_complete(context, options)
-            except KeyboardInterrupt:
-                raise
-            except Exception as err:
-                last_error = err
-                transient = is_transient_error(err)
-                should_retry = (
-                    (transient or cfg.retry_on_all_errors)
-                    and attempt < cfg.retry_attempts
-                )
-                if should_retry:
-                    if self._is_cancelled():
-                        raise
-                    # Exponential backoff with "equal jitter" (AWS architecture
-                    # recommendation) to avoid thundering-herd when multiple
-                    # parallel sub-agents all retry a 529 at the same moment.
-                    #   half the delay is deterministic exponential,
-                    #   half is uniform random in [0, base * 2^attempt / 2].
-                    base = cfg.retry_base_delay * (2 ** attempt)
-                    delay = base / 2 + random.uniform(0, base / 2)
-                    self._fire("on_retry", attempt + 1, err)
-                    # Signal UI that any partial output from the failed
-                    # attempt will be replayed on retry (visual de-duplication
-                    # hook).  ``partial_stream_text`` is stashed by
-                    # ``call_streaming`` on the exception; missing for
-                    # non-streaming path.
-                    partial_text = getattr(err, "partial_stream_text", "")
-                    reason = "transient_error" if transient else "error"
-                    self._fire("on_stream_retry", reason, partial_text)
-                    # Cancel-aware backoff: wake immediately on Ctrl-C so we
-                    # don't burn through a long retry window after cancel.
-                    if self._cancellable_sleep(delay):
-                        raise KeyboardInterrupt("cancelled during retry backoff")
-                    continue
-                raise
-
-        # Should not reach here, but just in case:
-        raise last_error  # type: ignore[misc]
+        return _retry_llm_call(
+            config=self.config,
+            context=context,
+            options=options,
+            call_streaming=self.call_streaming,
+            call_complete=self.call_complete,
+            fire=self._fire,
+            is_cancelled=self._is_cancelled,
+            cancellable_sleep=self._cancellable_sleep,
+        )
 
 
 __all__ = [

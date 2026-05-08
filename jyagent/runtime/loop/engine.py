@@ -80,12 +80,20 @@ def _t_as_dict(t: Any) -> dict:
 # module, not ``engine``.
 from .tool_executor import get_tool_dispatch_executor  # noqa: E402
 
-# LLM retry helpers used inside ``_call_llm_with_retry`` below.  Tests that
-# patch retry behavior must rebind BOTH ``llm_runner.is_transient_error`` and
-# ``engine.is_transient_error`` (engine binds the name at module-load time).
+# Helpers consumed by ``AgentLoop._call_llm_with_retry`` (a thin shim
+# over ``_retry_llm_call``) and the max_steps fallback path.
+#
+# ``is_transient_error`` is re-exported here primarily for back-compat
+# with tests that monkeypatch ``engine.is_transient_error`` to inject
+# transient failures.  After the retry-loop consolidation (2026-05) the
+# only functional caller is ``_retry_llm_call`` inside ``llm_runner``,
+# so patches against ``engine.is_transient_error`` are now effectively
+# no-ops — but the import is kept so existing tests keep importing
+# cleanly.  New tests should patch ``llm_runner.is_transient_error``.
 from .llm_runner import (  # noqa: E402
     is_transient_error,
     build_runtime_options,
+    _retry_llm_call,
 )
 
 # Terminal-path helper used by ``AgentLoop.run()``.  ``step.py`` imports
@@ -605,62 +613,30 @@ class AgentLoop(LoopThreadHelper):
     ) -> tuple[str, list[ToolCallRequest], str, dict]:
         """Call the LLM (streaming or complete) with transient-error retry.
 
-        We keep the retry loop in AgentLoop (rather than routing
-        straight to ``LLMRunner.call_with_retry``) so that it dispatches
-        through ``self._call_streaming`` / ``self._call_complete``.  Several
-        tests and internal diagnostics override those methods on a subclass
-        or monkeypatch them on the instance to inject transient failures —
-        that contract is preserved.
+        Thin shim over the shared ``_retry_llm_call`` helper.  We keep
+        the shim on ``AgentLoop`` (rather than routing straight to
+        ``LLMRunner.call_with_retry``) so the retry loop dispatches
+        through ``self._call_streaming`` / ``self._call_complete`` —
+        several tests and internal diagnostics override those methods
+        on a subclass or monkeypatch them on the instance to inject
+        transient failures, and that contract is preserved.
 
-        Returns (step_text, tool_call_blocks, stop_reason, final_message).
+        Returns ``(step_text, tool_call_blocks, stop_reason, final_message)``.
         """
-        cfg = self._config
-        last_error: BaseException | None = None
-
-        for attempt in range(cfg.retry_attempts + 1):
-            try:
-                if cfg.streaming:
-                    return self._call_streaming(context, options)
-                else:
-                    return self._call_complete(context, options)
-            except KeyboardInterrupt:
-                raise
-            except Exception as err:
-                last_error = err
-                transient = is_transient_error(err)
-                should_retry = (
-                    (transient or cfg.retry_on_all_errors)
-                    and attempt < cfg.retry_attempts
-                )
-                if should_retry:
-                    if self._is_cancelled():
-                        raise
-                    # Exponential backoff with "equal jitter" (AWS
-                    # architecture recommendation) to avoid thundering-herd
-                    # when multiple parallel sub-agents all retry a 529 at
-                    # the same moment:
-                    #   half the delay is deterministic exponential,
-                    #   half is uniform random in [0, base * 2^attempt / 2].
-                    base = cfg.retry_base_delay * (2 ** attempt)
-                    delay = base / 2 + random.uniform(0, base / 2)
-                    self._fire("on_retry", attempt + 1, err)
-                    # Signal UI that any partial output from the failed
-                    # attempt will be replayed on retry (visual
-                    # de-duplication hook).  ``partial_stream_text`` is
-                    # stashed by ``_call_streaming`` on the exception;
-                    # missing for the non-streaming path.
-                    partial_text = getattr(err, "partial_stream_text", "")
-                    reason = "transient_error" if transient else "error"
-                    self._fire("on_stream_retry", reason, partial_text)
-                    # Cancel-aware backoff: wake immediately on Ctrl-C so we
-                    # don't burn through a long retry window after cancel.
-                    if self._cancellable_sleep(delay):
-                        raise KeyboardInterrupt("cancelled during retry backoff")
-                    continue
-                raise
-
-        # Should not reach here, but just in case:
-        raise last_error  # type: ignore[misc]
+        return _retry_llm_call(
+            config=self._config,
+            context=context,
+            options=options,
+            call_streaming=self._call_streaming,
+            call_complete=self._call_complete,
+            fire=self._fire,
+            is_cancelled=self._is_cancelled,
+            cancellable_sleep=self._cancellable_sleep,
+            # Resolve via this module's globals so tests that patch
+            # ``engine.is_transient_error`` see their override take
+            # effect — the name binding is looked up at call time.
+            is_transient=is_transient_error,
+        )
 
     def _call_complete(
         self,
