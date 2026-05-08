@@ -38,8 +38,8 @@ from ...memory.conversation import estimate_conversation_tokens
 from .remediation import enrich_error
 from .tracing import get_tracer
 from .verification import should_verify, build_verification_prompt
-from .callbacks import LoopCallbacks  # re-exported for back-compat
-from .config import LoopConfig, LoopResult  # re-exported for back-compat
+from .callbacks import LoopCallbacks  # canonical public surface — imported via engine
+from .config import LoopConfig, LoopResult  # canonical public surface — imported via engine
 from ._thread_helpers import LoopThreadHelper  # cancel/_fire helpers
 
 

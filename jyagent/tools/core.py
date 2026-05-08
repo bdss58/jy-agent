@@ -45,9 +45,9 @@ def resolve_path(path: str, root: str | None = None) -> str:
     return os.path.abspath(path)
 
 
-# ``atomic_write`` is re-exported above (``from ..utils.files import atomic_write``)
-# so legacy ``from jyagent.tools.core import atomic_write`` callers keep working.
-# New code should import directly from ``jyagent.utils.files``.
+# ``atomic_write`` is imported from ``..utils.files`` for use in
+# ``write_file``/``edit_file`` below.  Callers outside this module should
+# import it from ``jyagent.utils.files`` directly — not from here.
 
 
 def should_skip_dir(dirname: str) -> bool:

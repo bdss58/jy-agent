@@ -156,8 +156,11 @@ StreamEvent = (
 
 
 # ─── Reasoning config ────────────────────────────────────────────────────────
-# Anthropic-specific types are defined in providers/_anthropic_reasoning.py
-# and re-exported here for backward compatibility.
+# Anthropic-specific reasoning types are defined in
+# providers/_anthropic_reasoning.py and re-exported here so that
+# ``jyagent.llm.types`` remains the single provider-neutral entry point
+# for reasoning types (consumed by ``llm/__init__.py`` and by the
+# ``ReasoningConfig`` union defined just below).
 
 from .providers._anthropic_reasoning import (
     AnthropicThinkingDisabledConfig,

@@ -28,7 +28,7 @@ from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.formatted_text import HTML
 
 from ..runtime.stats import get_stats
-from .terminal_renderer import TerminalRenderer, console  # re-exported for back-compat
+from .terminal_renderer import TerminalRenderer, console
 
 
 # ─── Prompt toolkit styling ──────────────────────────────────────────────────

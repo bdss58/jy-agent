@@ -251,11 +251,9 @@ def _looks_like_injection(body: str) -> bool:
 _MIN_UPDATE_KEYWORD_LEN = 6
 
 # Section headers and lines under them are protected from UPDATE-driven
-# replacement. The set itself now lives in operations.py so that the manual
-# `forget` primitive shares the same protection rail — see
-# operations._PROTECTED_SECTION_HEADERS / _compute_protected_indices. The
-# import above re-exports them locally for backward-compatibility with any
-# external caller that referenced extraction._PROTECTED_SECTION_HEADERS.
+# replacement. The set itself lives in ``_index.py`` (imported above) so
+# the manual ``forget`` primitive shares the same protection rail — see
+# ``_index._PROTECTED_SECTION_HEADERS`` / ``_compute_protected_indices``.
 
 
 def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, str]:

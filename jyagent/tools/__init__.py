@@ -2,7 +2,8 @@
 
 from ..runtime.tools.registry import get_registry
 
-# Re-export all tool functions for backward compatibility
+# Bring tool function impls into module scope so ``_TOOL_FN_MAP`` below
+# can wire them up at registry-init time.
 from .core import run_shell, read_file, write_file, list_directory, edit_file, run_background, check_background
 from .search import glob_files, grep_files
 from .facades import manage_memory, manage_skills
@@ -19,9 +20,6 @@ from .subagent import (
     CHECK_AGENT_SCHEMA,
 )
 from .web_search import web_search as web_search_fn, TOOL_SCHEMA as WEB_SEARCH_SCHEMA
-
-# Re-export constants from config (backward compat)
-from ..config import SKIP_DIRS, BINARY_EXTS
 
 # ─── Register core tools ──────────────────────────────────────────────────────
 

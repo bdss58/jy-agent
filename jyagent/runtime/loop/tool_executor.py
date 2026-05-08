@@ -382,7 +382,6 @@ def execute_tool_with_timeout(
     tool_input: dict,
     batch: ToolBatch,
     default_timeout: int,
-    executor: concurrent.futures.ThreadPoolExecutor | None = None,
     body_permits: threading.BoundedSemaphore | None = None,
     partial_side_effects: "MutableSequence[str] | collections.deque[str] | None" = None,
     cancel_event: threading.Event | None = None,
@@ -400,11 +399,6 @@ def execute_tool_with_timeout(
       * A timed-out thread keeps running but holds no pool slot.
       * Daemon status guarantees it cannot block process exit.
       * Thread creation overhead is ~0.1 ms — negligible next to any LLM call.
-
-    The ``executor`` parameter is kept for backwards compatibility (callers
-    that passed an explicit pool) but is now ignored.  Dispatch-level
-    parallelism still uses ``tool_dispatch_executor``; only the inner
-    timeout wrapper changed.
 
     ``body_permits`` (optional) caps concurrent live tool bodies to honour
     ``LoopConfig.max_tool_workers`` independent of the dispatch-pool width.
