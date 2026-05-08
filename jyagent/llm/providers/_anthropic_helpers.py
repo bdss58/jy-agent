@@ -13,13 +13,7 @@ from ...config import (
     ANTHROPIC_PROMPT_CACHE_ENABLED,
     ANTHROPIC_PROMPT_CACHE_TTL,
 )
-from ..messages import (  # noqa: F401 — re-export for backward compat
-    assistant_text,
-    inject_missing_tool_results,
-    normalize_anthropic_tool_call_id,
-    thinking_to_text_block,
-    transform_messages_for_target,
-)
+from ..messages import transform_messages_for_target
 from ..types import (
     AssistantMessage,
     Context,

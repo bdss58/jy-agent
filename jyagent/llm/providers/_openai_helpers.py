@@ -31,8 +31,6 @@ def _field(obj: Any, name: str, default: Any = None) -> Any:
 
 # ─── Model capability detection ─────────────────────────────────────────────
 
-_OPENAI_LEGACY_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4")
-
 _OPENAI_REASONING_EFFORTS = {"minimal", "none", "low", "medium", "high", "xhigh"}
 _OPENAI_REASONING_MODEL_EXACT = {"gpt-5"}
 _OPENAI_REASONING_MODEL_MINOR_MINIMUM = 4
@@ -70,17 +68,6 @@ def supports_openai_reasoning_effort(model: str) -> bool:
     if rest != digits and not rest.startswith(f"{digits}-"):
         return False
     return int(digits) >= _OPENAI_REASONING_MODEL_MINOR_MINIMUM
-
-
-def uses_openai_legacy_reasoning_transport(model: str) -> bool:
-    """Return True for o-series models that require transport quirks.
-
-    In the Responses API, o-series models are natively supported and
-    ``instructions`` works normally.  The only remaining quirk is that
-    temperature is not supported for these models.
-    """
-    normalized = model.strip().lower()
-    return any(normalized.startswith(p) for p in _OPENAI_LEGACY_REASONING_MODEL_PREFIXES)
 
 
 # ─── Response normalisation ────────────────────────────────────────────────
@@ -467,6 +454,5 @@ __all__ = [
     "map_stop_reason",
     "supports_openai_reasoning_effort",
     "usage_from_response",
-    "uses_openai_legacy_reasoning_transport",
     "validate_openai_reasoning",
 ]
