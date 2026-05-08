@@ -100,7 +100,7 @@ def _build_state(loop, *, messages=None) -> RunState:
 
 def _one_tool_call(name="writer", call_id="c1", tool_input=None):
     """Build an LLM response that requests a single tool call."""
-    from jyagent.runtime.loop.engine import ToolCallRequest
+    from jyagent.runtime.loop.llm_types import ToolCallRequest
     block = ToolCallRequest(id=call_id, name=name, input=tool_input or {"x": 1})
     msg = {
         "content": [
@@ -114,7 +114,7 @@ def _one_tool_call(name="writer", call_id="c1", tool_input=None):
 
 def _two_tool_calls():
     """Build an LLM response that requests two tool calls in one batch."""
-    from jyagent.runtime.loop.engine import ToolCallRequest
+    from jyagent.runtime.loop.llm_types import ToolCallRequest
     blocks = [
         ToolCallRequest(id="c1", name="reader", input={"path": "/x"}),
         ToolCallRequest(id="c2", name="writer", input={"path": "/y"}),
@@ -277,7 +277,7 @@ class TestPreExecuteGate:
         forever.
         """
         from jyagent.runtime.loop.step import _execute_tool_round
-        from jyagent.runtime.loop.engine import ToolCallRequest
+        from jyagent.runtime.loop.llm_types import ToolCallRequest
 
         cbs = LoopCallbacks(on_tool_pre_execute=lambda n, i: "deny")
         # Use a real (allowed) llm_response shape just to satisfy FakeLoop;

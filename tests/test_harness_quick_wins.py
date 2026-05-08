@@ -155,7 +155,7 @@ class TestCostTracker:
 # --- Response-aware stuck-loop detection ---
 
 from jyagent.runtime.loop.stuck_loop import StuckLoopDetector as _StuckLoopDetector
-from jyagent.runtime.loop.engine import ToolCallRequest
+from jyagent.runtime.loop.llm_types import ToolCallRequest
 
 
 class TestStuckLoopDetector:

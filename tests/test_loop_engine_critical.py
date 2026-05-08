@@ -20,7 +20,7 @@ from jyagent.runtime.loop import engine as le
 from jyagent.runtime.loop import tool_executor as le_te
 from jyagent.runtime.loop.compaction import compact_messages
 from jyagent.runtime.loop.cost import CostTracker
-from jyagent.runtime.loop.engine import ToolCallRequest
+from jyagent.runtime.loop.llm_types import ToolCallRequest
 from jyagent.runtime.loop.stuck_loop import StuckLoopDetector
 from jyagent.runtime.loop.tool_executor import (
     execute_tool_with_timeout as _execute_tool_with_timeout,

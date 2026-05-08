@@ -48,11 +48,10 @@ _logger = logging.getLogger(__name__)
 
 # ─── Core types ──────────────────────────────────────────────────────────────
 # ``ToolCallRequest`` lives in ``runtime/loop/llm_types.py`` (sibling to
-# ``LLMOptions`` and ``ModelSpec``).  The import above re-exports it here
-# so legacy ``from jyagent.runtime.loop.engine import ToolCallRequest``
-# imports (tests, out-of-tree callers) continue to work unchanged.  The
-# canonical location is ``llm_types`` — new code should import from
-# there.
+# ``LLMOptions`` and ``ModelSpec``); engine imports it here only because
+# its own method signatures reference it.  Callers must import from
+# ``llm_types`` directly — the legacy back-compat re-export was retired
+# (commit migrating tests off ``engine.ToolCallRequest``).
 
 # Type alias: returns (schemas_list, functions_dict)
 ToolSource = Callable[[], tuple[list[dict], dict[str, Callable]]]

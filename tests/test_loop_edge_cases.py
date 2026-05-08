@@ -1631,7 +1631,7 @@ reg.register("a", _t, {"name": "a", "input_schema": {"type": "object"}}, paralle
 reg.register("b", _t, {"name": "b", "input_schema": {"type": "object"}}, parallel_safe=True)
 batch = reg.freeze()
 
-from jyagent.runtime.loop.engine import ToolCallRequest
+from jyagent.runtime.loop.llm_types import ToolCallRequest
 blocks = [
     ToolCallRequest(id="1", name="a", input={"label": "a"}),
     ToolCallRequest(id="2", name="b", input={"label": "b"}),

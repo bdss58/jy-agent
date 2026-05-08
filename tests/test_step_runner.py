@@ -150,7 +150,7 @@ def _llm_with_tool_call(tool_name: str = "fake_tool", tool_input: dict | None = 
     The structure mirrors what _extract_tool_calls produces from a real
     Anthropic message — a list of ToolCallRequest-shaped namespaces.
     """
-    from jyagent.runtime.loop.engine import ToolCallRequest
+    from jyagent.runtime.loop.llm_types import ToolCallRequest
     block = ToolCallRequest(
         id="call_1", name=tool_name, input=tool_input or {"x": 1},
     )
@@ -262,7 +262,7 @@ class TestTruncation:
             initial_max_tokens=1024, token_scale_factor=2, max_tokens_cap=128_000,
         )
         # Truncated response: stop_reason='length' AND has tool calls.
-        from jyagent.runtime.loop.engine import ToolCallRequest
+        from jyagent.runtime.loop.llm_types import ToolCallRequest
         block = ToolCallRequest(id="x", name="t", input={})
         loop = FakeLoop(config=cfg, llm_response=(
             "partial", [block], "length",
@@ -284,7 +284,7 @@ class TestTruncation:
             max_steps=5, streaming=False, compact_messages=False,
             todos_enabled=False, auto_scale_on_truncation=True,
         )
-        from jyagent.runtime.loop.engine import ToolCallRequest
+        from jyagent.runtime.loop.llm_types import ToolCallRequest
         block = ToolCallRequest(id="x", name="t", input={})
         loop = FakeLoop(config=cfg, llm_response=(
             "p", [block], "length",
@@ -440,7 +440,7 @@ from unittest import mock
 
 def _tool_call_block(name: str = "fake_tool", call_id: str = "call_1", tool_input: dict | None = None):
     """Return a tool_use-shaped LLM response tuple for a single tool call."""
-    from jyagent.runtime.loop.engine import ToolCallRequest
+    from jyagent.runtime.loop.llm_types import ToolCallRequest
     block = ToolCallRequest(id=call_id, name=name, input=tool_input or {"x": 1})
     msg = {
         "content": [
@@ -641,7 +641,7 @@ class TestDuplicateToolCallsInSingleBatch:
             todos_enabled=False, dedup_threshold=3,
         )
         # Build an LLM response with 3 identical tool calls in ONE batch.
-        from jyagent.runtime.loop.engine import ToolCallRequest
+        from jyagent.runtime.loop.llm_types import ToolCallRequest
         blocks = [
             ToolCallRequest(id=f"c{i}", name="read_file", input={"path": "/tmp/z"})
             for i in range(3)
