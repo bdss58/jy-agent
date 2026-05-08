@@ -205,18 +205,6 @@ class TestSubagentMemoryScoping:
         assert subagent._get_memory_context() == ""
         assert subagent._get_memory_context(query="anything", mode="none") == ""
 
-    def test_full_mode_preserves_legacy_4kb_dump(self, monkeypatch, tmp_path):
-        """mode='full' is the legacy back-compat path — returns the 4KB dump."""
-        from jyagent.tools import subagent
-
-        fake_md = tmp_path / "MEMORY.md"
-        fake_md.write_text("# Agent Memory\n- rule 1\n")
-        monkeypatch.setattr("jyagent.config.MEMORY_MD_FILE", str(fake_md))
-
-        out = subagent._get_memory_context(mode="full")
-        assert "Project Memory" in out
-        assert "rule 1" in out
-
     def test_matched_mode_requires_query(self, monkeypatch, tmp_path):
         """mode='matched' with empty query → empty (no BM25 query possible)."""
         from jyagent.tools import subagent
@@ -247,7 +235,7 @@ class TestSubagentMemoryScoping:
         from jyagent.tools.subagent import TOOL_SCHEMA
         props = TOOL_SCHEMA["input_schema"]["properties"]
         assert "memory_mode" in props
-        assert set(props["memory_mode"]["enum"]) == {"none", "matched", "full"}
+        assert set(props["memory_mode"]["enum"]) == {"none", "matched"}
 
 
 # ─── Fix #5a: pricing coverage for the default model ────────────────────────

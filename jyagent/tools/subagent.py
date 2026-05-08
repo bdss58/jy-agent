@@ -178,14 +178,13 @@ TOOL_SCHEMA = {
             },
             "memory_mode": {
                 "type": "string",
-                "enum": ["none", "matched", "full"],
+                "enum": ["none", "matched"],
                 "description": (
                     "Control what parent memory the sub-agent sees. "
                     "'none' (default, strict isolation): no MEMORY.md. "
                     "'matched': BM25-retrieve top relevant topic/journal "
                     "snippets for the task — best for knowledge transfer "
-                    "without leaking the whole memory index. "
-                    "'full': legacy 4KB MEMORY.md dump (back-compat only)."
+                    "without leaking the whole memory index."
                 ),
             },
         },
@@ -215,7 +214,7 @@ Rules:
 # sub-agent system prompt.  Codex's context-management review flagged the
 # default as over-broad: the parent's durable user/project memory leaked
 # into every isolated task, many of which had no need for it.  The fix is
-# a three-mode scope gate controlled by the ``memory_mode`` schema param:
+# a two-mode scope gate controlled by the ``memory_mode`` schema param:
 #
 #   * "none"    — strict isolation (default).  No MEMORY.md, no topics,
 #                 no journal.  The sub-agent sees only ``task`` + optional
@@ -227,16 +226,12 @@ Rules:
 #                 Recommended when the caller wants some knowledge transfer
 #                 but cares about token cost / relevance.
 #
-#   * "full"    — legacy behaviour: first 4KB of MEMORY.md verbatim.  Kept
-#                 so programmatic callers that relied on the old default
-#                 can request it explicitly.
-#
 # This file does NOT call ``build_memory_context`` from ``memory.context``
 # (which always injects MEMORY.md) — that helper is deliberately scoped
 # to the main loop's system prompt.
 
 
-_SUBAGENT_MEMORY_MODES = ("none", "matched", "full")
+_SUBAGENT_MEMORY_MODES = ("none", "matched")
 _SUBAGENT_MEMORY_DEFAULT = "none"
 _SUBAGENT_MATCHED_TOP_K = 5
 _SUBAGENT_MATCHED_MAX_CHARS = 2000
@@ -256,42 +251,23 @@ def _get_memory_context(query: str = "", mode: str = _SUBAGENT_MEMORY_DEFAULT) -
     if mode == "none":
         return ""
 
-    if mode == "matched":
-        if not query:
-            return ""
-        try:
-            from ..memory.search import search_memory, render_hits
-        except Exception:
-            return ""
-        try:
-            hits = search_memory(query, top_k=_SUBAGENT_MATCHED_TOP_K)
-        except Exception:
-            return ""
-        if not hits:
-            return ""
-        rendered = render_hits(hits, max_body_chars=400)
-        if len(rendered) > _SUBAGENT_MATCHED_MAX_CHARS:
-            rendered = rendered[:_SUBAGENT_MATCHED_MAX_CHARS] + "\n[... truncated ...]"
-        return f"\n\n## Relevant Memory (BM25-matched to task)\n{rendered}"
-
-    # mode == "full" — legacy verbatim 4KB dump of MEMORY.md
-    try:
-        from ..config import MEMORY_MD_FILE
-    except ImportError:
-        from jyagent.config import MEMORY_MD_FILE
-
-    import os
-    if not os.path.isfile(MEMORY_MD_FILE):
+    # mode == "matched"
+    if not query:
         return ""
     try:
-        with open(MEMORY_MD_FILE, "r", encoding="utf-8") as f:
-            content = f.read(4096)
-        content = content.strip()
-        if not content:
-            return ""
-        return f"\n\n## Project Memory\n{content}"
+        from ..memory.search import search_memory, render_hits
     except Exception:
         return ""
+    try:
+        hits = search_memory(query, top_k=_SUBAGENT_MATCHED_TOP_K)
+    except Exception:
+        return ""
+    if not hits:
+        return ""
+    rendered = render_hits(hits, max_body_chars=400)
+    if len(rendered) > _SUBAGENT_MATCHED_MAX_CHARS:
+        rendered = rendered[:_SUBAGENT_MATCHED_MAX_CHARS] + "\n[... truncated ...]"
+    return f"\n\n## Relevant Memory (BM25-matched to task)\n{rendered}"
 
 
 def _extract_text_blocks(message):
@@ -397,7 +373,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
     runtime_owner = _get_runtime_owner()
 
     # Build system prompt with optional scoped memory context.  The task
-    # is the BM25 query when mode="matched"; for "full"/"none" it is ignored.
+    # is the BM25 query when mode="matched"; for "none" it is ignored.
     system_prompt = custom_system_prompt or _SUBAGENT_SYSTEM_PROMPT
     system_prompt += _get_memory_context(query=task, mode=memory_mode)
 
