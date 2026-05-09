@@ -97,3 +97,4 @@ Session notes live in `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 [gotcha] For refactor splits where behavior must be PRESERVED: extract by `sed -n '<start>,<end>p' original > chunk` and assemble files from those exact byte ranges; NEVER paraphrase function bodies from memory. Always run an AST diff (`ast.get_source_segment` per function) BEFORE the first test run to catch silent drift.
 [workflow] For high-risk refactors of central files (loop core, agent.py, etc.): consult Codex on the SPLIT STRATEGY before touching anything.
 [workflow] Before ANY edit to `jyagent/**.py` (runtime/source self-upgrade): run `git branch --show-current` + `git worktree list`; if on `main`, create a feature branch OR a new worktree BEFORE editing. Applies even to "small" diffs (comment-only, test-only) — the check is unconditional, not size-gated.
+[preference] Rejected "budget-driven multi-pass compaction" proposal (C4 review #8) — do not reintroduce without explicit ask

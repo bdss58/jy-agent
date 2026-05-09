@@ -168,5 +168,3 @@ _STOP_WORDS = {
     "good", "better", "best", "bad", "worse", "worst",
     "true", "false", "none", "null",
 }
-
-
