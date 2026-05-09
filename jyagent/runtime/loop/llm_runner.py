@@ -501,10 +501,15 @@ class LLMRunner(LoopThreadHelper):
                     final_message = event.get("message")
                     if final_message is not None:
                         final_message_source = "stream:done"
-                    # Buffered mode: flush the accumulated text now that we
-                    # know the stream completed cleanly.
-                    if cfg.buffered_streaming:
-                        _flush_pending()
+                    # NOTE: do NOT flush buffered text here.  The terminal
+                    # ``done`` event can still carry ``stop_reason="error"``
+                    # (provider-side failure with a partially-emitted reply),
+                    # in which case the partial text belongs on the retry's
+                    # ``on_stream_retry`` callback — not on the user-visible
+                    # ``on_text_delta`` stream.  The flush is deferred until
+                    # AFTER the ``stop_reason == "error"`` gate below, so
+                    # buffered mode only ever emits text from a confirmed
+                    # clean completion.
 
                 elif etype == "error":
                     final_message = event.get("message")
@@ -535,9 +540,18 @@ class LLMRunner(LoopThreadHelper):
                 err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
                 raise err
 
+            # Buffered mode: NOW that we've confirmed a clean stream
+            # (no error stop_reason, no exception in flight), flush the
+            # accumulated text to the live ``on_text_delta`` stream.  The
+            # flush is deliberately gated on success so the UI never sees
+            # text from a failed attempt that the retry layer is about to
+            # re-issue.
+            if cfg.buffered_streaming:
+                _flush_pending()
+
             # Successful completion: in live mode emitted_len already equals
-            # the full text length; in buffered mode the done-handler above
-            # flushed it.  Nothing more to do.
+            # the full text length; in buffered mode the deferred flush
+            # above emitted it.  Nothing more to do.
             final_text = extract_text(final_message)
             if final_text and not text_parts:
                 text_parts.append(final_text)

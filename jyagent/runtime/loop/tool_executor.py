@@ -153,10 +153,15 @@ def get_tool_dispatch_executor(
 # that only touch tool registration, doc generation, etc.).
 #
 # All in-process callers go through `get_tool_dispatch_executor(...)`:
-#   * `AgentLoop.__init__` (engine.py) — calls `_get_tool_dispatch_executor(
-#     config.max_tool_workers)` so the pool is sized correctly on first use.
-#   * `execute_tools(executor=...)` — called from step.py with `loop._executor`
-#     pre-set, so the fallback `pool = executor or tool_dispatch_executor`
+#   * `AgentLoop.__init__` (engine.py) — calls `get_tool_dispatch_executor(
+#     config.max_tool_workers)` to warm the pool to the configured size.
+#     The return value is intentionally discarded; readers go through
+#     ``AgentLoop._executor`` (a property) which re-resolves on every
+#     access so a later grow-and-replace cannot leave the loop holding
+#     a shut-down pool.
+#   * `execute_tools(executor=...)` — called from step.py with
+#     `loop._executor` (the property), which always returns the live
+#     pool.  The `pool = executor or tool_dispatch_executor` fallback
 #     branch never reaches a None pool in production.
 #
 # Tests that previously did `from .engine import _tool_dispatch_executor` at
