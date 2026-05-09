@@ -143,25 +143,38 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     # Kept inline per codex's review — this is a behavioural branch point,
     # not a helper candidate.
     if not tool_call_blocks:
-        # Pre-completion verification gate: if we mutated files and haven't
-        # verified yet, inject a self-check prompt and loop once more instead
-        # of returning.
+        # Pre-completion verification gate: if NEW mutations have been
+        # appended since the last verification (or since the turn started,
+        # if no verification has fired yet), inject a self-check prompt
+        # and loop once more instead of returning.
+        #
+        # Re-arming contract (latent-bug fix, 2026-05): verification can
+        # fire MULTIPLE TIMES per run.  Previously a one-shot
+        # ``verification_injected: bool`` flag locked the gate after the
+        # first fire, so a "verify → model does more mutations → return"
+        # pattern was never re-checked.  Now the gate scans messages from
+        # ``max(turn_start_idx, last_verification_idx + 1)`` so each
+        # verification only sees mutations newer than itself.  No
+        # mutations newer than the last verification → gate stays closed
+        # → loop terminates cleanly on the same step (idempotent — a
+        # second call against the same suffix returns False).
         #
         # Boundary guard (P0 fix): never inject on the final allowed step —
         # the follow-up model reply has no iteration left to run, and the
         # dangling `[VERIFICATION]` user message would otherwise leak into
         # the persisted session and poison the next turn.
+        verify_since = state.turn_start_idx
+        if state.last_verification_idx is not None:
+            verify_since = max(verify_since, state.last_verification_idx + 1)
         if (
-            not state.verification_injected
-            and should_verify(
+            should_verify(
                 messages,
                 state.tool_calls_count,
-                since_index=state.turn_start_idx,
+                since_index=verify_since,
                 batch=step_batch,
             )
             and step + 1 < cfg.max_steps
         ):
-            state.verification_injected = True
             if trace:
                 trace.add_span(step=step, event_type="verification")
             # Append the assistant's response, then inject verification.
@@ -174,6 +187,10 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
                 "role": "user",
                 "content": build_verification_prompt(messages),
             })
+            # Record the index of the just-appended verification user
+            # message so a subsequent gate evaluation only re-arms when
+            # NEW mutations land at indices > this one.
+            state.last_verification_idx = len(messages) - 1
             return StepContinue()
 
         if not step_text:

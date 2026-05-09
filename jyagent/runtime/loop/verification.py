@@ -54,13 +54,29 @@ def should_verify(
        mutating).  Classification is done via ``batch.is_mutating(name)``
        so a freshly-registered MCP mutator surfaces the gate without a
        static keyword change here.
-    4. A verification prompt has not already been injected this turn.
 
     ``since_index`` (default 0, i.e. scan everything) bounds the mutation
     scan to messages appended during *this* turn — pass the value of
     ``len(messages)`` captured at the start of ``_run_impl``.  Without
     this, a replayed historical mutation in prior turns would re-arm the
     verification gate on a non-mutating new turn.
+
+    Re-arming contract (latent-bug fix, 2026-05): ``should_verify``
+    intentionally does NOT consult ``_already_injected``.  The caller
+    (``step.run_step``) passes ``since_index = max(turn_start_idx,
+    last_verification_idx + 1)`` so that only mutations STRICTLY NEWER
+    than the last verification are counted.  That index floor fully
+    subsumes "don't inject twice in a row without new mutations":
+    immediately after an injection the scan window is empty, so the gate
+    naturally closes; after another mutation round it re-opens because
+    new tool_result messages land at indices > ``last_verification_idx``.
+    ``_already_injected`` remains as an internal helper so existing
+    tests that assert its narrow semantics keep passing, but it is no
+    longer in the gate path — it was actively WRONG there, because
+    ``role=user`` tool_result messages in Anthropic format and direct
+    ``role=user`` verification markers both live in the same role
+    namespace, and the "most recent user message is the marker" check
+    silently blocked re-firing even when new mutations had landed.
 
     ``batch`` is the immutable per-step ``ToolBatch`` snapshot the engine
     already builds for dispatch — re-using it keeps the mutating-set
@@ -71,9 +87,6 @@ def should_verify(
         return False
 
     if tool_calls_count < 1:
-        return False
-
-    if _already_injected(messages):
         return False
 
     if not _has_mutation(messages, since_index=since_index, batch=batch):

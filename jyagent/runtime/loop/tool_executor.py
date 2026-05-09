@@ -32,6 +32,7 @@ from __future__ import annotations
 import atexit
 import collections
 import concurrent.futures
+import copy
 import functools
 import inspect
 import logging
@@ -206,20 +207,41 @@ def execute_tool(
     try:
         if tool_input is None:
             tool_input = {}
+        # Deep-copy before invocation so a tool that mutates a nested
+        # structure it receives (e.g. ``paths.append(...)``,
+        # ``data["new_key"] = ...``) cannot corrupt the original
+        # ``ToolCallRequest.input`` — that dict is shared by reference
+        # with the persisted transcript, and a mutation here would
+        # silently drift the recorded call from the call the model
+        # actually issued.  Latent-bug fix 2026-05.
+        #
+        # The previous shallow ``dict(tool_input)`` only protected the
+        # top-level keys (and only on the cancel-injection branch) —
+        # nested mutable values (list, dict, set) still aliased the
+        # transcript.  ``deepcopy`` closes both gaps.
+        #
+        # Cost: O(n) in input size.  Strings and primitives are
+        # refcount-only (O(1)); lists/dicts are O(n).  Typical tool
+        # inputs are <1 KB, so this is sub-millisecond in the common
+        # case.  Deliberately unconditional — gating on "does this
+        # tool mutate its inputs" would require a per-tool flag we
+        # can't reliably populate for external / MCP tools.
+        safe_input = copy.deepcopy(tool_input)
         # Inject the cancel event only when the tool has opted in by
         # declaring ``_cancel_event`` in its signature.  We pass the
         # engine's event even when it's None (not set yet) so tools can
         # treat it uniformly — polling ``event.is_set()`` on a never-set
         # event is always False, which is the right semantic.
+        #
+        # Passed as an explicit kwarg (not merged into ``safe_input``)
+        # so it never appears as a regular parameter to the tool —
+        # threading.Event is not JSON-serialisable, and a stray
+        # ``_cancel_event`` key in a kwargs-spread would corrupt any
+        # downstream serialisation of the call arguments.
         if cancel_event is not None and _accepts_cancel_event(fn):
-            # Don't mutate the caller's dict — the ToolCallRequest.input
-            # is shared back into the persisted transcript and the
-            # runtime-injected kwarg must not leak there.
-            call_kwargs = dict(tool_input)
-            call_kwargs["_cancel_event"] = cancel_event
-            raw = fn(**call_kwargs)
+            raw = fn(_cancel_event=cancel_event, **safe_input)
         else:
-            raw = fn(**tool_input)
+            raw = fn(**safe_input)
         if isinstance(raw, ToolResult):
             return enrich_error(raw, name)
         return ToolResult(str(raw))
