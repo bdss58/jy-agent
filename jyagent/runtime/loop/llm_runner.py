@@ -31,6 +31,7 @@ This was previously ~30 lines of cut-and-paste between the two classes.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -405,6 +406,15 @@ class LLMRunner(LoopThreadHelper):
             exc_holder: list[BaseException | None] = [None]
             done = threading.Event()
 
+            # ContextVar propagation: ``threading.Thread`` does not
+            # auto-inherit the parent's context, so any session- /
+            # tracing-scoped CV consumed by ``runtime_owner.complete``
+            # (or its provider SDK) would silently disappear on the
+            # daemon side.  Snapshot the calling context and route the
+            # worker through ``ctx.run`` so the SDK call sees the same
+            # CV state as if it had run inline on the calling thread.
+            ctx_complete = contextvars.copy_context()
+
             def _worker() -> None:
                 try:
                     final_holder[0] = self.runtime_owner.complete(
@@ -416,7 +426,8 @@ class LLMRunner(LoopThreadHelper):
                     done.set()
 
             t = threading.Thread(
-                target=_worker,
+                target=ctx_complete.run,
+                args=(_worker,),
                 name="jyagent-llm-complete",
                 daemon=True,
             )
@@ -547,8 +558,18 @@ class LLMRunner(LoopThreadHelper):
                                 pass
                             return
 
+                # The watcher only does ``Event.wait`` and
+                # ``stream.close``; it never calls user-level code that
+                # might consult a ContextVar.  Still snapshot the
+                # parent's context for consistency with the other spawn
+                # sites — the cost is one C-level dict copy and it
+                # future-proofs against the watcher growing logic that
+                # does observe CVs (e.g. tracing spans wrapping the
+                # close call).
+                _ctx_watcher = contextvars.copy_context()
                 watcher_thread = threading.Thread(
-                    target=_stream_cancel_watcher,
+                    target=_ctx_watcher.run,
+                    args=(_stream_cancel_watcher,),
                     name="jyagent-llm-stream-cancel-watcher",
                     daemon=True,
                 )

@@ -57,6 +57,7 @@ re-exporting these names; existing imports keep working unchanged.
 from __future__ import annotations
 
 import collections
+import contextvars
 import copy
 import functools
 import inspect
@@ -282,8 +283,25 @@ def execute_tool_with_timeout(
     if body_permits is not None:
         body_permits.acquire()
     try:
+        # Propagate the caller's ContextVar state into the daemon
+        # worker.  ``threading.Thread`` does NOT auto-propagate
+        # ContextVars (the worker starts in an empty default context),
+        # so any request-/session-/tracing-scoped CV used by the tool
+        # body or its callees would silently disappear on the daemon
+        # side.  Snapshotting the context here and routing the worker
+        # through ``ctx.run`` reproduces the parent's CV state inside
+        # the daemon while keeping mutations local to the worker (a
+        # ``CV.set`` inside the body does not leak back).
+        #
+        # Each tool body gets its OWN context copy because a single
+        # ``Context`` cannot be entered concurrently — even if this
+        # particular call is one-at-a-time, the outer
+        # ``execute_tools`` parallel path may have multiple
+        # ``execute_tool_with_timeout`` invocations in flight.
+        ctx = contextvars.copy_context()
         t = threading.Thread(
-            target=_run_body,
+            target=ctx.run,
+            args=(_run_body,),
             name=f"jyagent-tool-body:{name}",
             daemon=True,
         )
