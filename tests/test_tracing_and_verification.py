@@ -214,13 +214,41 @@ class TestShouldVerify:
             assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is True
 
     def test_already_injected_returns_false(self):
-        """If verification prompt already in messages, don't inject again."""
+        """Re-arming contract (latent-bug fix, 2026-05): the gate is no
+        longer blocked by the mere PRESENCE of a prior verification
+        marker.  The caller (``step.run_step``) is responsible for
+        passing ``since_index = max(turn_start_idx, last_verification_idx
+        + 1)``.  When that floor advances past every mutation in the
+        scan window, the gate naturally returns False — no marker scan
+        needed.
+
+        This test pins the new contract: with the floor placed AFTER
+        the lone tool_result, the gate must close even though
+        ``VERIFICATION_ENABLED=1`` and ``tool_calls_count=1``.
+        """
         with mock.patch("jyagent.runtime.loop.verification.VERIFICATION_ENABLED", True):
             msgs = [
                 {"role": "tool_result", "tool_name": "edit_file", "content": "ok"},
                 {"role": "user", "content": f"{_VERIFICATION_MARKER} Before you finish..."},
             ]
-            assert should_verify(msgs, tool_calls_count=1, batch=_mutating_batch()) is False
+            # Caller's contract: bump the floor past the prior mutation
+            # at index 0, mirroring what step.run_step does after an
+            # injection.  The gate must close.
+            assert should_verify(
+                msgs, tool_calls_count=1,
+                since_index=2,  # past every existing message
+                batch=_mutating_batch(),
+            ) is False
+
+            # And the legacy "scan everything" call (since_index=0) NOW
+            # returns True against the same fixture — pre-existing
+            # mutation exceeds the floor.  This is intentional: the
+            # marker-presence gate was redundant with the index floor and
+            # actively wrong (it blocked re-firing after new mutation
+            # rounds).  See ``should_verify``'s docstring for rationale.
+            assert should_verify(
+                msgs, tool_calls_count=1, batch=_mutating_batch(),
+            ) is True
 
     def test_run_shell_counts_as_mutation(self):
         """run_shell is registered with mutating=True."""

@@ -43,7 +43,10 @@ class RunState:
       - **Token / cost accumulators**.
       - **Tool / reflection counters**.
       - **Truncation retry state**.
-      - **One-shot flags**: ``verification_injected``, ``unpriced_warned``.
+      - **Verification gate**: ``last_verification_idx`` (replaces the
+        older one-shot ``verification_injected`` bool — see the field doc
+        for the re-arming rationale).
+      - **One-shot flags**: ``unpriced_warned``.
       - **Heavy collaborators**: ``cost_tracker``, ``stuck_detector``,
         ``tools_batch``, ``trace``, ``effective_spec``. Built in setup;
         their object identity must remain stable for the entire run.
@@ -97,8 +100,16 @@ class RunState:
     consecutive_truncations: int = 0
     max_truncation_retries: int = 3
 
+    # Verification gate: index of the most recently injected
+    # ``[VERIFICATION]`` user message (``None`` if no verification has
+    # fired this run).  Used by the re-arming gate: a second verification
+    # may fire only after NEW mutations have been persisted at indices
+    # strictly greater than this one.  Previously a one-shot ``bool``
+    # flag, which collapsed the common "mutate → verify → mutate more →
+    # return" case into a single verification cycle.
+    last_verification_idx: int | None = None
+
     # One-shot flags
-    verification_injected: bool = False
     unpriced_warned: bool = False
 
     # Text accumulators

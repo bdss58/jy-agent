@@ -127,9 +127,20 @@ def _execute_tool_round(
     # could loop forever.  By including denial results — which all share
     # the same fixed content — the dedup detector trips on the second or
     # third repeat just like a normal stuck loop.
+    #
+    # Latent-bug fix 2026-05: key the denial set + result map by Python
+    # object identity (``id(block)``) rather than by the provider-assigned
+    # ``block.id`` string.  A malformed provider that emits two tool_call
+    # blocks with the SAME ``id`` used to silently collapse them into a
+    # single entry here, so Phase 3 would look up one result for two
+    # distinct blocks — stuck-loop detection saw only one call, the
+    # transcript emitted only one tool_result, and positional pairing
+    # broke downstream (``/history`` rendering, subagent arg reconstruction).
+    # Python object ids are unique per ToolCallRequest by construction, so
+    # the dict keys cannot collide even if ``block.id`` does.
     denial_msg = "Denied by user (on_tool_pre_execute gate)."
-    denied_ids = {b.id for b in denied_blocks}
-    results_by_id = {b.id: r for (b, r) in executed_results}
+    denied_oids = {id(b) for b in denied_blocks}
+    results_by_oid = {id(b): r for (b, r) in executed_results}
 
     # Phase 3: emit messages + fire on_tool_end + trace, IN ORIGINAL
     # tool_call_blocks ORDER.  Returns a ``tool_results_tuples`` list that
@@ -137,7 +148,7 @@ def _execute_tool_round(
     # /history rendering, positional pairing) see what they expect.
     tool_results_tuples: list = []
     for block in tool_call_blocks:
-        if block.id in denied_ids:
+        if id(block) in denied_oids:
             result = ToolResult(content=denial_msg, is_error=True)
             # Stamp duration_ms=0 for parity with executed tools (the
             # ``on_tool_end`` callback and trace pipeline both read this).
@@ -146,7 +157,7 @@ def _execute_tool_round(
             except Exception:
                 pass
         else:
-            result = results_by_id[block.id]
+            result = results_by_oid[id(block)]
 
         state.tool_calls_count += 1
         content_str = _truncate_result(
