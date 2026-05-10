@@ -521,19 +521,19 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
             else:
                 content = _extract_text(body, url)
 
-            # ── Content quality checks ──
-
-            # Check 1: Minimum length
-            content_stripped = content.strip() if content else ""
-            if len(content_stripped) < min_length:
-                errors.append(f"{strategy_name}: too-short content ({len(content_stripped)} chars, need {min_length})")
-                continue
-
-            # Check 2: Low-quality / fake-success detection
-            quality_issue = _is_low_quality(content_stripped, url)
-            if quality_issue:
-                errors.append(f"{strategy_name}: low-quality content — {quality_issue}")
-                continue
+            # ── Content quality checks (skipped in raw mode) ──
+            # raw=True means the caller wants the bytes as-is (JSON APIs,
+            # config files, short responses) — quality/length heuristics
+            # are designed for human-readable HTML pages and must not apply.
+            if not raw:
+                content_stripped = content.strip() if content else ""
+                if len(content_stripped) < min_length:
+                    errors.append(f"{strategy_name}: too-short content ({len(content_stripped)} chars, need {min_length})")
+                    continue
+                quality_issue = _is_low_quality(content_stripped, url)
+                if quality_issue:
+                    errors.append(f"{strategy_name}: low-quality content — {quality_issue}")
+                    continue
 
             # Content passed all quality checks!
 

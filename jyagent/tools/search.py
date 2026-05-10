@@ -51,9 +51,20 @@ def glob_files(pattern: str, path: str = ".", max_results: int = 200) -> ToolRes
             return ToolResult(f"Error: Directory not found: {path}", is_error=True)
 
         matches = []  # list of (rel_path, size, mtime)
-        is_recursive = '**' in pattern
 
-        for rel_path in _glob.iglob(pattern, root_dir=path, recursive=is_recursive):
+        # Recursion semantics: the docstring promises "searches recursively
+        # from `path`", but `_glob.iglob` only recurses when `**` is in the
+        # pattern. Patterns like "*.py" would otherwise silently match only
+        # the root dir. To honour the docstring, if the pattern has no path
+        # separator AND no `**`, rewrite it to `**/<pattern>` so it matches
+        # at any depth. Patterns that already contain `/` are taken literally
+        # — the caller has expressed intent about directory structure.
+        effective_pattern = pattern
+        if "**" not in pattern and "/" not in pattern and os.sep not in pattern:
+            effective_pattern = f"**/{pattern}"
+        is_recursive = "**" in effective_pattern
+
+        for rel_path in _glob.iglob(effective_pattern, root_dir=path, recursive=is_recursive):
             # Skip binary files
             if is_binary_ext(rel_path):
                 continue

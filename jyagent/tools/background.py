@@ -176,24 +176,6 @@ def run_background(
                 that accidentally prompt do not hang forever. Set False only
                 if the child must inherit the parent's stdin.
     """
-    # Reject if we're already at the concurrency cap.
-    with _bg_lock:
-        live = _count_live_jobs()
-    if live >= _BG_MAX_CONCURRENT:
-        return ToolResult(
-            json.dumps({
-                "status": "rejected",
-                "reason": "concurrency_cap",
-                "message": (
-                    f"Already {live} live background jobs (cap={_BG_MAX_CONCURRENT}). "
-                    f"Kill or wait for existing jobs before starting a new one."
-                ),
-                "live_jobs": live,
-                "cap": _BG_MAX_CONCURRENT,
-            }),
-            is_error=True,
-        )
-
     # Validate cwd early — Popen's error is less actionable.
     popen_cwd = None
     if cwd:
@@ -204,18 +186,41 @@ def run_background(
             )
         popen_cwd = cwd
 
+    # Reserve a sentinel slot atomically before Popen to prevent TOCTOU races
+    # where two parallel callers both pass the cap check before either
+    # registers. Sentinel keys are negative ints — real PIDs are positive —
+    # so they never collide, and _count_live_jobs ignores them (they have
+    # process=None). We count sentinels explicitly against the cap below.
     fh = None
     output_file = None
-    stdin_fh = None
+    proc = None
+    with _bg_lock:
+        live = _count_live_jobs()
+        sentinels = sum(1 for k in _background_processes if k < 0)
+        if live + sentinels >= _BG_MAX_CONCURRENT:
+            return ToolResult(
+                json.dumps({
+                    "status": "rejected",
+                    "reason": "concurrency_cap",
+                    "message": (
+                        f"Already {live + sentinels} live background jobs "
+                        f"(cap={_BG_MAX_CONCURRENT}). "
+                        f"Kill or wait for existing jobs before starting a new one."
+                    ),
+                    "live_jobs": live + sentinels,
+                    "cap": _BG_MAX_CONCURRENT,
+                }),
+                is_error=True,
+            )
+        sentinel_key = min(_background_processes.keys(), default=0) - 1
+        _background_processes[sentinel_key] = {"process": None}
+
     try:
         fd_int, output_file = tempfile.mkstemp(
             prefix="jyagent_bg_", suffix=".out", dir="/tmp",
         )
         fh = os.fdopen(fd_int, "w")
-        if stdin_null:
-            stdin_arg = subprocess.DEVNULL
-        else:
-            stdin_arg = None  # inherit
+        stdin_arg = subprocess.DEVNULL if stdin_null else None
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -228,6 +233,7 @@ def run_background(
         started_at = time.time()
         deadline = started_at + timeout_seconds if timeout_seconds > 0 else None
         with _bg_lock:
+            _background_processes.pop(sentinel_key, None)
             _background_processes[proc.pid] = {
                 "command": command,
                 "cwd": popen_cwd or "",
@@ -249,7 +255,31 @@ def run_background(
             "status": "started",
         }))
     except Exception as e:
-        # Clean up on failure — avoid leaking the temp file and fd
+        # Release the sentinel slot and clean up resources.
+        with _bg_lock:
+            _background_processes.pop(sentinel_key, None)
+        # If Popen succeeded but something raised afterwards (e.g. tempfile
+        # bookkeeping, unexpected TypeError), the child process is orphaned
+        # with no handle left to track it. Kill its process group before
+        # returning so we don't leak a runaway subprocess.
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, 15)  # SIGTERM to process group
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, 9)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
         if fh is not None:
             try:
                 fh.close()

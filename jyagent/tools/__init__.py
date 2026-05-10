@@ -51,8 +51,8 @@ _TOOL_METADATA = {
     "run_shell":       {"parallel_safe": False, "timeout_hint": "from_input", "compaction_priority": "ephemeral", "mutating": True},
     "write_file":      {"parallel_safe": False, "large_input_keys": {"content"}, "mutating": True},
     "edit_file":       {"parallel_safe": False, "large_input_keys": {"new_text", "old_text"}, "mutating": True},
-    "manage_memory":   {"parallel_safe": False},
-    "manage_skills":   {"parallel_safe": False},
+    "manage_memory":   {"parallel_safe": False, "mutating": True},
+    "manage_skills":   {"parallel_safe": False, "mutating": True},
     "web_fetch":       {"parallel_safe": False, "timeout_hint": 180, "compaction_priority": "persistent"},
     "mcp":             {"parallel_safe": False, "timeout_hint": 180, "mutating": True},
     # dispatch_agent is now serial.  Sub-agents
