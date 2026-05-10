@@ -109,6 +109,17 @@ class RunState:
     # return" case into a single verification cycle.
     last_verification_idx: int | None = None
 
+    # Prose-shaped tool-call recovery counter (Bug A — see finalize.py).
+    # Incremented each time the no-tool branch detects assistant text that
+    # looks like a malformed tool invocation and injects a corrective
+    # ``[MALFORMED_TOOL_CALL]`` user message instead of terminating the
+    # turn.  The gate only fires while this counter is below
+    # ``max_prose_tool_call_corrections`` — past that, the loop accepts
+    # the turn as terminal rather than re-prompting forever (e.g. against
+    # a model that genuinely insists on emitting pseudo-syntax).
+    prose_tool_call_corrections: int = 0
+    max_prose_tool_call_corrections: int = 2
+
     # One-shot flags
     unpriced_warned: bool = False
 

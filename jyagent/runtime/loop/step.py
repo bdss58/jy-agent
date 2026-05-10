@@ -94,7 +94,12 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     """
     # Lazy imports break the engine→step→engine cycle without polluting
     # module-load order. Cost: one dict lookup per step (negligible).
-    from .finalize import finalize_run, is_truncated
+    from .finalize import (
+        build_prose_tool_call_correction,
+        finalize_run,
+        is_truncated,
+        looks_like_prose_tool_call,
+    )
     from .llm_runner import extract_text as _extract_text
     from .compaction import truncate_tool_call_blocks as _truncate_tool_call_blocks
     from .verification import should_verify, build_verification_prompt
@@ -143,6 +148,43 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     # Kept inline per codex's review — this is a behavioural branch point,
     # not a helper candidate.
     if not tool_call_blocks:
+        # ── Prose-shaped tool-call gate (Bug A — see finalize.py) ─────────
+        #
+        # If the assistant text looks like a malformed tool invocation
+        # (e.g. ``[Tool call: run_shell]{...}`` or a ```tool_use``` fence)
+        # but no real structured tool_use block was emitted, the model
+        # most likely TRIED to call a tool and failed.  Terminating the
+        # turn here would silently swallow the user's request — the
+        # exact failure mode that motivated this gate.
+        #
+        # Remediation: append the assistant message (so the conversation
+        # records what was attempted), inject a corrective user message
+        # explaining the failure, and continue the loop so the model
+        # can retry — either with a real tool call or by switching to
+        # plain prose.
+        #
+        # Capped retries (``max_prose_tool_call_corrections``) prevent
+        # an infinite re-prompt loop if the model insists on the
+        # pseudo-syntax — past the cap we accept the turn as terminal.
+        # The cap is per-run, not per-step: once exceeded, subsequent
+        # prose-shaped attempts in the same run terminate normally.
+        if (
+            looks_like_prose_tool_call(step_text)
+            and state.prose_tool_call_corrections < state.max_prose_tool_call_corrections
+            and step + 1 < cfg.max_steps
+        ):
+            if trace:
+                trace.add_span(step=step, event_type="prose_tool_call_correction")
+            # Persist the assistant's malformed attempt so the model sees
+            # its own previous message + the correction in the next turn.
+            messages.append(final_message)
+            messages.append({
+                "role": "user",
+                "content": build_prose_tool_call_correction(),
+            })
+            state.prose_tool_call_corrections += 1
+            return StepContinue()
+
         # Pre-completion verification gate: if NEW mutations have been
         # appended since the last verification (or since the turn started,
         # if no verification has fired yet), inject a self-check prompt
