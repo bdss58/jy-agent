@@ -50,7 +50,7 @@ from jyagent.runtime.loop.callbacks import LoopCallbacks
 from jyagent.runtime.loop.config import LoopConfig
 from jyagent.runtime.loop.llm_types import ModelSpec, ToolCallRequest
 from jyagent.runtime.loop.step import RunState, StepContinue, run_step
-from jyagent.runtime.loop import tool_executor as te
+from jyagent.runtime.loop import tool_invocation as te
 from jyagent.runtime.tools.registry import ToolBatch, ToolRegistry
 from jyagent.runtime.tools.result import ToolResult
 
@@ -321,7 +321,7 @@ class TestToolCallIdCollision:
         ``state.tool_calls_count`` must advance by 2.  The OLD
         ``{b.id: r for ...}`` keying collapsed them into one entry.
         """
-        from jyagent.runtime.loop.step_tools import _execute_tool_round
+        from jyagent.runtime.loop.step import _execute_tool_round
 
         # Two distinct ToolCallRequest objects carrying the SAME id.
         # A legitimate adapter would never emit this; a malformed
@@ -374,7 +374,7 @@ class TestToolCallIdCollision:
         single ``{b.id: r}`` mapping picked whichever came last —
         ambiguous and wrong.
         """
-        from jyagent.runtime.loop.step_tools import _execute_tool_round
+        from jyagent.runtime.loop.step import _execute_tool_round
 
         blocks = [
             ToolCallRequest(id="same", name="reader", input={"x": 1}),

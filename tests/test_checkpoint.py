@@ -16,7 +16,7 @@ import threading
 import pytest
 
 from jyagent.runtime.loop import engine as le
-from jyagent.runtime.loop import tool_executor as le_te
+from jyagent.runtime.loop import tool_pool as le_te
 from jyagent.runtime.loop.checkpoint import (
     LoopCheckpoint,
     checkpoint_path,

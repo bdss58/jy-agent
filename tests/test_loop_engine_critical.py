@@ -17,15 +17,15 @@ from dataclasses import dataclass
 import pytest
 
 from jyagent.runtime.loop import engine as le
-from jyagent.runtime.loop import tool_executor as le_te
+from jyagent.runtime.loop import tool_pool as le_te
 from jyagent.runtime.loop.compaction import compact_messages
 from jyagent.runtime.loop.cost import CostTracker
 from jyagent.runtime.loop.llm_types import ToolCallRequest
 from jyagent.runtime.loop.stuck_loop import StuckLoopDetector
-from jyagent.runtime.loop.tool_executor import (
+from jyagent.runtime.loop.tool_invocation import (
     execute_tool_with_timeout as _execute_tool_with_timeout,
-    execute_tools as _execute_tools,
 )
+from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
 from jyagent.runtime.tools.result import ToolResult
 
 # Anthropic preserver registration is a module-import side effect of

@@ -39,7 +39,7 @@ from pathlib import Path
 import pytest
 
 from jyagent.runtime.loop import engine as le
-from jyagent.runtime.loop import tool_executor as le_te
+from jyagent.runtime.loop import tool_pool as le_te
 from jyagent.runtime.loop import llm_runner as le_lr
 
 
@@ -308,7 +308,7 @@ class TestFallbackFailureDoesNotPoisonCounters:
         warnings: list[str] = []
         cbs = le.LoopCallbacks(on_warning=lambda m: warnings.append(m))
 
-        from jyagent.runtime.loop.step_state import RunState
+        from jyagent.runtime.loop.step import RunState
         from jyagent.runtime.loop.cost import CostTracker
         from jyagent.runtime.tools.registry import ToolBatch
 

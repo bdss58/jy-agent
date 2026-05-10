@@ -64,7 +64,7 @@ class FakeLoop:
         self._cancel = cancel
         self._tool_source = None
         self._executor = None
-        # ``_cancel_event`` is read by run_step → _execute_tools → tool_executor
+        # ``_cancel_event`` is read by run_step → _execute_tools → step.execute_tools
         # so cooperating tools can be passed the live event.  Default ``None``
         # disables both kwarg injection and the wait-loop short-circuit, so
         # legacy tests that don't set up cancellation are unaffected.
@@ -428,12 +428,11 @@ class TestRunStateFromLoop:
 # ─── T7-T13: tool execution + cancellation + dedup + checkpoint + todos ─────
 #
 # These tests exercise code paths in step.run_step that depend on
-# `tool_executor.execute_tools`, so they monkeypatch that module-level function
+# `step.execute_tools`, so they monkeypatch that module-level function
 # rather than touching the registry.
 #
-# NOTE: step.py calls ``from .tool_executor import execute_tools`` inside
-# run_step (lazy, on every call), so patching the attribute on the
-# ``tool_executor`` module is sufficient — no engine alias involved.
+# NOTE: step.py imports ``execute_tools`` directly from ``tool_dispatch``,
+# so patching the attribute on the ``step`` module is sufficient.
 
 from unittest import mock
 
@@ -453,7 +452,7 @@ def _tool_call_block(name: str = "fake_tool", call_id: str = "call_1", tool_inpu
 
 
 def _tool_result(content: str, is_error: bool = False):
-    """Build a ToolResult the way tool_executor.execute_tools returns."""
+    """Build a ToolResult the way step.execute_tools returns."""
     from jyagent.runtime.tools.result import ToolResult
     return ToolResult(content=content, is_error=is_error)
 
@@ -468,7 +467,7 @@ class TestNormalToolExecution:
 
         # Mock the executor to return a deterministic result.
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("contents: hi"))],
         ) as mock_exec:
             outcome = run_step(loop, state)
@@ -496,7 +495,7 @@ class TestNormalToolExecution:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("ok"))],
         ):
             run_step(loop, state)
@@ -512,7 +511,7 @@ class TestNormalToolExecution:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("exit 1", is_error=True))],
         ):
             run_step(loop, state)
@@ -542,7 +541,7 @@ class TestCancellationBeforeTools:
         # Even though execute_tools should NOT be called, patch to
         # detect a regression.
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("should-not-run"))],
         ) as mock_exec:
             outcome = run_step(loop, state)
@@ -581,7 +580,7 @@ class TestCancellationAfterTools:
         loop._is_cancelled = _staged_cancel  # type: ignore[method-assign]
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("done"))],
         ):
             outcome = run_step(loop, state)
@@ -613,7 +612,7 @@ class TestStuckLoopDedupBreak:
         # advances state.step and state.all_text independently.
         outcomes = []
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("identical-output"))],
         ):
             for i in range(3):
@@ -659,7 +658,7 @@ class TestDuplicateToolCallsInSingleBatch:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(b, _tool_result("contents")) for b in blocks],
         ):
             outcome = run_step(loop, state)
@@ -673,7 +672,7 @@ class TestDuplicateToolCallsInSingleBatch:
         # first batch was properly counted as one.
         state.step = 1
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(b, _tool_result("contents")) for b in blocks],
         ):
             outcome2 = run_step(loop, state)
@@ -695,7 +694,7 @@ class TestCheckpointWrite:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("done"))],
         ):
             outcome = run_step(loop, state)
@@ -718,7 +717,7 @@ class TestCheckpointWrite:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("done"))],
         ):
             run_step(loop, state)
@@ -737,7 +736,7 @@ class TestCheckpointWrite:
         state.step = 2  # step 2 → (step+1) % 5 == 3, no checkpoint
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], _tool_result("done"))],
         ):
             run_step(loop, state)

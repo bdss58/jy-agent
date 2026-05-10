@@ -8,7 +8,7 @@
 #   * gate raising an exception → engine treats it as default (allow).
 #
 # Pattern follows tests/test_step_runner.py: a tiny FakeLoop + mock.patch on
-# tool_executor.execute_tools.
+# step.execute_tools.
 
 from __future__ import annotations
 
@@ -144,7 +144,7 @@ class TestPreExecuteGate:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], ToolResult(content="should-not-run"))],
         ) as mock_exec:
             outcome = run_step(loop, state)
@@ -178,7 +178,7 @@ class TestPreExecuteGate:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], ToolResult(content="contents"))],
         ) as mock_exec:
             run_step(loop, state)
@@ -196,7 +196,7 @@ class TestPreExecuteGate:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], ToolResult(content="ok"))],
         ) as mock_exec:
             run_step(loop, state)
@@ -225,7 +225,7 @@ class TestPreExecuteGate:
             return [(reader_block, ToolResult(content="read-ok"))]
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools", side_effect=_fake_execute,
+            "jyagent.runtime.loop.step.execute_tools", side_effect=_fake_execute,
         ):
             run_step(loop, state)
 
@@ -258,7 +258,7 @@ class TestPreExecuteGate:
         state = _build_state(loop)
 
         with mock.patch(
-            "jyagent.runtime.loop.tool_executor.execute_tools",
+            "jyagent.runtime.loop.step.execute_tools",
             return_value=[(loop.llm_response[1][0], ToolResult(content="still-ran"))],
         ) as mock_exec:
             run_step(loop, state)

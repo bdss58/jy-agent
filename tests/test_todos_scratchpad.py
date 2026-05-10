@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import pytest
 
 from jyagent.runtime.loop import engine as le
-from jyagent.runtime.loop import tool_executor as le_te
+from jyagent.runtime.loop import tool_pool as le_te
 from jyagent.runtime.loop.todos import (
     TodoItem,
     WRITE_TODOS_SCHEMA,

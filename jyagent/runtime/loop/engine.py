@@ -70,7 +70,8 @@ def _t_as_dict(t: Any) -> dict:
 
 # ─── Shared dispatch executor ────────────────────────────────────────────────
 # The shared tool-dispatch pool, its lazy-grow helper, and the
-# tool-execution helpers live in ``runtime/loop/tool_executor.py``.
+# tool-execution helpers live in the leaf modules under
+# ``runtime/loop/``.
 # Engine imports only what its own body uses.  Other call sites import
 # directly from the leaf module (``tool_executor``, ``cost``, ``stuck_loop``,
 # ``finalize``, ``compaction``).  Re-exports from this module are no longer
@@ -78,7 +79,7 @@ def _t_as_dict(t: Any) -> dict:
 # ``runtime/loop/step.py::run_step`` calls ``tool_executor.execute_tools``
 # directly, so any patching/monkeypatching for tests must target the leaf
 # module, not ``engine``.
-from .tool_executor import get_tool_dispatch_executor  # noqa: E402
+from .tool_pool import get_tool_dispatch_executor  # noqa: E402
 
 # Helpers consumed by ``AgentLoop._call_llm_with_retry`` (a thin shim
 # over ``_retry_llm_call``) and the max_steps fallback path.

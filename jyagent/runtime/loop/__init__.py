@@ -7,9 +7,9 @@ Lazy engine load.
 ``.engine`` are now lazy.  Cheap leaf modules (``callbacks``, ``config``,
 ``llm_client``, ``llm_types``, ``cost``) are imported eagerly because
 they have zero transitive engine cost.  Heavy modules (``engine``,
-``tool_executor``, ``llm_runner``, ``compaction``, ``step``) are NOT
-loaded by ``import jyagent.runtime.loop`` — they load only when a caller
-actually touches ``AgentLoop`` (or imports a heavy submodule directly).
+``llm_runner``, ``compaction``, ``step``) are NOT loaded by
+``import jyagent.runtime.loop`` — they load only when a caller actually
+touches ``AgentLoop`` (or imports a heavy submodule directly).
 
 Phase modules (``phases``, ``reflection``, ``checkpoint``, ``todos``,
 ``verification``, ``remediation``, ``tracing``) are still pre-bound as
@@ -50,9 +50,9 @@ _LAZY_SUBMODULES = (
     "verification",
     "remediation",
     "tracing",
-    # 'engine', 'tool_executor', 'llm_runner', 'compaction', 'step' are also
-    # lazily importable via the standard package mechanism — explicit listing
-    # is for the dir()/star-import convenience only.
+    # 'engine', 'llm_runner', 'compaction', 'step' are also lazily
+    # importable via the standard package mechanism — explicit listing is
+    # for the dir()/star-import convenience only.
 )
 
 

@@ -18,7 +18,8 @@ import pytest
 
 from jyagent.runtime.loop import checkpoint
 from jyagent.runtime.loop import engine as loop_engine
-from jyagent.runtime.loop import tool_executor as loop_engine_te
+from jyagent.runtime.loop import tool_pool as loop_engine_te
+from jyagent.runtime.loop.tool_invocation import execute_tool_with_timeout as _eet
 from jyagent.runtime.loop.config import LoopConfig
 from jyagent.runtime.tools.registry import ToolRegistry
 
@@ -521,7 +522,7 @@ class TestRunShellTimeoutCoercion:
         )
         batch = reg.freeze()
         # "30s" cannot be int()-coerced — old code raised ValueError here.
-        result = loop_engine_te.execute_tool_with_timeout(
+        result = _eet(
             "run_shell",
             {"command": "echo hi", "timeout": "30s"},
             batch,
@@ -542,7 +543,7 @@ class TestRunShellTimeoutCoercion:
             {"name": "run_shell", "input_schema": {"type": "object"}},
         )
         batch = reg.freeze()
-        result = loop_engine_te.execute_tool_with_timeout(
+        result = _eet(
             "run_shell",
             {"command": "ls", "timeout": [1, 2, 3]},
             batch,
@@ -569,7 +570,7 @@ class TestRunShellTimeoutCoercion:
         )
         batch = reg.freeze()
         # Valid int → coercion path runs fine, no fallback.
-        result = loop_engine_te.execute_tool_with_timeout(
+        result = _eet(
             "run_shell",
             {"command": "echo ok", "timeout": 30},
             batch,
@@ -1157,27 +1158,6 @@ class TestC4Phase1CostExtraction:
 # ─── Tool executor extracted to runtime/loop/tool_executor.py ────────────────
 
 
-class TestC4Phase2ToolExecutorExtraction:
-    """The tool-execution stack (execute_tool, execute_tool_with_timeout,
-    execute_tools, dispatch-pool state) now lives in runtime/loop/tool_executor.py.
-    Engine aliases the functions with underscore-prefixed names for internal
-    callers and exposes the mutable pool state via a PEP-562 ``__getattr__``
-    passthrough so existing tests that read the old names keep working
-    against the LIVE pool (not a stale snapshot).
-    """
-
-    def test_execute_tool_importable_from_new_home(self):
-        from jyagent.runtime.loop.tool_executor import (
-            execute_tool,
-            execute_tool_with_timeout,
-            execute_tools,
-            get_tool_dispatch_executor,
-        )
-        # All must be callables (smoke check).
-        assert callable(execute_tool)
-        assert callable(execute_tool_with_timeout)
-        assert callable(execute_tools)
-        assert callable(get_tool_dispatch_executor)
 
 
 
@@ -1503,7 +1483,6 @@ import sys
 import jyagent.runtime
 heavy = [
     'jyagent.runtime.loop.engine',
-    'jyagent.runtime.loop.tool_executor',
     'jyagent.runtime.loop.llm_runner',
     'jyagent.runtime.loop.compaction',
     'jyagent.runtime.loop.step',
@@ -1537,7 +1516,9 @@ print('OK')
 import jyagent.runtime
 # tool_executor itself isn't loaded yet; engine keeps it lazy.
 # import it explicitly and check the pool is None.
-from jyagent.runtime.loop import tool_executor as te
+from jyagent.runtime.loop import tool_pool as te
+from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 assert te.tool_dispatch_executor is None, 'pool eagerly initialised at import'
 assert te.tool_dispatch_cap == 0, f'expected cap=0 got {te.tool_dispatch_cap}'
 print('OK')
@@ -1617,7 +1598,9 @@ print('OK')
         test having already grown the pool.
         """
         out = self._run_in_subprocess('''
-from jyagent.runtime.loop import tool_executor as te
+from jyagent.runtime.loop import tool_pool as te
+from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 from jyagent.runtime.tools.registry import ToolRegistry
 
 # Verify the pool is None at this point (no AgentLoop ever constructed)
@@ -1639,7 +1622,7 @@ blocks = [
 ]
 
 # Critical path: executor=None forces the fallback that used to read None
-results = te.execute_tools(
+results = _execute_tools(
     blocks, batch,
     concurrent_mode=True, max_workers=4, timeout=10,
     executor=None,
@@ -1676,7 +1659,9 @@ class TestCooperativeCancelEvent:
         be called with its declared arguments only — not crash on an
         unexpected kwarg."""
         from jyagent.runtime.tools.registry import ToolRegistry
-        from jyagent.runtime.loop import tool_executor as te
+        from jyagent.runtime.loop import tool_pool as te
+        from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+        from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 
         seen_kwargs: list[set[str]] = []
 
@@ -1695,7 +1680,7 @@ class TestCooperativeCancelEvent:
         batch = reg.freeze()
 
         ev = threading.Event()
-        result = te.execute_tool("legacy_tool", {"x": 7}, batch, cancel_event=ev)
+        result = _execute_tool("legacy_tool", {"x": 7}, batch, cancel_event=ev)
         assert not result.is_error, result.content
         assert "got 7" in result.content
 
@@ -1703,7 +1688,9 @@ class TestCooperativeCancelEvent:
         """A tool that declares ``_cancel_event`` must observe the live
         event the runtime passes in."""
         from jyagent.runtime.tools.registry import ToolRegistry
-        from jyagent.runtime.loop import tool_executor as te
+        from jyagent.runtime.loop import tool_pool as te
+        from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+        from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 
         captured: dict = {}
 
@@ -1725,7 +1712,7 @@ class TestCooperativeCancelEvent:
         batch = reg.freeze()
 
         ev = threading.Event()
-        result = te.execute_tool("coop_tool", {"x": 3}, batch, cancel_event=ev)
+        result = _execute_tool("coop_tool", {"x": 3}, batch, cancel_event=ev)
         assert not result.is_error
         assert captured["event"] is ev
         assert captured["is_set_at_call"] is False
@@ -1735,7 +1722,9 @@ class TestCooperativeCancelEvent:
         ``_cancel_event`` kwarg is runtime-injected and would corrupt
         the persisted ToolCallRequest if it leaked back."""
         from jyagent.runtime.tools.registry import ToolRegistry
-        from jyagent.runtime.loop import tool_executor as te
+        from jyagent.runtime.loop import tool_pool as te
+        from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+        from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 
         def coop_tool(x: int, _cancel_event=None) -> str:
             return "ok"
@@ -1752,7 +1741,7 @@ class TestCooperativeCancelEvent:
 
         original_input = {"x": 9}
         ev = threading.Event()
-        te.execute_tool("coop_tool", original_input, batch, cancel_event=ev)
+        _execute_tool("coop_tool", original_input, batch, cancel_event=ev)
         # The caller's dict must remain unmodified — no _cancel_event key.
         assert "_cancel_event" not in original_input
         assert original_input == {"x": 9}
@@ -1763,7 +1752,9 @@ class TestCooperativeCancelEvent:
         return promptly with a Cancelled ToolResult — without waiting
         for the full ``timeout`` budget."""
         from jyagent.runtime.tools.registry import ToolRegistry
-        from jyagent.runtime.loop import tool_executor as te
+        from jyagent.runtime.loop import tool_pool as te
+        from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+        from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 
         # NON-cooperating slow tool — does not declare _cancel_event.
         def slow_tool() -> str:
@@ -1787,7 +1778,7 @@ class TestCooperativeCancelEvent:
         threading.Thread(target=trigger, daemon=True).start()
 
         t0 = time.monotonic()
-        result = te.execute_tool_with_timeout(
+        result = _execute_tool_with_timeout(
             "slow_tool", {}, batch,
             default_timeout=10,
             cancel_event=ev,
@@ -1808,7 +1799,9 @@ class TestCooperativeCancelEvent:
         """Passing ``cancel_event=None`` must keep the legacy fast path
         (single ``done.wait(timeout)``) — no polling overhead."""
         from jyagent.runtime.tools.registry import ToolRegistry
-        from jyagent.runtime.loop import tool_executor as te
+        from jyagent.runtime.loop import tool_pool as te
+        from jyagent.runtime.loop.tool_dispatch import execute_tools as _execute_tools
+        from jyagent.runtime.loop.tool_invocation import execute_tool as _execute_tool, execute_tool_with_timeout as _execute_tool_with_timeout
 
         def quick_tool() -> str:
             return "ok"
@@ -1821,7 +1814,7 @@ class TestCooperativeCancelEvent:
         )
         batch = reg.freeze()
 
-        result = te.execute_tool_with_timeout(
+        result = _execute_tool_with_timeout(
             "quick_tool", {}, batch,
             default_timeout=5,
             cancel_event=None,
@@ -1832,7 +1825,7 @@ class TestCooperativeCancelEvent:
     def test_signature_introspection_failure_falls_back_safely(self):
         """A callable whose ``inspect.signature`` raises must be treated
         as legacy (no kwarg injection) — never crash the dispatch."""
-        from jyagent.runtime.loop.tool_executor import _accepts_cancel_event
+        from jyagent.runtime.loop.tool_invocation import _accepts_cancel_event
 
         # Built-in C functions raise TypeError from inspect.signature.
         assert _accepts_cancel_event(len) is False
