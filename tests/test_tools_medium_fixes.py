@@ -152,3 +152,16 @@ def test_web_fetch_known_strategies_accepted(monkeypatch):
         if result.is_error:
             assert "unknown strategy" not in result.content.lower(), \
                 f"strategy={strat!r} was incorrectly rejected as unknown"
+
+
+def test_grep_files_context_lines_dont_count_toward_max_results(tmp_path):
+    # 5 matches, each with 1 context line above/below.
+    # max_results=3 should return 3 matches (not 3 total lines).
+    lines = []
+    for i in range(5):
+        lines += [f"context_before_{i}\n", f"MATCH_{i}\n", f"context_after_{i}\n"]
+    (tmp_path / "f.txt").write_text("".join(lines))
+    result = grep_files("MATCH_", str(tmp_path), max_results=3, context_lines=1)
+    assert not result.is_error
+    # Exactly 3 MATCH_ lines should appear
+    assert result.content.count("MATCH_") == 3

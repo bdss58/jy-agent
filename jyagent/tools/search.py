@@ -320,9 +320,11 @@ def _search_file(
         f.close()
 
     shown_context = set()  # Track context line numbers already shown
+    match_count = 0        # Count actual matches, not context lines
 
     for i, line in enumerate(lines):
         if regex.search(line):
+            match_count += 1
             ctx_start = max(0, i - context_lines)
             ctx_end = min(len(lines), i + context_lines + 1)
 
@@ -340,7 +342,9 @@ def _search_file(
                         f"{prefix} {show_path}:L{j + 1}: {lines[j].rstrip()}"
                     )
 
-            if len(results) >= max_results:
+            # Cap on actual matches, not total output lines (context lines
+            # don't count against the caller's requested match budget).
+            if match_count >= max_results:
                 break
 
     return results
