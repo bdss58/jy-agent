@@ -498,6 +498,7 @@ def run_shell(
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,  # prevent interactive commands from hanging
             start_new_session=True,
             # NOTE: text=False (default) — we decode at collect() time so
             # the bounded buffer holds bytes, not Python str objects.
@@ -676,7 +677,7 @@ def write_file(path: str, content: str) -> ToolResult:
         new_lines = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
         new_chars = len(content)
 
-        if old_exists and old_chars > 0:
+        if old_exists:
             line_delta = new_lines - old_lines
             char_delta = new_chars - old_chars
             delta_str = f"{'+' if line_delta >= 0 else ''}{line_delta} lines, {'+' if char_delta >= 0 else ''}{char_delta} chars"

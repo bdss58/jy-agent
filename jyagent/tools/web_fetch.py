@@ -154,15 +154,29 @@ def _is_garbled(text: str) -> bool:
     if ascii_printable < len(sample) * 0.3:
         return True
 
-    # Check 3: No common HTML markers in first 500 chars of what should be a web page
+    # Check 3: No common HTML markers in first 500 chars.
+    # Jina returns plain markdown that legitimately has no HTML markers,
+    # and CJK content gives an ASCII ratio around 0.3-0.5 that would
+    # otherwise false-positive here. Heuristic: if the sample looks like
+    # markdown (has a heading or link syntax near the top) treat it as
+    # valid plain text. Otherwise keep the old 0.5 threshold.
     head = sample[:500].lower()
     html_markers = ['<html', '<!doctype', '<head', '<body', '<div', '<meta', '<script', '<link']
     if not any(m in head for m in html_markers):
-        # Could be plain text or markdown (from Jina), which is fine
-        # Only flag as garbled if also has high non-ASCII ratio
-        ascii_ratio = ascii_printable / max(len(sample), 1)
-        if ascii_ratio < 0.5:
-            return True
+        md_markers = [
+            '\n# ', '\n## ', '\n### ',    # headings mid-doc
+            '](http', '](/',              # markdown links
+            '\n- ', '\n* ', '\n1. ',      # lists
+            '\n```', '\n---\n', '\n> ',   # fenced code / hr / blockquote
+        ]
+        looks_markdown = (
+            sample.startswith(('# ', '## ', '### '))
+            or any(m in sample[:1000] for m in md_markers)
+        )
+        if not looks_markdown:
+            ascii_ratio = ascii_printable / max(len(sample), 1)
+            if ascii_ratio < 0.5:
+                return True
 
     return False
 
