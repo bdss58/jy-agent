@@ -118,10 +118,8 @@ dmypy.json
 .agent_history
 mcp_stderr.log
 
-# Data directory — track only curated memory
+# Data directory
 data/*
-!data/memory/
-!data/memory/**
 
 # Package backups from evolution
 jyagent/backups/

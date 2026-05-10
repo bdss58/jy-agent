@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 
 try:
     from ..config import (
-        STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
+        DEFAULT_MAX_STEPS, STREAM_TIMEOUT,
+        get_active_model_spec, get_reasoning_config_for_provider,
     )
     from ..runtime.loop.engine import AgentLoop, LoopConfig, LoopCallbacks
     from ..runtime.tools.registry import get_registry
@@ -26,7 +27,8 @@ try:
     from ..runtime.stats import get_stats
 except ImportError:
     from jyagent.config import (
-        STREAM_TIMEOUT, get_active_model_spec, get_reasoning_config_for_provider,
+        DEFAULT_MAX_STEPS, STREAM_TIMEOUT,
+        get_active_model_spec, get_reasoning_config_for_provider,
     )
     from jyagent.runtime.loop.engine import AgentLoop, LoopConfig, LoopCallbacks
     from jyagent.runtime.tools.registry import get_registry
@@ -37,7 +39,11 @@ except ImportError:
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 
-_DEFAULT_MAX_STEPS = 30
+# Sub-agent step budget mirrors the main agent (``DEFAULT_MAX_STEPS`` resolves
+# from the ``AGENT_MAX_STEPS`` env var, default 100). Sub-agents handle focused
+# subtasks, so using the same budget avoids spurious ``max_steps`` exits when
+# the main agent delegates non-trivial work.
+_DEFAULT_MAX_STEPS = DEFAULT_MAX_STEPS
 _DEFAULT_MAX_TOKENS_PER_RESPONSE = 8192
 _SUBAGENT_STATUS_COMPLETED = "completed"
 _SUBAGENT_STATUS_MAX_STEPS = "max_steps"
@@ -170,10 +176,10 @@ TOOL_SCHEMA = {
             "timeout": {
                 "type": "integer",
                 "minimum": 60,
-                "maximum": 1800,
+                "maximum": 3600,
                 "description": (
-                    "Max runtime in seconds (default: 300 foreground, 900 background). "
-                    "Clamp: 60-1800."
+                    "Max runtime in seconds (default: 600 foreground, 1800 background). "
+                    "Clamp: 60-3600."
                 ),
             },
             "memory_mode": {
@@ -681,7 +687,7 @@ class _BackgroundAgent:
     started_at: float
     model: str = ""
     current_step: int = 0
-    current_max_steps: int = 30
+    current_max_steps: int = _DEFAULT_MAX_STEPS
     outcome: dict | None = None         # filled when future completes
     stats_recorded: bool = False
 
@@ -966,8 +972,8 @@ def check_agent(
 # ─── Main tool function ──────────────────────────────────────────────────────
 
 _BG_GRACE_PERIOD = 30  # seconds to wait before backgrounding
-_FG_DEFAULT_TIMEOUT = 300  # default foreground timeout
-_BG_DEFAULT_TIMEOUT = 900  # default background timeout
+_FG_DEFAULT_TIMEOUT = 600   # default foreground timeout
+_BG_DEFAULT_TIMEOUT = 1800  # default background timeout
 
 
 def dispatch_agent(
@@ -1010,7 +1016,7 @@ def dispatch_agent(
 
     # Resolve effective timeout
     if timeout > 0:
-        effective_timeout = max(60, min(1800, timeout))
+        effective_timeout = max(60, min(3600, timeout))
     elif background:
         effective_timeout = _BG_DEFAULT_TIMEOUT
     else:
