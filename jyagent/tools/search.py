@@ -153,7 +153,12 @@ def grep_files(
                 if file_results:
                     results.extend(file_results)
                     files_with_matches = 1
-            else:
+            elif output_mode == "files_only":
+                # Short-circuit on first match — full count is wasted work here.
+                if _has_match(path, regex):
+                    files_with_matches = 1
+                    file_match_counts.append((os.path.basename(path), 1))
+            else:  # count
                 count = _count_matches(path, regex)
                 if count > 0:
                     files_with_matches = 1
@@ -185,7 +190,14 @@ def grep_files(
                             files_with_matches += 1
                         if len(results) >= max_results:
                             break
-                    else:
+                    elif output_mode == "files_only":
+                        # Short-circuit: only need to know IF there's a match.
+                        if _has_match(filepath, regex):
+                            files_with_matches += 1
+                            file_match_counts.append((rel_path, 1))
+                        if files_with_matches >= max_results:
+                            break
+                    else:  # count
                         count = _count_matches(filepath, regex)
                         if count > 0:
                             files_with_matches += 1
@@ -233,11 +245,34 @@ def grep_files(
         return ToolResult(f"Error: {e}", is_error=True)
 
 
-def _count_matches(filepath: str, regex) -> int:
-    """Count regex matches in a file without storing content."""
+def _has_match(filepath: str, regex) -> bool:
+    """Return True as soon as the first regex match is found.
+
+    Much cheaper than `_count_matches > 0` for files_only mode —
+    short-circuits on the first hit instead of scanning the whole file.
+    """
     try:
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            return sum(1 for line in f if regex.search(line))
+            for line in f:
+                if regex.search(line):
+                    return True
+        return False
+    except (PermissionError, OSError):
+        return False
+
+
+def _count_matches(filepath: str, regex) -> int:
+    """Count total regex match occurrences (not matching lines).
+
+    A regex like `foo` matches twice on the line `foo foo bar`, so we
+    count via `regex.findall` per line, not `sum(1 for line if search)`.
+    """
+    try:
+        total = 0
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                total += len(regex.findall(line))
+        return total
     except (PermissionError, OSError):
         return 0
 

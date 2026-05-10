@@ -593,38 +593,40 @@ def read_file(path: str, offset: int = 0, limit: int = 0, line_numbers: bool = F
             size = os.path.getsize(path)
             return ToolResult(f"[Binary file: {path} ({size} bytes)]")
 
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            all_lines = f.readlines()
-
-        total_lines = len(all_lines)
-        total_chars = sum(len(l) for l in all_lines)
-
-        if offset > 0:
-            start = max(0, offset - 1)
-        else:
-            start = 0
-
-        if limit > 0:
-            end = min(start + limit, total_lines)
-        else:
-            end = total_lines
-
-        selected_lines = all_lines[start:end]
-
+        # Stream the file line-by-line to avoid loading multi-GB files into RAM.
+        # We need total_lines for the header, but only when paginating or showing
+        # line numbers — in the common case (no offset, no limit, no line_numbers)
+        # we skip the count pass entirely.
+        start = max(0, offset - 1) if offset > 0 else 0
         is_paginated = (offset > 0 or limit > 0)
-        header = ""
+
+        import itertools
 
         if is_paginated or line_numbers:
+            # Two-pass: count total lines first (cheap — just counts \n bytes),
+            # then stream the selected window.
+            with open(path, 'rb') as fb:
+                total_lines = sum(1 for _ in fb)
+            end = min(start + limit, total_lines) if limit > 0 else total_lines
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                selected_lines = list(itertools.islice(
+                    itertools.islice(f, start, None),  # skip `start` lines
+                    limit if limit > 0 else None,
+                ))
             showing_start = start + 1
             showing_end = start + len(selected_lines)
             header = f"[{path}: {total_lines} lines total, showing L{showing_start}-L{showing_end}]\n"
+        else:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                selected_lines = f.readlines()
+            total_lines = len(selected_lines)
+            header = ""
 
         if line_numbers:
             output_parts = []
             for i, line in enumerate(selected_lines):
                 line_num = start + i + 1
-                line_text = line.rstrip('\n')
-                output_parts.append(f"L{line_num}: {line_text}")
+                output_parts.append(f"L{line_num}: {line.rstrip(chr(10))}")
             content = '\n'.join(output_parts)
         else:
             content = ''.join(selected_lines)
@@ -633,6 +635,7 @@ def read_file(path: str, offset: int = 0, limit: int = 0, line_numbers: bool = F
 
         if len(result) > MAX_READ_CHARS:
             head = MAX_READ_CHARS - 5000
+            total_chars = sum(len(l) for l in selected_lines)
             result = (
                 result[:head]
                 + f"\n\n[... truncated at {MAX_READ_CHARS} chars, "
@@ -699,9 +702,21 @@ def list_directory(path: str = ".", depth: int = 1, limit: int = 200, offset: in
             return ToolResult(f"Error: Not a directory: {path}", is_error=True)
 
         entries = []
+        # Bound traversal: once we have enough entries to fill the page plus
+        # one extra (so we can tell the caller "there's more"), stop recursing.
+        # `list_directory` is called for orientation, not exhaustive listing;
+        # letting it walk a huge tree to completion just to drop 99% of the
+        # result defeats the purpose of `limit`.
+        budget = offset + limit + 1
+        # Track total_entries approximately — we stop early, so this may
+        # undercount. The header comment distinguishes "exact" vs "truncated".
+        stopped_early = [False]
 
         def _walk(dir_path, current_depth, prefix=""):
             if current_depth > depth:
+                return
+            if len(entries) >= budget:
+                stopped_early[0] = True
                 return
             try:
                 items = sorted(os.listdir(dir_path))
@@ -723,6 +738,9 @@ def list_directory(path: str = ".", depth: int = 1, limit: int = 200, offset: in
             all_items = [(d, True) for d in dirs_list] + [(f, False) for f in files_list]
 
             for i, (item, is_dir) in enumerate(all_items):
+                if len(entries) >= budget:
+                    stopped_early[0] = True
+                    return
                 item_path = os.path.join(dir_path, item)
                 is_last = (i == len(all_items) - 1)
 
@@ -758,11 +776,20 @@ def list_directory(path: str = ".", depth: int = 1, limit: int = 200, offset: in
         if rel_path == '.':
             rel_path = os.path.basename(path) or path
 
-        header = f"📁 {rel_path}/ ({total_entries} entries"
+        # When we stopped early, we know there's at least one more entry
+        # beyond the page but we don't know the true total.
+        if stopped_early[0]:
+            header = f"📁 {rel_path}/ ({total_entries}+ entries, traversal truncated"
+        else:
+            header = f"📁 {rel_path}/ ({total_entries} entries"
         if offset > 0:
             header += f", showing from #{offset + 1}"
-        if total_entries > offset + limit:
-            header += f", {total_entries - offset - limit} more"
+        if total_entries > offset + limit or stopped_early[0]:
+            remaining = max(total_entries - offset - limit, 0)
+            if stopped_early[0]:
+                header += f", more available"
+            else:
+                header += f", {remaining} more"
         header += ")\n"
 
         if not paginated:

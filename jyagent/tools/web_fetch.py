@@ -464,8 +464,15 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
 
     if strategy == "auto" and js_heavy:
         fetchers = _STRATEGY_MAP_JS_HEAVY["auto"]
+    elif strategy in _STRATEGY_MAP:
+        fetchers = _STRATEGY_MAP[strategy]
     else:
-        fetchers = _STRATEGY_MAP.get(strategy, _STRATEGY_MAP["auto"])
+        # Unknown strategy — surface the typo instead of silently running auto.
+        valid = ", ".join(sorted(_STRATEGY_MAP.keys()))
+        return ToolResult(
+            f"Error: unknown strategy {strategy!r}. Valid options: {valid}.",
+            is_error=True,
+        )
 
     # Determine minimum content threshold
     min_length = _MIN_CONTENT_LENGTH_SEARCH if is_search else _MIN_CONTENT_LENGTH
