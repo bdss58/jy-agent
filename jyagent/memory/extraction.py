@@ -10,18 +10,13 @@
 # This is the Mem0 pipeline, scaled down: we don't build a vector store, we
 # just BM25 the always-loaded index which is capped at 200 lines.
 
-import re
 import sys
 import threading
 from typing import Optional
 
 from ..config import CHARS_PER_TOKEN
-from ._index import (
-    read_memory_md, write_memory_md,
-    _MEMORY_MD_LOCK, _PROTECTED_SECTION_HEADERS, _compute_protected_indices,
-)
-from ._journal import append_journal
-from .operations import remember
+from ._index import read_memory_md
+from .operations import remember, replace_memory_entry as _replace_line
 from ._extraction_directives import (
     parse_directive as _parse_directive,
     _MIN_UPDATE_KEYWORD_LEN,
@@ -184,97 +179,6 @@ def _build_reconciliation_context(user_message: str, assistant_message: str) -> 
     return "\n".join(annotated)
 
 
-
-def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, str]:
-    """Replace MEMORY.md line(s) matching ``old_keyword`` with ``new_text``.
-
-    Replaces the supersede() function the agent used to expose. Behavior
-    differs in tier placement, not in semantics:
-
-      - Old line(s) are removed from MEMORY.md (Tier 1 stays lean — no
-        strikethrough accretion that costs prompt-cache hits forever).
-      - The old line(s) are archived to ``data/memory/journal/YYYY-MM.md``
-        with category ``memory_revision`` so "what did this used to say?"
-        questions can still be answered.
-      - The new line is appended via ``remember`` so soft-cap warnings,
-        category validation and prefix formatting stay in one place.
-
-    Same safety rails as the old supersede:
-      - Keyword must be ≥ ``_MIN_UPDATE_KEYWORD_LEN`` chars.
-      - Header / Behavioral-Rules / User-Profile / User-Preferences lines
-        are skipped silently.
-      - The whole read-modify-write runs under ``_MEMORY_MD_LOCK``.
-
-    Returns (status, message). ``status`` is ``"update"`` on success or
-    ``"skip"`` if no eligible line matched (mirroring the contract the
-    extraction loop relied on).
-    """
-    if len(old_keyword) < _MIN_UPDATE_KEYWORD_LEN:
-        return ("skip", f"Error: UPDATE keyword too short ({len(old_keyword)} < {_MIN_UPDATE_KEYWORD_LEN})")
-
-    with _MEMORY_MD_LOCK:
-        content = read_memory_md()
-        if not content:
-            return ("skip", f"No entries matched '{old_keyword}' — MEMORY.md empty")
-
-        # Identify protected line indices via the shared helper. Headers +
-        # lines inside Behavioral Rules / User Profile / User Preferences are
-        # never eligible for replacement.
-        lines = content.split("\n")
-        protected = _compute_protected_indices(lines)
-
-        keyword_lower = old_keyword.lower()
-        matched_indices: list[int] = []
-        matched_lines: list[str] = []
-        skipped_protected = 0
-        for i, line in enumerate(lines):
-            if keyword_lower not in line.lower():
-                continue
-            if i in protected:
-                skipped_protected += 1
-                continue
-            matched_indices.append(i)
-            matched_lines.append(line)
-
-        if not matched_lines:
-            if skipped_protected:
-                return (
-                    "skip",
-                    f"No entries matched '{old_keyword}' outside protected "
-                    f"sections ({skipped_protected} header/rule hit(s) ignored)",
-                )
-            return ("skip", f"No entries matched '{old_keyword}'")
-
-        # Archive the old line(s) to journal BEFORE removing them, so a
-        # crash between the two writes leaves the audit trail intact rather
-        # than an unrecoverable delete.
-        archive_body = "\n".join(f"  - {ln.strip()}" for ln in matched_lines)
-        append_journal(
-            f"Replaced via UPDATE directive (keyword='{old_keyword}'):\n"
-            f"{archive_body}\n"
-            f"  → [{category or 'note'}] {new_text}",
-            category="memory_revision",
-        )
-
-        # Delete ONLY the eligible matched indices in-place. The previous
-        # implementation called `forget_from_memory_md(old_keyword)` here,
-        # which was a substring delete with no protection list — a keyword
-        # appearing in both an eligible line and a protected line would have
-        # wiped the protected line too (Codex review 2026-05-05, CRITICAL).
-        kept = [ln for i, ln in enumerate(lines) if i not in set(matched_indices)]
-        write_memory_md("\n".join(kept))
-        remember(new_text, category, suppress_warning=True)
-
-        skipped_note = (
-            f" ({skipped_protected} protected line(s) preserved)"
-            if skipped_protected else ""
-        )
-        return (
-            "update",
-            f"♻️ Replaced {len(matched_lines)} line(s) matching '{old_keyword}'"
-            f"{skipped_note} with new [{category or 'note'}] entry "
-            "(old archived to journal)",
-        )
 
 
 def _apply_directive(line: str) -> tuple[str, str] | None:

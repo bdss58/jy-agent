@@ -46,7 +46,7 @@ from ._journal import (
 from ._consolidation import consolidate_memory
 
 # Cross-tier verbs (used by manage_memory tool)
-from .operations import remember, forget, show_memory
+from .operations import remember, forget, show_memory, replace_memory_entry
 
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
