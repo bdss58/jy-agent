@@ -117,15 +117,9 @@ def _cmd_new(cli, runtime_owner, conversation, **_):
     # resumable by id; bare /continue won't auto-resume them.
     if conversation.messages:
         try:
-            from .runtime.stats import get_stats
-            stats = get_stats()
             # Flush pending events so the session_end event sits on top of
             # them in the log.
-            checkpoint_session(conversation, metadata={
-                "provider": stats.provider or "",
-                "model": stats.model or "",
-                "reason": "new",
-            })
+            _safe_checkpoint(conversation, reason="new")
             end_session(conversation, reason="new")
         except Exception:
             pass  # Don't let session-end failure block /new
@@ -337,48 +331,47 @@ def _print_unexpected_error(cli, error: Exception):
         print(message, file=sys.stderr)
 
 
-def _checkpoint_turn(conversation) -> None:
-    """Per-turn durability: flush pending events to the session log.
+def _safe_checkpoint(conversation, *, reason: str | None = None) -> None:
+    """Flush pending events to the session log. Silent on failure.
 
-    Cheap (append + fsync batched at turn boundary) and silent on failure —
-    never block the user's turn on a disk hiccup.
+    Single durability primitive used by per-turn checkpoints, /new, and
+    graceful exit. Metadata always carries the active provider:model so
+    /sessions can render it; ``reason`` is added only when the caller
+    needs to tag the checkpoint (e.g. ``"new"``).
     """
     if not conversation or not conversation.messages:
         return
     try:
-        from .runtime.stats import get_stats
         stats = get_stats()
-        checkpoint_session(conversation, metadata={
+        metadata: dict = {
             "provider": stats.provider or "",
             "model": stats.model or "",
-        })
+        }
+        if reason:
+            metadata["reason"] = reason
+        checkpoint_session(conversation, metadata=metadata)
     except Exception:
-        pass
+        pass  # Never block a turn / exit on disk hiccup
+
+
+def _checkpoint_turn(conversation) -> None:
+    """Per-turn durability wrapper — kept for clarity at call sites."""
+    _safe_checkpoint(conversation)
 
 
 def _graceful_exit(cli, conversation=None):
     """Print goodbye, save session, and disconnect background services."""
-    # Flush any pending events before goodbye (fast, silent). Same call as
-    # _checkpoint_turn — the log is the only persistence, no separate
-    # archive step is needed.
-    if conversation and conversation.messages:
-        try:
-            from .runtime.stats import get_stats
-            stats = get_stats()
-            checkpoint_session(conversation, metadata={
-                "provider": stats.provider or "",
-                "model": stats.model or "",
-            })
-        except Exception:
-            pass  # Don't let session save failure block exit
+    _safe_checkpoint(conversation)
 
     cli.goodbye()  # Say goodbye — user sees immediate response
 
-    # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as stale processes
+    # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as
+    # stale processes. ``disconnect_all()`` is a no-op when no clients are
+    # registered — no need to peek at the private ``_clients`` dict.
     try:
         from .mcp import get_manager_if_exists
         mgr = get_manager_if_exists()
-        if mgr and mgr._clients:
+        if mgr is not None:
             mgr.disconnect_all()
     except Exception:
         pass
