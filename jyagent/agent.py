@@ -376,9 +376,10 @@ def _graceful_exit(cli, conversation=None):
 
     # Disconnect all MCP servers (kills Chrome, etc.) so they don't linger as stale processes
     try:
-        from .mcp.manager import _manager
-        if _manager and _manager._clients:
-            _manager.disconnect_all()
+        from .mcp import get_manager_if_exists
+        mgr = get_manager_if_exists()
+        if mgr and mgr._clients:
+            mgr.disconnect_all()
     except Exception:
         pass
 

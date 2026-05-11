@@ -19,9 +19,6 @@ from .conversion import (
 from ..runtime.tools.registry import get_registry
 from ..runtime.tools.result import ToolResult
 
-# Module version marker — bump this to confirm reloads are taking effect
-_MODULE_VERSION = "2.1.0"
-
 # Keepalive configuration
 KEEPALIVE_INTERVAL_SECONDS = 60  # Ping every 60 seconds
 KEEPALIVE_MAX_FAILURES = 3       # Mark dead after 3 consecutive failures
@@ -102,9 +99,6 @@ class MCPManager:
         # on this object; reach for ``manager._chrome`` directly when you
         # need them (e.g. ``tools/web_fetch.py``).
         self._chrome = ChromeBrowser(self)
-
-        # Module version for debugging reload issues
-        self._module_version = _MODULE_VERSION
 
     def load_servers(self, config: dict = None):
         """Load server configurations from config dict or .mcp.json."""
@@ -508,7 +502,7 @@ class MCPManager:
         if not self._configs:
             return "No MCP servers configured. Create a .mcp.json file."
         
-        lines = [f"MCP Servers (module v{_MODULE_VERSION}):"]
+        lines = ["MCP Servers:"]
         for name in sorted(self._configs.keys()):
             connected = self.is_connected(name)
             transport = self._configs[name].get("transport", "stdio")
@@ -539,33 +533,24 @@ _manager: Optional[MCPManager] = None
 
 
 def get_manager() -> MCPManager:
-    """Get or create the singleton MCPManager.
-    
-    If the module has been reloaded (version mismatch), automatically
-    recreates the manager to pick up code changes.
-    """
+    """Get or create the singleton MCPManager (lazy, idempotent)."""
     global _manager
     if _manager is None:
         _manager = MCPManager()
         _manager.load_servers()
-    elif getattr(_manager, '_module_version', None) != _MODULE_VERSION:
-        # Module was reloaded — recreate manager to pick up code changes
-        old_clients = dict(_manager._clients)
-        old_configs = dict(_manager._configs)
-        _manager._stop_keepalive()
-        # Don't disconnect existing clients — just re-wrap them
-        _manager = MCPManager()
-        _manager._configs = old_configs
-        _manager._clients = old_clients
-        _manager._module_version = _MODULE_VERSION
-        # Re-register tools for all connected servers
-        for server_name, client in old_clients.items():
-            if client.is_connected:
-                server_config = old_configs.get(server_name, {})
-                _manager._register_server_tools(server_name, client, server_config)
-                _manager._ping_failures[server_name] = 0
-        if old_clients:
-            _manager._start_keepalive()
+    return _manager
+
+
+def get_manager_if_exists() -> Optional[MCPManager]:
+    """Return the singleton if it has been created, else ``None``.
+
+    Useful for shutdown hooks that want to disconnect MCP servers ONLY if
+    they were ever connected — calling ``get_manager()`` would lazily
+    spawn an empty manager just to ask whether one exists. Replaces the
+    old ``from .mcp.manager import _manager`` private peek that
+    ``agent.py`` used at exit (the singleton was previously the only way
+    to do this without triggering creation).
+    """
     return _manager
 
 
