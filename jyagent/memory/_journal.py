@@ -17,7 +17,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .. import config as _cfg
-from ._index import ensure_dirs
+from ._paths import ensure_dirs
 
 
 _JOURNAL_LOCK = threading.Lock()

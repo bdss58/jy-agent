@@ -9,11 +9,11 @@
 # made each tier its own module.  Existing callers continue to import via
 # ``jyagent.memory.operations`` (which re-exports this module's API).
 
-import os
 import re
 import threading
 
 from .. import config as _cfg
+from ._paths import ensure_dirs
 
 # Access paths via _cfg.MEMORY_MD_FILE / _cfg.TOPICS_DIR (late-bound) so that
 # tests can patch config attributes *after* this module is imported.
@@ -58,10 +58,9 @@ _MEMORY_CATEGORY_RE = re.compile(r"^[a-z_]+$")
 _MEMORY_MD_LOCK = threading.RLock()
 
 
-def ensure_dirs() -> None:
-    os.makedirs(os.path.dirname(_cfg.MEMORY_MD_FILE), exist_ok=True)
-    os.makedirs(_cfg.TOPICS_DIR, exist_ok=True)
-    os.makedirs(_cfg.JOURNAL_DIR, exist_ok=True)
+# (``ensure_dirs`` is imported above from ``_paths`` and re-exported as a
+# module attribute here so existing callers of ``_index.ensure_dirs`` and the
+# package facade keep working unchanged.)
 
 # ─── MEMORY.md operations ─────────────────────────────────────────────────────
 

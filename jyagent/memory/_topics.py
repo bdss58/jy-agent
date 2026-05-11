@@ -25,8 +25,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .. import config as _cfg
+from ._paths import ensure_dirs
 from ._index import (
-    ensure_dirs,
     # Topic-index sync now lives in _index.py (it is a MEMORY.md
     # read-modify-write that needs the index lock). These shim names are
     # imported into _topics' module namespace so existing tests that

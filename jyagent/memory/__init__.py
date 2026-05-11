@@ -1,6 +1,7 @@
 # memory/ package — Self-use memory system (conversation, MEMORY.md, topics, compaction, sessions).
 #
 # Tier-aligned implementation (see data/memory/topics/memory-design.md):
+#   _paths.py         — shared dir bootstrap (ensure_dirs)
 #   _index.py         — Tier 1: MEMORY.md (always-loaded index)
 #   _topics.py        — Tier 2: curated topic files (on-demand)
 #   _journal.py       — Tier 3: chronological journal (on-demand)
@@ -18,9 +19,11 @@ from .compaction import (
     record_file_access, get_file_tracker, FileAccessTracker,
 )
 
+# Shared filesystem bootstrap (creates MEMORY/topics/journal dirs)
+from ._paths import ensure_dirs
+
 # Tier 1 — MEMORY.md (always-loaded index)
 from ._index import (
-    ensure_dirs,
     read_memory_md, read_memory_index,
     write_memory_md, append_memory_md,
     forget_from_memory_md,
