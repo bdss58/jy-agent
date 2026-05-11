@@ -125,7 +125,7 @@ class TestListCatalogKeyAccess:
         monkeypatch.setattr(skills_mod, "_manager", None)
         skills_mod.init_skills(str(skills_dir))
 
-        from jyagent.agent import _cmd_skills
+        from jyagent.agent_commands import _cmd_skills
 
         captured = {}
 
