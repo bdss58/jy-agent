@@ -581,35 +581,3 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
     return ToolResult(f"Error: All fetch strategies failed for {url}\n\nDetails:\n{error_detail}", is_error=True)
 
 
-# ─── Tool schema for auto-discovery by tools.py ──────────────────────────────
-
-TOOL_SCHEMA = {
-    "name": "web_fetch",
-    "description": "Fetch a URL and return its content as clean readable text. 5-tier anti-blocking cascade: curl_cffi (Chrome TLS impersonation) → httpx (browser headers) → Jina Reader (JS rendering proxy) → Chrome (agent's interactive browser) → error diagnostics. Supports pagination via start_index/max_length.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "url": {
-                "type": "string",
-                "description": "URL to fetch"
-            },
-            "max_length": {
-                "type": "integer",
-                "description": "Max chars per page (default 8000)"
-            },
-            "start_index": {
-                "type": "integer",
-                "description": "Start index for pagination (default 0)"
-            },
-            "raw": {
-                "type": "boolean",
-                "description": "Return raw content without text extraction (default false)"
-            },
-            "strategy": {
-                "type": "string",
-                "description": "Fetch strategy: auto, cffi, direct, jina, chrome (default auto)"
-            }
-        },
-        "required": ["url"]
-    }
-}

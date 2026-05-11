@@ -10,19 +10,22 @@ from .background import run_background, check_background
 from .search import glob_files, grep_files
 from .memory_tool import manage_memory
 from .skills_tool import manage_skills
-from .schemas import CORE_TOOLS
+from .schemas import (
+    CORE_TOOLS,
+    WEB_FETCH_SCHEMA,
+    WEB_SEARCH_SCHEMA,
+    MCP_SCHEMA,
+    SUBAGENT_SCHEMA,
+    CHECK_AGENT_SCHEMA,
+)
 # NOTE: alias as `web_fetch_fn` so the `.web_fetch` submodule is NOT shadowed
 # at `jyagent.tools.web_fetch`. Tests and downstream code can then do
 #     import jyagent.tools.web_fetch as web_fetch_mod
 # and patch internals naturally. (Same pattern as `web_search_fn` below.)
-from .web_fetch import web_fetch as web_fetch_fn, TOOL_SCHEMA as WEB_FETCH_SCHEMA
-from .mcp_tool import mcp, TOOL_SCHEMA as MCP_SCHEMA
-from .subagent import (
-    dispatch_agent, check_agent,
-    TOOL_SCHEMA as SUBAGENT_SCHEMA,
-    CHECK_AGENT_SCHEMA,
-)
-from .web_search import web_search as web_search_fn, TOOL_SCHEMA as WEB_SEARCH_SCHEMA
+from .web_fetch import web_fetch as web_fetch_fn
+from .mcp_tool import mcp
+from .subagent import dispatch_agent, check_agent
+from .web_search import web_search as web_search_fn
 
 # ─── Register core tools ──────────────────────────────────────────────────────
 

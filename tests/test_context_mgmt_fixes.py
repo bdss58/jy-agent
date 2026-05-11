@@ -232,7 +232,7 @@ class TestSubagentMemoryScoping:
 
     def test_dispatch_schema_advertises_memory_mode(self):
         """The public schema must expose memory_mode so the LLM can set it."""
-        from jyagent.tools.subagent import TOOL_SCHEMA
+        from jyagent.tools.schemas import SUBAGENT_SCHEMA as TOOL_SCHEMA
         props = TOOL_SCHEMA["input_schema"]["properties"]
         assert "memory_mode" in props
         assert set(props["memory_mode"]["enum"]) == {"none", "matched"}

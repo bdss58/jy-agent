@@ -111,29 +111,3 @@ def mcp(action: str, server: str = "") -> ToolResult:
         return ToolResult(f"❌ MCP error: {e}", is_error=True)
 
 
-# ─── Tool schema for auto-discovery ──────────────────────────────────────────
-
-TOOL_SCHEMA = {
-    "name": "mcp",
-    "description": (
-        "Manage MCP (Model Context Protocol) server connections. "
-        "Connect to servers to auto-discover and register their tools. "
-        "For example, 'connect' to 'chrome' registers browser automation tools "
-        "(navigate_page, click, take_snapshot, etc.) that you can then call directly."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "description": "Action: connect, disconnect, reconnect, status, list_servers",
-                "enum": ["connect", "disconnect", "reconnect", "status", "list_servers"],
-            },
-            "server": {
-                "type": "string",
-                "description": "MCP server name (e.g., 'chrome'). REQUIRED for 'reconnect'. Optional for 'connect'/'disconnect' (omit to target all). Not needed for 'status'/'list_servers'.",
-            },
-        },
-        "required": ["action"],
-    },
-}

@@ -283,31 +283,3 @@ def web_search(
     return ToolResult("\n".join(lines))
 
 
-# ─── Tool schema (for registration) ─────────────────────────────────────────
-
-TOOL_SCHEMA = {
-    "name": "web_search",
-    "description": (
-        "Search the web and return structured results (title, URL, snippet). "
-        "Cascades through SearxNG (if SEARXNG_URL set) → DuckDuckGo until "
-        "one returns enough results. No API key required for the DDG "
-        "fallback. Use this for finding information, news, comparisons, "
-        "fact-checking. For fetching a known URL, use web_fetch instead. "
-        "For comprehensive multi-source research, iterate: web_search → "
-        "pick top URLs → web_fetch each."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query string",
-            },
-            "max_results": {
-                "type": "integer",
-                "description": "Maximum number of results (default 10)",
-            },
-        },
-        "required": ["query"],
-    },
-}

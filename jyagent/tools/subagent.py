@@ -123,81 +123,6 @@ def _get_runtime_owner():
     return _runtime_owner
 
 
-# ─── Schema ───────────────────────────────────────────────────────────────────
-
-TOOL_SCHEMA = {
-    "name": "dispatch_agent",
-    "description": (
-        "Spawn a focused sub-agent to handle a specific subtask. The sub-agent gets its own "
-        "context window, runs silently, and returns its final answer. Use this for: "
-        "(1) parallel research — dispatch multiple sub-agents for different search queries, "
-        "(2) specialized tasks — give a sub-agent a focused job like 'analyze this file', "
-        "(3) context isolation — prevent a large subtask from polluting your main context. "
-        "The sub-agent has access to the same tools as you (or a subset via tool_whitelist). "
-        "Keep task descriptions specific and self-contained — the sub-agent has NO access to "
-        "your conversation history. "
-        "Set background=true for tasks that may take over 2 minutes; you'll get an agent_id "
-        "and can poll with check_agent()."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "task": {
-                "type": "string",
-                "description": (
-                    "Clear, specific task description. Must be self-contained — include all "
-                    "context the sub-agent needs. Example: 'Search the web for Python 3.14 "
-                    "breaking changes and summarize the top 5 issues with links.'"
-                ),
-            },
-            "context": {
-                "type": "string",
-                "description": (
-                    "Optional additional context or data for the sub-agent. "
-                    "Use this to pass relevant information from your conversation."
-                ),
-            },
-            "tool_whitelist": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": (
-                    "Optional list of tool names the sub-agent can use. "
-                    "Empty = all tools available. Example: ['web_fetch', 'read_file']"
-                ),
-            },
-            "background": {
-                "type": "boolean",
-                "description": (
-                    "If true, run in background and return immediately with agent_id. "
-                    "Poll with check_agent(). Use for tasks likely to exceed 2 minutes "
-                    "(research, multi-step analysis)."
-                ),
-            },
-            "timeout": {
-                "type": "integer",
-                "minimum": 60,
-                "maximum": 3600,
-                "description": (
-                    "Max runtime in seconds (default: 600 foreground, 1800 background). "
-                    "Clamp: 60-3600."
-                ),
-            },
-            "memory_mode": {
-                "type": "string",
-                "enum": ["none", "matched"],
-                "description": (
-                    "Control what parent memory the sub-agent sees. "
-                    "'none' (default, strict isolation): no MEMORY.md. "
-                    "'matched': BM25-retrieve top relevant topic/journal "
-                    "snippets for the task — best for knowledge transfer "
-                    "without leaking the whole memory index."
-                ),
-            },
-        },
-        "required": ["task"],
-    },
-}
-
 
 # ─── Sub-agent system prompt ─────────────────────────────────────────────────
 
@@ -820,43 +745,6 @@ def _record_bg_stats(agent: _BackgroundAgent) -> None:
     except Exception:
         pass  # stats recording is best-effort
 
-
-# ─── check_agent tool ───────────────────────────────────────────────────────
-
-CHECK_AGENT_SCHEMA = {
-    "name": "check_agent",
-    "description": (
-        "Check status of a background sub-agent or manage background agents. "
-        "Use after dispatch_agent(background=True) to poll for results. "
-        "action='status' (default) returns current progress/result. "
-        "action='wait' blocks up to wait_timeout_seconds for the agent to finish "
-        "then returns its result — prefer this over tight polling loops "
-        "(each poll costs a model turn). "
-        "action='kill' cancels the agent (cooperative cancel via cancel_event). "
-        "action='list' shows all active background agents."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "agent_id": {
-                "type": "integer",
-                "description": "ID of the background agent (from dispatch_agent response). Required for status/kill/wait.",
-            },
-            "action": {
-                "type": "string",
-                "enum": ["status", "wait", "kill", "list"],
-                "description": "Action: 'status' (default) check progress, 'wait' block until done or timeout, 'kill' cancel agent, 'list' show all active.",
-            },
-            "wait_timeout_seconds": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 300,
-                "description": "Only used with action='wait'. Max seconds to block waiting for the agent to finish. Default 60, hard cap 300.",
-            },
-        },
-        "required": [],
-    },
-}
 
 
 def check_agent(

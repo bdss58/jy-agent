@@ -4,8 +4,8 @@ import os
 
 import pytest
 
+from jyagent.tools.schemas import WEB_SEARCH_SCHEMA as TOOL_SCHEMA
 from jyagent.tools.web_search import (
-    TOOL_SCHEMA,
     _cascade,
     _search_ddg,
     _search_searxng,

@@ -8,9 +8,11 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from jyagent.tools.subagent import (
-    TOOL_SCHEMA,
+from jyagent.tools.schemas import (
+    SUBAGENT_SCHEMA as TOOL_SCHEMA,
     CHECK_AGENT_SCHEMA,
+)
+from jyagent.tools.subagent import (
     dispatch_agent,
     check_agent,
     _bg_registry,
