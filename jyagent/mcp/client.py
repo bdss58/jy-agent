@@ -11,7 +11,6 @@ structured content extraction, all transports (stdio/HTTP/SSE).
 import asyncio
 import io
 import os
-import signal
 import threading
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import asynccontextmanager
@@ -467,88 +466,15 @@ class MCPClient:
         return {"status": "disconnected", "name": self.name}
 
     def _force_kill_subprocess(self, pid: int):
-        """Force-kill a subprocess and all its descendants.
+        """Force-kill the subprocess and all its descendants by process group.
 
-        Last-resort cleanup when graceful disconnect times out.
-
-        Challenge: The MCP server (npm → chrome-devtools-mcp) is in one process group,
-        but Chrome (launched by the MCP server) does setsid() and runs in its own
-        process group. So os.killpg() on the npm group doesn't kill Chrome.
-
-        Strategy:
-        1. Walk the process tree to find ALL descendants (using pgrep -P recursively)
-        2. Kill Chrome's process group first (SIGTERM)
-        3. Kill the MCP server's process group (SIGTERM)
-        4. Escalate to SIGKILL if anything survives
+        Last-resort cleanup when graceful disconnect leaves children behind
+        (notably Chrome, which ``setsid()``-s into its own group so the npm
+        wrapper's group doesn't reach it). Delegates to
+        ``mcp.process_tree.force_kill_process_tree``.
         """
-        import time
-        import subprocess as sp
-
-        def _get_descendants(root_pid: int) -> set:
-            """Recursively find all descendant PIDs."""
-            descendants = set()
-            to_visit = [root_pid]
-            while to_visit:
-                parent = to_visit.pop()
-                try:
-                    result = sp.run(
-                        ["pgrep", "-P", str(parent)],
-                        capture_output=True, text=True, timeout=3
-                    )
-                    for line in result.stdout.strip().split('\n'):
-                        if line.strip():
-                            child_pid = int(line.strip())
-                            if child_pid not in descendants:
-                                descendants.add(child_pid)
-                                to_visit.append(child_pid)
-                except Exception:
-                    pass
-            return descendants
-
-        def _kill_pgid(pgid: int, sig: int):
-            """Send signal to a process group, ignoring errors."""
-            try:
-                os.killpg(pgid, sig)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
-        try:
-            # Collect all process group IDs in the tree
-            all_descendants = _get_descendants(pid)
-            all_pids = {pid} | all_descendants
-            pgids = set()
-            for p in all_pids:
-                try:
-                    pgids.add(os.getpgid(p))
-                except (ProcessLookupError, OSError):
-                    pass
-
-            # SIGTERM all process groups
-            for pgid in pgids:
-                _kill_pgid(pgid, signal.SIGTERM)
-
-            # Wait briefly for termination
-            for _ in range(20):  # 2 seconds max
-                alive = False
-                for p in all_pids:
-                    try:
-                        os.kill(p, 0)  # Check if still alive
-                        alive = True
-                        break
-                    except ProcessLookupError:
-                        pass
-                    except OSError:
-                        alive = True
-                        break
-                if not alive:
-                    return
-                time.sleep(0.1)
-
-            # Still alive — SIGKILL all process groups
-            for pgid in pgids:
-                _kill_pgid(pgid, signal.SIGKILL)
-        except Exception:
-            pass
+        from .process_tree import force_kill_process_tree
+        force_kill_process_tree(pid)
 
     # ─── Public API ──────────────────────────────────────────────────────────
 
