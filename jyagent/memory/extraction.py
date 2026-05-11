@@ -22,6 +22,20 @@ from ._index import (
 )
 from ._journal import append_journal
 from .operations import remember
+from ._extraction_directives import (
+    parse_directive as _parse_directive,
+    _MIN_UPDATE_KEYWORD_LEN,
+    # Tests / older callers still reach these compiled regexes by name.
+    _ADD_RE, _UPDATE_RE, _NOOP_RE,
+)
+from ._extraction_security import (
+    sanitize_body as _sanitize_body,
+    _looks_like_injection,
+    # Tests grep for _INJECTION_PATTERNS in an error message — expose it
+    # at the old attribute path.
+    _INJECTION_PATTERNS,
+    _URL_PATTERN, _HTML_TAG_PATTERN, _CODE_FENCE_PATTERN,
+)
 
 
 # Minimum user message length to trigger extraction (skip short commands)
@@ -170,91 +184,6 @@ def _build_reconciliation_context(user_message: str, assistant_message: str) -> 
     return "\n".join(annotated)
 
 
-_ADD_RE = re.compile(r"^\s*ADD::\s*(?:\[(?P<cat>[a-z_]+)\]\s*)?(?P<body>.+)$", re.IGNORECASE)
-_UPDATE_RE = re.compile(
-    r"^\s*UPDATE::\s*(?P<old>.+?)::\s*(?:\[(?P<cat>[a-z_]+)\]\s*)?(?P<body>.+)$",
-    re.IGNORECASE,
-)
-_NOOP_RE = re.compile(r"^\s*NOOP::", re.IGNORECASE)
-
-
-# ─── Injection-shaped content rejection ──────────────────────────────────────
-#
-# The auto-extraction pipeline sees the raw User: and Assistant: text, so any
-# pasted web page, tool output, or shell log can try to smuggle a "future
-# instruction" into always-loaded memory via the reconciler LLM. Layer 1 is
-# the SECURITY paragraph in EXTRACTION_PROMPT above. Layer 2 is this regex:
-# even if the LLM is fooled, the structural sanitiser drops the candidate
-# before it can land.
-#
-# What we reject (conservative — auto-extraction should bias toward NOOP):
-#   - Prompt-reset phrases: "ignore previous/above/prior instructions"
-#   - Role-rewrite phrases: "you are now X", "act as a", "from now on"
-#   - Embedded role markers: "system:", "<system>", "[INST]", ChatML tags
-#   - Code fences / HTML tags / URLs — these are content, not durable rules.
-#     Users who genuinely need a URL in a rule can hand-write it via `remember`.
-#
-# What we keep: ordinary facts about the user / environment / project /
-# tools / library gotchas — the legitimate memory shape.
-
-_INJECTION_PATTERNS = re.compile(
-    r"(?:"
-    # "ignore/disregard/forget [the/all/any/my/these] [previous/above/prior/...]
-    # [instruction/rule/...]" — allow up to 3 filler words between the verb
-    # and the target so "disregard the above rules" still catches.
-    r"(?:ignore|disregard|forget) (?:\w+ ){0,3}?(?:previous|above|prior|earlier|preceding|prompt|instruction|directive|rule|memory)"
-    r"|you are (?:now |a new |no longer )"
-    r"|act as (?:if you|a|an) "
-    r"|pretend (?:to be|you are) "
-    # "from now on" as a sentence opener almost always introduces an override.
-    # Catch it broadly — legitimate facts rarely need this phrase.
-    r"|\bfrom now on\b"
-    r"|\bnew (?:instruction|directive|rule|system prompt)\b"
-    r"|\bsystem\s*:\s*(?:you|reply|respond|do)"
-    r"|</?system\b"
-    r"|</?assistant\b"
-    r"|</?developer\b"
-    r"|\[/?INST\]"
-    r"|<\|im_(?:start|end)\|>"
-    r")",
-    re.IGNORECASE,
-)
-
-# URLs and HTML tags are content, not durable rules. Auto-extraction rejects
-# them; manual `remember` still accepts them.
-_URL_PATTERN = re.compile(r"\bhttps?://\S+", re.IGNORECASE)
-_HTML_TAG_PATTERN = re.compile(r"<[a-zA-Z][a-zA-Z0-9_-]{0,20}(?:\s[^<>]*)?/?>")
-# Fenced code blocks (backtick triplets) — never a durable rule.
-_CODE_FENCE_PATTERN = re.compile(r"`{3,}")
-
-
-def _looks_like_injection(body: str) -> bool:
-    """Return True if ``body`` matches any known prompt-injection shape.
-
-    Used only on the auto-extraction write path. Manual ``remember`` calls
-    bypass this because the user is the trust boundary there.
-    """
-    if _INJECTION_PATTERNS.search(body):
-        return True
-    if _URL_PATTERN.search(body):
-        return True
-    if _HTML_TAG_PATTERN.search(body):
-        return True
-    if _CODE_FENCE_PATTERN.search(body):
-        return True
-    return False
-
-
-# Minimum unique-substring length for an UPDATE directive's <old_keyword>.
-# Short substrings (e.g. "k8s") would steamroll many unrelated lines on
-# common tokens. Mirror the old supersede floor.
-_MIN_UPDATE_KEYWORD_LEN = 6
-
-# Section headers and lines under them are protected from UPDATE-driven
-# replacement. The set itself lives in ``_index.py`` (imported above) so
-# the manual ``forget`` primitive shares the same protection rail — see
-# ``_index._PROTECTED_SECTION_HEADERS`` / ``_compute_protected_indices``.
-
 
 def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, str]:
     """Replace MEMORY.md line(s) matching ``old_keyword`` with ``new_text``.
@@ -351,9 +280,14 @@ def _replace_line(old_keyword: str, new_text: str, category: str) -> tuple[str, 
 def _apply_directive(line: str) -> tuple[str, str] | None:
     """Interpret a single directive line. Returns (action, message) or None.
 
+    Pipeline:
+      1. ``_parse_directive`` — pure regex grammar, returns a tagged tuple.
+      2. ``_sanitize_body``   — structural validator + injection filter.
+      3. dispatch — call ``remember`` (ADD) or ``_replace_line`` (UPDATE).
+
     Unknown lines are dropped silently — the LLM sometimes emits prose
     commentary alongside directives, and we prefer resilience to strict
-    parsing here.
+    parsing here. Same for NOOP.
 
     Post-LLM validation (layered prompt-injection defenses):
       - H3 (2026-04-25): bodies clamped to one line / 120 chars; markdown
@@ -365,39 +299,20 @@ def _apply_directive(line: str) -> tuple[str, str] | None:
         ``EXTRACTION_PROMPT`` is the prompt-level defense; this function is
         the structural defense that runs regardless of what the LLM emits.
     """
-    stripped = line.strip()
-    if not stripped or _NOOP_RE.match(stripped):
+    parsed = _parse_directive(line)
+    if parsed is None or parsed[0] == "noop":
         return None
 
-    def _sanitize_body(body: str) -> str | None:
-        # One-line only; drop anything after an embedded newline.
-        body = body.splitlines()[0].strip().lstrip("-").strip()
-        if len(body) < 10 or len(body) > 120:
-            return None
-        # Don't let the LLM smuggle a new heading into MEMORY.md.
-        if body.lstrip().startswith(("#", "~~")):
-            return None
-        # Drop injection-shaped content — see _looks_like_injection for the
-        # full pattern list. Auto-extraction is the trust boundary, so we
-        # bias toward over-rejection here; a legitimate fact that gets
-        # filtered will simply get another shot on the next extraction tick.
-        if _looks_like_injection(body):
-            return None
-        return body
-
-    m = _UPDATE_RE.match(stripped)
-    if m:
-        old_keyword = m.group("old").strip().strip("`'\"")
-        category = (m.group("cat") or "").strip().lower()
-        body = _sanitize_body(m.group("body"))
+    if parsed[0] == "update":
+        _, old_keyword, raw_body, category = parsed
+        body = _sanitize_body(raw_body)
         if not (old_keyword and body):
             return None
         return _replace_line(old_keyword, body, category)
 
-    m = _ADD_RE.match(stripped)
-    if m:
-        category = (m.group("cat") or "").strip().lower()
-        body = _sanitize_body(m.group("body"))
+    if parsed[0] == "add":
+        _, raw_body, category = parsed
+        body = _sanitize_body(raw_body)
         if not body:
             return None
         remember(body, category)
