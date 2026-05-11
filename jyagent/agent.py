@@ -10,10 +10,10 @@ from .memory import (
     checkpoint_session, load_session, has_saved_session, end_session,
     delete_session,
     list_sessions, find_session,
-    should_extract, extract_and_remember,
+    should_extract, extract_and_remember, extract_text,
     record_file_access,
 )
-from .ui.terminal import build_streaming_callbacks, _interrupted_msg
+from .ui.terminal import build_streaming_callbacks, interrupted_msg
 from .runtime.loop.engine import AgentLoop, LoopConfig, LoopResult
 from .ui.cli import CLI, console
 from .ui.commands import bind_handler, find_command, get_handler
@@ -633,7 +633,7 @@ def run(runtime_owner: LLMOwner) -> None:
                         final_text = result.final_text
                         planner_messages = result.messages
                     elif result.status == "interrupted":
-                        _interrupted_msg()
+                        interrupted_msg()
                         response = result.text
                         final_text = ""
                         planner_messages = result.messages
@@ -687,8 +687,7 @@ def run(runtime_owner: LLMOwner) -> None:
 
                 # Proactive memory extraction (background, non-blocking)
                 if should_extract(user_input):
-                    from .memory.extraction import _extract_text
-                    asst_text = _extract_text(response) if response else ""
+                    asst_text = extract_text(response) if response else ""
                     if asst_text:
                         extract_and_remember(runtime_owner, user_input, asst_text)
 

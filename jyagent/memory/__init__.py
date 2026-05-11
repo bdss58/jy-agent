@@ -61,5 +61,5 @@ from .session import (
     replay_from_events,
 )
 from .event_log import EventLog, open_event_log, event_log_path
-from .extraction import should_extract, extract_and_remember
+from .extraction import should_extract, extract_and_remember, extract_text
 from .search import search_memory, render_hits, SearchHit, SearchChunk

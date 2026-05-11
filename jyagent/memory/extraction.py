@@ -108,8 +108,13 @@ Assistant: {assistant_message}
 """
 
 
-def _extract_text(content) -> str:
-    """Pull plain text from a message content field (str or list-of-blocks)."""
+def extract_text(content) -> str:
+    """Pull plain text from a message content field (str or list-of-blocks).
+
+    Public helper — used by the agent loop and tests to normalize message
+    content (Anthropic's structured blocks vs plain strings) before
+    handing to the extraction pipeline.
+    """
     if isinstance(content, str):
         return content
     if isinstance(content, list):

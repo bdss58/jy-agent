@@ -198,7 +198,7 @@ def _render_edit_diff(result_str: str, duration_ms: float | None = None):
             console.print(f"    {line}")
 
 
-def _interrupted_msg():
+def interrupted_msg():
     """Print interruption message."""
     sys.stdout.flush()
     console.print("\n[bold yellow]⚠ Interrupted by Ctrl-C[/bold yellow]")

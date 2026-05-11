@@ -42,7 +42,7 @@ from jyagent.memory.session import (
 )
 from jyagent.memory.event_log import event_log_path
 from jyagent.memory.conversation import ConversationMemory
-from jyagent.memory.extraction import should_extract, _extract_text
+from jyagent.memory.extraction import should_extract, extract_text
 
 
 def setup():
@@ -259,8 +259,8 @@ def test_max_memory_prompt_chars():
 # ─── Test 4: Proactive Extraction Logic ──────────────────────────────────────
 
 def test_extract_text_string():
-    assert _extract_text("hello") == "hello"
-    print("  ✅ _extract_text handles plain string")
+    assert extract_text("hello") == "hello"
+    print("  ✅ extract_text handles plain string")
 
 
 def test_extract_text_blocks():
@@ -269,10 +269,10 @@ def test_extract_text_blocks():
         {"type": "tool_use", "name": "read_file"},
         {"type": "text", "text": "Part 2"},
     ]
-    result = _extract_text(content)
+    result = extract_text(content)
     assert "Part 1" in result
     assert "Part 2" in result
-    print("  ✅ _extract_text handles block content")
+    print("  ✅ extract_text handles block content")
 
 
 def test_should_extract_interval():
