@@ -38,7 +38,7 @@ from jyagent.memory.search import (
 )
 from jyagent.memory import extraction
 from jyagent.memory import compaction
-from jyagent.tools.facades import manage_memory
+from jyagent.tools.memory_tool import manage_memory
 
 
 def setup():

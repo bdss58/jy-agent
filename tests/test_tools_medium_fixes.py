@@ -222,7 +222,7 @@ def test_is_garbled_still_catches_real_mojibake():
 
 def test_manage_skills_load_escapes_closing_tags(monkeypatch):
     """A SKILL.md body with </instructions> should not break the wrapper."""
-    from jyagent.tools.facades import manage_skills
+    from jyagent.tools.skills_tool import manage_skills
     from jyagent import skills as skills_mod
 
     class FakeMgr:

@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 
 from jyagent.skills import SkillManager
-from jyagent.tools.facades import manage_skills as manage_skills_tool
+from jyagent.tools.skills_tool import manage_skills as manage_skills_tool
 from jyagent import skills as skills_mod
 
 

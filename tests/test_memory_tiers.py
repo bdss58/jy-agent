@@ -34,7 +34,7 @@ from jyagent.memory import (
     remember, show_memory,
     ensure_dirs,
 )
-from jyagent.tools.facades import manage_memory
+from jyagent.tools.memory_tool import manage_memory
 
 
 def setup():

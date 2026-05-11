@@ -8,7 +8,8 @@ from .filesystem import read_file, write_file, list_directory, edit_file
 from .shell import run_shell
 from .background import run_background, check_background
 from .search import glob_files, grep_files
-from .facades import manage_memory, manage_skills
+from .memory_tool import manage_memory
+from .skills_tool import manage_skills
 from .schemas import CORE_TOOLS
 # NOTE: alias as `web_fetch_fn` so the `.web_fetch` submodule is NOT shadowed
 # at `jyagent.tools.web_fetch`. Tests and downstream code can then do
