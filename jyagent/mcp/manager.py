@@ -247,7 +247,7 @@ class MCPManager:
             # We need to capture server_name and mcp_name by value
             def make_tool_fn(sname, mname):
                 def tool_fn(**kwargs):
-                    return self._call_mcp_tool(sname, mname, kwargs)
+                    return self.call_tool(sname, mname, kwargs)
                 tool_fn.__name__ = agent_tool_name
                 tool_fn.__doc__ = schema["description"]
                 return tool_fn
@@ -273,13 +273,20 @@ class MCPManager:
             self._tool_to_server.pop(tool_name, None)
             self._registered_tools.discard(tool_name)
 
-    def _call_mcp_tool(self, server_name: str, mcp_tool_name: str,
-                       arguments: dict) -> ToolResult:
+    def call_tool(self, server_name: str, mcp_tool_name: str,
+                  arguments: dict) -> ToolResult:
         """Execute an MCP tool call and return the result as a ToolResult.
-        
-        Auto-reconnect: If the server is not connected, or if the call fails with
-        a "dead browser" error (e.g., Chrome's CDP pipe broke but stdio is alive),
-        this method will attempt to reconnect and retry once.
+
+        Public surface for callers outside ``MCPManager`` (notably
+        ``mcp.chrome.ChromeBrowser``) that need to invoke an MCP tool
+        without owning the connection. Handles:
+
+          - Auto-connect if the server is not currently connected.
+          - Auto-reconnect-and-retry if the call fails with a
+            ``is_dead_server_error`` (e.g. Chrome's CDP pipe broke but
+            stdio is alive — keepalive pings pass, tool calls fail).
+          - Timeout escalation for long-running tools (Lighthouse,
+            performance traces, screenshots).
         """
         client = self._clients.get(server_name)
         if client is None or not client.is_connected:
@@ -300,11 +307,11 @@ class MCPManager:
             return ToolResult(_extract_mcp_result(result))
         except Exception as e:
             error_msg = str(e)
-            
+
             # Check if this is a "dead browser" error (Chrome process died but
             # MCP stdio pipe still alive — keepalive pings pass, tool calls fail).
             # If so, force-reconnect (disconnect + connect) and retry once.
-            if self._is_dead_server_error(error_msg):
+            if self.is_dead_server_error(error_msg):
                 try:
                     self.disconnect(server_name)
                     self.load_servers()  # Reload config in case it changed
@@ -325,16 +332,26 @@ class MCPManager:
                         f"(auto-reconnect retry also failed: {retry_err})",
                         is_error=True
                     )
-            
+
             return ToolResult(f"Error calling {mcp_tool_name}: {error_msg}", is_error=True)
 
+    # Underscored alias kept for back-compat with the 2 tests in
+    # test_chrome_concurrency.py that monkey-patch ``mgr._call_mcp_tool``.
+    # New code should use the public ``call_tool``.
+    _call_mcp_tool = call_tool
+
     @staticmethod
-    def _is_dead_server_error(error_msg: str) -> bool:
+    def is_dead_server_error(error_msg: str) -> bool:
         """Check if an error indicates the underlying server process is dead.
-        
-        This detects the silent failure mode where the MCP stdio pipe is alive
-        (keepalive pings pass) but the server's backend (e.g., Chrome browser)
-        has crashed or its internal connection (e.g., CDP pipe) has broken.
+
+        Public name (the underscored alias below is back-compat). Detects the
+        silent failure mode where the MCP stdio pipe is alive (keepalive
+        pings pass) but the server's backend (e.g., Chrome browser) has
+        crashed or its internal connection (e.g., CDP pipe) has broken.
+
+        Note: this pattern list is browser-biased today. Step 5 of the
+        mcp/ cleanup moves the Chrome-specific patterns to ``chrome.py``
+        and leaves only generic transport errors here.
         """
         lower = error_msg.lower()
         dead_patterns = [
@@ -355,6 +372,12 @@ class MCPManager:
             "connection reset",
         ]
         return any(pattern in lower for pattern in dead_patterns)
+
+    # Underscored alias for back-compat with anything that imported the
+    # old private name. Python binds this at class-definition time to the
+    # staticmethod above, so ``MCPManager.is_dead_server_error`` and
+    # ``MCPManager._is_dead_server_error`` resolve to the same callable.
+    _is_dead_server_error = is_dead_server_error
 
     def _get_tool_timeout(self, tool_name: str) -> float:
         """Get appropriate timeout for a tool based on its name.

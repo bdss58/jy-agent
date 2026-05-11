@@ -151,7 +151,7 @@ class TestChromePageLock:
                 return _make_tool_result("OK")
             return _make_tool_result("OK")
 
-        mgr._call_mcp_tool = mock_call
+        mgr.call_tool = mock_call
 
         result = mgr._chrome._fetch_page_inner(
             "http://example.com", timeout=10,
@@ -189,7 +189,7 @@ class TestChromePageLock:
                 return _make_tool_result("OK")
             return _make_tool_result("OK")
 
-        mgr._call_mcp_tool = mock_call
+        mgr.call_tool = mock_call
 
         def fetch(name):
             threading.current_thread().name = name

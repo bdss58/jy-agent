@@ -14,7 +14,7 @@ Extracted from ``mcp/manager.py`` (2026-05-06) as part of the boundary
 cleanup that made ``MCPManager`` browser-agnostic.
 
 The manager owns the MCP connection lifecycle (``connect``, ``disconnect``,
-``is_connected``, ``_call_mcp_tool``, ``_is_dead_server_error``); the
+``is_connected``, ``call_tool``, ``is_dead_server_error``); the
 ``ChromeBrowser`` instance composes those primitives into refcounted +
 page-locked browser operations.
 
@@ -134,17 +134,17 @@ class ChromeBrowser:
                 raise RuntimeError(f"Failed to connect Chrome: {result}")
 
         # Health check: list_pages detects dead browser even if stdio pipe lives
-        health = self._mgr._call_mcp_tool(server, "list_pages", {})
+        health = self._mgr.call_tool(server, "list_pages", {})
         if health.is_error:
             error_msg = health.content or ""
-            if self._mgr._is_dead_server_error(error_msg):
+            if self._mgr.is_dead_server_error(error_msg):
                 self._mgr.disconnect(server)
                 result = self._mgr.connect(server)
                 if result.get("status") not in ("connected", "already_connected"):
                     raise RuntimeError(
                         f"Chrome is dead and reconnect failed: {result}")
                 # Re-check after reconnect
-                health = self._mgr._call_mcp_tool(server, "list_pages", {})
+                health = self._mgr.call_tool(server, "list_pages", {})
                 if health.is_error:
                     raise RuntimeError(
                         f"Chrome still unhealthy after reconnect: {health.content}")
@@ -202,7 +202,7 @@ class ChromeBrowser:
         import time as _time
 
         server = "chrome"
-        call = self._mgr._call_mcp_tool
+        call = self._mgr.call_tool
 
         with self._page_lock:
             # Remember which page was selected so we can restore focus after
