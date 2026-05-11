@@ -300,3 +300,181 @@ def memory_index_size_warning() -> str | None:
         + "; ".join(bits)
         + ". Move detail into topics/<name>.md (curated) or journal/YYYY-MM.md (chronological)."
     )
+
+
+# ─── Topic Files Index section (keep MEMORY.md in sync with topic CRUD) ──────
+#
+# Tier-2 topic files have a one-line "table of contents" inside MEMORY.md so
+# the always-loaded prompt can advertise what extended detail is available
+# without loading every topic body. Mutating that TOC is a read-modify-write
+# on MEMORY.md, so it lives here next to the lock and the file primitives.
+#
+# These were previously co-located with topic CRUD in ``_topics.py`` and
+# reached into ``_index._MEMORY_MD_LOCK`` from outside. Moved here 2026-05-12
+# (refactor/memory-cleanup step 1).
+
+TOPIC_INDEX_HEADING = "## Topic Files Index"
+
+_MAX_TOPIC_DESC_CHARS = 120
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def sanitize_topic_description(raw: str) -> str:
+    """Sanitize topic description text before writing into Tier 1 (MEMORY.md).
+
+    Topic bodies are arbitrary markdown, but the topic *index entry* in
+    MEMORY.md is always-loaded prompt text. A long or hostile first heading
+    would inject unbounded text into the system prompt on every turn.
+
+    Rules:
+      - strip whitespace and ASCII control chars
+      - strip leading ``#``/``~`` (so a heading body doesn't render as a new
+        markdown heading inside the index)
+      - collapse internal whitespace to single spaces
+      - truncate to ``_MAX_TOPIC_DESC_CHARS`` with an ellipsis
+    """
+    s = _CONTROL_CHARS_RE.sub("", raw or "")
+    s = s.strip()
+    s = s.lstrip("#").lstrip("~").strip()
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return "(no description)"
+    if len(s) > _MAX_TOPIC_DESC_CHARS:
+        s = s[: _MAX_TOPIC_DESC_CHARS - 1].rstrip() + "…"
+    return s
+
+
+def extract_topic_description(body: str) -> str:
+    """Extract a short description from topic body for the MEMORY.md index.
+
+    Uses the first ``#`` heading text. Falls back to the first non-empty
+    non-frontmatter line. Always passed through ``sanitize_topic_description``
+    so the index entry can never inject markdown control chars or unbounded
+    text into the always-loaded prompt.
+    """
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return sanitize_topic_description(stripped)
+        if stripped and not stripped.startswith("---"):
+            return sanitize_topic_description(stripped)
+    return "(no description)"
+
+
+def upsert_topic_index_entry(name: str, description: str) -> None:
+    """Add or update a topic entry in the ``## Topic Files Index`` section.
+
+    This is a MEMORY.md read-modify-write operation, so the whole sequence is
+    guarded by ``_MEMORY_MD_LOCK``. Existing entries are replaced in place so
+    the always-loaded topic index does not go stale after topic rewrites.
+    """
+    entry_marker = f"**{name}.md**"
+    new_entry = f"- {entry_marker} — {description}"
+
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        if not content:
+            write_memory_md(f"# Agent Memory\n\n{TOPIC_INDEX_HEADING}\n{new_entry}\n")
+            return
+
+        lines = content.split("\n")
+        if TOPIC_INDEX_HEADING in content:
+            result: list[str] = []
+            in_index = False
+            replaced = False
+            appended = False
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped == TOPIC_INDEX_HEADING:
+                    in_index = True
+                    result.append(line)
+                    continue
+
+                if in_index:
+                    if line.startswith("- **"):
+                        if entry_marker in line:
+                            if not replaced:
+                                result.append(new_entry)
+                                replaced = True
+                            continue
+                        result.append(line)
+                        continue
+                    if stripped == "":
+                        result.append(line)
+                        continue
+
+                    if not replaced and not appended:
+                        result.append(new_entry)
+                        appended = True
+                    in_index = False
+
+                result.append(line)
+
+            if in_index and not replaced and not appended:
+                result.append(new_entry)
+
+            write_memory_md("\n".join(result))
+            return
+
+        # Section doesn't exist — create it before later repo/project sections
+        # when possible, otherwise append at end.
+        result = []
+        inserted = False
+        protected_before_index = {
+            "## User Profile",
+            "## Behavioral Rules (CRITICAL)",
+            "## User Preferences",
+            "## Environment",
+            TOPIC_INDEX_HEADING,
+        }
+        for line in lines:
+            if (
+                not inserted
+                and line.strip().startswith("## ")
+                and line.strip() not in protected_before_index
+            ):
+                result.append(TOPIC_INDEX_HEADING)
+                result.append(new_entry)
+                result.append("")
+                inserted = True
+            result.append(line)
+        if not inserted:
+            if result and result[-1] != "":
+                result.append("")
+            result.append(TOPIC_INDEX_HEADING)
+            result.append(new_entry)
+        write_memory_md("\n".join(result))
+
+
+def remove_topic_index_entry(name: str) -> None:
+    """Remove a topic entry from the ``## Topic Files Index`` in MEMORY.md."""
+    with _MEMORY_MD_LOCK:
+        content = read_memory_md()
+        entry_marker = f"**{name}.md**"
+
+        if entry_marker not in content:
+            return
+
+        lines = content.split("\n")
+        new_lines = [line for line in lines if entry_marker not in line]
+
+        # If the section is now empty (only heading + blanks), remove it too
+        cleaned = []
+        skip_empty_section = False
+        for i, line in enumerate(new_lines):
+            if line.strip() == TOPIC_INDEX_HEADING:
+                # Check if next non-blank line is another ## heading or EOF
+                j = i + 1
+                while j < len(new_lines) and new_lines[j].strip() == "":
+                    j += 1
+                if j >= len(new_lines) or new_lines[j].startswith("## "):
+                    # Section is empty — skip heading and trailing blanks
+                    skip_empty_section = True
+                    continue
+            if skip_empty_section and line.strip() == "":
+                continue
+            skip_empty_section = False
+            cleaned.append(line)
+
+        write_memory_md("\n".join(cleaned))

@@ -1,17 +1,20 @@
 # Tier 2 — Topic files (curated, on-demand extended detail).
 #
-# Owns: frontmatter parsing/writing, topic CRUD (`list_topics`, `read_topic*`,
-# `write_topic`, `delete_topic`, `list_topic_sections`, `read_topic_section`),
-# and the helpers that keep MEMORY.md's "Topic Files Index" section in sync
-# whenever a topic is created, rewritten, or deleted (`_upsert_topic_index_entry`,
-# `_add_topic_index_entry`, `_remove_topic_index_entry`).
+# Owns: frontmatter parsing/writing and topic CRUD (`list_topics`, `read_topic*`,
+# `write_topic`, `delete_topic`, `list_topic_sections`, `read_topic_section`).
+#
+# The helpers that keep MEMORY.md's "Topic Files Index" section in sync used
+# to live here too, but they did read-modify-write on MEMORY.md and reached
+# into the index lock — that's a Tier-1 responsibility. Moved to ``_index.py``
+# on 2026-05-12 (refactor/memory-cleanup step 1). This module imports them
+# back as underscored shim names so existing callers and the
+# ``test_write_topic_is_atomic_on_crash`` monkey-patch keep working.
 #
 # Extracted from ``operations.py`` (2026-05-06) as part of the split that
 # made each tier its own module.  Existing callers continue to import via
 # ``jyagent.memory.operations`` (which re-exports this).
 #
-# Dependencies: ``_index`` for the MEMORY.md lock + read/write primitives
-# (the index-entry helpers do read-modify-write on MEMORY.md), and
+# Dependencies: ``_index`` for ``ensure_dirs`` + the topic-index helpers, and
 # ``jyagent.utils.files.atomic_write`` for crash-safe topic writes.
 
 from __future__ import annotations
@@ -22,7 +25,25 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .. import config as _cfg
-from ._index import _MEMORY_MD_LOCK, read_memory_md, write_memory_md, ensure_dirs
+from ._index import (
+    ensure_dirs,
+    # Topic-index sync now lives in _index.py (it is a MEMORY.md
+    # read-modify-write that needs the index lock). These shim names are
+    # imported into _topics' module namespace so existing tests that
+    # monkey-patch ``jyagent.memory._topics._upsert_topic_index_entry``
+    # continue to intercept the call from ``write_topic`` / ``delete_topic``
+    # below — function globals lookup at call time picks up the rebind.
+    extract_topic_description as _extract_topic_description,
+    sanitize_topic_description as _sanitize_topic_description,
+    upsert_topic_index_entry as _upsert_topic_index_entry,
+    remove_topic_index_entry as _remove_topic_index_entry,
+)
+
+
+# Backward-compat alias: the previous "_add_topic_index_entry" was already
+# documented as a wrapper around upsert. Keep the name exported for any
+# external callers / tests that imported it.
+_add_topic_index_entry = _upsert_topic_index_entry
 
 
 # ─── Topic file operations ────────────────────────────────────────────────────
@@ -207,180 +228,6 @@ def list_topic_sections(name: str) -> list[str]:
         if 2 <= len(m.group(1)) <= 3
     ]
 
-
-# ─── Topic index helpers (keep MEMORY.md in sync) ────────────────────────────
-
-_TOPIC_INDEX_HEADING = "## Topic Files Index"
-
-
-_MAX_TOPIC_DESC_CHARS = 120
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def _sanitize_topic_description(raw: str) -> str:
-    """Sanitize topic description text before writing into Tier 1 (MEMORY.md).
-
-    Topic bodies are arbitrary markdown, but the topic *index entry* in
-    MEMORY.md is always-loaded prompt text. A long or hostile first heading
-    would inject unbounded text into the system prompt on every turn.
-
-    Rules:
-      - strip whitespace and ASCII control chars
-      - strip leading ``#``/``~`` (so a heading body doesn't render as a new
-        markdown heading inside the index)
-      - collapse internal whitespace to single spaces
-      - truncate to ``_MAX_TOPIC_DESC_CHARS`` with an ellipsis
-    """
-    s = _CONTROL_CHARS_RE.sub("", raw or "")
-    s = s.strip()
-    s = s.lstrip("#").lstrip("~").strip()
-    s = re.sub(r"\s+", " ", s)
-    if not s:
-        return "(no description)"
-    if len(s) > _MAX_TOPIC_DESC_CHARS:
-        s = s[: _MAX_TOPIC_DESC_CHARS - 1].rstrip() + "…"
-    return s
-
-
-def _extract_topic_description(body: str) -> str:
-    """Extract a short description from topic body for the MEMORY.md index.
-
-    Uses the first ``#`` heading text. Falls back to the first non-empty
-    non-frontmatter line. Always passed through ``_sanitize_topic_description``
-    so the index entry can never inject markdown control chars or unbounded
-    text into the always-loaded prompt.
-    """
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            return _sanitize_topic_description(stripped)
-        if stripped and not stripped.startswith("---"):
-            return _sanitize_topic_description(stripped)
-    return "(no description)"
-
-
-def _upsert_topic_index_entry(name: str, description: str) -> None:
-    """Add or update a topic entry in the ``## Topic Files Index`` section.
-
-    This is a MEMORY.md read-modify-write operation, so the whole sequence is
-    guarded by ``_MEMORY_MD_LOCK``. Existing entries are replaced in place so
-    the always-loaded topic index does not go stale after topic rewrites.
-    """
-    entry_marker = f"**{name}.md**"
-    new_entry = f"- {entry_marker} — {description}"
-
-    with _MEMORY_MD_LOCK:
-        content = read_memory_md()
-        if not content:
-            write_memory_md(f"# Agent Memory\n\n{_TOPIC_INDEX_HEADING}\n{new_entry}\n")
-            return
-
-        lines = content.split("\n")
-        if _TOPIC_INDEX_HEADING in content:
-            result: list[str] = []
-            in_index = False
-            replaced = False
-            appended = False
-
-            for line in lines:
-                stripped = line.strip()
-                if stripped == _TOPIC_INDEX_HEADING:
-                    in_index = True
-                    result.append(line)
-                    continue
-
-                if in_index:
-                    if line.startswith("- **"):
-                        if entry_marker in line:
-                            if not replaced:
-                                result.append(new_entry)
-                                replaced = True
-                            continue
-                        result.append(line)
-                        continue
-                    if stripped == "":
-                        result.append(line)
-                        continue
-
-                    if not replaced and not appended:
-                        result.append(new_entry)
-                        appended = True
-                    in_index = False
-
-                result.append(line)
-
-            if in_index and not replaced and not appended:
-                result.append(new_entry)
-
-            write_memory_md("\n".join(result))
-            return
-
-        # Section doesn't exist — create it before later repo/project sections
-        # when possible, otherwise append at end.
-        result = []
-        inserted = False
-        protected_before_index = {
-            "## User Profile",
-            "## Behavioral Rules (CRITICAL)",
-            "## User Preferences",
-            "## Environment",
-            _TOPIC_INDEX_HEADING,
-        }
-        for line in lines:
-            if (
-                not inserted
-                and line.strip().startswith("## ")
-                and line.strip() not in protected_before_index
-            ):
-                result.append(_TOPIC_INDEX_HEADING)
-                result.append(new_entry)
-                result.append("")
-                inserted = True
-            result.append(line)
-        if not inserted:
-            if result and result[-1] != "":
-                result.append("")
-            result.append(_TOPIC_INDEX_HEADING)
-            result.append(new_entry)
-        write_memory_md("\n".join(result))
-
-
-def _add_topic_index_entry(name: str, description: str) -> None:
-    """Compatibility wrapper: upsert the topic entry in MEMORY.md."""
-    _upsert_topic_index_entry(name, description)
-
-
-def _remove_topic_index_entry(name: str) -> None:
-    """Remove a topic entry from the ``## Topic Files Index`` in MEMORY.md."""
-    with _MEMORY_MD_LOCK:
-        content = read_memory_md()
-        entry_marker = f"**{name}.md**"
-
-        if entry_marker not in content:
-            return
-
-        lines = content.split("\n")
-        new_lines = [line for line in lines if entry_marker not in line]
-
-        # If the section is now empty (only heading + blanks), remove it too
-        cleaned = []
-        skip_empty_section = False
-        for i, line in enumerate(new_lines):
-            if line.strip() == _TOPIC_INDEX_HEADING:
-                # Check if next non-blank line is another ## heading or EOF
-                j = i + 1
-                while j < len(new_lines) and new_lines[j].strip() == "":
-                    j += 1
-                if j >= len(new_lines) or new_lines[j].startswith("## "):
-                    # Section is empty — skip heading and trailing blanks
-                    skip_empty_section = True
-                    continue
-            if skip_empty_section and line.strip() == "":
-                continue
-            skip_empty_section = False
-            cleaned.append(line)
-
-        write_memory_md("\n".join(cleaned))
 
 
 def write_topic(name: str, content: str) -> None:

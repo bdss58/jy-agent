@@ -1,14 +1,12 @@
 # System prompt injection — build memory context for the system prompt.
 
 from ..config import MAX_MEMORY_PROMPT_CHARS
-from ._index import read_memory_index
+from ._index import read_memory_index, TOPIC_INDEX_HEADING as _TOPIC_INDEX_HEADING
 from ._topics import list_topics
 
 
-# Heading MEMORY.md uses for its own topic index. When present, we skip the
-# standalone "Topic files available:" listing below to avoid duplicating the
-# same information twice in the always-loaded system prompt.
-_TOPIC_INDEX_HEADING = "## Topic Files Index"
+# (_TOPIC_INDEX_HEADING is imported from _index so the constant lives in one
+# place — the module that actually owns the section's structure.)
 
 
 def build_memory_context(query: str = "") -> str:
