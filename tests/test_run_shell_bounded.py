@@ -26,8 +26,8 @@ import time
 
 import pytest
 
-from jyagent.tools import core as tools_core
-from jyagent.tools.core import run_shell
+from jyagent.tools import shell as tools_core
+from jyagent.tools.shell import run_shell
 
 
 def _rss_kb() -> int:

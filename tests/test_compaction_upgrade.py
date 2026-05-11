@@ -363,7 +363,7 @@ def test_format_messages_excludes_thinking():
 
 def test_track_file_from_tool_functions():
     """_track_file in core.py records to the global tracker."""
-    from jyagent.tools.core import _track_file
+    from jyagent.tools.filesystem import _track_file
     from jyagent.memory.compaction import get_file_tracker
 
     tracker = get_file_tracker()

@@ -12,7 +12,7 @@ import os
 import re
 import tempfile
 import pytest
-from jyagent.tools.core import read_file, list_directory
+from jyagent.tools.filesystem import read_file, list_directory
 from jyagent.tools.search import grep_files, _count_matches, _has_match
 from jyagent.tools.web_fetch import web_fetch
 
@@ -171,7 +171,7 @@ def test_grep_files_context_lines_dont_count_toward_max_results(tmp_path):
 
 def test_write_file_overwrite_empty_says_overwrote(tmp_path):
     """Overwriting an existing empty file should say 'Overwrote', not 'Created'."""
-    from jyagent.tools.core import write_file
+    from jyagent.tools.filesystem import write_file
     p = tmp_path / "empty.txt"
     p.write_text("")  # empty existing file
     result = write_file(str(p), "hello\n")
@@ -181,7 +181,7 @@ def test_write_file_overwrite_empty_says_overwrote(tmp_path):
 
 
 def test_write_file_brand_new_says_created(tmp_path):
-    from jyagent.tools.core import write_file
+    from jyagent.tools.filesystem import write_file
     p = tmp_path / "new.txt"
     result = write_file(str(p), "hello\n")
     assert not result.is_error
@@ -194,7 +194,7 @@ def test_run_shell_does_not_hang_on_stdin_read():
     Without stdin=DEVNULL the child blocks on read() until our timeout;
     with DEVNULL it gets immediate EOF and exits.
     """
-    from jyagent.tools.core import run_shell
+    from jyagent.tools.shell import run_shell
     import time
     t0 = time.time()
     result = run_shell("cat", timeout=5)
