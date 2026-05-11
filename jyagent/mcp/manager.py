@@ -86,7 +86,6 @@ class MCPManager:
         self._clients: dict[str, MCPClient] = {}
         self._configs: dict[str, dict] = {}
         self._tool_to_server: dict[str, str] = {}  # agent_tool_name → server_name
-        self._tool_to_mcp_name: dict[str, str] = {}  # agent_tool_name → original mcp tool name
         self._registered_tools: set[str] = set()
         
         # Keepalive
@@ -257,7 +256,6 @@ class MCPManager:
 
             registry.register(agent_tool_name, fn, schema)
             self._tool_to_server[agent_tool_name] = server_name
-            self._tool_to_mcp_name[agent_tool_name] = mcp_name
             self._registered_tools.add(agent_tool_name)
             count += 1
 
@@ -273,7 +271,6 @@ class MCPManager:
         for tool_name in to_remove:
             registry.unregister(tool_name)
             self._tool_to_server.pop(tool_name, None)
-            self._tool_to_mcp_name.pop(tool_name, None)
             self._registered_tools.discard(tool_name)
 
     def _call_mcp_tool(self, server_name: str, mcp_tool_name: str,

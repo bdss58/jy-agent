@@ -205,13 +205,22 @@ class MCPClient:
         self._loop_thread = None
 
     def connect(self, command: str = "", args: list[str] = None,
-                env: dict[str, str] = None, startup_wait: float = 3,
+                env: dict[str, str] = None,
                 init_timeout: float = 30, cwd: str = None,
                 url: str = None, transport: str = "stdio",
                 headers: dict[str, str] = None) -> dict:
         """Connect to an MCP server.
 
-        Supports stdio (default) and streamable_http transports.
+        Supports stdio (default) and streamable_http transports. For HTTP
+        transport, pass auth/headers via ``headers``; they are attached to
+        an ``httpx.AsyncClient`` that is injected into
+        ``mcp.client.streamable_http.streamable_http_client``.
+
+        Historical note: a ``startup_wait`` parameter existed here for ~2
+        years but was never consumed by any code path (init readiness is
+        gated by ``init_timeout`` and the SDK's own handshake). Removed
+        2026-05-12; ``.mcp.json`` entries that still set ``startup_wait``
+        are harmless — the manager reads server_config["init_timeout"] only.
         """
         if self.is_connected:
             return {"status": "already_connected", "name": self.name}
@@ -233,8 +242,23 @@ class MCPClient:
                     # Set up transport
                     if transport == "http" and url:
                         from mcp.client.streamable_http import streamable_http_client
+                        # Build an httpx.AsyncClient with caller-supplied
+                        # headers if any — the SDK's streamable_http_client
+                        # only accepts headers via an injected http_client
+                        # (signature: http_client: httpx.AsyncClient | None,
+                        # terminate_on_close: bool). Without this, an HTTP
+                        # MCP server with auth (e.g. "Authorization: Bearer …"
+                        # in .mcp.json) would silently lose its credentials.
+                        http_client = None
+                        if headers:
+                            import httpx
+                            http_client = await exit_stack.enter_async_context(
+                                httpx.AsyncClient(headers=headers)
+                            )
                         read, write, _ = await exit_stack.enter_async_context(
-                            streamable_http_client(url)
+                            streamable_http_client(url, http_client=http_client)
+                            if http_client is not None
+                            else streamable_http_client(url)
                         )
                     else:
                         process_env = None

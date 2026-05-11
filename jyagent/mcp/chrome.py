@@ -98,10 +98,19 @@ class ChromeBrowser:
 
         Only the last caller to release triggers the actual disconnect,
         preventing premature kills while other threads are still using Chrome.
+
+        Guards against a spurious release before any acquire: a 0 → 0
+        release MUST NOT trigger disconnect. The previous implementation
+        used ``self._refcount = max(0, self._refcount - 1)`` followed by
+        ``need_disconnect = (self._refcount == 0)``, which evaluated to
+        ``True`` when the refcount was already 0 — killing Chrome out from
+        under any caller who hadn't paired their acquire with this release.
+        Fixed 2026-05-12 by gating on the pre-decrement value.
         """
         with self._refcount_lock:
-            self._refcount = max(0, self._refcount - 1)
-            need_disconnect = (self._refcount == 0)
+            was = self._refcount
+            self._refcount = max(0, was - 1)
+            need_disconnect = (was == 1)
         if need_disconnect and self._mgr.is_connected("chrome"):
             try:
                 self._mgr.disconnect("chrome")
