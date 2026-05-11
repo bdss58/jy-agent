@@ -9,10 +9,13 @@ keepalive pings and tools/list_changed notification handling.
 import atexit
 import json
 import os
-import re
 import threading
 from typing import Optional
 from .client import MCPClient
+from .conversion import (
+    extract_mcp_result as _extract_mcp_result,
+    mcp_schema_to_agent_schema as _mcp_schema_to_agent_schema,
+)
 from ..runtime.tools.registry import get_registry
 from ..runtime.tools.result import ToolResult
 
@@ -64,66 +67,6 @@ _PRE_CONNECT_HOOKS = {
     "chrome": chrome_pre_connect,
 }
 
-
-# ─── MCP Tool → Agent Tool schema conversion ─────────────────────────────────
-
-def _mcp_schema_to_agent_schema(mcp_tool: dict, tool_name: str) -> dict:
-    """Convert an MCP tool schema to the agent's tool schema format.
-    
-    MCP format:
-        {"name": "navigate_page", "description": "...", "inputSchema": {"type": "object", "properties": {...}}}
-    
-    Agent format:
-        {"name": "mcp__chrome__navigate_page", "description": "...", "input_schema": {"type": "object", "properties": {...}}}
-    """
-    input_schema = mcp_tool.get("inputSchema", {"type": "object", "properties": {}})
-    
-    # Deep copy to avoid mutating the original
-    import copy
-    input_schema = copy.deepcopy(input_schema)
-    
-    # Ensure required field exists
-    if "required" not in input_schema:
-        input_schema["required"] = []
-    
-    # Strip 'default' keys that Bedrock doesn't support
-    if "properties" in input_schema:
-        for prop_name, prop_def in input_schema["properties"].items():
-            if isinstance(prop_def, dict):
-                prop_def.pop("default", None)
-                # Strip 'additionalProperties' from nested objects
-                prop_def.pop("additionalProperties", None)
-    
-    # Strip top-level additionalProperties  
-    input_schema.pop("additionalProperties", None)
-    
-    return {
-        "name": tool_name,
-        "description": mcp_tool.get("description", f"MCP tool: {mcp_tool.get('name', tool_name)}"),
-        "input_schema": input_schema,
-    }
-
-
-def _extract_mcp_result(result: dict) -> str:
-    """Extract readable text from an MCP tool call result."""
-    content = result.get("content", [])
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("type") == "image":
-                    texts.append(f"[Image: {item.get('mimeType', 'image')}]")
-                elif "text" in item:
-                    texts.append(item["text"])
-                else:
-                    texts.append(json.dumps(item, ensure_ascii=False))
-            elif isinstance(item, str):
-                texts.append(item)
-        return "\n".join(texts) if texts else json.dumps(result, indent=2, ensure_ascii=False)
-    elif isinstance(content, str):
-        return content
-    else:
-        return json.dumps(result, indent=2, ensure_ascii=False)
 
 
 # ─── MCPManager ──────────────────────────────────────────────────────────────

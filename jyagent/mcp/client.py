@@ -623,52 +623,20 @@ class MCPClient:
         return self._server_capabilities.model_dump(exclude_none=True)
 
     # ─── Conversion helpers ──────────────────────────────────────────────────
+    # The actual conversion logic lives in ``mcp.conversion`` (one module that
+    # owns both directions of the MCP↔agent type boundary). These are kept as
+    # underscored static-method shims so any external code that still calls
+    # ``MCPClient._tool_to_dict`` / ``_call_result_to_dict`` keeps working.
 
     @staticmethod
     def _tool_to_dict(tool: types.Tool) -> dict:
-        """Convert Pydantic Tool → dict for agent compatibility."""
-        return {
-            "name": tool.name,
-            "description": tool.description or f"MCP tool: {tool.name}",
-            "inputSchema": tool.inputSchema if tool.inputSchema else {"type": "object", "properties": {}},
-        }
+        from .conversion import tool_to_dict
+        return tool_to_dict(tool)
 
     @staticmethod
     def _call_result_to_dict(result: types.CallToolResult) -> dict:
-        """Convert CallToolResult → dict for agent compatibility.
-        
-        Forward-compatible with SDK v2's structured_content field.
-        """
-        content = []
-        for item in (result.content or []):
-            if isinstance(item, types.TextContent):
-                content.append({"type": "text", "text": item.text})
-            elif isinstance(item, types.ImageContent):
-                content.append({
-                    "type": "image",
-                    "data": item.data,
-                    "mimeType": item.mimeType,
-                })
-            elif isinstance(item, types.EmbeddedResource):
-                content.append({
-                    "type": "resource",
-                    "resource": item.resource.model_dump() if item.resource else {},
-                })
-            else:
-                content.append(item.model_dump() if hasattr(item, 'model_dump') else {"type": "unknown"})
-
-        result_dict = {
-            "content": content,
-            "isError": result.isError or False,
-        }
-
-        # Forward-compat — extract structured_content if SDK v2 adds it
-        if hasattr(result, 'structuredContent') and result.structuredContent:
-            result_dict["structuredContent"] = result.structuredContent
-        elif hasattr(result, 'structured_content') and result.structured_content:
-            result_dict["structuredContent"] = result.structured_content
-
-        return result_dict
+        from .conversion import call_result_to_dict
+        return call_result_to_dict(result)
 
     def __del__(self):
         try:
