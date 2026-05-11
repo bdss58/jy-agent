@@ -26,6 +26,11 @@ from zoneinfo import ZoneInfo
 
 from .. import config as _cfg
 from ._paths import ensure_dirs
+from ._markdown import (
+    parse_frontmatter as _parse_frontmatter,
+    build_frontmatter as _build_frontmatter,
+    SECTION_HEADER_RE as _SECTION_HEADER_RE,
+)
 from ._index import (
     # Topic-index sync now lives in _index.py (it is a MEMORY.md
     # read-modify-write that needs the index lock). These shim names are
@@ -48,7 +53,6 @@ _add_topic_index_entry = _upsert_topic_index_entry
 
 # ─── Topic file operations ────────────────────────────────────────────────────
 
-_FRONTMATTER_SEP = "---"
 ASIA_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -57,34 +61,9 @@ def _now_iso() -> str:
     return datetime.now(ASIA_SHANGHAI_TZ).isoformat(timespec="seconds")
 
 
-def _parse_frontmatter(raw: str) -> tuple[dict, str]:
-    """Parse YAML-style frontmatter from a topic file.
-
-    Returns (metadata_dict, body_text).  If no frontmatter, returns ({}, raw).
-    """
-    if not raw.startswith(_FRONTMATTER_SEP):
-        return {}, raw
-
-    parts = raw.split(_FRONTMATTER_SEP, 2)  # ['', yaml_block, body]
-    if len(parts) < 3:
-        return {}, raw
-
-    meta = {}
-    for line in parts[1].strip().splitlines():
-        if ":" in line:
-            key, _, val = line.partition(":")
-            meta[key.strip()] = val.strip()
-    body = parts[2].lstrip("\n")
-    return meta, body
-
-
-def _build_frontmatter(meta: dict) -> str:
-    """Serialize metadata dict into YAML frontmatter block."""
-    lines = [_FRONTMATTER_SEP]
-    for k, v in meta.items():
-        lines.append(f"{k}: {v}")
-    lines.append(_FRONTMATTER_SEP)
-    return "\n".join(lines) + "\n"
+# (_parse_frontmatter / _build_frontmatter are imported above from
+# ``_markdown`` and re-exported under their original underscore names so
+# existing tests and external callers keep working.)
 
 
 def list_topics() -> list[str]:
@@ -159,10 +138,9 @@ def read_topic_meta(name: str) -> dict:
     return meta
 
 
-# Match an ATX header line ("## Foo Bar") at column 0. Used by
-# read_topic_section to locate a single section without dragging in the
-# `re` import at call time.
-_SECTION_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+# (``_SECTION_HEADER_RE`` is imported at the top of this module from
+# ``_markdown`` and shimmed under its old name for the read_topic_section
+# helper below.)
 
 
 def read_topic_section(name: str, header: str) -> str:

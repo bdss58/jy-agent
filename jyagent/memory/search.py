@@ -23,6 +23,14 @@ import os
 import re
 from dataclasses import dataclass
 
+# Markdown chunking + frontmatter — shared with _topics. Keep underscored
+# aliases for the test suite (test_memory_upgrades imports _split_sections).
+from ._markdown import (
+    H2_H3_HEADER_RE as _H2_H3,
+    split_sections as _split_sections,
+    strip_frontmatter as _strip_frontmatter,
+)
+
 from .. import config as _cfg
 from ._topics import list_topics, read_topic
 from ._journal import list_journals, read_journal
@@ -103,43 +111,6 @@ def _tokenize(text: str) -> list[str]:
     return out
 
 
-# ─── Chunking ─────────────────────────────────────────────────────────────────
-
-# Match ATX-style markdown headers. We chunk on `##` and `###` only —
-# `#` is a file-level title we want to keep with the first chunk.
-_H2_H3 = re.compile(r"^(#{2,3})\s+(.+?)\s*$", re.MULTILINE)
-
-
-def _split_sections(body: str) -> list[tuple[str, str]]:
-    """Split a markdown body into (section_header, section_text) pairs.
-
-    The first chunk (before any `##` header) gets section = "".
-    Each header's text is included at the start of its chunk so searches that
-    hit the header still surface the full section.
-    """
-    headers: list[tuple[int, int, str]] = []  # (start, depth, text)
-    for m in _H2_H3.finditer(body):
-        depth = len(m.group(1))
-        headers.append((m.start(), depth, m.group(2).strip()))
-
-    if not headers:
-        return [("", body.strip())] if body.strip() else []
-
-    chunks: list[tuple[str, str]] = []
-    # Preamble (before the first header)
-    if headers[0][0] > 0:
-        pre = body[: headers[0][0]].strip()
-        if pre:
-            chunks.append(("", pre))
-
-    for i, (start, _depth, text) in enumerate(headers):
-        end = headers[i + 1][0] if i + 1 < len(headers) else len(body)
-        section_text = body[start:end].strip()
-        if section_text:
-            chunks.append((text, section_text))
-
-    return chunks
-
 
 # ─── Index + BM25 ─────────────────────────────────────────────────────────────
 
@@ -201,13 +172,6 @@ def _collect_chunks(
 
     return chunks
 
-
-_FRONTMATTER_RE = re.compile(r"^---\n.*?\n---\n", re.DOTALL)
-
-
-def _strip_frontmatter(body: str) -> str:
-    m = _FRONTMATTER_RE.match(body)
-    return body[m.end():] if m else body
 
 
 def _bm25_score(
