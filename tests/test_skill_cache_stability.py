@@ -164,7 +164,7 @@ class TestPinnedBodiesAreSeparate:
 
 
 class TestAgentSystemPromptIsStable:
-    """The end-to-end invariant: _build_full_system_prompt must produce
+    """The end-to-end invariant: build_system_prompt must produce
     byte-identical output before and after a skill is pinned."""
 
     def test_system_prompt_byte_identical_across_pin(
@@ -179,21 +179,21 @@ class TestAgentSystemPromptIsStable:
 
         # Stub out memory loading so the test is independent of the user's
         # real MEMORY.md / topic files.
-        from jyagent import agent as agent_mod
+        from jyagent import system_prompt as sp
         monkeypatch.setattr(
-            agent_mod, "build_memory_context", lambda query=None: ""
+            sp, "build_memory_context", lambda query=None: ""
         )
 
-        prompt_before = agent_mod._build_full_system_prompt(
+        prompt_before = sp.build_system_prompt(
             "any user input", mgr, force_rebuild=True,
         )
         mgr.pin("alpha")
-        prompt_after = agent_mod._build_full_system_prompt(
+        prompt_after = sp.build_system_prompt(
             "any user input", mgr, force_rebuild=True,
         )
 
         assert prompt_before == prompt_after, (
-            "_build_full_system_prompt changed after pinning a skill — "
+            "build_system_prompt changed after pinning a skill — "
             "this is the cache-invalidation regression we just fixed. "
             "Pinned bodies must be attached to the last user message, "
             "NOT to the system prompt."

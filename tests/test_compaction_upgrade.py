@@ -200,7 +200,7 @@ def test_compaction_system_prompt_includes_base_and_memory(monkeypatch):
     """Auto-compaction should reuse the full base+memory prompt prefix."""
     import shutil
     import jyagent.config as config
-    import jyagent.agent as agent
+    from jyagent import system_prompt as sp
     from jyagent.memory import ensure_dirs, write_memory_md
 
     tmpdir = tempfile.mkdtemp(prefix="jy_compact_prompt_test_")
@@ -212,15 +212,15 @@ def test_compaction_system_prompt_includes_base_and_memory(monkeypatch):
     try:
         ensure_dirs()
         write_memory_md("# Agent Memory\n\n[tip] compaction-memory-marker\n")
-        agent._cached_memory_context = None
+        sp.invalidate_memory_cache()
 
-        prompt = agent._build_compaction_system_prompt("trigger compaction")
+        prompt = sp.build_system_prompt("trigger compaction", include_skills=False)
 
         assert "TOOL-FIRST PRINCIPLE" in prompt
         assert "SELF-USE MEMORY" in prompt
         assert "compaction-memory-marker" in prompt
     finally:
-        agent._cached_memory_context = None
+        sp.invalidate_memory_cache()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
