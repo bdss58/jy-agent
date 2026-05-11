@@ -56,15 +56,16 @@ def load_config() -> dict:
         return {"mcpServers": {}}
 
 
-# ─── Pre-connect hook registry ────────────────────────────────────────────────
+# ─── Per-server policy registry ──────────────────────────────────────────────
 #
-# Browser-specific hooks live in ``mcp/chrome.py``; the manager only wires
-# them by server name.  Add new server-specific hooks here.
+# Server-specific policy (pre-connect hooks, dead-error patterns, tool
+# timeouts) lives in dedicated modules (e.g. ``mcp/chrome.py``); the manager
+# only wires them by server name. Add new server-specific policies here.
 
-from .chrome import chrome_pre_connect, ChromeBrowser  # noqa: E402
+from .chrome import CHROME_POLICY, ChromeBrowser  # noqa: E402
 
-_PRE_CONNECT_HOOKS = {
-    "chrome": chrome_pre_connect,
+_SERVER_POLICIES: dict[str, dict] = {
+    "chrome": CHROME_POLICY,
 }
 
 
@@ -132,9 +133,10 @@ class MCPManager:
             return {"status": "already_connected", "name": server_name}
 
         server_config = dict(self._configs[server_name])
-        
-        # Apply pre-connect hook if exists
-        hook = _PRE_CONNECT_HOOKS.get(server_name)
+
+        # Apply pre-connect hook if registered for this server
+        policy = _SERVER_POLICIES.get(server_name, {})
+        hook = policy.get("pre_connect")
         if hook:
             server_config = hook(server_config)
 
@@ -300,7 +302,7 @@ class MCPManager:
                 return ToolResult(f"MCP server '{server_name}' not connected: {e}", is_error=True)
 
         # Determine timeout based on tool name (some tools need longer)
-        timeout = self._get_tool_timeout(mcp_tool_name)
+        timeout = self._get_tool_timeout(mcp_tool_name, server_name)
 
         try:
             result = client.call_tool(mcp_tool_name, arguments, timeout=timeout)
@@ -311,7 +313,7 @@ class MCPManager:
             # Check if this is a "dead browser" error (Chrome process died but
             # MCP stdio pipe still alive — keepalive pings pass, tool calls fail).
             # If so, force-reconnect (disconnect + connect) and retry once.
-            if self.is_dead_server_error(error_msg):
+            if self.is_dead_server_error(error_msg, server_name):
                 try:
                     self.disconnect(server_name)
                     self.load_servers()  # Reload config in case it changed
@@ -340,38 +342,50 @@ class MCPManager:
     # New code should use the public ``call_tool``.
     _call_mcp_tool = call_tool
 
-    @staticmethod
-    def is_dead_server_error(error_msg: str) -> bool:
+    # Generic transport-level dead-error patterns shared by every MCP
+    # server. Server-specific patterns (Chrome's CDP errors, etc.) live
+    # in the per-server policy module and are merged in at lookup time.
+    _GENERIC_DEAD_ERROR_PATTERNS: tuple[str, ...] = (
+        "protocol error",
+        "connection refused",
+        "broken pipe",
+        "connection reset",
+    )
+
+    @classmethod
+    def is_dead_server_error(cls, error_msg: str, server_name: str = "") -> bool:
         """Check if an error indicates the underlying server process is dead.
 
-        Public name (the underscored alias below is back-compat). Detects the
-        silent failure mode where the MCP stdio pipe is alive (keepalive
-        pings pass) but the server's backend (e.g., Chrome browser) has
-        crashed or its internal connection (e.g., CDP pipe) has broken.
+        Detects the silent failure mode where the MCP stdio pipe is alive
+        (keepalive pings pass) but the server's backend (e.g., Chrome
+        browser) has crashed or its internal connection (e.g., CDP pipe)
+        has broken.
 
-        Note: this pattern list is browser-biased today. Step 5 of the
-        mcp/ cleanup moves the Chrome-specific patterns to ``chrome.py``
-        and leaves only generic transport errors here.
+        Pattern source:
+          - Generic transport errors are baked in (``broken pipe``,
+            ``connection reset``, etc.).
+          - Server-specific errors come from the per-server policy in
+            ``_SERVER_POLICIES`` (e.g. ``CHROME_DEAD_ERROR_PATTERNS`` in
+            ``mcp.chrome``). Pass ``server_name`` so we can look them up.
+          - When ``server_name`` is empty, ALL server policies are
+            unioned (legacy behaviour — keeps callers that don't know
+            the server name working).
         """
         lower = error_msg.lower()
-        dead_patterns = [
-            "target closed",
-            "session closed",
-            "browser disconnected",
-            "browser has been closed",
-            "browser was closed",
-            "not connected to devtools",
-            "protocol error",
-            "connection refused",
-            "no page available",
-            "page has been closed",
-            "execution context was destroyed",
-            "inspected target navigated or closed",
-            # Generic MCP-level connection errors
-            "broken pipe",
-            "connection reset",
-        ]
-        return any(pattern in lower for pattern in dead_patterns)
+        for pattern in cls._GENERIC_DEAD_ERROR_PATTERNS:
+            if pattern in lower:
+                return True
+        if server_name:
+            policy = _SERVER_POLICIES.get(server_name, {})
+            for pattern in policy.get("dead_error_patterns", ()):
+                if pattern in lower:
+                    return True
+        else:
+            for policy in _SERVER_POLICIES.values():
+                for pattern in policy.get("dead_error_patterns", ()):
+                    if pattern in lower:
+                        return True
+        return False
 
     # Underscored alias for back-compat with anything that imported the
     # old private name. Python binds this at class-definition time to the
@@ -379,20 +393,33 @@ class MCPManager:
     # ``MCPManager._is_dead_server_error`` resolve to the same callable.
     _is_dead_server_error = is_dead_server_error
 
-    def _get_tool_timeout(self, tool_name: str) -> float:
-        """Get appropriate timeout for a tool based on its name.
-        
-        Some MCP tools (Lighthouse, performance traces, etc.) can take
-        much longer than the default 30s.
+    # Default timeouts for MCP tool calls. Per-server policy can extend
+    # the long-running pattern list (Chrome contributes Lighthouse,
+    # screenshots, performance traces — see ``CHROME_POLICY``).
+    _DEFAULT_TOOL_TIMEOUT = 60.0
+    _LONG_RUNNING_TOOL_TIMEOUT = 120.0
+
+    def _get_tool_timeout(self, tool_name: str, server_name: str = "") -> float:
+        """Pick a per-call timeout based on the tool name + server policy.
+
+        Returns ``_LONG_RUNNING_TOOL_TIMEOUT`` (120s) when ``tool_name``
+        matches any long-running substring contributed by the server's
+        policy (e.g. Chrome's ``lighthouse`` / ``screenshot`` / ``trace`` /
+        ``snapshot`` / ``memory``). Otherwise returns the default (60s).
+
+        Without a known ``server_name``, every server policy is unioned —
+        same fallback shape as ``is_dead_server_error``.
         """
-        long_running_patterns = [
-            "lighthouse", "performance", "trace", "audit",
-            "screenshot", "snapshot", "memory",
-        ]
-        for pattern in long_running_patterns:
-            if pattern in tool_name.lower():
-                return 120
-        return 60  # Default: 60s (was 30s, increased for reliability)
+        lower = tool_name.lower()
+        if server_name:
+            policies = [_SERVER_POLICIES.get(server_name, {})]
+        else:
+            policies = list(_SERVER_POLICIES.values())
+        for policy in policies:
+            for pattern in policy.get("long_running_tool_patterns", ()):
+                if pattern in lower:
+                    return self._LONG_RUNNING_TOOL_TIMEOUT
+        return self._DEFAULT_TOOL_TIMEOUT
 
     # ─── tools/list_changed notification handler ──────────────────────────
 

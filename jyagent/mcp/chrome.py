@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from .manager import MCPManager
 
 
-__all__ = ["ChromeBrowser", "chrome_pre_connect"]
+__all__ = ["ChromeBrowser", "chrome_pre_connect", "CHROME_POLICY"]
 
 
 # ─── Pre-connect hook ────────────────────────────────────────────────────────
@@ -41,11 +41,59 @@ __all__ = ["ChromeBrowser", "chrome_pre_connect"]
 def chrome_pre_connect(server_config: dict) -> dict:
     """No-op hook: lets chrome-devtools-mcp launch its own managed Chrome instance.
 
-    Registered in ``MCPManager._PRE_CONNECT_HOOKS`` keyed on the ``"chrome"``
+    Registered in ``MCPManager._SERVER_POLICIES`` keyed on the ``"chrome"``
     server name.  Future Chrome-specific connection setup (e.g. detecting an
     already-running Chrome and attaching to it via CDP) belongs here.
     """
     return server_config
+
+
+# ─── Chrome-specific error/timeout policy ────────────────────────────────────
+#
+# These patterns used to live in ``manager.py`` (``is_dead_server_error`` and
+# ``_get_tool_timeout``), even though every entry is a Chrome / CDP /
+# Lighthouse string. That was the "Chrome smarts leaking into generic
+# manager" smell flagged by codex review 2026-05-12.
+#
+# Now: chrome.py owns its policy. manager.py keeps only generic transport
+# patterns and consults the per-server policy at call_tool time.
+
+# Errors strings that indicate the Chrome browser process is dead even
+# though the MCP stdio pipe still drains. The agent retries the tool call
+# once after a force-reconnect when any of these appear.
+CHROME_DEAD_ERROR_PATTERNS = (
+    "target closed",
+    "session closed",
+    "browser disconnected",
+    "browser has been closed",
+    "browser was closed",
+    "not connected to devtools",
+    "no page available",
+    "page has been closed",
+    "execution context was destroyed",
+    "inspected target navigated or closed",
+)
+
+# Tool-name substrings (case-insensitive) that get the long-running tool
+# timeout. All current entries are Chrome-devtools-mcp tools.
+CHROME_LONG_RUNNING_TOOL_PATTERNS = (
+    "lighthouse",
+    "performance",
+    "trace",
+    "audit",
+    "screenshot",
+    "snapshot",
+    "memory",
+)
+
+# Server-policy entry consumed by ``MCPManager``. Exposed as a single
+# dict so the manager can look up Chrome behaviour by server name without
+# importing Chrome-specific symbols by name.
+CHROME_POLICY: dict = {
+    "pre_connect": chrome_pre_connect,
+    "dead_error_patterns": CHROME_DEAD_ERROR_PATTERNS,
+    "long_running_tool_patterns": CHROME_LONG_RUNNING_TOOL_PATTERNS,
+}
 
 
 # ─── ChromeBrowser ───────────────────────────────────────────────────────────
@@ -137,7 +185,7 @@ class ChromeBrowser:
         health = self._mgr.call_tool(server, "list_pages", {})
         if health.is_error:
             error_msg = health.content or ""
-            if self._mgr.is_dead_server_error(error_msg):
+            if self._mgr.is_dead_server_error(error_msg, server):
                 self._mgr.disconnect(server)
                 result = self._mgr.connect(server)
                 if result.get("status") not in ("connected", "already_connected"):
