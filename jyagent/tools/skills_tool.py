@@ -58,16 +58,12 @@ def manage_skills(action: str, name: str = "", description: str = "",
                 )
 
             body = skill.get("body", "")
-            # Defensively escape closing tags inside the body so a SKILL.md
-            # containing literal "</instructions>" or "</skill>" can't break
-            # out of the wrapper. Replace with a visible sentinel so authors
-            # can spot the substitution if they ever inspect the rendered
-            # tool result. (Safety > authoring convenience.)
-            def _safe_body(s: str) -> str:
-                return (s.replace("</instructions>", "<\u200b/instructions>")
-                         .replace("</skill>",        "<\u200b/skill>"))
-
-            body = _safe_body(body)
+            # Defensively escape closing wrapper tags inside the body so a
+            # SKILL.md containing literal "</instructions>" or "</skill>"
+            # can't break out of the wrapper. Shared with the pin-path —
+            # see jyagent.skills.safe_skill_body.
+            from ..skills import safe_skill_body
+            body = safe_skill_body(body)
             # Reserve ~1 KB headroom for the wrapper XML so the result does not
             # collide with MAX_TOOL_RESULT_CHARS (currently 8000) and silently
             # truncate the tail of SKILL.md.

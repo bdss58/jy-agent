@@ -48,6 +48,38 @@ SKILL_FILENAME = "SKILL.md"
 # Progressive disclosure budgets
 MAX_CATALOG_TOKENS_PER_SKILL = 150   # ~name + description for advertising
 
+
+# ─── Safety helpers ──────────────────────────────────────────────────────────
+
+# Zero-width space sentinel injected between '<' and '/instructions>' (or
+# '/skill>') so the agent's prompt parser cannot break out of the wrapper
+# XML when a SKILL.md body legitimately contains those literal tokens
+# (e.g. a meta-skill about writing skills).  The character is invisible in
+# rendered output but visible enough on inspection to make the substitution
+# obvious to authors who go looking.
+_ZWSP = "\u200b"
+
+
+def safe_skill_body(s: str) -> str:
+    """Escape closing wrapper tags inside a SKILL.md body.
+
+    Both the load-path (manage_skills(action='load')) in
+    ``jyagent.tools.skills_tool`` and the pin-path
+    (``build_pinned_bodies_block``) inject the body between
+    ``<instructions>`` and ``</instructions>``.  A body containing those
+    literal tokens — e.g. a skill that documents the skill format itself
+    — would otherwise break the wrapper and inject prompt content.
+
+    Hoisted to module scope so both code paths share the same escape.
+    Previously inlined only in the load-path (a 2026-05 codex review
+    found the pin-path missed it; see ``test_pinned_skill_body_escapes_closing_tags``).
+    """
+    return (
+        s.replace("</instructions>", f"<{_ZWSP}/instructions>")
+         .replace("</skill>",        f"<{_ZWSP}/skill>")
+    )
+
+
 # ─── SKILL.md Parser ─────────────────────────────────────────────────────────
 
 def parse_skill_md(filepath: str) -> Optional[dict]:
@@ -537,7 +569,27 @@ class SkillManager:
                 lines.append(f"<resources>{html.escape(', '.join(resources))}</resources>")
 
             lines.append("<instructions>")
-            lines.append(body[:MAX_INSTRUCTIONS_CHARS])
+            # Escape closing wrapper tags so a SKILL.md body containing
+            # literal "</instructions>" / "</skill>" can't break out of
+            # the pinned-skill wrapper. Same protection the load-path
+            # has had since the 2026-05 review (test_tools_medium_fixes
+            # only covered the load-path); shared helper now lives in
+            # ``safe_skill_body`` at module scope.
+            safe_body = safe_skill_body(body)
+            full_len = len(safe_body)
+            truncated = full_len > MAX_INSTRUCTIONS_CHARS
+            lines.append(safe_body[:MAX_INSTRUCTIONS_CHARS])
+            if truncated:
+                # Surface truncation rather than silently dropping the tail.
+                # The load-path emits an equivalent notice (see
+                # skills_tool._safe_body block).  Visible to the model so
+                # it knows to ``manage_skills(action='read', ...)`` for the
+                # full content if needed.
+                lines.append(
+                    f"[... SKILL.md body truncated from {full_len} to "
+                    f"{MAX_INSTRUCTIONS_CHARS} chars; read remaining content "
+                    f"via manage_skills(action='read', name='{name}', resource_path=...)]"
+                )
             lines.append("</instructions>")
             lines.append("</pinned_skill>")
 
