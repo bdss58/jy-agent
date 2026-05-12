@@ -12,7 +12,8 @@ from .memory import (
     has_saved_session,
     should_extract, extract_and_remember, extract_text,
 )
-from .ui.terminal import build_streaming_callbacks, interrupted_msg
+from .ui.terminal import build_streaming_callbacks
+from .ui.loop_result_presenter import present_loop_result
 from .runtime.loop.engine import AgentLoop, LoopResult
 from .runtime.loop.config import build_default_loop_config
 from .ui.cli import CLI, console
@@ -236,54 +237,11 @@ def run(runtime_owner: LLMOwner) -> None:
                     finally:
                         spinner.stop()  # ensure spinner is always cleaned up
 
-                    # Handle LoopResult status branches
-                    if result.status == "completed":
-                        streaming_ui.flush_trailing_newline()
-                        response = result.text
-                        final_text = result.final_text
-                        planner_messages = result.messages
-                    elif result.status == "max_steps":
-                        max_step_msg = f"\n\n⚠️ Reached maximum reasoning steps ({config.max_steps}). My response may be incomplete."
-                        sys.stdout.flush()
-                        console.print(f"[bold yellow]{max_step_msg}[/bold yellow]")
-
-                        response = result.text or "I've reached my maximum reasoning steps. Please try rephrasing your request."
-                        final_text = result.final_text
-                        planner_messages = result.messages
-                    elif result.status == "interrupted":
-                        interrupted_msg()
-                        response = result.text
-                        final_text = ""
-                        planner_messages = result.messages
-                    elif result.status == "error":
-                        error_msg = f"\n[Error: {result.error}]"
-                        sys.stdout.flush()
-                        console.print(error_msg, style="bold red", markup=False)
-                        if result.text:
-                            response = result.text + f"\n\n[Error: {result.error}]"
-                        else:
-                            response = f"Error during planning: {result.error}"
-                        final_text = ""
-                        planner_messages = result.messages
-                    elif result.status == "cost_limit":
-                        cost_msg = f"\n\n⚠️ {result.error}"
-                        sys.stdout.flush()
-                        console.print(cost_msg, style="bold yellow", markup=False)
-                        response = result.text + cost_msg if result.text else cost_msg
-                        final_text = result.final_text
-                        planner_messages = result.messages
-                    elif result.status == "dedup_break":
-                        dedup_msg = f"\n\n⚠️ Loop detected — stopped to prevent infinite loop."
-                        sys.stdout.flush()
-                        console.print(dedup_msg, style="bold yellow", markup=False)
-                        response = result.text + dedup_msg if result.text else dedup_msg
-                        final_text = result.final_text
-                        planner_messages = result.messages
-                    else:
-                        # Fallback — should not happen
-                        response = result.text or "Unknown error"
-                        final_text = ""
-                        planner_messages = result.messages
+                    # Map LoopResult → printed banner + persistence triple.
+                    presented = present_loop_result(result, config, streaming_ui)
+                    response = presented.response
+                    final_text = presented.final_text
+                    planner_messages = presented.planner_messages
 
                 except KeyboardInterrupt:
                     cli.print_system("\n⚠ Interrupted — returning to prompt.")
