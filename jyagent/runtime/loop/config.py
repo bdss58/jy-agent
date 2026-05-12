@@ -140,4 +140,43 @@ class LoopResult:
     partial_side_effects: list[str] = field(default_factory=list)
 
 
-__all__ = ["LoopConfig", "LoopResult"]
+def build_default_loop_config(**overrides: Any) -> LoopConfig:
+    """Factory: build a ``LoopConfig`` from the app's default constants.
+
+    Centralizes the wiring between ``jyagent.config`` (DEFAULT_*) and
+    ``LoopConfig`` so the main run-loop doesn't carry a 19-line inline
+    constructor.  Pass ``**overrides`` to tweak fields (used by tests
+    and any future per-mode config).
+
+    Kept in this module so it lives next to ``LoopConfig`` itself; the
+    one-time ``jyagent.config`` import cost is paid lazily on first call.
+    """
+    from ...config import (
+        DEFAULT_MAX_STEPS, DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP,
+        DEFAULT_TOOL_TIMEOUT, MAX_WORKING_TOKENS,
+        COMPACT_TOOL_RESULT_CHARS, MAX_TOOL_RESULT_CHARS,
+    )
+    defaults: dict[str, Any] = dict(
+        max_steps=DEFAULT_MAX_STEPS,
+        initial_max_tokens=DEFAULT_MAX_TOKENS,
+        max_tokens_cap=MAX_TOKENS_CAP,
+        auto_scale_on_truncation=True,
+        token_scale_factor=2,
+        concurrent_tools=True,
+        max_tool_workers=4,
+        tool_timeout=DEFAULT_TOOL_TIMEOUT,
+        retry_attempts=10,
+        retry_base_delay=2.0,
+        compact_messages=True,
+        max_working_tokens=MAX_WORKING_TOKENS,
+        compact_tool_result_chars=COMPACT_TOOL_RESULT_CHARS,
+        max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
+        streaming=True,
+        truncate_large_inputs=True,
+        fallback_on_max_steps=True,
+    )
+    defaults.update(overrides)
+    return LoopConfig(**defaults)
+
+
+__all__ = ["LoopConfig", "LoopResult", "build_default_loop_config"]

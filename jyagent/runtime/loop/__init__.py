@@ -21,12 +21,13 @@ this is a no-op in terms of import-side-effects today, but stays
 forward-compatible if a phase later grows engine-pulling code.
 """
 from .callbacks import LoopCallbacks
-from .config import LoopConfig, LoopResult
+from .config import LoopConfig, LoopResult, build_default_loop_config
 
 __all__ = [
     "AgentLoop",        # lazy from .engine
     "LoopConfig",
     "LoopResult",
+    "build_default_loop_config",
     "LoopCallbacks",
     "phases",           # lazy
     "reflection",       # lazy

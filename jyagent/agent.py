@@ -13,17 +13,13 @@ from .memory import (
     should_extract, extract_and_remember, extract_text,
 )
 from .ui.terminal import build_streaming_callbacks, interrupted_msg
-from .runtime.loop.engine import AgentLoop, LoopConfig, LoopResult
+from .runtime.loop.engine import AgentLoop, LoopResult
+from .runtime.loop.config import build_default_loop_config
 from .ui.cli import CLI, console
 from .ui.commands import find_command, get_handler
 from .skills import init_skills
 from .llm import LLMOwner
 from .runtime.stats import get_stats
-from .config import (
-    DEFAULT_MAX_TOKENS, MAX_TOKENS_CAP, DEFAULT_MAX_STEPS,
-    MAX_TOOL_RESULT_CHARS, MAX_WORKING_TOKENS, DEFAULT_TOOL_TIMEOUT,
-    COMPACT_TOOL_RESULT_CHARS,
-)
 from .system_prompt import build_system_prompt, invalidate_memory_cache
 from .agent_commands import _safe_checkpoint  # noqa: F401 — also registers /commands
 
@@ -200,26 +196,8 @@ def run(runtime_owner: LLMOwner) -> None:
                 sys.stdout.flush()
 
                 try:
-                    # Build LoopConfig inline
-                    config = LoopConfig(
-                        max_steps=DEFAULT_MAX_STEPS,
-                        initial_max_tokens=DEFAULT_MAX_TOKENS,
-                        max_tokens_cap=MAX_TOKENS_CAP,
-                        auto_scale_on_truncation=True,
-                        token_scale_factor=2,
-                        concurrent_tools=True,
-                        max_tool_workers=4,
-                        tool_timeout=DEFAULT_TOOL_TIMEOUT,
-                        retry_attempts=10,
-                        retry_base_delay=2.0,
-                        compact_messages=True,
-                        max_working_tokens=MAX_WORKING_TOKENS,
-                        compact_tool_result_chars=COMPACT_TOOL_RESULT_CHARS,
-                        max_tool_result_chars=MAX_TOOL_RESULT_CHARS,
-                        streaming=True,
-                        truncate_large_inputs=True,
-                        fallback_on_max_steps=True,
-                    )
+                    # Build LoopConfig from app defaults (factory keeps wiring in one place)
+                    config = build_default_loop_config()
 
                     # Build streaming callbacks
                     stats = get_stats()
