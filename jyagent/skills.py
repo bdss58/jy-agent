@@ -280,11 +280,28 @@ def _parse_yaml_kv(line: str) -> Optional[tuple]:
     if value in ('>-', '>', '|', '|-'):
         return (key, value)
 
-    # Strip quotes
+    # Quoted string handling.
+    #
+    # Double-quoted values are decoded as JSON strings so embedded
+    # ``\"``, ``\\``, ``\n``, ``\t`` etc. unescape correctly.  This pairs
+    # with ``create_skill``, which JSON-encodes descriptions and
+    # metadata values for guaranteed-valid YAML output.  JSON strings
+    # are a strict subset of YAML 1.2 double-quoted flow scalars, so
+    # this is round-trip safe.
+    #
+    # Single-quoted values follow YAML's simpler rule: only ``''`` is an
+    # escape (for a literal single quote); nothing else needs decoding.
     if len(value) >= 2:
-        if (value.startswith('"') and value.endswith('"')) or \
-           (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                import json as _json
+                value = _json.loads(value)
+            except (ValueError, TypeError):
+                # Malformed escape — fall back to naive strip so the
+                # parser doesn't fail outright on a hand-written file.
+                value = value[1:-1]
+        elif value.startswith("'") and value.endswith("'"):
+            value = value[1:-1].replace("''", "'")
 
     return (key, value)
 
@@ -609,30 +626,90 @@ class SkillManager:
         if name in self._skills:
             return f"Error: Skill '{name}' already exists."
 
-        # Create directory structure
+        # Path-traversal / symlink check.
+        #
+        # The name regex above blocks '..' and '/' in the name itself, so
+        # ``os.path.join(self.skills_dir, name)`` can't escape the skills
+        # tree via the argument.  But ``skill_dir`` may ALREADY exist as a
+        # pre-planted symlink pointing outside the tree, in which case the
+        # subsequent makedirs + open(SKILL.md, 'w') would happily follow
+        # the link and write through it.  Reject if realpath(skill_dir)
+        # lands outside realpath(self.skills_dir).
+        #
+        # Threat realism is low (requires an attacker who can write to
+        # the skills directory before create_skill runs — at which point
+        # they can already do worse) but the check is ~5 lines and
+        # closes the foot-gun cleanly.  Flagged by the 2026-05 codex review.
         skill_dir = os.path.join(self.skills_dir, name)
+        try:
+            real_root = os.path.realpath(self.skills_dir)
+            real_target = os.path.realpath(skill_dir)
+            # commonpath raises ValueError on different drives (Windows);
+            # in that case the paths obviously can't be related.
+            if os.path.commonpath([real_root, real_target]) != real_root:
+                return (
+                    f"Error: refusing to create skill '{name}' — its target "
+                    f"directory resolves outside the skills tree (possible "
+                    f"pre-planted symlink). Remove '{skill_dir}' and retry."
+                )
+        except ValueError:
+            return (
+                f"Error: refusing to create skill '{name}' — target path "
+                f"is unrelated to the skills root."
+            )
+
+        # Create directory structure
         os.makedirs(skill_dir, exist_ok=True)
         os.makedirs(os.path.join(skill_dir, "scripts"), exist_ok=True)
         os.makedirs(os.path.join(skill_dir, "references"), exist_ok=True)
         os.makedirs(os.path.join(skill_dir, "assets"), exist_ok=True)
 
-        # Build SKILL.md
+        # Build SKILL.md.
+        #
+        # YAML escaping note: ``description`` and ``metadata`` values can
+        # contain quotes, newlines, colons, or leading ``>``/``|`` chars
+        # that would corrupt a naive ``description: >-\n  {value}`` block
+        # or a ``key: "{value}"`` line.  JSON-encoded strings are a strict
+        # subset of YAML 1.2 flow scalars, so ``json.dumps(s)`` always
+        # produces a syntactically valid YAML string regardless of
+        # content.  Cheap, dep-free, and round-trips correctly through
+        # any YAML 1.2 parser.  Flagged by the 2026-05 codex review.
+        import json as _json
         fm_lines = [
             "---",
-            f"name: {name}",
-            "description: >-",
-            f"  {description}",
+            f"name: {name}",  # name already passed the regex; no escaping needed
+            f"description: {_json.dumps(description, ensure_ascii=False)}",
         ]
         if metadata:
             fm_lines.append("metadata:")
             for k, v in metadata.items():
-                fm_lines.append(f"  {k}: \"{v}\"")
+                # Keys are restricted to plain identifiers; values get the
+                # same JSON-safe treatment as ``description``.  Non-string
+                # values (numbers, bools, nested dicts) also round-trip
+                # via json.dumps without corrupting the YAML structure.
+                fm_lines.append(f"  {k}: {_json.dumps(v, ensure_ascii=False)}")
         fm_lines.append("---")
         fm_lines.append("")
         fm_lines.append(instructions)
 
         skill_md_path = os.path.join(skill_dir, SKILL_FILENAME)
-        with open(skill_md_path, 'w', encoding='utf-8') as f:
+        # Refuse to follow a symlink at the SKILL.md path itself (defense
+        # in depth — the symlink check above catches the directory, this
+        # catches a more targeted "symlink the SKILL.md file" attack).
+        # ``O_NOFOLLOW`` is POSIX-only; fall back to a path check on
+        # platforms that don't expose it.
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow
+        try:
+            fd = os.open(skill_md_path, flags, 0o644)
+        except OSError as e:
+            return (
+                f"Error: could not open '{skill_md_path}' for writing: {e}. "
+                f"If the file exists as a symlink, refusing to follow it."
+            )
+        # ``os.fdopen`` takes ownership of fd; the ``with`` context manager
+        # closes it on any exit path (success or exception).
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write("\n".join(fm_lines))
 
         # Re-discover to pick up the new skill
