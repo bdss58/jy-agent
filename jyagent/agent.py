@@ -5,6 +5,7 @@
 # System prompt assembly lives in jyagent.system_prompt.
 
 import sys
+from dataclasses import dataclass
 from .runtime.tools.registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
@@ -67,6 +68,27 @@ def _graceful_exit(cli, conversation=None):
 
 
 
+# ─── Run-loop state ──────────────────────────────────────────────────────────
+
+@dataclass
+class AgentRunState:
+    """Mutable per-session state shared between the run loop and slash-command handlers.
+
+    Replaced an ad-hoc ``{"use_markdown": True}`` dict during the
+    LIGHT-CLEANUP follow-up so the contract is typed and the
+    inter-turn "force context rebuild" signal isn't a magic string key.
+
+    Fields:
+      * ``use_markdown`` — render the final assistant text as Rich Markdown.
+        Toggled by the ``/markdown`` slash command.
+      * ``force_rebuild_context`` — set True by the auto-compaction callback;
+        consumed (and reset) once at the start of the next turn so the system
+        prompt is rebuilt against the freshly-compacted memory state.
+    """
+    use_markdown: bool = True
+    force_rebuild_context: bool = False
+
+
 # ─── Main agent loop ─────────────────────────────────────────────────────────
 
 def run(runtime_owner: LLMOwner) -> None:
@@ -76,7 +98,7 @@ def run(runtime_owner: LLMOwner) -> None:
 
     try:
         cli = CLI()
-        state = {"use_markdown": True}
+        state = AgentRunState()
         stats = get_stats()
         stats.set_active_model(runtime_owner.model_spec.provider, runtime_owner.model_spec.model)
 
@@ -150,7 +172,7 @@ def run(runtime_owner: LLMOwner) -> None:
                 # Auto-compact check (token-based, with memory re-injection callback)
                 def _on_compacted():
                     """Callback after auto-compaction: signal context rebuild."""
-                    state["_force_rebuild_context"] = True
+                    state.force_rebuild_context = True
 
                 # Pass the same base+memory prefix shape used for normal turns
                 # so compaction remains cache-friendly without dropping rules.
@@ -168,7 +190,8 @@ def run(runtime_owner: LLMOwner) -> None:
                 # Active skill bodies are attached separately as a tail block on
                 # the last user message (below) so per-turn activation diffs do
                 # NOT invalidate the system-prompt prefix cache.
-                force_rebuild = state.pop("_force_rebuild_context", False)
+                force_rebuild = state.force_rebuild_context
+                state.force_rebuild_context = False
                 full_system_prompt = build_system_prompt(
                     user_input, skill_mgr,
                     force_rebuild=force_rebuild,
@@ -269,7 +292,7 @@ def run(runtime_owner: LLMOwner) -> None:
 
                 # Render final LLM output (not intermediate tool-use text) with rich markdown
                 from .ui.terminal import render_final_text
-                render_final_text(final_text, markdown=state["use_markdown"])
+                render_final_text(final_text, markdown=state.use_markdown)
 
                 # Show turn stats (tokens + cost)
                 cli.print_turn_summary()

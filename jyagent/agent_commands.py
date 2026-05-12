@@ -62,8 +62,8 @@ def _cmd_multi(cli, **_):
 
 
 def _cmd_markdown(cli, state, **_):
-    state["use_markdown"] = not state["use_markdown"]
-    cli.print_system(f"Markdown rendering {'ON' if state['use_markdown'] else 'OFF'}")
+    state.use_markdown = not state.use_markdown
+    cli.print_system(f"Markdown rendering {'ON' if state.use_markdown else 'OFF'}")
 
 
 def _cmd_history(cli, conversation, **_):
