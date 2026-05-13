@@ -5,6 +5,100 @@
 
 import json
 import os
+import sys
+
+
+# ─── Env-var coercion helpers ────────────────────────────────────────────────
+#
+# Goals (post-2026-05 codex review):
+#   * Surface a useful error at import time: instead of a raw
+#     ``ValueError: invalid literal for int() with base 10: 'banana'`` traceback,
+#     report which env var was bad and the value seen.
+#   * Validate ranges (``min``, ``max``) for numeric knobs that would silently
+#     break downstream if 0 / negative / oversized.
+#   * Provide ONE canonical boolean parse so ``ANTHROPIC_PROMPT_CACHE=banana``
+#     and ``JYAGENT_ASK=banana`` agree on what an unknown value means
+#     (previously: prompt-cache treated unknown as enabled, ASK treated unknown
+#     as disabled — observable behaviour drift).
+#
+# These helpers run at import time, so they MUST NOT import any provider /
+# heavy module — keep them dep-free.
+
+
+class ConfigError(RuntimeError):
+    """Raised when an env-var-backed config value is invalid.
+
+    Surfaces the env var NAME and the offending value, so import-time
+    failures point the user directly at what to fix instead of a raw
+    Python traceback.  Caught in ``__main__`` for a friendlier message.
+    """
+
+
+def _int_env(name: str, default: int, *,
+             min: int | None = None, max: int | None = None) -> int:
+    """Parse an int env var with bounds, raising ``ConfigError`` on failure."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        value = default
+    else:
+        try:
+            value = int(raw.strip())
+        except (ValueError, AttributeError) as e:
+            raise ConfigError(
+                f"{name}={raw!r} is not a valid integer: {e}. "
+                f"Default is {default}."
+            ) from e
+    if min is not None and value < min:
+        raise ConfigError(
+            f"{name}={value} is below the minimum {min}. "
+            f"Set a value >= {min} or unset to use default {default}."
+        )
+    if max is not None and value > max:
+        raise ConfigError(
+            f"{name}={value} is above the maximum {max}. "
+            f"Set a value <= {max} or unset to use default {default}."
+        )
+    return value
+
+
+# Canonical boolean tokens.  ``_bool_env`` falls back to ``default`` (with a
+# stderr warning) when the env var is set to an unrecognized value, so a typo
+# never silently flips a critical flag in either direction.
+_BOOL_TRUE = frozenset({"1", "true", "yes", "on", "y", "t"})
+_BOOL_FALSE = frozenset({"0", "false", "no", "off", "n", "f", ""})
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """Parse a bool env var with a SINGLE canonical mapping.
+
+    Previously two ad-hoc parses lived in this file:
+      * ``ANTHROPIC_PROMPT_CACHE`` — "negative list": unknown values
+        treated as TRUE (any non-falsy → enabled).
+      * ``JYAGENT_ASK`` — "positive list": unknown values treated as FALSE.
+
+    That meant ``ANTHROPIC_PROMPT_CACHE=banana`` enabled caching and
+    ``JYAGENT_ASK=banana`` disabled ASK — same input, opposite semantics.
+
+    The unified rule: known TRUE token → True, known FALSE token → False,
+    anything else → ``default`` plus a stderr warning so the user sees
+    the typo instead of inheriting a silent surprise.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if token in _BOOL_TRUE:
+        return True
+    if token in _BOOL_FALSE:
+        return False
+    print(
+        f"WARNING: {name}={raw!r} is not a recognized boolean "
+        f"({sorted(_BOOL_TRUE | _BOOL_FALSE - {''})}). "
+        f"Falling back to default {default}.",
+        file=sys.stderr,
+    )
+    return default
+
 
 # ─── Project root (absolute, from __file__ — immune to CWD changes) ──────────
 
@@ -19,8 +113,8 @@ LAUNCH_DIR: str = ""  # Set once at startup by __main__.main(); do NOT read from
 DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 AGENT_PROVIDER = (os.environ.get("AGENT_PROVIDER") or "anthropic").strip() or "anthropic"
 AGENT_MODEL = os.environ.get("AGENT_MODEL", DEFAULT_ANTHROPIC_MODEL)
-DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
-MAX_TOKENS_CAP = int(os.environ.get("AGENT_MAX_TOKENS_CAP", "128000"))
+DEFAULT_MAX_TOKENS = _int_env("AGENT_MAX_TOKENS", 16384, min=1)
+MAX_TOKENS_CAP = _int_env("AGENT_MAX_TOKENS_CAP", 128000, min=1)
 SUPPORTED_RUNTIME_PROVIDERS: set[str] = {"anthropic"}
 
 # ─── Anthropic prompt caching ─────────────────────────────────────────────────
@@ -39,9 +133,10 @@ SUPPORTED_RUNTIME_PROVIDERS: set[str] = {"anthropic"}
 #
 # Set ANTHROPIC_PROMPT_CACHE=0 to disable (default: enabled).
 # Set ANTHROPIC_PROMPT_CACHE_TTL=1h for 1-hour cache (default: 5m).
-ANTHROPIC_PROMPT_CACHE_ENABLED = (
-    os.environ.get("ANTHROPIC_PROMPT_CACHE", "1").lower() not in ("0", "false", "no", "off")
-)
+ANTHROPIC_PROMPT_CACHE_ENABLED = _bool_env("ANTHROPIC_PROMPT_CACHE", True)
+# TTL is validated lazily at provider-call time (only "5m" / "1h" are
+# accepted today, but the set may grow — keep authoritative validation
+# at the boundary rather than mirror it here).
 ANTHROPIC_PROMPT_CACHE_TTL = os.environ.get("ANTHROPIC_PROMPT_CACHE_TTL", "5m").strip()
 
 
@@ -51,7 +146,14 @@ def register_provider(name: str) -> None:
 
 
 def get_extra_headers_from_env(env_var: str) -> dict[str, str]:
-    """Parse provider-specific extra HTTP headers from a JSON env var."""
+    """Parse provider-specific extra HTTP headers from a JSON env var.
+
+    Security note: the env var is a trust boundary already (any code that
+    can set it can do worse), so we accept arbitrary header names/values.
+    Callers that ship the result to a provider should be aware that this
+    can override auth or routing headers if mis-set; that is intentional
+    (it's how proxy / custom-Anthropic-deployments are supported).
+    """
     raw = (os.environ.get(env_var) or "").strip()
     if not raw:
         return {}
@@ -76,14 +178,14 @@ def get_extra_headers_from_env(env_var: str) -> dict[str, str]:
 
 # ─── Planner / Tool dispatch ─────────────────────────────────────────────────
 
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "100"))
-MAX_TOOL_RESULT_CHARS = int(os.environ.get("AGENT_MAX_TOOL_RESULT_CHARS", "8000"))
-MAX_TOOL_USE_INPUT_CHARS = int(os.environ.get("AGENT_MAX_TOOL_USE_INPUT_CHARS", "4000"))
-MAX_WORKING_TOKENS = int(os.environ.get("AGENT_MAX_WORKING_TOKENS", "180000"))  # Layer 1 safety net (cheap truncation within a turn)
-DEFAULT_TOOL_TIMEOUT = int(os.environ.get("AGENT_TOOL_TIMEOUT", "120"))
-STREAM_TIMEOUT = int(os.environ.get("AGENT_STREAM_TIMEOUT", "300"))
+DEFAULT_MAX_STEPS = _int_env("AGENT_MAX_STEPS", 100, min=1)
+MAX_TOOL_RESULT_CHARS = _int_env("AGENT_MAX_TOOL_RESULT_CHARS", 8000, min=100)
+MAX_TOOL_USE_INPUT_CHARS = _int_env("AGENT_MAX_TOOL_USE_INPUT_CHARS", 4000, min=100)
+MAX_WORKING_TOKENS = _int_env("AGENT_MAX_WORKING_TOKENS", 180000, min=1000)  # Layer 1 safety net (cheap truncation within a turn)
+DEFAULT_TOOL_TIMEOUT = _int_env("AGENT_TOOL_TIMEOUT", 120, min=1)
+STREAM_TIMEOUT = _int_env("AGENT_STREAM_TIMEOUT", 300, min=1)
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
-OBSERVATION_MASK_DISTANCE = int(os.environ.get("AGENT_OBSERVATION_MASK_DISTANCE", "5"))  # fully clear tool results older than N messages from the end
+OBSERVATION_MASK_DISTANCE = _int_env("AGENT_OBSERVATION_MASK_DISTANCE", 5, min=0)  # fully clear tool results older than N messages from the end
 
 # ─── Tool approval gate ──────────────────────────────────────────────────────
 # When True, the CLI prompts before executing any *mutating* tool call.
@@ -91,7 +193,7 @@ OBSERVATION_MASK_DISTANCE = int(os.environ.get("AGENT_OBSERVATION_MASK_DISTANCE"
 # glob_files, web_search, web_fetch, manage_memory query, etc.) are still
 # auto-approved — same policy as the ``mutating`` flag in tools/__init__.py.
 # Toggled by the ``--ask`` CLI flag (see __main__.py) or the env var below.
-ASK_BEFORE_TOOLS = (os.environ.get("JYAGENT_ASK", "0").lower() in ("1", "true", "yes"))
+ASK_BEFORE_TOOLS = _bool_env("JYAGENT_ASK", False)
 
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
@@ -100,19 +202,19 @@ TOPICS_DIR = os.path.join(MEMORY_DIR, "topics")
 JOURNAL_DIR = os.path.join(MEMORY_DIR, "journal")  # Tier 3: never auto-loaded
 MEMORY_MD_FILE = os.path.join(MEMORY_DIR, "MEMORY.md")
 
-COMPACT_TOKEN_THRESHOLD = int(os.environ.get("AGENT_COMPACT_TOKEN_THRESHOLD", "150000"))  # Layer 2 (LLM summary between turns); matches Anthropic API default & 75% of 200K window
-SUMMARIZE_KEEP_RECENT = int(os.environ.get("AGENT_SUMMARIZE_KEEP_RECENT", "6"))
-SUMMARIZE_THRESHOLD = int(os.environ.get("AGENT_SUMMARIZE_THRESHOLD", "20"))
-FILE_REINJECTION_COUNT = int(os.environ.get("AGENT_FILE_REINJECTION_COUNT", "5"))  # re-inject N most recent files after compaction
-FILE_REINJECTION_MAX_TOKENS = int(os.environ.get("AGENT_FILE_REINJECTION_MAX_TOKENS", "50000"))  # cap total re-injected content
-MAX_SESSIONS = 50
+COMPACT_TOKEN_THRESHOLD = _int_env("AGENT_COMPACT_TOKEN_THRESHOLD", 150000, min=1000)  # Layer 2 (LLM summary between turns); matches Anthropic API default & 75% of 200K window
+SUMMARIZE_KEEP_RECENT = _int_env("AGENT_SUMMARIZE_KEEP_RECENT", 6, min=0)
+# (Dropped 2026-05: SUMMARIZE_THRESHOLD, MAX_SESSIONS, WEB_FETCH_MIN_CONTENT_LENGTH
+#  were never referenced anywhere in the codebase.  Removed per codex review.)
+FILE_REINJECTION_COUNT = _int_env("AGENT_FILE_REINJECTION_COUNT", 5, min=0)  # re-inject N most recent files after compaction
+FILE_REINJECTION_MAX_TOKENS = _int_env("AGENT_FILE_REINJECTION_MAX_TOKENS", 50000, min=0)  # cap total re-injected content
 MAX_MEMORY_INDEX_LINES = 200
 MAX_MEMORY_INDEX_BYTES = 25 * 1024
 # Soft warning thresholds (matches Letta-style "approaching cap" guidance,
 # Anthropic CLAUDE.md best practice: target <200 lines, warn at 75%).
-MEMORY_INDEX_WARN_LINES = int(os.environ.get("AGENT_MEMORY_WARN_LINES", "150"))
-MEMORY_INDEX_WARN_BYTES = int(os.environ.get("AGENT_MEMORY_WARN_BYTES", str(18 * 1024)))
-MAX_MEMORY_PROMPT_CHARS = int(os.environ.get("AGENT_MAX_MEMORY_PROMPT_CHARS", "10000"))
+MEMORY_INDEX_WARN_LINES = _int_env("AGENT_MEMORY_WARN_LINES", 150, min=0)
+MEMORY_INDEX_WARN_BYTES = _int_env("AGENT_MEMORY_WARN_BYTES", 18 * 1024, min=0)
+MAX_MEMORY_PROMPT_CHARS = _int_env("AGENT_MAX_MEMORY_PROMPT_CHARS", 10000, min=0)
 CHARS_PER_TOKEN = 4
 
 # Session persistence
@@ -120,8 +222,8 @@ SESSIONS_DIR = os.path.join(PROJECT_ROOT, "data", "sessions")
 
 # ─── Skills ───────────────────────────────────────────────────────────────────
 
-MAX_INSTRUCTIONS_CHARS = int(os.environ.get("AGENT_MAX_SKILL_CHARS", "8000"))
-MAX_RESOURCE_CHARS = int(os.environ.get("AGENT_MAX_RESOURCE_CHARS", "10000"))
+MAX_INSTRUCTIONS_CHARS = _int_env("AGENT_MAX_SKILL_CHARS", 8000, min=100)
+MAX_RESOURCE_CHARS = _int_env("AGENT_MAX_RESOURCE_CHARS", 10000, min=100)
 # NOTE: there is NO skill router — not per-turn, not elsewhere.  The main
 # model sees the skill catalog in the system prompt and self-activates via
 # the manage_skills tool (progressive disclosure, same pattern Claude Code
@@ -132,8 +234,7 @@ MAX_RESOURCE_CHARS = int(os.environ.get("AGENT_MAX_RESOURCE_CHARS", "10000"))
 
 # ─── Web Fetch ────────────────────────────────────────────────────────────────
 
-WEB_FETCH_DEFAULT_MAX_LENGTH = int(os.environ.get("WEB_FETCH_MAX_LENGTH", "8000"))
-WEB_FETCH_MIN_CONTENT_LENGTH = 50
+WEB_FETCH_DEFAULT_MAX_LENGTH = _int_env("WEB_FETCH_MAX_LENGTH", 8000, min=100)
 
 # ─── File constants ───────────────────────────────────────────────────────────
 
