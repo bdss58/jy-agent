@@ -24,13 +24,16 @@ CLI::
     .venv/bin/python -m jyagent.tools.macos.clipboard info
     .venv/bin/python -m jyagent.tools.macos.clipboard verify-image  # exit 0 iff PNGf on clipboard
 
-WARNING — text clobbers image
------------------------------
+WARNING — text clobbers image, and image-identity is not introspectable
+-----------------------------------------------------------------------
 Pasting text to the clipboard (e.g. the name of the contact you're searching
 for) REPLACES any image that was there. Always re-load the image to the
 clipboard AFTER any text-paste step and BEFORE the ⌘V that commits the
-attachment. :func:`ensure_image_on_clipboard` below is the idempotent form
-that checks first and reloads only if needed.
+attachment. :func:`ensure_image_on_clipboard` does this unconditionally —
+it always re-loads, because macOS gives no cheap way to confirm "the image
+currently on the clipboard is the SAME image as ``path``" (only its
+NSPasteboard type and byte count). Short-circuiting on "any image present"
+would happily paste the wrong attachment from a previous step.
 """
 
 from __future__ import annotations
@@ -71,12 +74,17 @@ def set_image_clipboard(path: str | Path) -> None:
     p = Path(path).expanduser().resolve()
     if not p.exists():
         raise ClipboardError(f"image file not found: {p}")
-    # NOTE: POSIX-path alias coercion is the one that reliably round-trips
-    # into PNGf on macOS 12+. ``read POSIX file "..." as «class PNGf»`` in a
-    # single read works too, but tripping up on the alias form is less common.
+    # AppleScript string literal: backslash is the escape char, double-quote
+    # closes the string. Both can occur in legitimate macOS pathnames (e.g.
+    # ``/tmp/foo "bar".png`` or a path containing ``\``), so escape them
+    # before interpolation. Newlines / control chars are illegal in macOS
+    # pathnames per POSIX, so we only need to handle these two.
+    posix = str(p).replace("\\", "\\\\").replace('"', '\\"')
+    # NOTE: POSIX-path coercion is the one that reliably round-trips into
+    # PNGf on macOS 12+.
     script = (
         f'set the clipboard to '
-        f'(read (POSIX file "{p}") as «class PNGf»)'
+        f'(read (POSIX file "{posix}") as «class PNGf»)'
     )
     _osascript(script)
 
@@ -120,18 +128,26 @@ def clipboard_has_image() -> bool:
 
 
 def ensure_image_on_clipboard(path: str | Path) -> None:
-    """Load image if the clipboard doesn't already contain a pasteable image.
+    """Load ``path`` onto the clipboard as a PNGf image, ALWAYS.
 
-    Idempotent. Safe to call right before ⌘V to guarantee the paste will
-    land as an image attachment and not as stale text.
+    Why not short-circuit when an image is already there? Because macOS gives
+    us no cheap, reliable way to ask "is the image currently on the clipboard
+    the SAME image as ``path``?" — ``clipboard info`` only reports types and
+    byte counts, not a content hash. A short-circuit on "any image present"
+    would happily leave a stale attachment from a previous step in place and
+    paste the wrong file (e.g. yesterday's screenshot instead of today's
+    generated image). For send/forward workflows that's a wrong-recipient-
+    grade bug, so we re-load unconditionally and then verify.
+
+    Idempotent in the sense that calling it twice with the same path is
+    safe; NOT idempotent in the sense of "skip work if cached" — that
+    optimization is unsafe here.
     """
-    if clipboard_has_image():
-        return
     set_image_clipboard(path)
     if not clipboard_has_image():
         raise ClipboardError(
-            f"tried to load {path} as image but clipboard still has no image. "
-            f"Current info: {clipboard_info()}"
+            f"tried to load {path} as image but clipboard still has no "
+            f"pasteable image. Current info: {clipboard_info()}"
         )
 
 
@@ -158,7 +174,9 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     sp_v = sub.add_parser("verify-image")
     sp_v.add_argument(
         "--reload", metavar="PATH", default=None,
-        help="If no image is present, reload from this path and re-verify.",
+        help=("If set, (re)load PATH onto the clipboard as PNGf and verify "
+              "an image is present. Always overwrites — see "
+              "ensure_image_on_clipboard for why."),
     )
 
     args = p.parse_args(argv)
