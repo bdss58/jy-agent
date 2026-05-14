@@ -1,18 +1,26 @@
 ---
 name: codex-cli
 description: >-
-  Delegate tasks to Codex CLI — coding, code review, image/vision analysis, and
-  structured output. Use this skill whenever the user explicitly asks for Codex,
-  Codex CLI, `codex exec`, `codex review`, or a Codex-specific workflow such as
-  "delegate to Codex", "review with Codex", or "use Codex to analyze this repo".
+  Delegate tasks to Codex CLI — design/planning consultation, coding, code
+  review, image/vision analysis, and structured output. Use this skill whenever
+  the user explicitly asks for Codex, Codex CLI, `codex exec`, `codex review`,
+  or a Codex-specific workflow such as "delegate to Codex", "review with
+  Codex", or "use Codex to analyze this repo". ALSO TRIGGER PROACTIVELY on
+  DESIGN / PLANNING tasks before non-trivial implementation — the user has
+  stated a durable preference that Codex should be consulted during design and
+  planning, not just review. Trigger verbs: "plan this", "design X", "how
+  should I architect Y", "sketch an approach for", "what's the best way to
+  structure", "API design", "schema design", "refactor plan", "migration
+  plan", "compare approaches", "second opinion on this plan". Workflow: draft
+  a short plan, then `codex exec` it for a second opinion BEFORE coding.
   Also TRIGGER on image/vision tasks: "analyze this image", "describe this
   screenshot", "what's in this picture", "read this diagram/chart", "compare
   these screenshots" — because jy-agent has no native vision and Codex provides
   it via the `-i` flag. TRIGGER on: "use Codex", "Codex CLI", "codex exec",
-  "codex review", "delegate to Codex", "analyze/describe image/screenshot",
-  "what's in this image", "read this chart/diagram". DO NOT TRIGGER on: generic
-  coding tasks without Codex mention, trivial direct edits, or requests that
-  explicitly ask for Claude or another agent.
+  "codex review", "delegate to Codex", "plan/design/architect", "second
+  opinion", "analyze/describe image/screenshot", "what's in this image", "read
+  this chart/diagram". DO NOT TRIGGER on: trivial direct edits, one-line fixes,
+  reading files, or requests that explicitly ask for Claude or another agent.
 metadata:
   author: jy-agent
   version: "2.0"
