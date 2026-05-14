@@ -11,11 +11,18 @@ description: >-
   "forward to my WeChat", "post to WeChat Mac". DO NOT TRIGGER on: WeChat
   web/mobile, WeChat work/企业微信, reading existing WeChat messages
   (the AX tree exposes nothing — there is no read path), or any other
-  Mac-app automation (write a new skill or use the macos tool modules
+  Mac-app automation (write a new skill or use the jyagent.macos library
   directly).
+compatibility: >-
+  macOS 13+ (Retina @2x display assumed). Requires WeChat for Mac running
+  and signed in, the jyagent.macos library importable on PYTHONPATH (ships
+  with jy-agent; see scripts/profiles.py for the WeChat-specific row
+  profile), pyobjc-framework-Quartz, and Pillow. macOS TCC grants required
+  on the launching terminal: Privacy & Security → Automation (WeChat +
+  System Events) AND Privacy & Security → Accessibility.
 metadata:
   author: jy-agent
-  version: "1.0"
+  version: "1.1"
   platform: macos
   app: WeChat for Mac
 ---
@@ -27,7 +34,10 @@ exposes only the 3 traffic-light buttons. The only reliable automation path
 is **clipboard → ⌘F search → pixel-structural row detection → Quartz
 coordinate click → clipboard reload → ⌘V → user-confirmed Return**.
 
-All the heavy lifting lives in `jyagent.tools.macos.*`. This skill is the
+Generic Mac UI primitives live in `jyagent.macos.*` (mouse, keys, clipboard,
+screencap, canvas_rows). The WeChat-specific row-classification profile
+lives next to this skill in `scripts/profiles.py` — so a WeChat reskin is a
+one-file fix here, not a change to the shared library. This skill is the
 checklist that orchestrates them and surfaces every gotcha at decision time.
 
 > **Safety rail (non-negotiable)**: NEVER press the final Return on the
@@ -85,19 +95,19 @@ The text itself is the payload — nothing to prepare.
 ## Step 2 — Bring WeChat to the Front
 
 ```bash
-.venv/bin/python -m jyagent.tools.macos.keys activate WeChat
+.venv/bin/python -m jyagent.macos.keys activate WeChat
 sleep 0.5
-.venv/bin/python -m jyagent.tools.macos.keys keystroke 1 --cmd   # ⌘1 = Chats tab
+.venv/bin/python -m jyagent.macos.keys keystroke 1 --cmd   # ⌘1 = Chats tab
 sleep 0.3
 ```
 
 ## Step 3 — Open the Search Panel and Type the Contact Name
 
 ```bash
-.venv/bin/python -m jyagent.tools.macos.clipboard set-text "<contact name>"
-.venv/bin/python -m jyagent.tools.macos.keys keystroke f --cmd   # ⌘F
+.venv/bin/python -m jyagent.macos.clipboard set-text "<contact name>"
+.venv/bin/python -m jyagent.macos.keys keystroke f --cmd   # ⌘F
 sleep 0.4
-.venv/bin/python -m jyagent.tools.macos.keys keystroke v --cmd   # ⌘V (paste name)
+.venv/bin/python -m jyagent.macos.keys keystroke v --cmd   # ⌘V (paste name)
 sleep 1.6                                                         # let dropdown render
 ```
 
@@ -125,9 +135,18 @@ osascript -e '
   end tell'
 # → "222,92,368,518"  (or similar; capture these as $PX $PY $PW $PH)
 
-# 2. Capture and classify.
-.venv/bin/python -m jyagent.tools.macos.screencap region $PX $PY $PW $PH /tmp/wx-search.png
-.venv/bin/python -m jyagent.tools.macos.canvas_rows /tmp/wx-search.png --only contact --json
+# 2. Capture and classify. The WeChat-specific profile lives next to this
+#    skill in scripts/profiles.py — invoke it directly OR pass its path to
+#    the generic canvas_rows CLI; both forms emit identical JSON.
+.venv/bin/python -m jyagent.macos.screencap region $PX $PY $PW $PH /tmp/wx-search.png
+
+# Form A (preferred — skill-local CLI, no --profile flag needed):
+.venv/bin/python skills/wechat-mac-send/scripts/profiles.py /tmp/wx-search.png --only contact --json
+
+# Form B (generic CLI with explicit profile path):
+.venv/bin/python -m jyagent.macos.canvas_rows /tmp/wx-search.png \
+    --profile skills/wechat-mac-send/scripts/profiles.py:WECHAT_SEARCH_PROFILE \
+    --only contact --json
 ```
 
 The JSON output lists every band the classifier labels `contact`. Pick the
@@ -137,7 +156,7 @@ Compute screen coordinates from the band:
 
 ```python
 # image coords come from the JSON above (canvas_rows runs at native Retina)
-from jyagent.tools.macos.canvas_rows import image_y_to_screen_y
+from jyagent.macos.canvas_rows import image_y_to_screen_y
 
 PANEL_PX, PANEL_PY = 222, 92          # from the osascript above (LOGICAL coords)
 PANEL_PW = 368                         # logical width of panel
@@ -156,10 +175,10 @@ each time. The panel position varies with display, theme, and user resize.
 ## Step 5 — Click the Contact and Verify the Header
 
 ```bash
-.venv/bin/python -m jyagent.tools.macos.mouse click "$CLICK_X" "$CLICK_Y"
+.venv/bin/python -m jyagent.macos.mouse click "$CLICK_X" "$CLICK_Y"
 sleep 0.8
 # Capture the main chat window and read the header strip.
-.venv/bin/python -m jyagent.tools.macos.screencap full /tmp/wx-after-click.png
+.venv/bin/python -m jyagent.macos.screencap full /tmp/wx-after-click.png
 ```
 
 **Verify** the chat header shows the intended recipient. Two options:
@@ -178,24 +197,24 @@ ambiguity.
 ```bash
 # IMPORTANT: the search text we pasted in Step 3 clobbered any prior
 # clipboard contents. Always reload the image RIGHT BEFORE ⌘V.
-.venv/bin/python -m jyagent.tools.macos.clipboard set-image /path/to/image.png
-.venv/bin/python -m jyagent.tools.macos.clipboard verify-image   # exit 0 iff PNGf present
-.venv/bin/python -m jyagent.tools.macos.keys keystroke v --cmd    # ⌘V → image stages in input
+.venv/bin/python -m jyagent.macos.clipboard set-image /path/to/image.png
+.venv/bin/python -m jyagent.macos.clipboard verify-image   # exit 0 iff PNGf present
+.venv/bin/python -m jyagent.macos.keys keystroke v --cmd    # ⌘V → image stages in input
 sleep 0.6
 ```
 
 ### Text case
 
 ```bash
-.venv/bin/python -m jyagent.tools.macos.clipboard set-text "<message body>"
-.venv/bin/python -m jyagent.tools.macos.keys keystroke v --cmd
+.venv/bin/python -m jyagent.macos.clipboard set-text "<message body>"
+.venv/bin/python -m jyagent.macos.keys keystroke v --cmd
 sleep 0.3
 ```
 
 ## Step 7 — Final Verification and User Confirmation
 
 ```bash
-.venv/bin/python -m jyagent.tools.macos.screencap full /tmp/wx-staged.png
+.venv/bin/python -m jyagent.macos.screencap full /tmp/wx-staged.png
 ```
 
 Show the user a summary that includes:
@@ -214,9 +233,9 @@ incident.
 Only after explicit confirmation:
 
 ```bash
-.venv/bin/python -m jyagent.tools.macos.keys keycode 36   # Return
+.venv/bin/python -m jyagent.macos.keys keycode 36   # Return
 sleep 0.5
-.venv/bin/python -m jyagent.tools.macos.screencap full /tmp/wx-sent.png
+.venv/bin/python -m jyagent.macos.screencap full /tmp/wx-sent.png
 ```
 
 Report back to the user with the post-send screenshot.
@@ -247,11 +266,13 @@ Report back to the user with the post-send screenshot.
 
 ## See Also
 
-- `jyagent/tools/macos/canvas_rows.py` — the pixel classifier (pure PIL)
-- `jyagent/tools/macos/mouse.py` — Quartz click synthesis
-- `jyagent/tools/macos/clipboard.py` — PNGf clipboard helpers
-- `jyagent/tools/macos/keys.py` — AppleScript keystroke + key-code dispatch
-- `jyagent/tools/macos/screencap.py` — region/full screenshot wrappers
+- `jyagent/macos/canvas_rows.py` — the pixel classifier (pure PIL, generic)
+- `jyagent/macos/mouse.py` — Quartz click synthesis
+- `jyagent/macos/clipboard.py` — PNGf clipboard helpers
+- `jyagent/macos/keys.py` — AppleScript keystroke + key-code dispatch
+- `jyagent/macos/screencap.py` — region/full screenshot wrappers
+- `scripts/profiles.py` — **the WeChat-specific row profile** (lives with
+  this skill, not in the generic library — calibration drift is local)
 - `tests/test_macos_canvas_rows.py` — classifier behavior tests
 - `data/memory/topics/wechat-mac-automation.md` — historical playbook
   (this skill is the operational form of it)

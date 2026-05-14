@@ -1,14 +1,11 @@
-"""Tests for jyagent.tools.macos.canvas_rows.
+"""Tests for jyagent.macos.canvas_rows.
 
-No macOS dependency — pure PIL image synthesis. We fabricate a tiny
-"search panel" image that contains:
-
-- A query-suggestion row (green + black text, height ≈ 22 img-px)
-- A section header (grey-only, short)
-- A real contact row (green name, height ≈ 70 img-px)
-- A second suggestion row (sanity: multiple same-label rows)
-
-and verify ``detect_bands`` + ``classify_bands`` identify them correctly.
+No macOS dependency — pure PIL image synthesis. We fabricate panels and
+verify ``detect_bands`` + ``classify_bands`` identify rows correctly. The
+library is generic; app-specific profiles live with their consuming skill,
+so this test file uses a small *synthetic* profile defined inline. The
+real WeChat profile is exercised separately in
+``tests/test_wechat_search_profile.py``.
 """
 
 from __future__ import annotations
@@ -19,11 +16,10 @@ pytest.importorskip("PIL")
 
 from PIL import Image, ImageDraw
 
-from jyagent.tools.macos.canvas_rows import (
+from jyagent.macos.canvas_rows import (
     Band,
     RowProfile,
     RowRule,
-    WECHAT_SEARCH_PROFILE,
     classify_bands,
     detect_bands,
     image_x_to_screen_x,
@@ -79,6 +75,47 @@ def test_image_to_screen_coords_halve_on_retina():
     assert image_y_to_screen_y(144, 92, scale=1) == 236
 
 
+# ─── Synthetic profile used by detection/classification tests ───────────────
+#
+# We deliberately do NOT import any app-specific profile here — the library
+# must work with any profile shape. This stand-in mimics WeChat's row types
+# (suggestion / section_header / contact) using the same generic predicates,
+# which keeps the existing test fixtures meaningful while proving the
+# library has no app-specific knowledge.
+
+GENERIC_TEST_PROFILE = RowProfile(
+    name="generic_test",
+    text_x_start=110,
+    text_x_end=700,
+    x_step=3,
+    text_darkness_threshold=180,
+    band_merge_gap=3,
+    signatures={
+        "green": is_wechat_green,
+        "black": is_near_black_text,
+        "grey":  is_mid_grey_text,
+    },
+    rules=(
+        RowRule(
+            label="contact",
+            required_signatures=frozenset({"green"}),
+            height_min=50, height_max=85,
+        ),
+        RowRule(
+            label="suggestion",
+            required_signatures=frozenset({"green", "black"}),
+            height_min=15, height_max=30,
+        ),
+        RowRule(
+            label="section_header",
+            required_signatures=frozenset({"grey"}),
+            forbidden_signatures=frozenset({"green", "black"}),
+            height_min=8, height_max=22,
+        ),
+    ),
+)
+
+
 # ─── Band detection fixture ──────────────────────────────────────────────────
 
 
@@ -89,7 +126,7 @@ def _paint_row(draw: ImageDraw.ImageDraw, *, y: int, height: int, color,
 
 
 @pytest.fixture
-def fake_wechat_panel(tmp_path):
+def fake_panel(tmp_path):
     """Synthesize a 736×520 panel with one of every expected row type."""
     W, H = 736, 520
     img = Image.new("RGB", (W, H), (255, 255, 255))
@@ -138,8 +175,8 @@ def fake_wechat_panel(tmp_path):
 # ─── detect_bands ────────────────────────────────────────────────────────────
 
 
-def test_detect_bands_finds_every_painted_stripe(fake_wechat_panel):
-    bands = detect_bands(fake_wechat_panel, WECHAT_SEARCH_PROFILE)
+def test_detect_bands_finds_every_painted_stripe(fake_panel):
+    bands = detect_bands(fake_panel, GENERIC_TEST_PROFILE)
     # We painted 5 visually-distinct bands (two contact rows each merged
     # from their 3 sub-stripes because the gaps are < band_merge_gap=3).
     assert len(bands) == 6, [
@@ -147,8 +184,8 @@ def test_detect_bands_finds_every_painted_stripe(fake_wechat_panel):
     ]
 
 
-def test_detect_bands_aggregates_signatures(fake_wechat_panel):
-    bands = detect_bands(fake_wechat_panel, WECHAT_SEARCH_PROFILE)
+def test_detect_bands_aggregates_signatures(fake_panel):
+    bands = detect_bands(fake_panel, GENERIC_TEST_PROFILE)
     # First band is the y=40 suggestion: must have green AND black.
     first = bands[0]
     assert "green" in first.signatures
@@ -159,7 +196,7 @@ def test_detect_bands_returns_empty_for_blank_image(tmp_path):
     blank = Image.new("RGB", (600, 400), (255, 255, 255))
     path = tmp_path / "blank.png"
     blank.save(path)
-    assert detect_bands(path, WECHAT_SEARCH_PROFILE) == []
+    assert detect_bands(path, GENERIC_TEST_PROFILE) == []
 
 
 def test_detect_bands_respects_text_column_bounds(tmp_path):
@@ -170,42 +207,107 @@ def test_detect_bands_respects_text_column_bounds(tmp_path):
     d.rectangle([10, 50, 80, 80], fill=(0, 0, 0))
     path = tmp_path / "outside.png"
     img.save(path)
-    assert detect_bands(path, WECHAT_SEARCH_PROFILE) == []
+    assert detect_bands(path, GENERIC_TEST_PROFILE) == []
 
 
-# ─── classify_bands with WECHAT_SEARCH_PROFILE ──────────────────────────────
+# ─── classify_bands with the test profile ──────────────────────────────────
 
 
-def test_classify_labels_all_row_types(fake_wechat_panel):
-    bands = detect_bands(fake_wechat_panel, WECHAT_SEARCH_PROFILE)
-    rows = classify_bands(bands, WECHAT_SEARCH_PROFILE)
+def test_classify_labels_all_row_types(fake_panel):
+    bands = detect_bands(fake_panel, GENERIC_TEST_PROFILE)
+    rows = classify_bands(bands, GENERIC_TEST_PROFILE)
     labels = [r.label for r in rows]
 
     assert labels.count("suggestion") == 2
     assert labels.count("section_header") == 2
     assert labels.count("contact") == 2
-    assert "unknown" not in labels
 
 
-def test_classify_contact_rows_have_expected_height(fake_wechat_panel):
-    bands = detect_bands(fake_wechat_panel, WECHAT_SEARCH_PROFILE)
-    rows = classify_bands(bands, WECHAT_SEARCH_PROFILE)
-    contacts = [r for r in rows if r.label == "contact"]
-    assert len(contacts) == 2
-    for c in contacts:
-        # We painted these as ~70 img-px. Profile allows 50..85.
-        assert 50 <= c.band.height <= 85
+def test_classify_first_match_wins():
+    """If a band matches multiple rules, the FIRST in declaration order wins."""
+    profile = RowProfile(
+        name="ambiguous",
+        text_x_start=0, text_x_end=100,
+        signatures={"green": is_wechat_green},
+        rules=(
+            RowRule(label="first",  required_signatures=frozenset({"green"})),
+            RowRule(label="second", required_signatures=frozenset({"green"})),
+        ),
+    )
+    band = Band(y_start=0, y_end=20, signatures=frozenset({"green"}))
+    rows = classify_bands([band], profile)
+    assert rows[0].label == "first"
 
 
-# ─── Custom RowProfile smoke ────────────────────────────────────────────────
+def test_classify_unknown_label_when_no_rule_matches():
+    profile = RowProfile(
+        name="picky",
+        text_x_start=0, text_x_end=100,
+        signatures={"green": is_wechat_green},
+        rules=(
+            RowRule(
+                label="needs_red",
+                required_signatures=frozenset({"red"}),
+            ),
+        ),
+    )
+    band = Band(y_start=0, y_end=20, signatures=frozenset({"green"}))
+    rows = classify_bands([band], profile)
+    assert rows[0].label == "unknown"
 
 
-def test_custom_profile_round_trip(tmp_path):
-    """A caller can build its own RowProfile for a different app."""
-    # Image: one single 30-px-tall dark stripe.
-    img = Image.new("RGB", (400, 200), (255, 255, 255))
+def test_classify_forbidden_signatures_block_match():
+    """A rule with a forbidden signature must reject bands containing it."""
+    profile = RowProfile(
+        name="forbid",
+        text_x_start=0, text_x_end=100,
+        signatures={
+            "green": is_wechat_green,
+            "black": is_near_black_text,
+        },
+        rules=(
+            RowRule(
+                label="green_only",
+                required_signatures=frozenset({"green"}),
+                forbidden_signatures=frozenset({"black"}),
+            ),
+        ),
+    )
+    # Band with both green AND black — must fall through to "unknown".
+    band = Band(y_start=0, y_end=20, signatures=frozenset({"green", "black"}))
+    rows = classify_bands([band], profile)
+    assert rows[0].label == "unknown"
+
+
+def test_classify_height_constraints_apply():
+    """A rule with height bounds must reject bands of the wrong height."""
+    profile = RowProfile(
+        name="height",
+        text_x_start=0, text_x_end=100,
+        signatures={"green": is_wechat_green},
+        rules=(
+            RowRule(
+                label="tall",
+                required_signatures=frozenset({"green"}),
+                height_min=50, height_max=85,
+            ),
+        ),
+    )
+    too_short = Band(y_start=0, y_end=10, signatures=frozenset({"green"}))
+    just_right = Band(y_start=0, y_end=60, signatures=frozenset({"green"}))
+    rows = classify_bands([too_short, just_right], profile)
+    assert [r.label for r in rows] == ["unknown", "tall"]
+
+
+# ─── Custom profile (proves the abstraction is reusable) ────────────────────
+
+
+def test_custom_profile_with_different_signatures(tmp_path):
+    """A caller can define their own predicates and rules from scratch."""
+    img = Image.new("RGB", (400, 100), (255, 255, 255))
     d = ImageDraw.Draw(img)
-    d.rectangle([50, 40, 300, 70], fill=(10, 10, 10))
+    # Paint a single dark band that matches only the custom predicate.
+    d.rectangle([60, 30, 200, 60], fill=(50, 50, 50))
     path = tmp_path / "custom.png"
     img.save(path)
 

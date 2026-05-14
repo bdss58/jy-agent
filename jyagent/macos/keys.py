@@ -7,7 +7,7 @@ non-AppKit apps (Electron, custom canvases, games) that AX cannot read.
 
 Python::
 
-    from jyagent.tools.macos.keys import keystroke, key_code, activate
+    from jyagent.macos.keys import keystroke, key_code, activate
     activate("WeChat")
     keystroke("f", cmd=True)        # ⌘F
     keystroke("v", cmd=True)        # ⌘V
@@ -16,10 +16,10 @@ Python::
 
 CLI::
 
-    python -m jyagent.tools.macos.keys activate WeChat
-    python -m jyagent.tools.macos.keys keystroke f --cmd
-    python -m jyagent.tools.macos.keys keycode 36
-    python -m jyagent.tools.macos.keys type "hello world"
+    python -m jyagent.macos.keys activate WeChat
+    python -m jyagent.macos.keys keystroke f --cmd
+    python -m jyagent.macos.keys keycode 36
+    python -m jyagent.macos.keys type "hello world"
 
 Common key codes::
 
@@ -114,7 +114,7 @@ def key_code(
 def type_text(text: str) -> None:
     """Type a string by keystroke. Slow but works in any text field.
 
-    Prefer :func:`jyagent.tools.macos.clipboard.set_text_clipboard` + ⌘V
+    Prefer :func:`jyagent.macos.clipboard.set_text_clipboard` + ⌘V
     for anything more than a few characters — System Events keystroke is
     slow and can drop characters under load.
     """
@@ -137,7 +137,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     import argparse
 
     p = argparse.ArgumentParser(
-        prog="python -m jyagent.tools.macos.keys",
+        prog="python -m jyagent.macos.keys",
         description="Send keystrokes / key codes to the frontmost macOS app.",
     )
     sub = p.add_subparsers(dest="subcmd", required=True)

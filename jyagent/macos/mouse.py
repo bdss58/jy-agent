@@ -2,13 +2,13 @@
 
 Usage (Python)::
 
-    from jyagent.tools.macos.mouse import click
+    from jyagent.macos.mouse import click
     click(406, 365)
 
 Usage (CLI, for skill bodies that prefer run_shell)::
 
-    .venv/bin/python -m jyagent.tools.macos.mouse click 406 365
-    .venv/bin/python -m jyagent.tools.macos.mouse move 406 365
+    .venv/bin/python -m jyagent.macos.mouse click 406 365
+    .venv/bin/python -m jyagent.macos.mouse move 406 365
 
 Requires ``pyobjc-framework-Quartz``. Install with::
 
@@ -18,7 +18,7 @@ Requires ``pyobjc-framework-Quartz``. Install with::
 Coordinates are **logical screen** coordinates (the same units AppKit uses
 for window frames), NOT image pixels. On Retina displays, divide an image-y
 from a ``screencapture`` PNG by 2 (and add the panel origin) — see
-:func:`jyagent.tools.macos.canvas_rows.image_y_to_screen_y`.
+:func:`jyagent.macos.canvas_rows.image_y_to_screen_y`.
 
 TCC permissions required (one-time):
 
@@ -115,7 +115,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     import argparse
 
     p = argparse.ArgumentParser(
-        prog="python -m jyagent.tools.macos.mouse",
+        prog="python -m jyagent.macos.mouse",
         description="Synthesize mouse events on macOS via Quartz.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)

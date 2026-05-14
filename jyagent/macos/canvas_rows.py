@@ -6,7 +6,7 @@ locate clickable rows deterministically by scanning a screenshot for text
 "bands" and classifying each by color signatures + band height.
 
 This module is **pure PIL** — no Quartz, no macOS-only deps. The screenshot
-itself is captured separately (see :mod:`jyagent.tools.macos.screencap` for
+itself is captured separately (see :mod:`jyagent.macos.screencap` for
 the macOS-specific capture wrapper).
 
 Vocabulary
@@ -29,13 +29,24 @@ Typical use
 -----------
 .. code-block:: python
 
-    from jyagent.tools.macos.canvas_rows import (
-        detect_bands, classify_bands, WECHAT_SEARCH_PROFILE,
+    from jyagent.macos.canvas_rows import detect_bands, classify_bands
+    # App-specific profile lives with the skill, not here. Skill scripts/
+    # dirs aren't Python packages, so import by file path:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "wechat_profile",
+        "skills/wechat-mac-send/scripts/profiles.py",
     )
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
 
-    bands = detect_bands("/tmp/search-panel.png")
-    rows = classify_bands(bands, WECHAT_SEARCH_PROFILE)
+    bands = detect_bands("/tmp/search-panel.png", mod.WECHAT_SEARCH_PROFILE)
+    rows = classify_bands(bands, mod.WECHAT_SEARCH_PROFILE)
     contact_rows = [r for r in rows if r.label == "contact"]
+
+App-specific profiles do NOT belong in this module — they belong with
+the skill that consumes them. See ``skills/wechat-mac-send/scripts/
+profiles.py`` for the canonical example. The CLI ``--profile`` flag
+accepts both ``module:attr`` and ``path/to/file.py:attr`` forms.
 """
 
 from __future__ import annotations
@@ -287,52 +298,53 @@ def image_x_to_screen_x(
     return panel_origin_x + image_x / scale
 
 
-# ─── Built-in profile: WeChat for Mac search panel ───────────────────────────
-#
-# Calibrated 2026-05-13 on macOS 14, WeChat 4.x, default theme, English+CJK
-# UI. Search panel size: 368×518 logical (= 736×1036 image px at @2x). The
-# real-contact row is 67-72 image-px tall (2 lines: name on top, last-msg
-# preview on bottom). Query-suggestion rows are 22 image-px tall (1 line).
-# Section headers ("功能", "群聊", "相关搜索") are grey-only and short.
-
-WECHAT_SEARCH_PROFILE = RowProfile(
-    name="wechat_search_panel",
-    text_x_start=110,   # skip icon / avatar column
-    text_x_end=700,     # leave a margin past the right edge of text column
-    x_step=3,
-    text_darkness_threshold=180,
-    band_merge_gap=3,
-    signatures={
-        "green": is_wechat_green,
-        "black": is_near_black_text,
-        "grey":  is_mid_grey_text,
-    },
-    rules=(
-        # Real contact: tall row, with green-highlighted name + grey preview.
-        # Height range covers single-line (no preview yet) up to 2-line.
-        RowRule(
-            label="contact",
-            required_signatures=frozenset({"green"}),
-            height_min=50, height_max=85,
-        ),
-        # Query suggestion: short row, mixes green (the query) + black (suffix).
-        RowRule(
-            label="suggestion",
-            required_signatures=frozenset({"green", "black"}),
-            height_min=15, height_max=30,
-        ),
-        # Section header: short, grey-only, NO green, NO black.
-        RowRule(
-            label="section_header",
-            required_signatures=frozenset({"grey"}),
-            forbidden_signatures=frozenset({"green", "black"}),
-            height_min=8, height_max=22,
-        ),
-    ),
-)
-
-
 # ─── CLI shim ────────────────────────────────────────────────────────────────
+
+
+def _import_profile(spec: str) -> "RowProfile":
+    """Import a ``RowProfile`` by ``module:attr`` *or* ``path/to/file.py:attr``.
+
+    Two forms are supported because skill ``scripts/`` directories under
+    ``skills/<name>/`` are NOT Python packages (the hyphen in skill names
+    rules that out, and the agentskills.io spec does not require them to
+    be importable). For those, pass the filesystem path::
+
+        --profile skills/wechat-mac-send/scripts/profiles.py:WECHAT_SEARCH_PROFILE
+
+    For a normal in-package profile (e.g. shipped inside ``jyagent.macos``),
+    use the dotted form::
+
+        --profile some.dotted.module:ATTR
+    """
+    import importlib
+    import importlib.util
+    from pathlib import Path
+
+    if ":" not in spec:
+        raise SystemExit(
+            f"--profile must be 'module:attr' or 'path/to/file.py:attr', "
+            f"got {spec!r}."
+        )
+    head, attr = spec.rsplit(":", 1)
+
+    looks_like_path = head.endswith(".py") or "/" in head or head.startswith(".")
+    if looks_like_path:
+        path = Path(head).expanduser().resolve()
+        if not path.exists():
+            raise SystemExit(f"profile file not found: {path}")
+        mod_name = f"_canvas_rows_profile_{path.stem}"
+        m_spec = importlib.util.spec_from_file_location(mod_name, path)
+        if m_spec is None or m_spec.loader is None:  # pragma: no cover
+            raise SystemExit(f"could not load profile from {path}")
+        mod = importlib.util.module_from_spec(m_spec)
+        m_spec.loader.exec_module(mod)
+    else:
+        mod = importlib.import_module(head)
+
+    try:
+        return getattr(mod, attr)
+    except AttributeError as exc:  # pragma: no cover
+        raise SystemExit(f"profile {spec}: {exc}") from exc
 
 
 def _cli(argv: Sequence[str] | None = None) -> int:
@@ -341,14 +353,22 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     import sys
 
     p = argparse.ArgumentParser(
-        prog="python -m jyagent.tools.macos.canvas_rows",
-        description="Classify rows in a Mac-app screenshot by pixel signatures.",
+        prog="python -m jyagent.macos.canvas_rows",
+        description=(
+            "Classify rows in a Mac-app screenshot by pixel signatures. "
+            "App-specific row profiles are imported by dotted path — they "
+            "live with the consuming skill, not in this generic library."
+        ),
     )
     p.add_argument("image", help="Path to PNG screenshot (Retina @2x).")
     p.add_argument(
-        "--profile", default="wechat_search",
-        choices=["wechat_search"],
-        help="Which built-in profile to apply. (Add more by editing this module.)",
+        "--profile", required=True,
+        help=(
+            "Either 'module:attr' (importable dotted path) or "
+            "'path/to/file.py:attr' (filesystem path to a Python file). "
+            "Example: "
+            "skills/wechat-mac-send/scripts/profiles.py:WECHAT_SEARCH_PROFILE"
+        ),
     )
     p.add_argument(
         "--only", default=None,
@@ -360,7 +380,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    profile = {"wechat_search": WECHAT_SEARCH_PROFILE}[args.profile]
+    profile = _import_profile(args.profile)
     bands = detect_bands(args.image, profile)
     rows = classify_bands(bands, profile)
     if args.only:

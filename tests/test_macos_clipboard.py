@@ -1,9 +1,9 @@
-"""Tests for jyagent.tools.macos.clipboard.
+"""Tests for jyagent.macos.clipboard.
 
 These tests are pure-Python: we monkeypatch the ``_osascript`` shellout (and
 ``subprocess.run`` for ``pbcopy``) so the test suite is portable and fast.
 Real macOS-only behavior (NSPasteboard round-trip) is implicitly covered by
-the manual ``python -m jyagent.tools.macos.clipboard`` smoke runs.
+the manual ``python -m jyagent.macos.clipboard`` smoke runs.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from jyagent.tools.macos import clipboard as cb
+from jyagent.macos import clipboard as cb
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────

@@ -11,9 +11,9 @@ Why a module instead of inlining ``screencapture`` calls in skill bodies?
 
 CLI::
 
-    .venv/bin/python -m jyagent.tools.macos.screencap full /tmp/full.png
-    .venv/bin/python -m jyagent.tools.macos.screencap region 222 92 368 518 /tmp/panel.png
-    .venv/bin/python -m jyagent.tools.macos.screencap window /tmp/win.png   # interactive: click target
+    .venv/bin/python -m jyagent.macos.screencap full /tmp/full.png
+    .venv/bin/python -m jyagent.macos.screencap region 222 92 368 518 /tmp/panel.png
+    .venv/bin/python -m jyagent.macos.screencap window /tmp/win.png   # interactive: click target
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     import argparse
 
     p = argparse.ArgumentParser(
-        prog="python -m jyagent.tools.macos.screencap",
+        prog="python -m jyagent.macos.screencap",
         description="Thin wrappers around macOS screencapture.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -10,7 +10,7 @@ the PNGf class coercion and sets the clipboard directly.
 
 Python::
 
-    from jyagent.tools.macos.clipboard import (
+    from jyagent.macos.clipboard import (
         set_image_clipboard, set_text_clipboard, clipboard_info,
     )
     set_image_clipboard("/tmp/cat.png")
@@ -19,10 +19,10 @@ Python::
 
 CLI::
 
-    .venv/bin/python -m jyagent.tools.macos.clipboard set-image /tmp/cat.png
-    .venv/bin/python -m jyagent.tools.macos.clipboard set-text "文件传输助手"
-    .venv/bin/python -m jyagent.tools.macos.clipboard info
-    .venv/bin/python -m jyagent.tools.macos.clipboard verify-image  # exit 0 iff PNGf on clipboard
+    .venv/bin/python -m jyagent.macos.clipboard set-image /tmp/cat.png
+    .venv/bin/python -m jyagent.macos.clipboard set-text "文件传输助手"
+    .venv/bin/python -m jyagent.macos.clipboard info
+    .venv/bin/python -m jyagent.macos.clipboard verify-image  # exit 0 iff PNGf on clipboard
 
 WARNING — text clobbers image, and image-identity is not introspectable
 -----------------------------------------------------------------------
@@ -158,7 +158,7 @@ def _cli(argv: Sequence[str] | None = None) -> int:
     import argparse
 
     p = argparse.ArgumentParser(
-        prog="python -m jyagent.tools.macos.clipboard",
+        prog="python -m jyagent.macos.clipboard",
         description="macOS clipboard helpers (image-as-PNGf, text, verify).",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
