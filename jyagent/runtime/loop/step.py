@@ -138,6 +138,18 @@ class RunState:
     prose_tool_call_corrections: int = 0
     max_prose_tool_call_corrections: int = 2
 
+    # Empty-assistant-turn recovery counter (Bug B — see finalize.py and
+    # session ``fe07d3bc-e5dc-49c3-aa7e-5190c2b98b72``, 2026-05-14).
+    # Incremented each time the no-tool branch detects a structurally
+    # empty assistant turn (no visible text, no tool call — typically
+    # caused by an empty extended-thinking block from Anthropic) and
+    # injects a corrective ``[EMPTY_TURN]`` user message instead of
+    # terminating the turn.  Capped at ``max_empty_turn_corrections`` so
+    # a model that legitimately has nothing more to say isn't pestered
+    # in a loop; past the cap we accept the empty turn as terminal.
+    empty_turn_corrections: int = 0
+    max_empty_turn_corrections: int = 2
+
     unpriced_warned: bool = False
     all_text: str = ""
     final_text: str = ""
@@ -276,9 +288,11 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     # Lazy imports break the engine→step→engine cycle without polluting
     # module-load order. Cost: one dict lookup per step (negligible).
     from .finalize import (
+        build_empty_turn_correction,
         build_prose_tool_call_correction,
         finalize_run,
         is_truncated,
+        looks_like_empty_turn,
         looks_like_prose_tool_call,
     )
     from .llm_runner import extract_text as _extract_text
@@ -329,6 +343,49 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
     # Kept inline per codex's review — this is a behavioural branch point,
     # not a helper candidate.
     if not tool_call_blocks:
+        # ── Empty-assistant-turn gate (Bug B — see finalize.py) ───────────
+        #
+        # If the model returned a structurally empty turn — no visible
+        # text and no tool call, e.g. only an empty extended-thinking
+        # block — the no-tool branch would otherwise treat it as a clean
+        # terminal completion.  From the user's perspective this is the
+        # "agent silently halted while running" symptom (session
+        # ``fe07d3bc-e5dc-49c3-aa7e-5190c2b98b72``: last assistant turn
+        # was ``{"type": "thinking", "thinking": "", "signature": ""}``
+        # right after a failing pytest result, leaving the user staring
+        # at nothing for 10 minutes before they typed "continue").
+        #
+        # Remediation: append the (empty) assistant message so the
+        # conversation records that something WAS returned, inject a
+        # short ``[EMPTY_TURN]`` user prompt asking the model to
+        # continue, and run another step.  Capped retries
+        # (``max_empty_turn_corrections``) prevent an infinite loop if
+        # the model genuinely has nothing more to say — past the cap
+        # the loop accepts the empty turn as terminal.
+        #
+        # Ordered BEFORE the prose-tool-call gate: an empty turn matches
+        # neither prose-shaped tool calls nor verification mutations, so
+        # this is the most specific case and gets first dibs.
+        if (
+            looks_like_empty_turn(step_text, tool_call_blocks, final_message)
+            and state.empty_turn_corrections < state.max_empty_turn_corrections
+            and step + 1 < cfg.max_steps
+        ):
+            if trace:
+                trace.add_span(step=step, event_type="empty_turn_correction")
+            # Record the empty turn so the model sees its own (empty)
+            # last message followed by the correction.  Persisting the
+            # empty assistant message also makes the failure visible in
+            # session replay / postmortems instead of being silently
+            # swallowed.
+            messages.append(final_message)
+            messages.append({
+                "role": "user",
+                "content": build_empty_turn_correction(),
+            })
+            state.empty_turn_corrections += 1
+            return StepContinue()
+
         # ── Prose-shaped tool-call gate (Bug A — see finalize.py) ─────────
         #
         # If the assistant text looks like a malformed tool invocation

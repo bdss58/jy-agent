@@ -131,24 +131,162 @@ def build_prose_tool_call_correction() -> str:
     )
 
 
+# ── Empty-assistant-turn detector (Bug B — see session fe07d3bc, 2026-05-14) ─
+#
+# Failure mode: the provider returned a structurally-valid assistant
+# response that nevertheless carried NO visible output — e.g. only an
+# empty extended-thinking block:
+#
+#     {"role": "assistant",
+#      "content": [{"type": "thinking", "thinking": "", "signature": ""}],
+#      "stop_reason": "stop",
+#      "usage": {"output_tokens": 63, ...}}
+#
+# ``extract_text`` (which sums only ``type == "text"`` blocks) yields
+# ``step_text == ""``, ``tool_call_blocks == []``, and the no-tool branch
+# of ``run_step`` accepts it as a clean terminal completion.  From the
+# user's perspective the agent silently halted mid-task right after a
+# tool result — the exact "sudden stop while prompting" symptom from
+# session ``fe07d3bc-e5dc-49c3-aa7e-5190c2b98b72`` (1014 events, last
+# assistant turn at seq=1014 was an empty thinking block).
+#
+# Detector: assistant content has zero non-empty text blocks AND zero
+# tool_use blocks.  Thinking blocks (even non-empty ones) do NOT count as
+# visible output because the user never sees them.  We deliberately do
+# NOT key off ``stop_reason`` — Anthropic, OpenAI, and Gemini all use
+# slightly different terminal strings (``stop`` / ``end_turn`` /
+# ``stop_sequence``), and the symptom is the absence of output, not the
+# reason string.
+#
+# Returning True is purely advisory — caller decides remediation.  Like
+# the prose-tool-call gate the recovery is a one-shot "continue" prompt,
+# bounded by a per-run cap so a model that genuinely has nothing to say
+# isn't pestered forever.
+# Content-block types that the user NEVER sees in the rendered transcript
+# and that therefore do NOT count as "visible output" for the empty-turn
+# detector.  This list is the conservative core of the gate (Codex
+# review, 2026-05-14): if a future provider adds a NEW visible block type
+# (e.g. ``image``, ``citation``, ``ui_card``), we MUST NOT treat a turn
+# carrying only that block as empty — falsely retrying would erase real
+# output and pester the model.  Hence the rule is:
+#
+#   * every block whose ``type`` is in this set → invisible.
+#   * every block whose ``type`` is NOT in this set → visible (don't fire).
+#
+# Keep the set tight.  Add a type here ONLY after confirming end users
+# truly never see it (e.g. it is stripped by the renderer before display).
+_INVISIBLE_BLOCK_TYPES: frozenset[str] = frozenset({
+    "thinking",
+    "redacted_thinking",
+})
+
+
+def looks_like_empty_turn(
+    step_text: str,
+    tool_call_blocks: list,
+    final_message: "Message | dict | None",
+) -> bool:
+    """Detect an assistant turn that produced no visible output AND no tool call.
+
+    Returns True iff:
+
+      * ``tool_call_blocks`` is empty (no structured tool invocation), AND
+      * ``step_text`` (concatenated visible text blocks) is empty or
+        whitespace-only, AND
+      * the assistant ``final_message`` carries no non-empty ``text``
+        content block AND no content block whose ``type`` is OUTSIDE the
+        invisible-types allowlist.  I.e. every present block must be a
+        known-invisible kind (``thinking`` / ``redacted_thinking``) or an
+        empty ``text``.
+
+    The allowlist contract (Codex review, 2026-05-14) is the important
+    half: a future visible block type (e.g. ``image``, ``citation``)
+    must NOT register as empty, because retrying would erase real
+    output.  Unknown block types fall through to "visible" by default,
+    keeping the detector safely on the no-false-fire side.
+
+    Cheap — short-circuits as soon as any visible content is seen.
+    """
+    if tool_call_blocks:
+        return False
+    if step_text and step_text.strip():
+        return False
+    if not isinstance(final_message, dict):
+        # No structured message to inspect (e.g. provider returned a bare
+        # string).  ``step_text`` was already empty → still an empty turn.
+        return True
+    content = final_message.get("content")
+    if not isinstance(content, list):
+        # Same reasoning as above: no structured content list means we
+        # only have the (already-empty) ``step_text`` to go on.
+        return True
+    for block in content:
+        if not isinstance(block, dict):
+            # A non-dict block is an unknown shape — treat as visible to
+            # stay on the safe side (don't fire).
+            return False
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text", "")
+            if isinstance(text, str) and text.strip():
+                return False
+            # Empty text block → invisible, keep scanning.
+            continue
+        if btype in _INVISIBLE_BLOCK_TYPES:
+            continue
+        # Unknown / non-text / non-thinking block type → treat as
+        # visible.  This is the Codex-review guard against silently
+        # discarding future provider features.
+        return False
+    return True
+
+
+# Sentinel marker for the corrective user message injected when an empty
+# assistant turn is detected.  Public so ``step.py`` can compose the
+# message and ``strip_dangling_verification`` can recognize an unanswered
+# correction at terminal cleanup time.
+EMPTY_TURN_MARKER = "[EMPTY_TURN]"
+
+
+def build_empty_turn_correction() -> str:
+    """Build the corrective user message injected when Bug B fires.
+
+    Terse on purpose — verbose prompts here just steal tokens from the
+    retry.  Starts with ``EMPTY_TURN_MARKER`` so the gate can detect
+    repeats and ``strip_dangling_verification`` can drop a dangling one.
+    """
+    return (
+        f"{EMPTY_TURN_MARKER} Your previous response was empty — no visible "
+        "text and no tool call.  Please continue from where you left off: "
+        "either invoke the next tool, or summarize the result so the user "
+        "can see it."
+    )
+
+
 def strip_dangling_verification(messages: "list[Message]") -> None:
-    """Remove a trailing unanswered ``[VERIFICATION]`` user message in-place.
+    """Remove a trailing unanswered recovery-marker user message in-place.
 
-    The verification gate appends a user prompt asking the model to self-
-    check before returning.  If the loop exits before the model replies
-    (max_steps, KeyboardInterrupt, uncaught exception), that unanswered user
-    message would leak into the persisted session and poison the next turn.
+    Historically scoped to ``[VERIFICATION]`` — hence the name, which is
+    retained for call-site stability.  The function now strips any of
+    three recovery-marker families, all of which share the same failure
+    mode (a corrective user prompt was injected and the loop terminated
+    before the model replied) and the same fix (drop the dangling tail):
 
-    Also strips a trailing unanswered ``[MALFORMED_TOOL_CALL]`` user
-    message — same failure mode (injected by the prose-tool-call gate and
-    never answered because the run terminated before the next step),
-    same fix (drop it from the persisted tail).
+      * ``[VERIFICATION]`` — verification gate self-check prompt.
+      * ``[MALFORMED_TOOL_CALL]`` — Bug A: prose-shaped tool-call
+        correction.  See ``looks_like_prose_tool_call``.
+      * ``[EMPTY_TURN]`` — Bug B: empty-assistant-turn correction.
+        See ``looks_like_empty_turn``.
 
-    Idempotent: safe to call on every terminal path regardless of whether a
-    verification was actually injected.  This is why the canonical exit
+    If any future recovery gate adds a marker, register it in the
+    ``startswith`` block below AND add a regression test.  Leaving a
+    dangling correction in the persisted tail poisons the next turn.
+
+    Idempotent: safe to call on every terminal path regardless of whether
+    a correction was actually injected.  This is why the canonical exit
     helper ``finalize_run`` calls it unconditionally — gating on a
-    ``verification_injected`` flag is a micro-optimization that historically
-    led to bugs (cleanup forgotten on new exit paths).
+    per-marker ``*_injected`` flag is a micro-optimization that
+    historically led to bugs (cleanup forgotten on new exit paths).
     """
     if not messages:
         return
@@ -161,6 +299,7 @@ def strip_dangling_verification(messages: "list[Message]") -> None:
     if isinstance(tail_content, str) and (
         tail_content.startswith("[VERIFICATION]")
         or tail_content.startswith(PROSE_TOOL_CALL_MARKER)
+        or tail_content.startswith(EMPTY_TURN_MARKER)
     ):
         messages.pop()
 
@@ -245,9 +384,12 @@ def finalize_run(
 
 
 __all__ = [
+    "build_empty_turn_correction",
     "build_prose_tool_call_correction",
+    "EMPTY_TURN_MARKER",
     "finalize_run",
     "is_truncated",
+    "looks_like_empty_turn",
     "looks_like_prose_tool_call",
     "PROSE_TOOL_CALL_MARKER",
     "strip_dangling_verification",
