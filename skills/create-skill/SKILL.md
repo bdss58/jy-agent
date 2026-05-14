@@ -13,7 +13,7 @@ description: >-
   general coding tasks, or asking about what skills are available.
 metadata:
   author: jy-agent
-  version: "3.0"
+  version: "3.1"
 ---
 
 # Skill Creator
@@ -138,13 +138,19 @@ Details go in references/. Scripts run as black boxes.
 
 ### Phase 3: Validate
 
-Run the validator to catch structural issues:
+Run the local validator to catch structural issues:
 ```bash
 python scripts/validate_skill.py <skill-dir>
 ```
 
 It checks: frontmatter format, name rules, description quality,
 body length, decision trees, broken references, and ALL-CAPS rules.
+
+For spec-strict validation, the upstream `skills-ref` tool from
+github.com/agentskills/agentskills also works:
+```bash
+skills-ref validate <skill-dir>     # if installed
+```
 
 ### Phase 4: Test Triggers
 
@@ -170,6 +176,15 @@ Create custom eval sets for thorough testing. Format:
 ]
 ```
 
+**Trigger nuance** (from agentskills.io): agents only consult skills for
+tasks that need capabilities beyond what they can handle alone. A simple
+one-step request ("read this PDF") may not trigger even with a perfect
+description, because the agent can already do it. Skills win on unfamiliar
+APIs, domain workflows, uncommon formats, and project-specific conventions.
+
+**Run each query 3+ times** and compute a trigger rate — model behavior is
+nondeterministic, so a single hit-or-miss tells you very little.
+
 ### Phase 5: Optimize Description (if needed)
 
 If trigger tests aren't perfect, run automated optimization:
@@ -183,6 +198,18 @@ This loop:
 3. Re-tests → compares scores
 4. Keeps the best-scoring version
 5. Writes it back to SKILL.md
+
+### Phase 5b: Output Evals (optional but powerful)
+
+Triggering correctly is necessary but not sufficient. To know whether the
+skill *actually helps*, run output evals comparing **with-skill** vs
+**without-skill** (or vs the previous version) on the same prompts.
+
+See [Eval Workflow](references/eval-workflow.md) for the canonical
+`evals/evals.json` schema, workspace layout, assertion writing, and the
+iterate-until-plateau loop. The single most important principle: always
+compare to a baseline. A skill that produces "good" output is uninteresting
+if the base model produced equally good output without it.
 
 ### Phase 6: Register
 
@@ -229,8 +256,12 @@ Creates a `.skill` file (ZIP archive) after validation. Excludes
 
 ## Reference Files
 
-- [📋 Spec Summary](references/spec-summary.md) — Agent Skills specification
+Load only when relevant — progressive disclosure.
+
+- [📋 Spec Summary](references/spec-summary.md) — Agent Skills specification (frontmatter fields, name rules, progressive disclosure tiers)
 - [📝 Writing Guide](references/writing-guide.md) — Detailed writing patterns, quality checklist
+- [🧪 Eval Workflow](references/eval-workflow.md) — Read when running output evals (evals.json schema, workspace layout, assertions, iteration loop)
+- [🛠 Scripts Guide](references/scripts-guide.md) — Read when adding `scripts/` (one-off commands vs bundled, PEP 723 inline deps, error-message design)
 - [📊 Schemas](references/schemas.md) — JSON formats for evals, results, grading
 - [🎯 Grader Agent](agents/grader.md) — Instructions for evaluating skill output quality
 
