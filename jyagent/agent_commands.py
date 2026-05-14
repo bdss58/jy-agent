@@ -261,6 +261,58 @@ def _cmd_sessions(cli, **_):
     cli.print_system("\n".join(lines))
 
 
+def _cmd_think(cli, state, user_input, **_):
+    """Re-render the most recent turn's reasoning, expanded.
+
+    Usage:
+        /think        — print all reasoning blocks from the last turn.
+        /think N      — print only the Nth block (1-indexed).
+
+    The blocks are exactly what was streamed in dim italic during the
+    turn — but printed in full (no fold cap).  If the last turn had no
+    reasoning (the model didn't think, or thinking was disabled in
+    config), prints a short notice.
+    """
+    blocks = getattr(state, "last_reasoning_blocks", None) or []
+    if not blocks:
+        cli.print_system(
+            "No reasoning recorded for the last turn. "
+            "(The model may not have thought, or reasoning display is disabled.)"
+        )
+        return
+
+    # Parse optional 1-indexed block selector.
+    parts = user_input.strip().split(None, 1)
+    selected: list[tuple[int, object]] = list(enumerate(blocks, start=1))
+    if len(parts) > 1:
+        arg = parts[1].strip()
+        try:
+            n = int(arg)
+        except ValueError:
+            cli.print_error(f"/think: expected a block number, got {arg!r}")
+            return
+        if n < 1 or n > len(blocks):
+            cli.print_error(
+                f"/think: block {n} out of range (1..{len(blocks)})"
+            )
+            return
+        selected = [(n, blocks[n - 1])]
+
+    from rich.text import Text
+    from .ui.cli import console
+    for idx, block in selected:
+        n_lines = block.text.count("\n") + (0 if block.text.endswith("\n") else 1) if block.text else 0
+        header = Text()
+        header.append(f"\n  ◆ reasoning block {idx}/{len(blocks)}", style="bold dim")
+        if block.reason != "end":
+            header.append(f" (terminated by: {block.reason})", style="dim yellow")
+        header.append(f"  · {n_lines} line{'s' if n_lines != 1 else ''}", style="dim")
+        console.print(header)
+        # Body — keep the same dim italic styling as the live preview so
+        # it's visually obvious this is reasoning, not answer text.
+        console.print(Text(block.text.rstrip("\n"), style="dim italic"))
+
+
 # ─── Dispatch wiring ─────────────────────────────────────────────────────────
 #
 # Importing this module is the ONLY thing required to make these handlers
@@ -279,3 +331,4 @@ bind_handler("/skills",    _cmd_skills)
 bind_handler("/skill",     _cmd_skill)
 bind_handler("/stats",     _cmd_stats)
 bind_handler("/model",     _cmd_model)
+bind_handler("/think",     _cmd_think)

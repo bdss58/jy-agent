@@ -16,6 +16,18 @@ class LoopCallbacks:
     on_text_delta: Callable[[str], None] | None = None
     on_thinking_start: Callable[[], None] | None = None
     on_thinking_stop: Callable[[], None] | None = None
+    # Fires for every thinking/reasoning text chunk while the model is in a
+    # thinking block.  Used by UIs that want to render an inline preview of
+    # the reasoning stream (vs. the spinner-only default).  Pure observation:
+    # the engine still records the full thinking text into the assistant
+    # message regardless of whether this is wired.
+    on_thinking_delta: Callable[[str], None] | None = None
+    # Fires once when a thinking block terminates, with the block's full
+    # accumulated text and a reason string in
+    # {"end", "tool_interrupt", "retry", "error"}.  Lets UIs print a fold
+    # marker / footer that depends on the total line count (only known at
+    # this point).  Fires AFTER on_thinking_stop.
+    on_thinking_block_end: Callable[[str, str], None] | None = None
     on_tool_start: Callable[[str, dict], None] | None = None
     # Gate callback fired AFTER ``on_tool_start`` and BEFORE the tool actually
     # runs.  Return ``"deny"`` to skip execution (the engine will synthesize a

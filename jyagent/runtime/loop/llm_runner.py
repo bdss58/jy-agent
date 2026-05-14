@@ -505,7 +505,29 @@ class LLMRunner(LoopThreadHelper):
         # all) — exactly the case we want to catch.
         final_message_source: str = "stream:fallback"
         thinking_active = False
+        # Per-block thinking buffer.  Accumulates the text of the CURRENT
+        # thinking block (between thinking_start/_delta and the event that
+        # terminates it — clean end, tool interrupt, or stream-level error).
+        # Fed by `on_thinking_delta` fires; flushed by `on_thinking_block_end`
+        # with a reason string so the UI can decide its fold-marker footer.
+        thinking_buf: list[str] = []
         stream = None
+
+        def _end_thinking_block(reason: str) -> None:
+            """Flush the current thinking block to on_thinking_block_end.
+
+            ``reason`` is one of:
+              * ``"end"``           — clean ``thinking_end`` event.
+              * ``"tool_interrupt"`` — ended because a tool_call started.
+              * ``"retry"``         — stream attempt failed; retry pending.
+              * ``"error"``         — terminal error (no retry).
+            Safe to call when no block is active (no-op).
+            """
+            if not thinking_buf:
+                return
+            block_text = "".join(thinking_buf)
+            thinking_buf.clear()
+            self._fire("on_thinking_block_end", block_text, reason)
 
         def _flush_pending() -> None:
             """Emit un-flushed buffered deltas (buffered mode only)."""
@@ -586,6 +608,10 @@ class LLMRunner(LoopThreadHelper):
                     if thinking_active:
                         thinking_active = False
                         self._fire("on_thinking_stop")
+                        # Transitioning from reasoning → answer text means
+                        # the thinking block is done cleanly (the model
+                        # decided to start writing its reply).
+                        _end_thinking_block("end")
                     text_parts.append(text)
                     if not cfg.buffered_streaming:
                         # Live mode: emit now.
@@ -602,16 +628,28 @@ class LLMRunner(LoopThreadHelper):
                     if not thinking_active:
                         thinking_active = True
                         self._fire("on_thinking_start")
+                    chunk = event.get("text", "")
+                    if chunk:
+                        thinking_buf.append(chunk)
+                        self._fire("on_thinking_delta", chunk)
 
                 elif etype in ("tool_call_start", "tool_call_delta"):
                     if thinking_active:
                         thinking_active = False
                         self._fire("on_thinking_stop")
+                        # A tool call cut the reasoning short — the UI's
+                        # fold marker should signal the interrupt rather
+                        # than treat it as a clean end.
+                        _end_thinking_block("tool_interrupt")
 
                 elif etype == "thinking_end":
                     if thinking_active:
                         thinking_active = False
                         self._fire("on_thinking_stop")
+                    # Always flush on thinking_end (covers the case where
+                    # thinking_active was already False because some other
+                    # transition cleared it first).
+                    _end_thinking_block("end")
 
                 elif etype == "done":
                     # Defensive: a malformed adapter event missing 'message'
@@ -693,6 +731,12 @@ class LLMRunner(LoopThreadHelper):
             # at a different layer.
             if not hasattr(err, "partial_stream_text"):
                 err.partial_stream_text = "".join(text_parts)  # type: ignore[attr-defined]
+            # Flush any in-progress thinking block so the UI's
+            # on_thinking_block_end fires with reason="error".  The retry
+            # layer will fire on_stream_retry on top of this; the UI is
+            # expected to treat "error" + subsequent "retry" reset as a
+            # rollback signal.
+            _end_thinking_block("error")
             raise
 
         finally:
@@ -706,6 +750,12 @@ class LLMRunner(LoopThreadHelper):
                 # add needless latency to every stream call.
             if thinking_active:
                 self._fire("on_thinking_stop")
+            # Defensive: if we somehow exit with a non-empty thinking
+            # buffer (e.g. a code path we missed), surface it as "end" so
+            # the UI doesn't silently lose its preview state.  No-op if
+            # already drained by the normal paths above.
+            if thinking_buf:
+                _end_thinking_block("end")
             if stream is not None:
                 try:
                     stream.close()

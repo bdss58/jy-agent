@@ -195,6 +195,18 @@ OBSERVATION_MASK_DISTANCE = _int_env("AGENT_OBSERVATION_MASK_DISTANCE", 5, min=0
 # Toggled by the ``--ask`` CLI flag (see __main__.py) or the env var below.
 ASK_BEFORE_TOOLS = _bool_env("JYAGENT_ASK", False)
 
+# ─── Reasoning preview ──────────────────────────────────────────────────────
+#
+# Tier-A reasoning UX (see ui/terminal.py::_ReasoningStreamer).  When
+# enabled, the first ``REASONING_PREVIEW_LINES`` lines of each thinking
+# block stream inline in dim italic; the rest folds behind a `[/think]`
+# marker.  Set ``REASONING_SHOW=0`` to disable entirely (spinner-only
+# behaviour, same as before tier-A).  Setting ``REASONING_PREVIEW_LINES=0``
+# folds everything (only the marker is shown); a large value
+# effectively disables folding for short blocks.
+REASONING_SHOW = _bool_env("JYAGENT_REASONING_SHOW", True)
+REASONING_PREVIEW_LINES = _int_env("JYAGENT_REASONING_PREVIEW_LINES", 5, min=0)
+
 # ─── Memory ───────────────────────────────────────────────────────────────────
 
 MEMORY_DIR = os.path.join(PROJECT_ROOT, "data", "memory")

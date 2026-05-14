@@ -3,7 +3,7 @@
 import sys
 import time
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ..runtime.loop.engine import LoopCallbacks
 from .cli import console
 
@@ -14,6 +14,136 @@ from .cli import console
 class StreamState:
     """Typed state shared between streaming callbacks."""
     needs_newline: bool = False
+
+
+# ─── Reasoning (thinking) preview state ─────────────────────────────────────
+#
+# Tier-A reasoning UX: stream the first N lines of a thinking block in dim
+# italic, then suppress further deltas and print a fold marker when the block
+# ends.  Each completed block is recorded so the ``/think`` slash command can
+# re-render the most recent turn's reasoning expanded.
+#
+# State machine (per turn — a fresh StreamingUI is built per turn in agent.py):
+#
+#   on_thinking_delta(chunk) → _ReasoningStreamer.feed(chunk)
+#       streams up to ``preview_lines`` newlines worth of text, then flips
+#       ``in_fold`` and stops writing (still buffers for the record).
+#
+#   on_thinking_block_end(text, reason) → _ReasoningStreamer.finalize(...)
+#       newline-terminates the preview if mid-line, prints the fold marker
+#       footer if the block was truncated, and appends a ReasoningBlock to
+#       ``StreamingUI.reasoning_blocks``.
+#
+#   on_stream_retry(reason, partial) → _ReasoningStreamer.discard_last()
+#       The runner already flushed a block with reason="error" on its way
+#       out; we drop it from the record so the upcoming replay doesn't
+#       produce a duplicate entry.  We do NOT erase the on-screen output
+#       (the user has already seen it); the retry marker that the existing
+#       on_stream_retry handler prints is the user's cue.
+
+@dataclass
+class ReasoningBlock:
+    """One completed reasoning/thinking block within a turn."""
+    text: str
+    reason: str  # "end" | "tool_interrupt" | "error"
+
+
+@dataclass
+class _ReasoningStreamer:
+    """Mutable per-turn state for the reasoning preview renderer."""
+    preview_lines: int = 5
+    # Lines newline-terminated so far in the current block.
+    lines_emitted: int = 0
+    # True once we've hit ``preview_lines`` and stopped writing chunks.
+    in_fold: bool = False
+    # True if the current preview line has unterminated chars (needs a
+    # trailing newline before we print the fold marker / next block).
+    needs_newline: bool = False
+    # Completed blocks for the current turn, in order.
+    blocks: list[ReasoningBlock] = field(default_factory=list)
+
+    def _reset_block(self) -> None:
+        self.lines_emitted = 0
+        self.in_fold = False
+        self.needs_newline = False
+
+    def feed(self, chunk: str) -> None:
+        """Stream a thinking_delta chunk to stdout, capped at preview_lines."""
+        if not chunk or self.in_fold:
+            return
+        # Write up to (preview_lines - lines_emitted) newlines worth of
+        # content; once we'd cross the cap, write only the portion up to
+        # the final allowed newline and stop.
+        remaining = self.preview_lines - self.lines_emitted
+        if remaining <= 0:
+            self.in_fold = True
+            return
+
+        # Find newline positions in this chunk.
+        nls = [i for i, c in enumerate(chunk) if c == "\n"]
+        if len(nls) < remaining:
+            # Whole chunk fits within budget.
+            self._write_dim(chunk)
+            self.lines_emitted += len(nls)
+            # If the chunk doesn't end with \n, we have an open line.
+            self.needs_newline = not chunk.endswith("\n")
+        else:
+            # Cap at the ``remaining``-th newline (inclusive).
+            cut = nls[remaining - 1] + 1
+            self._write_dim(chunk[:cut])
+            self.lines_emitted += remaining
+            self.needs_newline = False
+            self.in_fold = True
+
+    @staticmethod
+    def _write_dim(text: str) -> None:
+        """Write text in dim italic style via raw ANSI (Rich can't stream chars)."""
+        # ESC[2;3m = dim + italic; ESC[0m = reset.
+        # We wrap each chunk independently so a forgotten reset can never
+        # bleed into subsequent normal text.
+        sys.stdout.write(f"\033[2;3m{text}\033[0m")
+        sys.stdout.flush()
+
+    def finalize(self, full_text: str, reason: str) -> None:
+        """End-of-block: print fold marker if needed, record the block."""
+        # Terminate any open preview line so the marker/next output starts
+        # on its own row.
+        if self.needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.needs_newline = False
+
+        total_lines = full_text.count("\n") + (0 if full_text.endswith("\n") else 1) if full_text else 0
+        # If we never entered fold mode and the whole thing fit, no marker
+        # is needed — the preview WAS the full content.
+        if self.in_fold and total_lines > self.lines_emitted:
+            hidden = total_lines - self.lines_emitted
+            reason_tag = "" if reason == "end" else f" · {reason}"
+            from rich.text import Text
+            marker = Text()
+            marker.append(f"  ▸ {hidden} more line{'s' if hidden != 1 else ''} folded", style="dim italic")
+            marker.append(f" · /think to expand{reason_tag}", style="dim")
+            console.print(marker)
+
+        self.blocks.append(ReasoningBlock(text=full_text, reason=reason))
+        self._reset_block()
+
+    def discard_last(self) -> None:
+        """Drop the most recently recorded block (used on stream-retry).
+
+        Called from on_stream_retry: the runner just fired
+        on_thinking_block_end(reason="error") on its way out of a failed
+        stream attempt; the retry will replay the reasoning, so we don't
+        want a duplicate entry in ``blocks``.  The text already written to
+        stdout stays — the user has seen it, and the on_stream_retry banner
+        printed by the existing handler is the signal that what follows is
+        a re-emission.
+        """
+        if self.blocks and self.blocks[-1].reason == "error":
+            self.blocks.pop()
+        # Also reset the in-flight preview counters: the replay starts a
+        # fresh block, so the preview budget should reset.
+        self._reset_block()
 
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
@@ -265,6 +395,14 @@ class StreamingUI:
     callbacks: LoopCallbacks
     spinner: "ThinkingSpinner"
     _stream_state: StreamState
+    # Per-turn reasoning preview state.  Exposed so the CLI's ``/think``
+    # slash command can re-render this turn's reasoning expanded.
+    _reasoning: "_ReasoningStreamer" = field(default_factory=_ReasoningStreamer)
+
+    @property
+    def reasoning_blocks(self) -> list[ReasoningBlock]:
+        """Completed reasoning blocks from this turn (in order)."""
+        return list(self._reasoning.blocks)
 
     def flush_trailing_newline(self) -> None:
         if self._stream_state.needs_newline:
@@ -273,7 +411,14 @@ class StreamingUI:
             self._stream_state.needs_newline = False
 
 
-def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> StreamingUI:
+def build_streaming_callbacks(
+    stats,
+    runtime_owner,
+    *,
+    ask: bool = False,
+    reasoning_show: bool = True,
+    reasoning_preview_lines: int = 5,
+) -> StreamingUI:
     """
     Build LoopCallbacks for streaming AgentLoop with terminal UX.
 
@@ -287,15 +432,31 @@ def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> Str
     pauses for [y/N/a] before running.  Read-only tools auto-approve.
     Choosing ``a`` (allow-all) disables the gate for the rest of the
     session.
+
+    ``reasoning_show=True`` (default) streams the first
+    ``reasoning_preview_lines`` lines of each thinking block in dim italic
+    and prints a fold marker after long blocks; the full text is recorded
+    on the returned ``StreamingUI`` so a ``/think`` slash command can
+    re-render it.  Set ``reasoning_show=False`` to fall back to the
+    spinner-only behaviour (reasoning text discarded for display, full
+    text still preserved into the assistant message by the engine).
     """
     # Mutable state shared by callbacks
     spinner = ThinkingSpinner()
     stream_state = StreamState()
+    reasoning_streamer = _ReasoningStreamer(preview_lines=reasoning_preview_lines)
     # Closure-mutable so the "a" answer can latch for the session.
     allow_all = [False]
 
     def _on_text_delta(text: str):
         spinner.stop()
+        # If a thinking-preview line was open (no trailing newline), close
+        # it before answer text begins.  This keeps the reasoning preview
+        # and the answer on separate visual rows.
+        if reasoning_show and reasoning_streamer.needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            reasoning_streamer.needs_newline = False
         _stream_write(text)
         stream_state.needs_newline = True
 
@@ -305,12 +466,47 @@ def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> Str
     def _on_thinking_stop():
         spinner.stop()
 
+    def _on_thinking_delta(chunk: str):
+        if not reasoning_show:
+            return
+        # Stop the spinner the moment real reasoning text starts streaming;
+        # otherwise the spinner line fights with our preview output.
+        spinner.stop()
+        reasoning_streamer.feed(chunk)
+
+    def _on_thinking_block_end(full_text: str, reason: str):
+        if not reasoning_show:
+            return
+        reasoning_streamer.finalize(full_text, reason)
+
+    def _on_stream_retry(reason: str, partial_text: str):
+        # Existing UX banner first (mirrors _on_retry for transient errors,
+        # but on_stream_retry fires for every retry — both transient and
+        # truncation — with partial-text context).
+        sys.stdout.flush()
+        # Drop the partial reasoning block the runner just flushed with
+        # reason="error" so the replay doesn't double-record it.  The text
+        # already on screen stays — the user has seen it, and the banner
+        # below is the signal that what follows is a re-emission.
+        if reasoning_show:
+            reasoning_streamer.discard_last()
+        console.print(
+            f"\n⚡ Stream retry ({reason}); replaying...",
+            style="bold yellow",
+        )
+
     def _on_tool_start(name: str, tool_input: dict):
         spinner.stop()
         if stream_state.needs_newline:
             sys.stdout.write("\n")
             sys.stdout.flush()
             stream_state.needs_newline = False
+        # Also terminate any open thinking-preview line so the tool header
+        # doesn't appear glued to the tail of a reasoning chunk.
+        if reasoning_show and reasoning_streamer.needs_newline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            reasoning_streamer.needs_newline = False
         _tool_call_header(name, tool_input)
 
     def _on_tool_end(name: str, content: str, is_error: bool, duration_ms: float | None = None):
@@ -398,10 +594,13 @@ def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> Str
         on_text_delta=_on_text_delta,
         on_thinking_start=_on_thinking_start,
         on_thinking_stop=_on_thinking_stop,
+        on_thinking_delta=_on_thinking_delta,
+        on_thinking_block_end=_on_thinking_block_end,
         on_tool_start=_on_tool_start,
         on_tool_pre_execute=_on_tool_pre_execute,
         on_tool_end=_on_tool_end,
         on_retry=_on_retry,
+        on_stream_retry=_on_stream_retry,
         on_usage=_on_usage,
         on_step_progress=_on_step_progress,
         on_compaction=_on_compaction,
@@ -410,4 +609,9 @@ def build_streaming_callbacks(stats, runtime_owner, *, ask: bool = False) -> Str
         on_tool_batch=_on_tool_batch,
     )
 
-    return StreamingUI(callbacks=callbacks, spinner=spinner, _stream_state=stream_state)
+    return StreamingUI(
+        callbacks=callbacks,
+        spinner=spinner,
+        _stream_state=stream_state,
+        _reasoning=reasoning_streamer,
+    )

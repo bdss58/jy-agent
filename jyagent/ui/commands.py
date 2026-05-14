@@ -55,6 +55,8 @@ COMMANDS: tuple[Command, ...] = (
     Command("/multi",     "Toggle multi-line input mode",           group="General"),
     Command("/markdown",  "Toggle markdown rendering",              group="General"),
     Command("/stats",     "Show session statistics (tokens, cost)", group="General"),
+    Command("/think",     "Show last turn's reasoning expanded (no arg=most recent)",
+            group="General", prefix=True),
     # Skills
     Command("/skills",    "List all available skills and status",   group="Skills"),
     Command("/skill",     "Activate (/skill X) or deactivate (/skill -X) a skill",

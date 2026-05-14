@@ -5,7 +5,7 @@
 # System prompt assembly lives in jyagent.system_prompt.
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from .runtime.tools.registry import get_registry
 import jyagent.tools  # noqa: F401 — triggers tool registration
 from .memory import (
@@ -84,9 +84,17 @@ class AgentRunState:
       * ``force_rebuild_context`` — set True by the auto-compaction callback;
         consumed (and reset) once at the start of the next turn so the system
         prompt is rebuilt against the freshly-compacted memory state.
+      * ``last_reasoning_blocks`` — the reasoning/thinking blocks recorded
+        during the most recent turn, in order.  Populated from the turn's
+        StreamingUI when the engine returns; consumed by the ``/think``
+        slash command to re-render the most recent reasoning expanded.
     """
     use_markdown: bool = True
     force_rebuild_context: bool = False
+    # Default to empty so /think before any turn returns a clean message.
+    # Stored as a list[ReasoningBlock] but typed loosely to avoid pulling
+    # the UI module into the agent dataclass at import time.
+    last_reasoning_blocks: list = field(default_factory=list)
 
 
 # ─── Main agent loop ─────────────────────────────────────────────────────────
@@ -226,9 +234,17 @@ def run(runtime_owner: LLMOwner) -> None:
                     # Build streaming callbacks
                     stats = get_stats()
                     stats.new_turn()
-                    from .config import ASK_BEFORE_TOOLS
+                    from .config import (
+                        ASK_BEFORE_TOOLS,
+                        REASONING_SHOW,
+                        REASONING_PREVIEW_LINES,
+                    )
                     streaming_ui = build_streaming_callbacks(
-                        stats, runtime_owner, ask=ASK_BEFORE_TOOLS,
+                        stats,
+                        runtime_owner,
+                        ask=ASK_BEFORE_TOOLS,
+                        reasoning_show=REASONING_SHOW,
+                        reasoning_preview_lines=REASONING_PREVIEW_LINES,
                     )
                     callbacks = streaming_ui.callbacks
                     spinner = streaming_ui.spinner
@@ -266,11 +282,22 @@ def run(runtime_owner: LLMOwner) -> None:
                     final_text = presented.final_text
                     planner_messages = presented.planner_messages
 
+                    # Stash this turn's reasoning blocks for /think to
+                    # re-render later.  Always overwrite — /think always
+                    # targets the MOST RECENT turn that produced reasoning.
+                    state.last_reasoning_blocks = streaming_ui.reasoning_blocks
+
                 except KeyboardInterrupt:
                     cli.print_system("\n⚠ Interrupted — returning to prompt.")
                     response = "[Response interrupted by user]"
                     final_text = ""
                     planner_messages = []
+                    # On interrupt, still capture whatever reasoning got
+                    # recorded before the cancel — useful for /think.
+                    try:
+                        state.last_reasoning_blocks = streaming_ui.reasoning_blocks
+                    except Exception:
+                        pass
 
                 # Invalidate memory cache after planner runs (tools may have written memory)
                 invalidate_memory_cache()
