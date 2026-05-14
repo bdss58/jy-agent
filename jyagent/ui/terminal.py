@@ -216,7 +216,6 @@ def render_final_text(text: str, *, markdown: bool = True) -> None:
     only need to pass the final text and a toggle.
     """
     from rich.markdown import Markdown
-    from rich.panel import Panel
 
     if not markdown:
         return
@@ -225,14 +224,12 @@ def render_final_text(text: str, *, markdown: bool = True) -> None:
         return
     try:
         md = Markdown(text, code_theme="monokai")
+        # No Panel/border: borders get included when users select-and-copy
+        # the rendered output. Use a thin header + trailing hint instead so
+        # copying picks up only the actual content.
         console.print()
-        console.print(Panel(
-            md,
-            title="[bold green]📝 Rendered[/bold green]",
-            border_style="green",
-            padding=(0, 1),
-            subtitle="[dim]/markdown to toggle[/dim]",
-        ))
+        console.print("[bold green]📝 Rendered[/bold green] [dim](/markdown to toggle)[/dim]")
+        console.print(md)
     except Exception:
         # Markdown rendering is best-effort — never crash the turn over it.
         pass
