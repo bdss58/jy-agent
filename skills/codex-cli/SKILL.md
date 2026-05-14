@@ -32,33 +32,36 @@ Delegate tasks to the local Codex CLI from inside `jy-agent`.
 Codex handles coding, code review, **image/vision analysis**, and structured
 output with JSON schema enforcement.
 
-## Timeout Policy: `run_shell` vs `run_background`
+## Timeout Policy: one mode, one cap
 
-Codex CLI can be slow. Choose the right execution mode:
+Codex CLI is slow and its network can flake; its built-in retry needs runway.
+Don't agonize over per-call timeouts — use one rule:
 
-```
-How long will this Codex call take?
-├─ Preflight (which codex, codex --version)
-│   → run_shell(cmd, timeout=60)
-│
-├─ Quick task — scoped review, small analysis, simple fix (<5 min likely)
-│   → run_shell(cmd, timeout=600)
-│
-├─ Medium task — multi-file analysis, complex implementation
-│   → Prefer run_background(cmd), then poll with check_background(pid)
-│   → Fallback: try run_shell(timeout=600), switch to background if it times out
-│
-└─ Heavy task — large repo scan, architecture review, broad refactor
-    → Always use run_background(cmd) + check_background(pid) polling loop
-```
+> **Always run Codex via `run_background(cmd, timeout_seconds=3600)`**, then
+> poll with `check_background(pid, tail=30)` every 1-3 min. Use
+> `action="wait"` (≤300 s blocks) instead of sleep loops. If output is
+> identical across 2-3 polls → `action="kill"` manually; don't wait for the
+> 3600 s deadline.
+
+The 3600 s is a **safety net**, not an SLA — active polling is what catches
+real stuck jobs in 1-2 min. The deadline only fires if you walk away.
+
+The only exception is **preflight** commands that aren't real Codex calls
+(`which codex`, `codex --version`, `codex --help`) — those go through
+`run_shell(cmd, timeout=60)`. Anything that actually invokes the model
+(`codex exec`, `codex review`) → background, 3600 s.
+
+> Note: `run_shell` is hard-capped at 600 s by the tool, so passing larger
+> timeouts there is illegal — that's another reason every real Codex call
+> belongs in `run_background`.
 
 ### Background execution pattern
 
 ```python
-# Step 1: Start with a deadline so a runaway task gets auto-killed
+# Step 1: Start with the standard 1-hour safety net
 run_background(
     'codex exec --sandbox read-only "Analyze the full codebase"',
-    timeout_seconds=1200,   # 20 min hard cap
+    timeout_seconds=3600,   # 1 hour hard cap — covers heavy tasks + retries
 )
 # → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
 
@@ -89,30 +92,26 @@ return `{"status":"rejected","reason":"concurrency_cap"}` if you exceed it.
 
 ### Diagnosing "stuck" Codex processes
 
-Codex research/analysis tasks routinely take 3-10 minutes. Don't assume
-a running process is stuck just because it's been going for a few minutes.
+Codex research/analysis tasks routinely take 3-10 minutes; heavy ones with
+network retries can go 15-30 min. Don't assume a running process is stuck
+just because it's been going for a while — read its output first.
 
 ```
 Codex still running after N seconds →
 ├─ N < 300s (5 min) — Probably fine. Poll with tail=20, be patient.
 │
-├─ N = 300-600s — Read a larger window: check_background(pid, tail=50)
+├─ N = 300-900s — Read a larger window: check_background(pid, tail=50)
 │   ├─ Output shows progress (new content each poll) → Let it run
 │   ├─ Output is identical across 2-3 polls → Likely stuck, kill it
 │   └─ Output shows repeated identical tool calls → Stuck in a loop, kill it
 │
-└─ N > 600s — Read full output (tail=0), extract whatever it produced,
-    then kill and use the partial results.
+└─ N > 900s — Read full output (tail=0), extract whatever it produced,
+    then kill and use the partial results. The 3600 s deadline is a
+    safety net, not a target — don't wait it out.
 ```
 
 **Key rule**: Always read substantial output (`tail=50`) before deciding
 to kill. Never judge from `tail=3` alone — that's not enough to see patterns.
-
-### When run_shell times out at 600s
-
-Do NOT just retry the same command. Instead:
-1. Switch to `run_background` for the same command, OR
-2. Narrow the task scope and try `run_shell` again with a tighter prompt
 
 ## Decision Tree: Should Codex Handle This?
 
@@ -307,70 +306,69 @@ These are Claude Code flags, not Codex flags.
 
 ## Core Invocation Patterns
 
+All real Codex calls use `run_background(..., timeout_seconds=3600)` — see the
+"Timeout Policy" section. Polling guidance is shared at the end of this section.
+
 ### Pattern A: Read-only analysis or planning
 
 ```python
-run_shell('codex exec --sandbox read-only -C /path/to/repo "Analyze X and suggest a fix"', timeout=600)
+run_background('codex exec --sandbox read-only -C /path/to/repo "Analyze X and suggest a fix"', timeout_seconds=3600)
 ```
 
 For multi-line prompts, use a heredoc:
 
 ```python
-run_shell("""cat <<'EOF' | codex exec --sandbox read-only -C /path/to/repo -
+run_background("""cat <<'EOF' | codex exec --sandbox read-only -C /path/to/repo -
 Goal: Analyze the auth module.
 Context: JWT header parsing fails on empty input.
 Done when: Return diagnosis and recommended fix.
-EOF""", timeout=600)
+EOF""", timeout_seconds=3600)
 ```
 
 ### Pattern B: Implementation
 
 ```python
-run_shell('codex exec --sandbox workspace-write -C /path/to/repo "Fix the null pointer in parse_config and run tests"', timeout=600)
+run_background('codex exec --sandbox workspace-write -C /path/to/repo "Fix the null pointer in parse_config and run tests"', timeout_seconds=3600)
 ```
 
 ### Pattern C: Review
 
 ```python
-run_shell('codex review --uncommitted', timeout=600)
+run_background('codex review --uncommitted', timeout_seconds=3600)
 # or with a base branch:
-run_shell('codex review --base main', timeout=600)
+run_background('codex review --base main', timeout_seconds=3600)
 ```
 
 ### Pattern D: Follow-up on the same Codex task
 
 ```python
-run_shell('codex exec resume --last "Now add regression tests for the fix"', timeout=600)
+run_background('codex exec resume --last "Now add regression tests for the fix"', timeout_seconds=3600)
 ```
 
 ### Pattern E: Structured output
 
 ```python
-run_shell('codex exec --sandbox read-only --output-schema /tmp/schema.json "Review the auth layer"', timeout=600)
+run_background('codex exec --sandbox read-only --output-schema /tmp/schema.json "Review the auth layer"', timeout_seconds=3600)
 ```
 
-### Pattern F: Background execution (for slow tasks)
+### Polling each of the above
 
-Use `run_background` + `check_background` when the task may exceed 600 seconds.
-This is the **preferred pattern for complex Codex tasks**.
+Every pattern returns instantly with a PID; collect results the same way:
 
 ```python
 # Start — returns instantly with PID
-run_background('codex exec --sandbox read-only -C /path/to/repo "Comprehensive architecture review"')
 # → {"pid": 12345, "output_file": "/tmp/jyagent_bg_xxx.out", "status": "started"}
 
-# Poll every 30-60s — use tail to avoid output flood
+# Block up to 120s waiting for completion (saves a model turn vs. tight polling)
+check_background(12345, action="wait", wait_timeout_seconds=120)
+
+# While running, peek at progress without flooding context:
 check_background(12345, tail=30)
 # → {"status": "running", "elapsed_seconds": 120.5, "output": "...last 30 lines..."}
 
-# When status == "done", read full output
+# Once status != "running", read full output:
 check_background(12345)
-# → {"status": "done", "exit_code": 0, "output": "...complete result..."}
-```
-
-For implementation tasks in background:
-```python
-run_background('codex exec --full-auto -C /path/to/repo "Refactor the auth module to use JWT"')
+# → {"status": "succeeded", "exit_code": 0, "output": "...complete result..."}
 ```
 
 ## Anti-Patterns
@@ -399,8 +397,8 @@ run_background('codex exec --full-auto -C /path/to/repo "Refactor the auth modul
 ❌ **Don't** claim delegation succeeded if `codex` is unavailable
 ✅ **Do** fail fast, report the environment problem, and stop
 
-❌ **Don't** retry `run_shell(timeout=600)` when it times out — the task is too slow for synchronous execution
-✅ **Do** switch to `run_background` + `check_background` polling for slow tasks
+❌ **Don't** invoke real Codex calls (`codex exec`, `codex review`) via `run_shell` — its 600 s tool cap kills tasks that Codex's retry would otherwise rescue
+✅ **Do** use `run_background(cmd, timeout_seconds=3600)` for every real Codex call; reserve `run_shell` for trivial preflight (`which codex`, `codex --version`)
 
 ❌ **Don't** poll `check_background` with `tail=0` every few seconds on a running process — it floods context with repeated full output
 ✅ **Do** use `tail=20` or `tail=30` while polling; only use `tail=0` for the final read after status is "done"
