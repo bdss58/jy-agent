@@ -10,45 +10,21 @@
 # rendering).  Importing this module is what wires them up — agent.py imports
 # it once during ``run()`` startup so command dispatch works.
 #
-# This file also owns ``_safe_checkpoint`` because ``_cmd_new`` needs it; the
-# top-level orchestrator (``agent.py``) imports the helper from here for the
-# per-turn checkpoint and graceful-exit flows.
+# Session durability (``safe_checkpoint``) lives in ``jyagent.durability``
+# and is consumed here only by ``_cmd_new``.  Keeping it out of this module
+# clarifies that the slash-command registry has no business with disk I/O.
 
 from .memory import (
-    checkpoint_session, end_session, find_session, has_saved_session,
+    end_session, find_session, has_saved_session,
     list_sessions, load_session,
 )
+from .durability import safe_checkpoint as _safe_checkpoint
 from .ui.commands import bind_handler
 from .runtime.stats import get_stats
 from .runtime.tools.registry import get_registry
 from .skills import get_skill_manager
 from .llm import LLMOwner
 from .system_prompt import invalidate_memory_cache
-
-
-# ─── Shared session-checkpoint helper ────────────────────────────────────────
-
-def _safe_checkpoint(conversation, *, reason: str | None = None) -> None:
-    """Flush pending events to the session log. Silent on failure.
-
-    Single durability primitive used by per-turn checkpoints, /new, and
-    graceful exit. Metadata always carries the active provider:model so
-    /sessions can render it; ``reason`` is added only when the caller
-    needs to tag the checkpoint (e.g. ``"new"``).
-    """
-    if not conversation or not conversation.messages:
-        return
-    try:
-        stats = get_stats()
-        metadata: dict = {
-            "provider": stats.provider or "",
-            "model": stats.model or "",
-        }
-        if reason:
-            metadata["reason"] = reason
-        checkpoint_session(conversation, metadata=metadata)
-    except Exception:
-        pass  # Never block a turn / exit on disk hiccup
 
 
 # ─── Command handlers ────────────────────────────────────────────────────────

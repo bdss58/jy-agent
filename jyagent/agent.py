@@ -23,7 +23,8 @@ from .skills import init_skills
 from .llm import LLMOwner
 from .runtime.stats import get_stats
 from .system_prompt import build_system_prompt, invalidate_memory_cache
-from .agent_commands import _safe_checkpoint  # noqa: F401 — also registers /commands
+from .durability import safe_checkpoint as _safe_checkpoint
+import jyagent.agent_commands  # noqa: F401 — registers /commands via bind_handler at import time
 
 
 
