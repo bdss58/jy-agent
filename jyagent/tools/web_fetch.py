@@ -570,7 +570,7 @@ def web_fetch(url: str, max_length: int = 8000, start_index: int = 0,
                 if remaining > 0:
                     header += f" ({remaining} chars remaining, use start_index={start_index + len(page)} for next page)"
 
-            return ToolResult(f"{header}\n\n{page}")
+            return ToolResult(f"{header}\n\n{page}", taint=True)
 
         except Exception as e:
             errors.append(f"{strategy_name}: {type(e).__name__}: {e}")
