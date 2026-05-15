@@ -24,9 +24,8 @@ etc.).
 
 The ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` helpers live on
 the ``LoopThreadHelper`` mixin (``_thread_helpers.py``) — both ``LLMRunner``
-and ``AgentLoop`` inherit them and override the helper's two class-level
-attribute-name strings to point at their respective instance attributes.
-This was previously ~30 lines of cut-and-paste between the two classes.
+and ``AgentLoop`` inherit them and expose ``_cancel_event`` / ``_callbacks``
+instance attributes for the helper to read.
 """
 
 from __future__ import annotations
@@ -276,22 +275,15 @@ class LLMRunner(LoopThreadHelper):
       * runtime_owner — the LLMOwner (provider-neutral façade)
       * config — the loop's LoopConfig (for streaming flag, retry count,
         buffered_streaming, etc.)
-      * callbacks — LoopCallbacks for on_text_delta, on_thinking_*,
+      * _callbacks — LoopCallbacks for on_text_delta, on_thinking_*,
         on_retry, on_stream_retry, on_usage
-      * cancel_event — optional threading.Event for cooperative cancel
+      * _cancel_event — optional threading.Event for cooperative cancel
       * model_spec — optional override (sub-agent tier)
 
     Inherits ``_is_cancelled`` / ``_cancellable_sleep`` / ``_fire`` from
-    ``LoopThreadHelper``.  Overrides the
-    helper's two attribute-name class-vars because LLMRunner uses
-    un-prefixed instance attribute names (``cancel_event`` / ``callbacks``)
-    while AgentLoop uses underscore-prefixed names.
+    ``LoopThreadHelper`` (canonical ``_callbacks`` / ``_cancel_event``
+    instance-attribute names; same convention AgentLoop uses).
     """
-
-    # Tell the LoopThreadHelper mixin which instance attributes hold
-    # the cancel event and callbacks dataclass.
-    _helper_cancel_event_attr = "cancel_event"
-    _helper_callbacks_attr = "callbacks"
 
     def __init__(
         self,
@@ -303,8 +295,8 @@ class LLMRunner(LoopThreadHelper):
     ):
         self.runtime_owner = runtime_owner
         self.config = config
-        self.callbacks = callbacks
-        self.cancel_event = cancel_event
+        self._callbacks = callbacks
+        self._cancel_event = cancel_event
         self.model_spec = model_spec
 
     # ── provider-output validation gate ──────────────────────────────────────
@@ -361,10 +353,8 @@ class LLMRunner(LoopThreadHelper):
 
     # ── cancellation + callback helpers from LoopThreadHelper ───────────────
     # ``_is_cancelled``, ``_cancellable_sleep``, ``_fire`` live on the
-    # ``LoopThreadHelper`` mixin (see ``_thread_helpers.py``).  Class-var
-    # overrides at the top of this class point the helper's attribute
-    # lookups at LLMRunner's un-prefixed ``cancel_event`` / ``callbacks``
-    # instance attributes.
+    # ``LoopThreadHelper`` mixin (see ``_thread_helpers.py``).  The mixin
+    # reads ``_cancel_event`` / ``_callbacks`` directly off ``self``.
 
     # ── non-streaming call ───────────────────────────────────────────────
 
@@ -395,7 +385,7 @@ class LLMRunner(LoopThreadHelper):
         if self._is_cancelled():
             raise KeyboardInterrupt("cancelled before complete()")
 
-        if self.cancel_event is None:
+        if self._cancel_event is None:
             # Fast path: no cancel machinery needed.
             final_message = self.runtime_owner.complete(
                 context, options=options, model_spec=self.model_spec,
@@ -561,9 +551,9 @@ class LLMRunner(LoopThreadHelper):
             # Returns early (no watcher spawned) when there's no
             # cancel_event — avoids the tiny thread overhead on the common
             # non-CLI path where cancellation isn't wired up.
-            if self.cancel_event is not None:
+            if self._cancel_event is not None:
                 watcher_stop = threading.Event()
-                _cancel_ev = self.cancel_event  # local capture for closure
+                _cancel_ev = self._cancel_event  # local capture for closure
 
                 def _stream_cancel_watcher() -> None:
                     # Wake on EITHER the cancel signal OR the stop signal

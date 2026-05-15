@@ -188,11 +188,11 @@ class TestIsTransientPredicatePatchSurfaces:
         runner.config = le.LoopConfig(
             streaming=False, retry_attempts=3, retry_base_delay=0.0,
         )
-        runner.callbacks = le.LoopCallbacks(
+        runner._callbacks = le.LoopCallbacks(
             on_retry=lambda *a: None,
             on_stream_retry=lambda *a: None,
         )
-        runner.cancel_event = None
+        runner._cancel_event = None
 
         calls = {"n": 0}
 

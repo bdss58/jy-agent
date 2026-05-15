@@ -255,8 +255,8 @@ class TestCallCompleteDaemonInheritsCV:
         runner = le_lr.LLMRunner.__new__(le_lr.LLMRunner)
         runner.runtime_owner = owner
         runner.config = le_lr.LoopConfig(streaming=False)
-        runner.callbacks = le_lr.LoopCallbacks()
-        runner.cancel_event = cancel_event
+        runner._callbacks = le_lr.LoopCallbacks()
+        runner._cancel_event = cancel_event
         runner.model_spec = None
 
         token = _TEST_CV.set("complete-cv")
