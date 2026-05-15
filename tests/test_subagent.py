@@ -388,6 +388,90 @@ class TestCheckAgentInvalidId:
         assert "agent_id is required" in result.content
 
 
+class TestCheckAgentIdempotencyAndPersistence:
+    """G2 + G9 fix (2026-05): check_agent reads must be idempotent and
+    recoverable from disk after a wait-timeout-lost result.
+
+    Three guarantees being verified:
+      (a) Calling check_agent on a completed agent multiple times
+          returns the SAME outcome each time (no consume-on-read).
+      (b) The completed agent's outcome is persisted to disk under
+          data/sessions/subagents/<pid>-<id>.json.
+      (c) After hard-removing the agent from the in-memory registry
+          (simulating eviction or a lost wait), check_agent still
+          returns the outcome via the disk fallback.
+    """
+
+    def _run_one_and_get_id(self, content="persisted answer"):
+        gate = threading.Event()
+
+        def slow(*args, **kwargs):
+            gate.wait(timeout=10)
+            return _completed_outcome(content)
+
+        with (
+            patch("jyagent.tools.subagent._run_subagent", side_effect=slow),
+            patch("jyagent.tools.subagent._BG_GRACE_PERIOD", 0.05),
+        ):
+            result = dispatch_agent(task="persist task", background=True)
+            payload = json.loads(result.content)
+            agent_id = payload["agent_id"]
+            gate.set()
+            time.sleep(0.3)  # let the worker thread finish
+
+        return agent_id
+
+    def test_repeat_reads_return_same_outcome(self):
+        agent_id = self._run_one_and_get_id("the answer is 42")
+
+        r1 = check_agent(agent_id=agent_id, action="status")
+        r2 = check_agent(agent_id=agent_id, action="status")
+        r3 = check_agent(agent_id=agent_id, action="status")
+
+        assert "the answer is 42" in r1.content
+        assert r1.content == r2.content == r3.content
+        assert not (r1.is_error or r2.is_error or r3.is_error)
+
+    def test_outcome_persisted_to_disk(self):
+        from jyagent.tools.subagent import (
+            _subagent_outcome_path,
+            _load_subagent_outcome_from_disk,
+        )
+
+        agent_id = self._run_one_and_get_id("persisted answer")
+        # Trigger persistence by reading once.
+        check_agent(agent_id=agent_id, action="status")
+
+        import os
+        path = _subagent_outcome_path(agent_id)
+        assert os.path.exists(path), f"expected persisted record at {path}"
+
+        record = _load_subagent_outcome_from_disk(agent_id)
+        assert record is not None
+        assert record["agent_id"] == agent_id
+        assert record["outcome"]["content"] == "persisted answer"
+        assert record["outcome"]["status"] == _SUBAGENT_STATUS_COMPLETED
+
+    def test_disk_fallback_after_registry_eviction(self):
+        """Simulates the wait-timeout-lost scenario: the in-memory record
+        is gone, but check_agent still recovers the outcome from disk."""
+        agent_id = self._run_one_and_get_id("recovered answer")
+        # Read once to ensure persistence has happened, then nuke the
+        # in-memory record to simulate eviction / a prior client-timeout
+        # path that did remove it.
+        check_agent(agent_id=agent_id, action="status")
+        _bg_registry._agents.pop(agent_id, None)
+        try:
+            _bg_registry._completed_order.remove(agent_id)
+        except ValueError:
+            pass
+
+        # The disk fallback should kick in and rebuild the outcome.
+        recovered = check_agent(agent_id=agent_id, action="status")
+        assert "recovered answer" in recovered.content
+        assert not recovered.is_error
+
+
 class TestForegroundSoftHandoff:
     """Foreground dispatch_agent that exceeds its timeout should return
     a timeout_handoff with agent_id (not an error)."""

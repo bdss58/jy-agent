@@ -6,14 +6,16 @@
 # Sub-agents run silently (no terminal streaming), have their own context
 # window and message history, and return only their final answer to the parent.
 
+import os
 import json
 import sys
 import time
+import collections
 import traceback
 import threading
 import contextvars
 import concurrent.futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 try:
     from ..config import (
@@ -484,6 +486,96 @@ def _get_bg_executor() -> concurrent.futures.ThreadPoolExecutor:
         return _bg_executor
 
 
+# ─── Subagent outcome persistence ────────────────────────────────────────────
+#
+# 2026-05 (G2 + G9 fix): completed subagent outcomes are now persisted to disk
+# at ``data/sessions/subagents/<pid>-<agent_id>.json`` so that:
+#
+#   1. ``check_agent(agent_id)`` is **idempotent** — the agent record is NOT
+#      removed after the first successful read. Multiple reads return the
+#      same outcome.
+#   2. If ``check_agent(action='wait')`` is called from a tool wrapper that
+#      times out client-side (e.g. the 120s outer cap), the agent's outcome
+#      is preserved on disk and can be recovered on a follow-up call,
+#      instead of being silently discarded.
+#   3. Reasonably bounded RAM: the in-memory registry caps the number of
+#      completed agents kept hot (newer ones evict older ones); evicted
+#      outcomes live on disk and are loaded back on miss.
+#
+# Disk filename uses ``<pid>-<agent_id>`` so concurrent or successive jyagent
+# processes don't collide on the per-process monotonic ``_next_id``.
+
+
+_MAX_COMPLETED_IN_MEMORY = 100
+
+
+def _subagent_persist_dir() -> str:
+    """Return (and lazily create) the on-disk subagent outcome directory."""
+    try:
+        from ..config import SESSIONS_DIR
+    except ImportError:
+        from jyagent.config import SESSIONS_DIR
+    path = os.path.join(SESSIONS_DIR, "subagents")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _subagent_outcome_path(agent_id: int) -> str:
+    """File path for a given agent_id, namespaced by current process PID."""
+    return os.path.join(
+        _subagent_persist_dir(), f"{os.getpid()}-{agent_id}.json",
+    )
+
+
+def _persist_subagent_outcome(agent: "_BackgroundAgent") -> None:
+    """Write a completed agent's outcome + metadata to disk (best-effort).
+
+    Safe to call multiple times — overwrites atomically. Failures are
+    swallowed: persistence is a recovery aid, not a correctness requirement.
+    """
+    if agent.outcome is None:
+        return
+    record = {
+        "agent_id": agent.agent_id,
+        "task": agent.task,
+        "model": agent.model,
+        "started_at": agent.started_at,
+        "done_at": agent.done_at,
+        "steps": agent.current_step,
+        "max_steps": agent.current_max_steps,
+        "outcome": agent.outcome,
+    }
+    path = _subagent_outcome_path(agent.agent_id)
+    try:
+        # Atomic write: tmp file + rename
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _load_subagent_outcome_from_disk(agent_id: int) -> dict | None:
+    """Best-effort load of a previously persisted outcome record for agent_id.
+
+    Returns the full record dict (with ``outcome`` key) or None on miss /
+    error. Only looks up the **current process's** record — across-process
+    collisions are avoided by the PID-prefixed filename.
+    """
+    path = _subagent_outcome_path(agent_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 @dataclass
 class _BackgroundAgent:
     agent_id: int
@@ -496,16 +588,35 @@ class _BackgroundAgent:
     current_max_steps: int = _DEFAULT_MAX_STEPS
     outcome: dict | None = None         # filled when future completes
     stats_recorded: bool = False
+    done_at: float | None = None        # wall-clock time outcome was captured
+    persisted: bool = False              # set once written to disk
 
 
 class _BackgroundAgentRegistry:
-    """Thread-safe registry for background sub-agent jobs."""
+    """Thread-safe registry for background sub-agent jobs.
+
+    Lifecycle (post-2026-05 G2+G9 fix):
+
+      register() → agent enters ``_agents`` as running.
+      Future completes → ``mark_done()`` records outcome + persists to disk.
+      ``get(id)`` → returns the agent record, alive OR completed, until
+                    the agent is evicted by the ``_MAX_COMPLETED_IN_MEMORY``
+                    cap. Reads are idempotent.
+      Disk fallback: if ``get(id)`` misses (evicted or process restart of
+                     the same id range), the caller may consult
+                     ``_load_subagent_outcome_from_disk(id)`` directly to
+                     reconstruct the answer. See ``check_agent``.
+      ``cancel_all()`` → wipes RAM + on-disk outcomes (used by test fixture
+                         and shutdown).
+    """
 
     _MAX_CONCURRENT = 5
 
     def __init__(self):
         self._lock = threading.Lock()
         self._agents: dict[int, _BackgroundAgent] = {}
+        # Insertion-ordered completed-agent IDs for FIFO eviction.
+        self._completed_order: collections.deque[int] = collections.deque()
         self._next_id = 0
 
     def register(self, task, future, cancel_event, max_steps, model, started_at=None) -> int:
@@ -543,8 +654,53 @@ class _BackgroundAgentRegistry:
             return self._agents.get(agent_id)
 
     def remove(self, agent_id: int) -> None:
+        """Hard-remove an agent from in-memory registry.
+
+        Note: as of the 2026-05 G2+G9 fix, normal ``check_agent`` reads no
+        longer call this — completed agents stay resident until evicted by
+        the FIFO cap. ``remove`` survives for ``cancel_all`` and explicit
+        kill paths only.
+        """
         with self._lock:
             self._agents.pop(agent_id, None)
+            try:
+                self._completed_order.remove(agent_id)
+            except ValueError:
+                pass
+
+    def mark_done(self, agent_id: int, outcome: dict) -> None:
+        """Record a completed agent's outcome, persist to disk, evict if needed.
+
+        Idempotent — calling twice is a no-op. The outcome is captured on
+        the agent record, the agent is appended to the FIFO completion
+        queue, and the record is written to disk. When more than
+        ``_MAX_COMPLETED_IN_MEMORY`` completed agents are resident, the
+        oldest is dropped from RAM (its on-disk record remains, so it can
+        still be loaded by ``_load_subagent_outcome_from_disk``).
+        """
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if agent is None:
+                return
+            if agent.outcome is None:
+                agent.outcome = outcome
+            if agent.done_at is None:
+                agent.done_at = time.time()
+            if agent_id not in self._completed_order:
+                self._completed_order.append(agent_id)
+        # Persist outside the lock — disk I/O shouldn't block other ops.
+        if not agent.persisted:
+            _persist_subagent_outcome(agent)
+            agent.persisted = True
+        # FIFO eviction of oldest completed agents past the cap.
+        self._evict_excess_completed()
+
+    def _evict_excess_completed(self) -> None:
+        """Drop oldest completed agents from RAM once over the in-memory cap."""
+        with self._lock:
+            while len(self._completed_order) > _MAX_COMPLETED_IN_MEMORY:
+                oldest = self._completed_order.popleft()
+                self._agents.pop(oldest, None)
 
     def list_active(self) -> list[dict]:
         """Return summary of all active background agents."""
@@ -572,7 +728,14 @@ class _BackgroundAgentRegistry:
                     agent.current_max_steps = max_steps
 
     def cancel_all(self):
-        """Cancel all background agents (for cleanup on exit)."""
+        """Cancel all background agents and clear persistence (for test
+        cleanup and shutdown).
+
+        Wipes both RAM and on-disk outcome records for the current process,
+        so test fixtures that call ``cancel_all()`` between tests don't
+        leak stale outcomes into later tests that happen to reuse the same
+        ``agent_id`` (the per-process ``_next_id`` is not reset).
+        """
         with self._lock:
             agents = list(self._agents.values())
         for a in agents:
@@ -583,6 +746,21 @@ class _BackgroundAgentRegistry:
                 pass
         with self._lock:
             self._agents.clear()
+            self._completed_order.clear()
+        # Best-effort wipe of this process's on-disk records.
+        try:
+            persist_dir = _subagent_persist_dir()
+            prefix = f"{os.getpid()}-"
+            for fname in os.listdir(persist_dir):
+                if fname.startswith(prefix) and (
+                    fname.endswith(".json") or fname.endswith(".json.tmp")
+                ):
+                    try:
+                        os.remove(os.path.join(persist_dir, fname))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 # Module-level singleton
@@ -628,12 +806,34 @@ def _record_bg_stats(agent: _BackgroundAgent) -> None:
 
 
 
+def _outcome_from_disk_record(record: dict) -> ToolResult:
+    """Reconstruct a ``check_agent`` ToolResult from a persisted disk record.
+
+    Used when an agent_id has been evicted from the in-memory registry
+    (or referenced by a follow-up call after a prior ``check_agent``).
+    """
+    outcome = record.get("outcome") or {}
+    status = outcome.get("status", "completed")
+    answer = outcome.get("content", "")
+    return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
+
+
 def check_agent(
     agent_id: int = -1,
     action: str = "status",
     wait_timeout_seconds: int = 60,
 ) -> ToolResult:
-    """Check on or manage background sub-agents."""
+    """Check on or manage background sub-agents.
+
+    Reads are idempotent — calling ``check_agent`` on a completed agent
+    multiple times returns the same outcome until it is evicted from
+    the in-memory registry by the FIFO cap (after which it is still
+    recoverable from disk, see ``_load_subagent_outcome_from_disk``).
+
+    On a registry miss, falls back to disk: an agent whose outcome
+    survived a prior client-side wait-timeout can still be retrieved by
+    its id.
+    """
     if action == "list":
         return ToolResult(json.dumps(_bg_registry.list_active()))
 
@@ -645,6 +845,11 @@ def check_agent(
 
     agent = _bg_registry.get(agent_id)
     if agent is None:
+        # Disk fallback — the agent may have been evicted from RAM or its
+        # outcome may have been persisted by a prior, lost wait-timeout.
+        record = _load_subagent_outcome_from_disk(agent_id)
+        if record is not None:
+            return _outcome_from_disk_record(record)
         return ToolResult(
             f"Error: No background agent with id={agent_id}. "
             "Use check_agent(action='list') to see active agents.",
@@ -696,17 +901,25 @@ def check_agent(
         try:
             outcome = agent.future.result(timeout=0)
         except Exception as e:
-            _bg_registry.remove(agent_id)
+            # Real exception from the worker — keep the record so a follow-up
+            # call returns the same error rather than "not found".
+            err_outcome = {"status": "exception", "content": f"Background agent failed: {e}"}
+            if agent.outcome is None:
+                agent.outcome = err_outcome
+            _bg_registry.mark_done(agent_id, agent.outcome)
             return ToolResult(
                 f"Error: Background agent failed: {e}", is_error=True,
             )
 
-        # Record stats, print terminal summary, return result
-        agent.outcome = outcome
+        # Capture outcome on the agent record, record stats, persist + cap.
+        # All three operations are idempotent — safe to call on every
+        # check_agent invocation after completion.
+        if agent.outcome is None:
+            agent.outcome = outcome
         _record_bg_stats(agent)
-        _bg_registry.remove(agent_id)
+        _bg_registry.mark_done(agent_id, outcome)
 
-        elapsed = time.time() - agent.started_at
+        elapsed = (agent.done_at or time.time()) - agent.started_at
         status = outcome.get("status", "completed")
         answer = outcome.get("content", "")
         steps = outcome.get("steps", 0)
@@ -714,15 +927,19 @@ def check_agent(
         out_tok = outcome.get("output_tokens", 0)
         tool_calls = outcome.get("tool_calls", 0)
 
-        # Terminal summary
-        status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
-        status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
-        sys.stdout.write(
-            f"{status_color}  {status_icon} 🤖 Background agent done{COLOR_RESET}"
-            f"{COLOR_DIM} ({status}, {elapsed:.1f}s, {steps} steps, {tool_calls} tool calls, "
-            f"{in_tok}+{out_tok} tokens){COLOR_RESET}\n"
-        )
-        sys.stdout.flush()
+        # Terminal summary — print only ONCE per agent (first observation).
+        # ``summary_printed`` is an attribute we set lazily so the dataclass
+        # default doesn't need a migration.
+        if not getattr(agent, "summary_printed", False):
+            status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
+            status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
+            sys.stdout.write(
+                f"{status_color}  {status_icon} 🤖 Background agent done{COLOR_RESET}"
+                f"{COLOR_DIM} ({status}, {elapsed:.1f}s, {steps} steps, {tool_calls} tool calls, "
+                f"{in_tok}+{out_tok} tokens){COLOR_RESET}\n"
+            )
+            sys.stdout.flush()
+            agent.summary_printed = True
 
         return ToolResult(answer, is_error=(status != _SUBAGENT_STATUS_COMPLETED))
     else:
