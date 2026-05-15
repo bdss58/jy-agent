@@ -36,7 +36,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol, Union, runtime_checkable
+from typing import TYPE_CHECKING, Any, Callable, Literal, Union
 
 from .llm_types import LLMOptions
 from .tool_dispatch import execute_tools
@@ -44,64 +44,22 @@ from ..tools.registry import ToolBatch, get_registry
 from ..tools.result import ToolResult
 
 if TYPE_CHECKING:
-    from .callbacks import LoopCallbacks
-    from .config import LoopConfig, LoopResult
-    from .llm_client import LLMClient
-    from .llm_types import ModelSpec, ToolCallRequest
+    from .config import LoopResult
+    from .engine import AgentLoop
 
 
 # ─── Run-context contract ────────────────────────────────────────────────────
+#
+# ``run_step`` and its helpers all take ``loop: AgentLoop`` as their first
+# argument.  The annotation is only consulted by type-checkers (it lives
+# under ``TYPE_CHECKING`` to dodge the runtime import cycle: engine.py
+# imports step.py).  We used to model this with a ``runtime_checkable``
+# ``RunContext`` Protocol so step.py wouldn't have an "outbound" annotation
+# pointing at engine.py — but the Protocol only ever had one real
+# implementer (AgentLoop) and the runtime-check was never used.  Dropped
+# in the 2026-05 simplification pass.
 
 ToolSource = Callable[[], tuple[list[dict], dict[str, Callable]]]
-
-
-@runtime_checkable
-class RunContext(Protocol):
-    """Structural contract for objects that drive ``run_step``."""
-
-    _config: "LoopConfig"
-    _callbacks: "LoopCallbacks"
-    _runtime_owner: "LLMClient"
-    _model_spec: "ModelSpec | None"
-    _tool_source: "ToolSource | None"
-    _executor: ThreadPoolExecutor
-    _cancel_event: "threading.Event | None"
-    _partial_side_effects: "collections.deque[str]"
-    _run_id: str
-    _todos: list
-
-    def _fire(self, event_name: str, *args: Any) -> None:
-        ...
-
-    def _fire_with_return(self, event_name: str, *args: Any) -> Any:
-        ...
-
-    def _is_cancelled(self) -> bool:
-        ...
-
-    def _call_llm_with_retry(
-        self,
-        context: dict,
-        options: "LLMOptions",
-        step: int,
-    ) -> "tuple[str, list[ToolCallRequest], str, dict]":
-        ...
-
-    def _write_checkpoint(
-        self,
-        *,
-        step: "int | str",
-        messages: list,
-        total_input_tokens: int,
-        total_output_tokens: int,
-        tool_calls_count: int,
-        status: str,
-        total_cache_creation_tokens: int = 0,
-        total_cache_read_tokens: int = 0,
-        api_calls: int = 0,
-        error: "str | None" = None,
-    ) -> None:
-        ...
 
 
 # ─── Run-scoped mutable state + outcome types ────────────────────────────────
@@ -165,7 +123,7 @@ class RunState:
     @classmethod
     def prepare_for_run(
         cls,
-        loop: "RunContext",
+        loop: "AgentLoop",
         system_prompt: str,
         messages: list,
         initial_todos: list | None = None,
@@ -255,7 +213,7 @@ StepOutcome = Union[StepContinue, StepTerminate, StepBreak]
 # ─── The per-step body ───────────────────────────────────────────────────────
 
 
-def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
+def run_step(loop: "AgentLoop", state: RunState) -> StepOutcome:
     """Execute one iteration of the agent loop.
 
     Thin orchestrator. Each phase is extracted into a private helper
@@ -565,7 +523,7 @@ def run_step(loop: "RunContext", state: RunState) -> StepOutcome:
 # ─── Per-step setup helpers ─────────────────────────────────────────────────
 
 
-def _prepare_step_batch(loop: "RunContext", state: RunState) -> ToolBatch:
+def _prepare_step_batch(loop: "AgentLoop", state: RunState) -> ToolBatch:
     cfg = loop._config
     registry = get_registry()
     step = state.step
@@ -592,7 +550,7 @@ def _prepare_step_batch(loop: "RunContext", state: RunState) -> ToolBatch:
 
 
 def _compact_and_build_context(
-    loop: "RunContext",
+    loop: "AgentLoop",
     state: RunState,
     step_batch: ToolBatch,
 ) -> dict:
@@ -627,7 +585,7 @@ def _compact_and_build_context(
     return context
 
 
-def _build_step_options(loop: "RunContext", state: RunState) -> LLMOptions:
+def _build_step_options(loop: "AgentLoop", state: RunState) -> LLMOptions:
     from .llm_runner import build_runtime_options as _build_runtime_options
 
     cfg = loop._config
@@ -674,7 +632,7 @@ def _build_step_options(loop: "RunContext", state: RunState) -> LLMOptions:
 
 
 def _execute_tool_round(
-    loop: "RunContext",
+    loop: "AgentLoop",
     state: RunState,
     step_batch: ToolBatch,
     tool_call_blocks: list,
@@ -778,7 +736,7 @@ def _execute_tool_round(
 
 
 def _check_stuck_loop(
-    loop: "RunContext",
+    loop: "AgentLoop",
     state: RunState,
     tool_results_tuples: list,
 ) -> "StepOutcome | None":
@@ -837,7 +795,7 @@ def _check_stuck_loop(
 
 
 def _record_llm_usage_and_cost(
-    loop: "RunContext",
+    loop: "AgentLoop",
     state: RunState,
     final_message: dict,
     llm_dur_ms: float,
@@ -916,7 +874,7 @@ def _record_llm_usage_and_cost(
 
 
 def _append_assistant_message(
-    loop: "RunContext",
+    loop: "AgentLoop",
     state: RunState,
     step_batch: ToolBatch,
     final_message: dict,
@@ -940,7 +898,7 @@ def _append_assistant_message(
 
 
 def _maybe_reflect(
-    loop: "RunContext",
+    loop: "AgentLoop",
     state: RunState,
     tool_results_tuples: list,
 ) -> None:
@@ -973,7 +931,7 @@ def _maybe_reflect(
         trace.add_span(step=step, event_type="reflection")
 
 
-def _maybe_checkpoint(loop: "RunContext", state: RunState) -> None:
+def _maybe_checkpoint(loop: "AgentLoop", state: RunState) -> None:
     cfg = loop._config
     step = state.step
 

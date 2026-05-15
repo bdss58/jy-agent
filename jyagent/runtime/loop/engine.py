@@ -215,9 +215,6 @@ class AgentLoop(LoopThreadHelper):
         fast path inside ``get_tool_dispatch_executor`` is a single
         attribute check, so per-dispatch cost is negligible.
 
-        Satisfies the ``_executor: ThreadPoolExecutor`` member of the
-        ``RunContext`` protocol used by ``runtime/loop/step_tools.py``.
-
         Test escape hatch: assigning ``loop._executor = X`` records X
         as an override (via the setter below) and the property returns
         it on subsequent reads.  Production code never assigns

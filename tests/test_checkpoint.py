@@ -320,7 +320,7 @@ class TestWriteCheckpointEnabled:
         would hit a ``TypeError`` — latent because tests mock the method.
 
         Lock the signature + ensure the values round-trip to LoopCheckpoint.
-        Codex review 2026-05 exposed this when building RunContext."""
+        Codex review 2026-05 exposed this when building the run-step context."""
         loop = _make_bare_loop(le.LoopConfig(
             checkpoint_dir=str(tmp_path),
             checkpoint_every_n_steps=1,
