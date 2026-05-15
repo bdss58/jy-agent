@@ -120,6 +120,134 @@ def _ensure_memory_context(user_input: str, *, force_rebuild: bool) -> str:
     return _cached_memory_context
 
 
+# ─── Project context block (G1-lite) ─────────────────────────────────────────
+#
+# When the user launches jy-agent from inside a project repo that already has
+# an AGENTS.md / CLAUDE.md (the cross-tool 2025-26 convention for repo-rooted
+# agent instructions), surface its content as a one-shot block in the system
+# prompt — visible to the agent for the whole session, cache-stable across
+# turns (LAUNCH_DIR is constant per session).
+#
+# Design notes:
+#   * AGENTS.md is preferred over CLAUDE.md (broader 2026 adoption — Codex,
+#     Cursor, Aider, Copilot, Gemini CLI, Windsurf, Amp, Amazon Q all read it).
+#     CLAUDE.md is the Claude-Code-specific fallback.
+#   * Search starts at LAUNCH_DIR and walks up to the user's home directory
+#     (or filesystem root, whichever comes first). The nearest match wins.
+#   * Hard caps:  PROJECT_CONTEXT_MAX_BYTES (12 KB) and PROJECT_CONTEXT_MAX_LINES
+#     (300). Files exceeding either are truncated with a clear marker so the
+#     agent knows there's more.
+#   * Cached after first build for the lifetime of the process — content is
+#     not re-read on every turn (no inotify, deliberately). To refresh after
+#     editing the file, restart the agent.
+
+PROJECT_CONTEXT_MAX_BYTES = 12 * 1024
+PROJECT_CONTEXT_MAX_LINES = 300
+_PROJECT_CONTEXT_FILENAMES = ("AGENTS.md", "CLAUDE.md")
+_cached_project_context: str | None = None  # None = not yet computed; "" = no file
+_cached_project_context_path: str | None = None
+
+
+def _find_project_context_file(start_dir: str) -> str | None:
+    """Walk ancestors of ``start_dir`` looking for AGENTS.md / CLAUDE.md.
+
+    Stops at the user's home directory or the filesystem root, whichever
+    comes first. AGENTS.md beats CLAUDE.md at the same level.
+    """
+    if not start_dir or not os.path.isdir(start_dir):
+        return None
+    home = os.path.realpath(os.path.expanduser("~"))
+    cur = os.path.realpath(os.path.abspath(start_dir))
+    # Cap the walk at 25 levels — defensive against weird mount layouts.
+    for _ in range(25):
+        # Home-guard: a file directly at $HOME (or anywhere above) is
+        # treated as global, not project-scoped, and is intentionally
+        # ignored. Use MEMORY.md for global rules; the project-context
+        # block is reserved for repo-local norms. Stop the walk BEFORE
+        # peeking inside $HOME so a `cd ~ && jy-agent` from a user that
+        # happens to keep an AGENTS.md at $HOME doesn't always preload it.
+        if cur == home:
+            return None
+        for name in _PROJECT_CONTEXT_FILENAMES:
+            candidate = os.path.join(cur, name)
+            if os.path.isfile(candidate):
+                return candidate
+        parent = os.path.dirname(cur)
+        if parent == cur:           # filesystem root
+            return None
+        cur = parent
+    return None
+
+
+def _read_project_context_file(path: str) -> str:
+    """Read and cap a project context file. Returns the wrapped block body."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read(PROJECT_CONTEXT_MAX_BYTES + 1)
+    except Exception:
+        return ""
+    truncated_by_bytes = len(raw) > PROJECT_CONTEXT_MAX_BYTES
+    if truncated_by_bytes:
+        raw = raw[:PROJECT_CONTEXT_MAX_BYTES]
+    lines = raw.splitlines()
+    truncated_by_lines = len(lines) > PROJECT_CONTEXT_MAX_LINES
+    if truncated_by_lines:
+        lines = lines[:PROJECT_CONTEXT_MAX_LINES]
+    body = "\n".join(lines)
+    if truncated_by_bytes or truncated_by_lines:
+        body += (
+            "\n\n[... truncated by jy-agent: file exceeds "
+            f"{PROJECT_CONTEXT_MAX_BYTES} bytes / {PROJECT_CONTEXT_MAX_LINES} lines. "
+            "Use read_file to see the full content on demand.]"
+        )
+    return body
+
+
+def _build_project_context_block() -> str:
+    """Locate and render the project context block. Cached after first call."""
+    global _cached_project_context, _cached_project_context_path
+    if _cached_project_context is not None:
+        return _cached_project_context
+    from .config import LAUNCH_DIR
+    path = _find_project_context_file(LAUNCH_DIR)
+    if path is None:
+        _cached_project_context = ""
+        return ""
+    body = _read_project_context_file(path)
+    if not body.strip():
+        _cached_project_context = ""
+        return ""
+    _cached_project_context_path = path
+    # XML-wrap for clear delimitation; same pattern as memory + skills blocks.
+    _cached_project_context = (
+        "<project_context>\n"
+        f"Source file: {path}\n"
+        "This file was authored by a human (or another agent) to describe "
+        "this project's conventions. Treat it as ground truth for project-"
+        "specific norms (build commands, test framework, code style, etc.).\n\n"
+        f"{body}\n"
+        "</project_context>"
+    )
+    return _cached_project_context
+
+
+def project_context_source() -> str | None:
+    """Public accessor: returns the on-disk path of the active project
+    context file, or None if none was found. Useful for CLI banner /
+    debugging."""
+    _build_project_context_block()  # ensure cache is populated
+    return _cached_project_context_path
+
+
+def invalidate_project_context_cache() -> None:
+    """Force re-detection on the next build (e.g. after the user moves
+    or edits the project file). Not currently wired to any slash command
+    — restart the agent to refresh project context."""
+    global _cached_project_context, _cached_project_context_path
+    _cached_project_context = None
+    _cached_project_context_path = None
+
+
 # ─── Public builders ─────────────────────────────────────────────────────────
 
 def build_system_prompt(
@@ -129,17 +257,28 @@ def build_system_prompt(
     force_rebuild: bool = False,
     include_skills: bool = True,
 ) -> str:
-    """Assemble the full system prompt: base + memory + (optional) skill catalog.
+    """Assemble the full system prompt: base + memory + project context +
+    (optional) skill catalog.
+
+    Layer order (cache-prefix-friendly: most stable first):
+
+      1. base_system_prompt()       — constant per process
+      2. memory block               — changes only on memory writes/compaction
+      3. project context block      — constant per process (LAUNCH_DIR-keyed)
+      4. skill catalog              — changes only when skills/ dir changes
 
     ``include_skills=False`` is used by compaction so the summarizer sees the
     same base+memory prefix as a regular turn (cache-friendly) without the
     skill catalog churn.
     """
     memory = _ensure_memory_context(user_input, force_rebuild=force_rebuild)
+    project_ctx = _build_project_context_block()
 
     prompt = base_system_prompt()
     if memory:
         prompt = prompt + "\n\n" + memory
+    if project_ctx:
+        prompt = prompt + "\n\n" + project_ctx
 
     if include_skills and skill_mgr is not None:
         catalog = skill_mgr.build_catalog_block()

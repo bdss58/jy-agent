@@ -137,6 +137,16 @@ def run(runtime_owner: LLMOwner) -> None:
         else:
             cli.print_system("📦 No skills found. Create them in skills/ directory.")
 
+        # G1-lite: announce auto-detected project context (AGENTS.md / CLAUDE.md)
+        # so the user knows it's been ingested into the system prompt.
+        try:
+            from .system_prompt import project_context_source
+            _proj_ctx_path = project_context_source()
+            if _proj_ctx_path:
+                cli.print_system(f"📄 Project context loaded: {_proj_ctx_path}")
+        except Exception:
+            pass
+
         while True:
             try:
                 user_input = cli.get_input()
