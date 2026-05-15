@@ -29,8 +29,8 @@ class LoopThreadHelper:
       * ``_callbacks`` — ``LoopCallbacks`` (or ``None`` for silent runs)
     """
 
-    _cancel_event: Any  # threading.Event | None — declared by subclass
-    _callbacks: Any      # LoopCallbacks | None — declared by subclass
+    _cancel_event: Any = None   # threading.Event | None — set by subclass __init__
+    _callbacks: Any = None      # LoopCallbacks | None — set by subclass __init__
 
     def _is_cancelled(self) -> bool:
         ev = self._cancel_event
