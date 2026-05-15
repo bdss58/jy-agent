@@ -13,9 +13,15 @@ class ToolResult:
     String-like interface: delegates common str methods to self.content so that
     existing code using ``"text" in result`` or ``result.startswith(...)`` keeps working.
     """
-    __slots__ = ('content', 'is_error', 'duration_ms')
+    __slots__ = ('content', 'is_error', 'duration_ms', 'taint')
 
-    def __init__(self, content: str, is_error: bool = False, duration_ms: float | None = None):
+    def __init__(
+        self,
+        content: str,
+        is_error: bool = False,
+        duration_ms: float | None = None,
+        taint: bool = False,
+    ):
         self.content = content
         self.is_error = is_error
         # Wall-clock duration of the tool call in milliseconds. Stamped by the
@@ -25,6 +31,17 @@ class ToolResult:
         # serially in submission order after all bodies have completed).
         # ``None`` = not measured (direct caller or legacy construction).
         self.duration_ms = duration_ms
+        # Taint flag — True if this result imported UNTRUSTED content into
+        # the agent's context (web fetch, web search, file reads from outside
+        # the project root in future versions).  The runtime loop records the
+        # step index of any tainted result onto ``RunState.tainted_steps``;
+        # the approval gate (``on_tool_pre_execute``) consults that set to
+        # decide whether a downstream taint-sensitive tool needs an extra
+        # confirmation prompt regardless of ``allow_all`` mode.  Pure flag —
+        # the content itself is unchanged.  Default False (most results are
+        # trusted: local file reads inside project, shell commands the user
+        # already approved, agent-internal tools).
+        self.taint = taint
 
     def __str__(self):
         return self.content

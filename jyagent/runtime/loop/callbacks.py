@@ -61,6 +61,22 @@ class LoopCallbacks:
     # for logging / progress display.  Step < 0 indicates a terminal
     # checkpoint (e.g. final.json).
     on_checkpoint: Callable[[str, int], None] | None = None
+    # Fires once after a step whose tool batch produced at least one
+    # ToolResult with ``.taint=True`` (i.e. imported untrusted content
+    # into the agent's context, typically a ``web_fetch`` or
+    # ``web_search`` result).  The argument is the step index at which
+    # the taint entered.  Used by interactive UIs to track an active
+    # taint window so the approval gate can enforce extra prompting on
+    # downstream taint-sensitive tool calls even in allow-all mode.
+    # Purely observational — does not affect the loop.  Subagent / silent
+    # runs may leave this None.
+    on_tool_taint: Callable[[int], None] | None = None
+    # Fires when compaction drops messages from the in-context window.
+    # Argument is the lowest step index that still survives in context
+    # (i.e. anything strictly below this is gone).  UIs that maintain a
+    # taint-step set can prune entries that no longer correspond to any
+    # surviving message.  Purely observational.
+    on_taint_horizon: Callable[[int], None] | None = None
 
 
 __all__ = ["LoopCallbacks"]

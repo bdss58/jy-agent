@@ -115,6 +115,17 @@ class RunState:
     stuck_detector: Any = None
     tools_batch: ToolBatch = field(default_factory=ToolBatch.empty)
     trace: Any = None
+
+    # ─── Taint tracking (sandboxing Tier 2) ──────────────────────────────
+    # Step indices at which a tool call returned a result with
+    # ``ToolResult.taint=True`` (untrusted content imported into the agent
+    # context — currently ``web_fetch`` and ``web_search``).  The approval
+    # gate consults this set: when non-empty, taint-sensitive tools
+    # (``run_shell``, ``write_file``, memory writes, etc.) force a prompt
+    # even in allow-all mode.  In-memory only — never serialized to session
+    # checkpoints (the user's approval state is per-run).  Compaction can
+    # prune entries via the ``on_taint_horizon`` callback.
+    tainted_steps: set[int] = field(default_factory=set)
     effective_spec: Any = None
     write_todos_fn: Any = None
     reflection_module: Any = None
@@ -731,6 +742,17 @@ def _execute_tool_round(
             "is_error": result.is_error,
         })
         tool_results_tuples.append((block, result))
+
+    # ─── Taint tracking (sandboxing Tier 2) ──────────────────────────────
+    # If any tool result in this batch imported untrusted content into the
+    # agent context (``web_fetch`` / ``web_search`` set ``ToolResult.taint``),
+    # record the step on RunState and fire ``on_tool_taint`` so interactive
+    # UIs (the approval gate in ui/terminal.py) can force prompting on
+    # downstream taint-sensitive tools even in allow-all mode.  Only fires
+    # once per step — multiple tainted results in the same batch collapse.
+    if any(getattr(r, "taint", False) for (_b, r) in tool_results_tuples):
+        state.tainted_steps.add(step)
+        loop._fire("on_tool_taint", step)
 
     return None, tool_results_tuples
 
