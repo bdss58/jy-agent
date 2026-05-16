@@ -5,8 +5,8 @@
 #   _index.py         — Tier 1: MEMORY.md (always-loaded index)
 #   _topics.py        — Tier 2: curated topic files (on-demand)
 #   _journal.py       — Tier 3: chronological journal (on-demand)
-#   _consolidation.py — read-only dedup/size analysis
-#   operations.py     — cross-tier verbs (remember / forget / show_memory)
+#   operations.py     — cross-tier verbs (remember / forget / show_memory /
+#                       replace_memory_entry / consolidate_memory)
 #
 # This package surface re-exports the public API. Importers should use
 # ``from jyagent.memory import …`` rather than reaching into submodules,
@@ -42,11 +42,11 @@ from ._journal import (
     list_journals, read_journal, append_journal,
 )
 
-# Read-only analyzer
-from ._consolidation import consolidate_memory
-
 # Cross-tier verbs (used by manage_memory tool)
-from .operations import remember, forget, show_memory, replace_memory_entry
+from .operations import (
+    remember, forget, show_memory, replace_memory_entry,
+    consolidate_memory,
+)
 
 from .context import build_memory_context
 from .conversation import estimate_tokens, estimate_conversation_tokens, estimate_message_tokens
