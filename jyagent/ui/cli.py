@@ -1,24 +1,24 @@
-"""CLI module — combines a prompt_toolkit input session with a Rich renderer.
+"""CLI module — combines a prompt_toolkit input session with the Rich renderer.
 
 Architecture:
-    * :class:`jyagent.ui.terminal_renderer.TerminalRenderer` owns ALL output.
+    * :class:`jyagent.ui.terminal_renderer.TerminalRenderer` owns ALL output
+      (banner, system/error lines, history, help).
     * This module owns the input layer (prompt_toolkit session, history file,
       multi-line toggle, status-bar/toolbar callbacks) and the public ``CLI``
-      class that composes both.
+      class.
 
 ``CLI`` inherits from ``TerminalRenderer`` so the existing call surface
-``cli.print_system(...) / cli.print_history(...)`` continues to work
-unchanged in ``agent.py``.  The split is in the *file layout* (Renderer
-methods live in ``terminal_renderer.py``, input methods live here), which
-makes it easy to swap in a Textual or web renderer later — only this file
-needs to change to a different concrete renderer base.
+``cli.print_system(...) / cli.print_history(...)`` keeps working unchanged
+in ``agent.py``.  This is a pragmatic single-class facade for the only
+front-end we support (a Rich-on-stdout terminal); the input/output split
+is in the file layout, not in a runtime-swappable abstraction.
 
 The ``console`` symbol is re-exported from :mod:`jyagent.ui.output` so
-existing ``from .ui.cli import CLI, console`` imports keep working
-(``console`` is the canonical output singleton — see ``ui/output.py``).
+``from .ui.cli import CLI, console`` imports keep working (``console`` is
+the canonical output singleton — see ``ui/output.py``).
 """
 
-import os
+from pathlib import Path
 from typing import Optional
 
 from prompt_toolkit import PromptSession
@@ -42,7 +42,7 @@ PT_STYLE = PTStyle.from_dict({
 })
 
 
-# ─── CLI = Renderer + Input ──────────────────────────────────────────────────
+# ─── CLI = TerminalRenderer + prompt_toolkit input ──────────────────────────
 
 
 class CLI(TerminalRenderer):
@@ -57,14 +57,9 @@ class CLI(TerminalRenderer):
         self.multiline_mode = [False]  # mutable container for toggle
 
         # Resolve history file path relative to project root.
-        # NOTE: cli.py lives at jyagent/ui/cli.py (depth 2 inside the package),
-        # so we need three dirname() calls to escape to the project root.
-        # If you ever move this file, update the depth count — see
-        # MEMORY.md gotcha "When moving a Python module deeper..."
-        project_root = os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        )
-        history_path = os.path.join(project_root, history_file)
+        # cli.py lives at jyagent/ui/cli.py, so parents[2] is the repo root.
+        project_root = Path(__file__).resolve().parents[2]
+        history_path = str(project_root / history_file)
 
         self.session = PromptSession(
             history=FileHistory(history_path),

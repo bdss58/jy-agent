@@ -1,12 +1,12 @@
-"""TerminalRenderer — Rich-on-stdout implementation of the :class:`Renderer` protocol.
+"""TerminalRenderer — Rich-on-stdout rendering surface used by ``CLI``.
 
-Extracted from the old monolithic ``CLI`` class so the rendering surface is
-swappable.  ``CLI`` (in :mod:`jyagent.ui.cli`) now inherits from this class
-and adds only the input-side concerns (prompt_toolkit session, multi-line
-toggle).  ``agent.py`` continues to interact with a ``CLI`` instance — the
-same method calls work without changes.
+Owns ALL terminal output: banner, status lines, history, help, errors.
+``CLI`` (in :mod:`jyagent.ui.cli`) inherits from this class and adds only
+the input-side concerns (prompt_toolkit session, multi-line toggle).
+``agent.py`` interacts with a ``CLI`` instance — calls into this class's
+methods work transparently via inheritance.
 
-Public methods (Renderer protocol):
+Public methods used by ``agent.py``:
     print_banner / print_system / print_error / print_separator
     print_history / print_help / print_turn_summary / goodbye
 
@@ -35,7 +35,7 @@ from .output import CUSTOM_THEME, console
 
 
 class TerminalRenderer:
-    """Rich-on-stdout renderer.  Satisfies :class:`jyagent.ui.renderer.Renderer`."""
+    """Rich-on-stdout renderer.  Base class of :class:`jyagent.ui.cli.CLI`."""
 
     # ─── Banner / lifecycle ──────────────────────────────────────────────
 
