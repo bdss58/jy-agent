@@ -9,7 +9,19 @@
 # the index itself) and must emit one of ADD / UPDATE / NOOP per candidate.
 # This is the Mem0 pipeline, scaled down: we don't build a vector store, we
 # just BM25 the always-loaded index which is capped at 200 lines.
+#
+# Security: auto-extraction sees the raw User: / Assistant: text of each
+# exchange. Any pasted web page, tool output, or shell log can try to smuggle
+# a "future instruction" into always-loaded MEMORY.md via the reconciler LLM.
+# We defend in two layers:
+#   Layer 1 — the SECURITY paragraph inside EXTRACTION_PROMPT below.
+#   Layer 2 — the structural ``_sanitize_body`` / ``_looks_like_injection``
+#             validators further down this module. Even if the LLM is fooled,
+#             we reject candidates whose body matches a known injection shape,
+#             contains URLs, HTML tags, or code fences. Manual ``remember``
+#             calls bypass both layers — the human user is the trust boundary.
 
+import re
 import sys
 import threading
 from typing import Optional
@@ -22,14 +34,6 @@ from ._extraction_directives import (
     _MIN_UPDATE_KEYWORD_LEN,
     # Tests / older callers still reach these compiled regexes by name.
     _ADD_RE, _UPDATE_RE, _NOOP_RE,
-)
-from ._extraction_security import (
-    sanitize_body as _sanitize_body,
-    _looks_like_injection,
-    # Tests grep for _INJECTION_PATTERNS in an error message — expose it
-    # at the old attribute path.
-    _INJECTION_PATTERNS,
-    _URL_PATTERN, _HTML_TAG_PATTERN, _CODE_FENCE_PATTERN,
 )
 
 
@@ -48,6 +52,99 @@ _NEIGHBOUR_LINES = 4
 # Module-level state
 _messages_since_extraction = 0
 _extraction_lock = threading.Lock()
+
+
+# ─── Layer-2 structural defenses (auto-extraction write path) ────────────────
+#
+# Folded back from ``_extraction_security.py`` 2026-05-17 (was extracted on
+# 2026-05 but had only this module as a caller). See
+# data/memory/topics/simplification-audit-2026-05.md verdict 3.1.
+
+# Minimum durable-memory body length after sanitisation. Shorter candidates
+# are too generic to be worth remembering.
+_MIN_BODY_CHARS = 10
+
+# Maximum durable-memory body length — matches the 120-char target used in
+# EXTRACTION_PROMPT.
+_MAX_BODY_CHARS = 120
+
+
+_INJECTION_PATTERNS = re.compile(
+    r"(?:"
+    # "ignore/disregard/forget [the/all/any/my/these] [previous/above/prior/...]
+    # [instruction/rule/...]" — allow up to 3 filler words between the verb
+    # and the target so "disregard the above rules" still catches.
+    r"(?:ignore|disregard|forget) (?:\w+ ){0,3}?(?:previous|above|prior|earlier|preceding|prompt|instruction|directive|rule|memory)"
+    r"|you are (?:now |a new |no longer )"
+    r"|act as (?:if you|a|an) "
+    r"|pretend (?:to be|you are) "
+    # "from now on" as a sentence opener almost always introduces an override.
+    # Catch it broadly — legitimate facts rarely need this phrase.
+    r"|\bfrom now on\b"
+    r"|\bnew (?:instruction|directive|rule|system prompt)\b"
+    r"|\bsystem\s*:\s*(?:you|reply|respond|do)"
+    r"|</?system\b"
+    r"|</?assistant\b"
+    r"|</?developer\b"
+    r"|\[/?INST\]"
+    r"|<\|im_(?:start|end)\|>"
+    r")",
+    re.IGNORECASE,
+)
+
+# URLs and HTML tags are content, not durable rules. Auto-extraction rejects
+# them; manual `remember` still accepts them.
+_URL_PATTERN = re.compile(r"\bhttps?://\S+", re.IGNORECASE)
+_HTML_TAG_PATTERN = re.compile(r"<[a-zA-Z][a-zA-Z0-9_-]{0,20}(?:\s[^<>]*)?/?>")
+# Fenced code blocks (backtick triplets) — never a durable rule.
+_CODE_FENCE_PATTERN = re.compile(r"`{3,}")
+
+
+def _looks_like_injection(body: str) -> bool:
+    """Return True if ``body`` matches any known prompt-injection shape.
+
+    Used only on the auto-extraction write path. Manual ``remember`` calls
+    bypass this because the user is the trust boundary there.
+    """
+    if _INJECTION_PATTERNS.search(body):
+        return True
+    if _URL_PATTERN.search(body):
+        return True
+    if _HTML_TAG_PATTERN.search(body):
+        return True
+    if _CODE_FENCE_PATTERN.search(body):
+        return True
+    return False
+
+
+def _sanitize_body(body: str) -> str | None:
+    """Structural validator for one directive body line.
+
+    Returns the cleaned body on success, or ``None`` if the candidate must
+    be dropped (too short/long, markdown heading, strikethrough, or
+    injection-shaped).
+
+    Rules:
+      - one line only (anything after an embedded newline is discarded)
+      - leading hyphens stripped (the LLM sometimes emits bullet lists)
+      - length clamp ``_MIN_BODY_CHARS`` … ``_MAX_BODY_CHARS``
+      - reject leading ``#`` (markdown heading) / ``~~`` (strikethrough) —
+        those would smuggle structure into the always-loaded prompt.
+      - reject injection-shaped content per ``_looks_like_injection``.
+
+    Auto-extraction is the trust boundary, so this function biases toward
+    over-rejection — a legitimate fact that gets filtered just gets
+    another shot on the next extraction tick.
+    """
+    body = body.splitlines()[0].strip().lstrip("-").strip()
+    if len(body) < _MIN_BODY_CHARS or len(body) > _MAX_BODY_CHARS:
+        return None
+    if body.lstrip().startswith(("#", "~~")):
+        return None
+    if _looks_like_injection(body):
+        return None
+    return body
+
 
 EXTRACTION_PROMPT = """\
 You are a memory reconciler for an AI agent. Analyze the conversation exchange \
