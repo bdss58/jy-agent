@@ -16,10 +16,9 @@ import sys
 #     report which env var was bad and the value seen.
 #   * Validate ranges (``min``, ``max``) for numeric knobs that would silently
 #     break downstream if 0 / negative / oversized.
-#   * Provide ONE canonical boolean parse so ``ANTHROPIC_PROMPT_CACHE=banana``
-#     and ``JYAGENT_ASK=banana`` agree on what an unknown value means
-#     (previously: prompt-cache treated unknown as enabled, ASK treated unknown
-#     as disabled — observable behaviour drift).
+#   * Provide ONE canonical boolean parse so every boolean env var agrees on
+#     what an unknown value means (historical drift: one flag treated unknown
+#     as enabled, another as disabled — same input, opposite semantics).
 #
 # These helpers run at import time, so they MUST NOT import any provider /
 # heavy module — keep them dep-free.
@@ -71,17 +70,11 @@ _BOOL_FALSE = frozenset({"0", "false", "no", "off", "n", "f", ""})
 def _bool_env(name: str, default: bool) -> bool:
     """Parse a bool env var with a SINGLE canonical mapping.
 
-    Previously two ad-hoc parses lived in this file:
-      * ``ANTHROPIC_PROMPT_CACHE`` — "negative list": unknown values
-        treated as TRUE (any non-falsy → enabled).
-      * ``JYAGENT_ASK`` — "positive list": unknown values treated as FALSE.
-
-    That meant ``ANTHROPIC_PROMPT_CACHE=banana`` enabled caching and
-    ``JYAGENT_ASK=banana`` disabled ASK — same input, opposite semantics.
-
-    The unified rule: known TRUE token → True, known FALSE token → False,
-    anything else → ``default`` plus a stderr warning so the user sees
-    the typo instead of inheriting a silent surprise.
+    Historical drift in this file had two ad-hoc parses with opposite
+    semantics for unknown values (one treated unknown as TRUE, another as
+    FALSE).  The unified rule: known TRUE token → True, known FALSE token
+    → False, anything else → ``default`` plus a stderr warning so the user
+    sees the typo instead of inheriting a silent surprise.
     """
     raw = os.environ.get(name)
     if raw is None:
@@ -186,14 +179,6 @@ DEFAULT_TOOL_TIMEOUT = _int_env("AGENT_TOOL_TIMEOUT", 120, min=1)
 STREAM_TIMEOUT = _int_env("AGENT_STREAM_TIMEOUT", 300, min=1)
 COMPACT_TOOL_RESULT_CHARS = 2000  # aggressive limit when compacting old tool results
 OBSERVATION_MASK_DISTANCE = _int_env("AGENT_OBSERVATION_MASK_DISTANCE", 5, min=0)  # fully clear tool results older than N messages from the end
-
-# ─── Tool approval gate ──────────────────────────────────────────────────────
-# When True, the CLI prompts before executing any *mutating* tool call.
-# Read-only / idempotent tools (read_file, list_directory, grep_files,
-# glob_files, web_search, web_fetch, manage_memory query, etc.) are still
-# auto-approved — same policy as the ``mutating`` flag in tools/__init__.py.
-# Toggled by the ``--ask`` CLI flag (see __main__.py) or the env var below.
-ASK_BEFORE_TOOLS = _bool_env("JYAGENT_ASK", False)
 
 # ─── Reasoning preview ──────────────────────────────────────────────────────
 #

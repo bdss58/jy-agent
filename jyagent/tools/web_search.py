@@ -280,6 +280,6 @@ def web_search(
             lines.append(f"   {snippet}")
         lines.append("")
 
-    return ToolResult("\n".join(lines), taint=True)
+    return ToolResult("\n".join(lines))
 
 

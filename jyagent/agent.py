@@ -246,14 +246,12 @@ def run(runtime_owner: LLMOwner) -> None:
                     stats = get_stats()
                     stats.new_turn()
                     from .config import (
-                        ASK_BEFORE_TOOLS,
                         REASONING_SHOW,
                         REASONING_PREVIEW_LINES,
                     )
                     streaming_ui = build_streaming_callbacks(
                         stats,
                         runtime_owner,
-                        ask=ASK_BEFORE_TOOLS,
                         reasoning_show=REASONING_SHOW,
                         reasoning_preview_lines=REASONING_PREVIEW_LINES,
                     )

@@ -32,8 +32,9 @@ class LoopCallbacks:
     # Gate callback fired AFTER ``on_tool_start`` and BEFORE the tool actually
     # runs.  Return ``"deny"`` to skip execution (the engine will synthesize a
     # ``Denied by user`` ToolResult); return ``"allow"`` / ``None`` to proceed.
-    # Used by interactive UIs to implement an approval gate (Claude-Code-style
-    # ``--ask`` flag).  Sub-agent and silent runs leave this as None.
+    # Reserved infrastructure — no built-in UI consumer in this single-user
+    # agent; a custom embedder could wire it to gate untrusted-skill calls.
+    # Sub-agent and silent runs leave this as None.
     on_tool_pre_execute: Callable[[str, dict], str | None] | None = None
     on_tool_end: Callable[..., None] | None = None  # (name, content, is_error, duration_ms | None)
     on_retry: Callable[[int, Exception], None] | None = None  # (attempt, error)
@@ -61,22 +62,6 @@ class LoopCallbacks:
     # for logging / progress display.  Step < 0 indicates a terminal
     # checkpoint (e.g. final.json).
     on_checkpoint: Callable[[str, int], None] | None = None
-    # Fires once after a step whose tool batch produced at least one
-    # ToolResult with ``.taint=True`` (i.e. imported untrusted content
-    # into the agent's context, typically a ``web_fetch`` or
-    # ``web_search`` result).  The argument is the step index at which
-    # the taint entered.  Used by interactive UIs to track an active
-    # taint window so the approval gate can enforce extra prompting on
-    # downstream taint-sensitive tool calls even in allow-all mode.
-    # Purely observational — does not affect the loop.  Subagent / silent
-    # runs may leave this None.
-    on_tool_taint: Callable[[int], None] | None = None
-    # Fires when compaction drops messages from the in-context window.
-    # Argument is the lowest step index that still survives in context
-    # (i.e. anything strictly below this is gone).  UIs that maintain a
-    # taint-step set can prune entries that no longer correspond to any
-    # surviving message.  Purely observational.
-    on_taint_horizon: Callable[[int], None] | None = None
 
 
 __all__ = ["LoopCallbacks"]

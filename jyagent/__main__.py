@@ -44,25 +44,11 @@ def main():
     """Main entry point."""
     _load_dotenv()
 
-    # ─── Minimal CLI flag parsing ───────────────────────────────────────
-    # We don't use argparse to keep startup lean; the agent reads its
-    # options from environment variables.  --ask sets JYAGENT_ASK=1 so
-    # config.ASK_BEFORE_TOOLS picks it up at import time (see below).
-    import sys as _sys
-    argv = _sys.argv[1:]
-    if "--ask" in argv:
-        os.environ["JYAGENT_ASK"] = "1"
-        _sys.argv = [_sys.argv[0]] + [a for a in argv if a != "--ask"]
-
     # LAUNCH_DIR is set by run.sh *before* it cd's to the project root.
     # os.getcwd() here already points to the project dir, NOT the user's dir.
     # Fall back to cwd only for direct `python -m jyagent` invocations (no run.sh).
     import jyagent.config as _cfg
     _cfg.LAUNCH_DIR = os.environ.get("LAUNCH_DIR") or os.getcwd()
-    # Re-read JYAGENT_ASK in case --ask was passed AFTER dotenv load above.
-    _cfg.ASK_BEFORE_TOOLS = (
-        os.environ.get("JYAGENT_ASK", "0").lower() in ("1", "true", "yes")
-    )
 
     # Change CWD to the user's launch directory so all tools (run_shell,
     # read_file, etc.) operate in the user's project by default.

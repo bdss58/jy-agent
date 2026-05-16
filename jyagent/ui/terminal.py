@@ -1,6 +1,5 @@
 # Terminal UX — Formatting, colors, spinner, and streaming callbacks for AgentLoop.
 
-import os
 import sys
 import time
 import threading
@@ -466,7 +465,6 @@ def build_streaming_callbacks(
     stats,
     runtime_owner,
     *,
-    ask: bool = False,
     reasoning_show: bool = True,
     reasoning_preview_lines: int = 5,
 ) -> StreamingUI:
@@ -477,12 +475,6 @@ def build_streaming_callbacks(
     ``AgentLoop``, ``ui.spinner`` to ensure stop() in a ``finally``, and
     ``ui.flush_trailing_newline()`` after the loop finishes to terminate
     the streamed text line cleanly.
-
-    Set ``ask=True`` to enable the per-call approval gate: every *mutating*
-    tool call (run_shell, write_file, edit_file, mcp, dispatch_agent, ...)
-    pauses for [y/N/a] before running.  Read-only tools auto-approve.
-    Choosing ``a`` (allow-all) disables the gate for the rest of the
-    session.
 
     ``reasoning_show=True`` (default) streams the first
     ``reasoning_preview_lines`` lines of each thinking block in dim italic
@@ -496,8 +488,6 @@ def build_streaming_callbacks(
     spinner = ThinkingSpinner()
     stream_state = StreamState()
     reasoning_streamer = _ReasoningStreamer(preview_lines=reasoning_preview_lines)
-    # Closure-mutable so the "a" answer can latch for the session.
-    allow_all = [False]
 
     def _on_text_delta(text: str):
         spinner.stop()
@@ -596,136 +586,6 @@ def build_streaming_callbacks(
     def _on_tool_batch(n_tools: int):
         _tool_info(f"Executing {n_tools} tool calls...")
 
-    # ─── Sandboxing Tier 1+2 state (blast-radius preview + taint tracking) ─
-    # Single global on/off — defaults to ON.  Set JYAGENT_SAFE_MODE=off to
-    # disable both the blast-radius preview banner and the active-taint
-    # forced-prompt behaviour.  Approval gate proper (ask=True) is
-    # independent; this only affects what the gate decides AUTOMATICALLY
-    # (i.e. when allow-all is in effect).
-    _safe_mode = os.environ.get("JYAGENT_SAFE_MODE", "on").strip().lower() != "off"
-    # Active-taint window: step indices at which web_fetch / web_search
-    # imported untrusted content into the agent's context.  When non-empty,
-    # taint-sensitive tools (run_shell, write_file, memory writes, …) force
-    # an explicit prompt even in allow-all mode.  Populated by
-    # _on_tool_taint, pruned by _on_taint_horizon.
-    active_taint: set[int] = set()
-
-    def _on_tool_taint(step: int):
-        active_taint.add(step)
-        if _safe_mode:
-            _tool_info(
-                f"⚠️ Untrusted content imported (step {step + 1}). "
-                "Downstream shell / write / memory tools will re-prompt "
-                "until this content is out of context."
-            )
-
-    def _on_taint_horizon(min_step: int):
-        # Compaction dropped messages with step < min_step.  Prune.
-        before = len(active_taint)
-        active_taint.intersection_update({s for s in active_taint if s >= min_step})
-        if _safe_mode and before and not active_taint:
-            _tool_info("✓ Untrusted content has aged out of context (taint cleared).")
-
-    def _on_tool_pre_execute(name: str, tool_input: dict) -> str:
-        """Approval gate with blast-radius preview + taint-aware re-prompting.
-
-        Decision order:
-          1. ``ask=False`` and no active taint and not irreversible → allow.
-          2. ``allow_all`` latched AND not irreversible AND not (taint-active
-             and tool is taint-sensitive) → allow.
-          3. Show blast-radius banner; prompt [y/N/a].
-
-        Note: irreversibility and taint-sensitivity FORCE a prompt even
-        when allow-all is latched.  Approval fatigue is a real cost but
-        these are exactly the calls where ``y`` should be a deliberate
-        keystroke (see CVE-2026-26268 / CVE-2025-53773 — flipping the
-        approval bit via prompt injection is in the threat model).
-        """
-        from ..tools.display import blast_radius
-        br = blast_radius(name, tool_input)
-        taint_active_and_sensitive = bool(active_taint) and br.taint_sensitive
-
-        # Fast path: trusted read-only tool, no active taint.
-        if br.verb in ("NONE", "READ") and not taint_active_and_sensitive:
-            if not ask or allow_all[0]:
-                return "allow"
-            # Fall back to old registry-based check for unregistered tools.
-            try:
-                from ..runtime.tools.registry import get_registry
-                if not get_registry().freeze().is_mutating(name):
-                    return "allow"
-            except Exception:
-                pass  # If registry is unreachable, fall through to ask.
-
-        # Allow-all may bypass for mutating-but-safe calls, but NEVER for:
-        #   - irreversible side effects (rm -rf, git push, WeChat send, …)
-        #   - taint-sensitive calls while taint is active in context
-        force_prompt = _safe_mode and (br.irreversible or taint_active_and_sensitive)
-        if (not ask or allow_all[0]) and not force_prompt:
-            return "allow"
-
-        # Make sure the streamed text line has a terminator before our prompt.
-        if stream_state.needs_newline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            stream_state.needs_newline = False
-
-        from rich.text import Text
-        args_preview = format_tool_args(name, tool_input)
-
-        # Blast-radius banner (one line, no extra prompt — informational).
-        if _safe_mode and br.verb != "NONE":
-            tag = Text()
-            tag.append("  ▸ ", style="dim")
-            verb_style = {
-                "EXEC": "bold red",
-                "DELETE": "bold red",
-                "SEND": "bold magenta",
-                "WRITE": "bold yellow",
-                "FETCH": "bold cyan",
-                "NETWORK": "bold cyan",
-                "SPAWN": "bold blue",
-                "READ": "dim",
-            }.get(br.verb, "bold")
-            tag.append(br.verb, style=verb_style)
-            if br.target:
-                tag.append(f"  {br.target}", style="dim")
-            flags: list[str] = []
-            if br.irreversible:
-                flags.append("irreversible")
-            if br.taint_source:
-                flags.append("untrusted-source")
-            if taint_active_and_sensitive:
-                flags.append("taint-active")
-            if flags:
-                tag.append(f"  ({', '.join(flags)})", style="bold red")
-            console.print(tag)
-
-        prompt = Text()
-        prompt.append("  ❓ Approve ", style="bold yellow")
-        prompt.append(name, style="bold")
-        if args_preview:
-            prompt.append(f"  {args_preview}", style="dim")
-        # Hide 'a' (all) option when the call would be force-prompted anyway,
-        # so the user doesn't think they can disable this prompt.
-        suffix = "  [y/N]: " if force_prompt else "  [y/N/a]: "
-        prompt.append(suffix, style="bold yellow")
-        console.print(prompt, end="")
-        try:
-            answer = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[bold red]  ✗ Denied (input aborted)[/bold red]")
-            return "deny"
-        if answer in ("y", "yes"):
-            return "allow"
-        if answer in ("a", "all") and not force_prompt:
-            allow_all[0] = True
-            console.print("[dim]  (allow-all enabled for this session — "
-                          "irreversible + taint-sensitive calls still prompt)[/dim]")
-            return "allow"
-        console.print("[bold red]  ✗ Denied[/bold red]")
-        return "deny"
-
     callbacks = LoopCallbacks(
         on_text_delta=_on_text_delta,
         on_thinking_start=_on_thinking_start,
@@ -733,7 +593,6 @@ def build_streaming_callbacks(
         on_thinking_delta=_on_thinking_delta,
         on_thinking_block_end=_on_thinking_block_end,
         on_tool_start=_on_tool_start,
-        on_tool_pre_execute=_on_tool_pre_execute,
         on_tool_end=_on_tool_end,
         on_retry=_on_retry,
         on_stream_retry=_on_stream_retry,
@@ -743,8 +602,6 @@ def build_streaming_callbacks(
         on_warning=_on_warning,
         on_truncation=_on_truncation,
         on_tool_batch=_on_tool_batch,
-        on_tool_taint=_on_tool_taint,
-        on_taint_horizon=_on_taint_horizon,
     )
 
     return StreamingUI(
