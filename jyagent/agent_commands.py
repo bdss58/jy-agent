@@ -275,7 +275,7 @@ def _cmd_think(cli, state, user_input, **_):
         selected = [(n, blocks[n - 1])]
 
     from rich.text import Text
-    from .ui.cli import console
+    from .ui.output import console
     for idx, block in selected:
         n_lines = block.text.count("\n") + (0 if block.text.endswith("\n") else 1) if block.text else 0
         header = Text()

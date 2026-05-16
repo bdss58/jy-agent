@@ -19,7 +19,7 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .cli import console
+from .output import console
 from .terminal import interrupted_msg
 
 if TYPE_CHECKING:

@@ -17,7 +17,8 @@ from .ui.terminal import build_streaming_callbacks
 from .ui.loop_result_presenter import present_loop_result
 from .runtime.loop.engine import AgentLoop, LoopResult
 from .runtime.loop.config import build_default_loop_config
-from .ui.cli import CLI, console
+from .ui.cli import CLI
+from .ui.output import console
 from .ui.commands import find_command, get_handler
 from .skills import init_skills
 from .llm import LLMOwner

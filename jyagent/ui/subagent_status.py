@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 
+from .output import _STDOUT_LOCK
+
 # ─── ANSI palette ────────────────────────────────────────────────────────────
 
 COLOR_DIM = "\033[2m"
@@ -127,14 +129,20 @@ class _SubagentTracker:
                 elapsed = now - oldest_t0
                 line = f"\r{COLOR_DIM}  {frame} 🤖 {count} sub-agents running ({elapsed:.0f}s){COLOR_RESET}"
 
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            # Serialize on the package-shared lock so this spinner cannot
+            # interleave with the planner spinner / reasoning preview /
+            # streaming text in :mod:`jyagent.ui.terminal`.
+            with _STDOUT_LOCK:
+                sys.stdout.write(line)
+                sys.stdout.flush()
             idx += 1
             self._stop.wait(0.1)
 
-        # Clear the spinner line
-        sys.stdout.write("\r" + " " * 120 + "\r")
-        sys.stdout.flush()
+        # Clear the spinner line (still under the shared lock so a
+        # concurrent writer doesn't paint into the half-cleared row).
+        with _STDOUT_LOCK:
+            sys.stdout.write("\r" + " " * 120 + "\r")
+            sys.stdout.flush()
 
 # Global singleton — sub-agents register/deregister via this.
 _subagent_tracker = _SubagentTracker()

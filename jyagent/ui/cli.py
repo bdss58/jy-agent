@@ -13,8 +13,9 @@ methods live in ``terminal_renderer.py``, input methods live here), which
 makes it easy to swap in a Textual or web renderer later — only this file
 needs to change to a different concrete renderer base.
 
-The ``console`` symbol is re-exported from :mod:`terminal_renderer` so
-existing ``from .ui.cli import CLI, console`` imports keep working.
+The ``console`` symbol is re-exported from :mod:`jyagent.ui.output` so
+existing ``from .ui.cli import CLI, console`` imports keep working
+(``console`` is the canonical output singleton — see ``ui/output.py``).
 """
 
 import os
@@ -28,7 +29,8 @@ from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.formatted_text import HTML
 
 from ..runtime.stats import get_stats
-from .terminal_renderer import TerminalRenderer, console
+from .output import console
+from .terminal_renderer import TerminalRenderer
 
 
 # ─── Prompt toolkit styling ──────────────────────────────────────────────────

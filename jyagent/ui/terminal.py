@@ -5,7 +5,7 @@ import time
 import threading
 from dataclasses import dataclass, field
 from ..runtime.loop.engine import LoopCallbacks
-from .cli import console
+from .output import _STDOUT_LOCK, console
 
 
 # ─── Stream state ────────────────────────────────────────────────────────────
@@ -100,17 +100,19 @@ class _ReasoningStreamer:
         """Write text in dim italic style via raw ANSI (Rich can't stream chars)."""
         # ESC[2;3m = dim + italic; ESC[0m = reset.
         # We wrap each chunk independently so a forgotten reset can never
-        # bleed into subsequent normal text.
-        sys.stdout.write(f"\033[2;3m{text}\033[0m")
-        sys.stdout.flush()
+        # bleed into subsequent normal text.  Take the shared stdout lock
+        # so this cannot interleave mid-line with the spinner / sub-agent
+        # status / streaming text writers — see ``output._STDOUT_LOCK``.
+        with _STDOUT_LOCK:
+            sys.stdout.write(f"\033[2;3m{text}\033[0m")
+            sys.stdout.flush()
 
     def finalize(self, full_text: str, reason: str) -> None:
         """End-of-block: print fold marker if needed, record the block."""
         # Terminate any open preview line so the marker/next output starts
         # on its own row.
         if self.needs_newline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _locked_newline()
             self.needs_newline = False
 
         total_lines = full_text.count("\n") + (0 if full_text.endswith("\n") else 1) if full_text else 0
@@ -148,21 +150,36 @@ class _ReasoningStreamer:
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
 
-# Shared lock for ALL raw ``sys.stdout`` writes from this module.  The
-# ``ThinkingSpinner`` runs a daemon thread that writes spinner frames, while
-# the main thread streams model text via ``_stream_write`` and clears the
-# spinner line in ``ThinkingSpinner.stop()``.  Without serialization, a
-# spinner frame written between the main thread's clear and the first
-# streamed character leaves stale glyphs on the line.  All raw stdout writes
-# in this module must take this lock; Rich's ``console.print`` has its own
-# internal lock and is excluded.
-_STDOUT_LOCK = threading.Lock()
+# Raw-stdout writes serialize on the package-shared lock exported from
+# :mod:`jyagent.ui.output`.  The ``ThinkingSpinner`` runs a background
+# thread that writes spinner frames, while the main thread streams model
+# text via ``_stream_write`` and clears the spinner line in
+# ``ThinkingSpinner.stop()``.  Without serialization, a spinner frame
+# written between the main thread's clear and the first streamed
+# character leaves stale glyphs on the line.  Every raw-stdout writer in
+# this module (spinner, ``_stream_write``, ``_ReasoningStreamer._write_dim``)
+# must take this lock; Rich's ``console.print`` has its own internal lock
+# and is excluded.  The same lock is acquired by the sub-agent status
+# spinner in :mod:`jyagent.ui.subagent_status` so threaded ANSI from two
+# UI modules cannot interleave mid-line.
 
 
 def _stream_write(text: str):
     """Write streamed text to stdout (char-level streaming — Rich can't do this)."""
     with _STDOUT_LOCK:
         sys.stdout.write(text)
+        sys.stdout.flush()
+
+
+def _locked_newline() -> None:
+    """Write a single newline under the shared stdout lock.
+
+    Used by callers that need to terminate an in-flight raw-stdout line
+    (streaming text, reasoning preview) before printing the next thing.
+    Equivalent to ``_stream_write("\\n")`` but named for the common case.
+    """
+    with _STDOUT_LOCK:
+        sys.stdout.write("\n")
         sys.stdout.flush()
 
 
@@ -456,8 +473,7 @@ class StreamingUI:
 
     def flush_trailing_newline(self) -> None:
         if self._stream_state.needs_newline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _locked_newline()
             self._stream_state.needs_newline = False
 
 
@@ -495,8 +511,7 @@ def build_streaming_callbacks(
         # it before answer text begins.  This keeps the reasoning preview
         # and the answer on separate visual rows.
         if reasoning_show and reasoning_streamer.needs_newline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _locked_newline()
             reasoning_streamer.needs_newline = False
         _stream_write(text)
         stream_state.needs_newline = True
@@ -539,14 +554,12 @@ def build_streaming_callbacks(
     def _on_tool_start(name: str, tool_input: dict):
         spinner.stop()
         if stream_state.needs_newline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _locked_newline()
             stream_state.needs_newline = False
         # Also terminate any open thinking-preview line so the tool header
         # doesn't appear glued to the tail of a reasoning chunk.
         if reasoning_show and reasoning_streamer.needs_newline:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            _locked_newline()
             reasoning_streamer.needs_newline = False
         _tool_call_header(name, tool_input)
 

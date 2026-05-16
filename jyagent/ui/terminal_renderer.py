@@ -24,28 +24,11 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
-from rich.theme import Theme
 
 from ..runtime.stats import get_stats
-
-
-# ─── Rich console with custom theme ──────────────────────────────────────────
-
-CUSTOM_THEME = Theme({
-    "agent":  "bold green",
-    "user":   "bold cyan",
-    "system": "yellow",
-    "error":  "bold red",
-    "dim":    "dim",
-    "banner": "bold magenta",
-    "tool":   "yellow",
-    "info":   "dim cyan",
-})
-
-console = Console(theme=CUSTOM_THEME, highlight=False)
+from .output import CUSTOM_THEME, console
 
 
 # ─── Renderer ────────────────────────────────────────────────────────────────

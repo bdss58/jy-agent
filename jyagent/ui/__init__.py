@@ -9,7 +9,8 @@
 #   Renderer                   — protocol any renderer must satisfy
 #   TerminalRenderer           — concrete Rich-on-stdout renderer
 
-from .cli import CLI, console
+from .cli import CLI
+from .output import console
 from .terminal import build_streaming_callbacks, render_final_text, StreamingUI
 from .terminal_renderer import TerminalRenderer
 from .renderer import Renderer
