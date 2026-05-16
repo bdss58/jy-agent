@@ -149,10 +149,22 @@ class _ReasoningStreamer:
 
 # ─── Output helpers ──────────────────────────────────────────────────────────
 
+# Shared lock for ALL raw ``sys.stdout`` writes from this module.  The
+# ``ThinkingSpinner`` runs a daemon thread that writes spinner frames, while
+# the main thread streams model text via ``_stream_write`` and clears the
+# spinner line in ``ThinkingSpinner.stop()``.  Without serialization, a
+# spinner frame written between the main thread's clear and the first
+# streamed character leaves stale glyphs on the line.  All raw stdout writes
+# in this module must take this lock; Rich's ``console.print`` has its own
+# internal lock and is excluded.
+_STDOUT_LOCK = threading.Lock()
+
+
 def _stream_write(text: str):
     """Write streamed text to stdout (char-level streaming — Rich can't do this)."""
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    with _STDOUT_LOCK:
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
 
 # ─── Thinking spinner ───────────────────────────────────────────────────────
@@ -184,11 +196,21 @@ class ThinkingSpinner:
             return
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=1)
+            # Join WITHOUT a timeout: the daemon thread's wait cycle is
+            # 80 ms, so it returns promptly once the event is set.  A
+            # ``join(timeout=1)`` followed by an unconditional clear was
+            # racy — if the daemon happened to be mid-write when the join
+            # gave up, we'd clear the line and the daemon would then write
+            # one final spinner frame on top of the now-streaming text.
+            # Daemon=True still protects against pathological hangs at
+            # interpreter shutdown.
+            self._thread.join()
         self._started = False
-        # Clear the spinner line
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
+        # Clear the spinner line.  Take the shared stdout lock so this can
+        # never interleave with a (vestigial) spinner write.
+        with _STDOUT_LOCK:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
 
     def _animate(self):
         idx = 0
@@ -196,8 +218,15 @@ class ThinkingSpinner:
         while not self._stop_event.is_set():
             elapsed = time.time() - t0
             frame = self._FRAMES[idx % len(self._FRAMES)]
-            sys.stdout.write(f"\r\033[2m  {frame} {self._label}... ({elapsed:.1f}s)\033[0m")
-            sys.stdout.flush()
+            with _STDOUT_LOCK:
+                # Re-check the stop flag inside the lock: stop() may have
+                # fired between the while-check and acquiring the lock; in
+                # that case skip the write so we don't paint a frame after
+                # the line was cleared.
+                if self._stop_event.is_set():
+                    break
+                sys.stdout.write(f"\r\033[2m  {frame} {self._label}... ({elapsed:.1f}s)\033[0m")
+                sys.stdout.flush()
             idx += 1
             self._stop_event.wait(0.08)
 
@@ -316,16 +345,20 @@ def _render_edit_diff(result_str: str, duration_ms: float | None = None):
         header.append(f" ({dur_str})", style="dim")
     console.print(header)
 
-    # Render context lines with diff coloring
+    # Render context lines with diff coloring.
+    # NOTE: check ``stripped`` for content-bearing prefixes (">", "L<n>:"),
+    # but check the ORIGINAL ``line`` for the leading-space marker — after
+    # ``strip()`` the leading whitespace is gone, so a `stripped.startswith(" ")`
+    # branch is provably unreachable (was a real bug, caught in code review).
     for line in lines[1:]:
         stripped = line.strip()
         if stripped.startswith(">"):
             # Changed line — highlight in green
             console.print(Text(f"    {line}", style="green"))
-        elif stripped.startswith("L") or stripped.startswith(" "):
-            # Context line — dim
+        elif stripped.startswith("L") or line.startswith(" "):
+            # Context line (numbered "L42:" form, or simply indented) — dim
             console.print(Text(f"    {line}", style="dim"))
-        elif line.strip():
+        elif stripped:
             console.print(f"    {line}")
 
 
@@ -336,12 +369,25 @@ def interrupted_msg():
 
 
 def render_final_text(text: str, *, markdown: bool = True) -> None:
-    """Render the assistant's final text answer.
+    """Render the assistant's final text answer as a Markdown panel.
 
-    When ``markdown`` is True and the text doesn't look like a status marker
-    (e.g. ``[Response interrupted by user]``), wrap it in a Rich Markdown panel.
-    Otherwise this is a no-op — the streaming callbacks already wrote the
-    plain text to stdout, and we don't want to duplicate it.
+    **Dual output is intentional**, not a bug.  By the time we get here the
+    streaming callbacks have already written the raw assistant text to
+    stdout char-by-char (that's the only way to get a true streaming feel
+    — Rich can't stream Markdown mid-render).  After the stream completes,
+    we *re-render* the same text through Rich's Markdown renderer so the
+    user sees both:
+
+      1. the raw stream (preserved for select-and-copy, scrollback, and
+         any consumer piping our stdout), and
+      2. a polished Markdown panel below it (headings, lists, code
+         highlighting via ``monokai``).
+
+    Skipped when:
+
+      * ``markdown=False`` (user toggled it off via ``/markdown``), or
+      * the text is empty / a status marker like
+        ``[Response interrupted by user]`` — re-rendering those adds no value.
 
     Centralised here so the UI package owns all rendering decisions; callers
     only need to pass the final text and a toggle.
@@ -353,17 +399,21 @@ def render_final_text(text: str, *, markdown: bool = True) -> None:
     stripped = text.strip() if text else ""
     if not stripped or stripped.startswith("["):
         return
+
+    # No Panel/border around the Markdown body: borders get included when
+    # users select-and-copy the rendered output.  A thin header + trailing
+    # hint gives the visual cue without polluting copy-paste.
+    console.print()
+    console.print("[bold green]📝 Rendered[/bold green] [dim](/markdown to toggle)[/dim]")
     try:
-        md = Markdown(text, code_theme="monokai")
-        # No Panel/border: borders get included when users select-and-copy
-        # the rendered output. Use a thin header + trailing hint instead so
-        # copying picks up only the actual content.
-        console.print()
-        console.print("[bold green]📝 Rendered[/bold green] [dim](/markdown to toggle)[/dim]")
-        console.print(md)
-    except Exception:
-        # Markdown rendering is best-effort — never crash the turn over it.
-        pass
+        console.print(Markdown(text, code_theme="monokai"))
+    except Exception as e:
+        # Markdown rendering is best-effort — never crash the turn over
+        # it.  But also don't leave the user staring at a header with no
+        # body: surface a short notice and re-print the raw text plainly
+        # so the dual-output contract still holds.
+        console.print(f"[dim](markdown render failed: {type(e).__name__}; showing raw text)[/dim]")
+        console.print(text)
 
 
 def _runtime_warning(msg: str):
