@@ -4,6 +4,9 @@ import sys
 import time
 import threading
 from dataclasses import dataclass, field
+
+from rich.text import Text
+
 from ..runtime.loop.engine import LoopCallbacks
 from .output import _STDOUT_LOCK, console
 
@@ -121,7 +124,6 @@ class _ReasoningStreamer:
         if self.in_fold and total_lines > self.lines_emitted:
             hidden = total_lines - self.lines_emitted
             reason_tag = "" if reason == "end" else f" · {reason}"
-            from rich.text import Text
             marker = Text()
             marker.append(f"  ▸ {hidden} more line{'s' if hidden != 1 else ''} folded", style="dim italic")
             marker.append(f" · /think to expand{reason_tag}", style="dim")
@@ -269,7 +271,6 @@ def _tool_call_header(tool_name: str, tool_input: dict):
     args_preview = format_tool_args(tool_name, tool_input)
     # Flush raw stdout first to maintain ordering with Rich output
     sys.stdout.flush()
-    from rich.text import Text
     text = Text()
     text.append(f"\n  {icon} {tool_name}", style="yellow")
     if args_preview:
@@ -304,7 +305,6 @@ def _format_duration(duration_ms: float | None) -> str:
 
 def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = False, duration_ms: float | None = None):
     """Print a compact tool result summary with smart formatting."""
-    from rich.text import Text
     # Flush raw stdout to maintain ordering with Rich output
     sys.stdout.flush()
 
@@ -347,7 +347,6 @@ def _tool_result_preview(result_str: str, tool_name: str = "", is_error: bool = 
 
 def _render_edit_diff(result_str: str, duration_ms: float | None = None):
     """Render edit_file output with color-coded diff lines using Rich Text."""
-    from rich.text import Text
     # Flush raw stdout to maintain ordering with Rich output
     sys.stdout.flush()
 
@@ -435,7 +434,6 @@ def render_final_text(text: str, *, markdown: bool = True) -> None:
 def _runtime_warning(msg: str):
     """Print a short runtime recovery warning without aborting the turn."""
     sys.stdout.flush()
-    from rich.text import Text
     text = Text(f"\n  ⚠ {msg}", style="dim yellow")
     console.print(text)
 
