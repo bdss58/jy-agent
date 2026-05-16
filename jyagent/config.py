@@ -24,12 +24,18 @@ import sys
 # heavy module — keep them dep-free.
 
 
-class ConfigError(RuntimeError):
+class ConfigError(ValueError):
     """Raised when an env-var-backed config value is invalid.
 
     Surfaces the env var NAME and the offending value, so import-time
     failures point the user directly at what to fix instead of a raw
-    Python traceback.  Caught in ``__main__`` for a friendlier message.
+    Python traceback.
+
+    Inherits from ``ValueError`` because that is what "bad config value"
+    semantically is — and so any caller that broadly catches
+    ``ValueError`` (e.g. tests asserting on argument validation) keeps
+    working when a helper switches from a bare ``raise ValueError(...)``
+    to ``raise ConfigError(...)``.
     """
 
 
@@ -153,17 +159,17 @@ def get_extra_headers_from_env(env_var: str) -> dict[str, str]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as err:
-        raise ValueError(
+        raise ConfigError(
             f"{env_var} must be a JSON object of string header names to string values: {err.msg}."
         ) from err
     if not isinstance(parsed, dict):
-        raise ValueError(
+        raise ConfigError(
             f"{env_var} must be a JSON object of string header names to string values; "
             f"got {type(parsed).__name__}."
         )
     for key, value in parsed.items():
         if not isinstance(key, str) or not isinstance(value, str):
-            raise ValueError(
+            raise ConfigError(
                 f"{env_var} must be a JSON object of string header names to string values; "
                 f"invalid entry {key!r}: {type(value).__name__}."
             )
