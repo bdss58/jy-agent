@@ -122,14 +122,6 @@ def type_text(text: str) -> None:
     _osascript(f'tell application "System Events" to keystroke "{esc}"')
 
 
-# Convenience aliases for the most common keys.
-def press_return() -> None: key_code(36)
-def press_escape() -> None: key_code(53)
-def press_tab()    -> None: key_code(48)
-def press_down()   -> None: key_code(125)
-def press_up()     -> None: key_code(126)
-
-
 # ─── CLI shim ────────────────────────────────────────────────────────────────
 
 

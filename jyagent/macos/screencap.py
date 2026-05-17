@@ -68,12 +68,6 @@ def capture_window_interactive(out_path: str | Path) -> Path:
     return p
 
 
-# Retina scale on Apple Silicon / most modern Macs. screencapture writes the
-# image at the native resolution of the display, so a 368×518 logical region
-# becomes a 736×1036 PNG on a 2x panel.
-DEFAULT_RETINA_SCALE = 2
-
-
 # ─── CLI shim ────────────────────────────────────────────────────────────────
 
 

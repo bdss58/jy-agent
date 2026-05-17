@@ -261,8 +261,9 @@ Report back to the user with the post-send screenshot.
 - **Work on WeChat Web / Mobile / 企业微信** — different app, different
   surface. Write a separate skill if needed.
 - **Handle multi-monitor / non-Retina displays** — calibrated for @2x
-  Retina. Update `DEFAULT_RETINA_SCALE` in `screencap.py` and the
-  `image_*_to_screen_*` `scale=` param if you ever run on a 1x display.
+  Retina. Pass `scale=1` to the `image_*_to_screen_*` functions in
+  `jyagent/macos/canvas_rows.py` (and re-calibrate panel origin
+  coordinates) if you ever run on a 1x display.
 
 ## See Also
 
