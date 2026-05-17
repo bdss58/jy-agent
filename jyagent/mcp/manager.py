@@ -84,8 +84,7 @@ class MCPManager:
         self._clients: dict[str, MCPClient] = {}
         self._configs: dict[str, dict] = {}
         self._tool_to_server: dict[str, str] = {}  # agent_tool_name → server_name
-        self._registered_tools: set[str] = set()
-        
+
         # Keepalive
         self._keepalive_thread: Optional[threading.Thread] = None
         self._keepalive_stop = threading.Event()
@@ -233,7 +232,7 @@ class MCPManager:
             agent_tool_name = self._make_tool_name(server_name, mcp_name, use_prefix)
             
             # Skip if already registered (e.g., from a previous connect)
-            if agent_tool_name in self._registered_tools:
+            if agent_tool_name in self._tool_to_server:
                 continue
 
             # Convert schema
@@ -252,7 +251,6 @@ class MCPManager:
 
             registry.register(agent_tool_name, fn, schema)
             self._tool_to_server[agent_tool_name] = server_name
-            self._registered_tools.add(agent_tool_name)
             count += 1
 
         return count
@@ -267,7 +265,6 @@ class MCPManager:
         for tool_name in to_remove:
             registry.unregister(tool_name)
             self._tool_to_server.pop(tool_name, None)
-            self._registered_tools.discard(tool_name)
 
     def call_tool(self, server_name: str, mcp_tool_name: str,
                   arguments: dict) -> ToolResult:
@@ -331,11 +328,6 @@ class MCPManager:
 
             return ToolResult(f"Error calling {mcp_tool_name}: {error_msg}", is_error=True)
 
-    # Underscored alias kept for back-compat with the 2 tests in
-    # test_chrome_concurrency.py that monkey-patch ``mgr._call_mcp_tool``.
-    # New code should use the public ``call_tool``.
-    _call_mcp_tool = call_tool
-
     # Generic transport-level dead-error patterns shared by every MCP
     # server. Server-specific patterns (Chrome's CDP errors, etc.) live
     # in the per-server policy module and are merged in at lookup time.
@@ -380,12 +372,6 @@ class MCPManager:
                     if pattern in lower:
                         return True
         return False
-
-    # Underscored alias for back-compat with anything that imported the
-    # old private name. Python binds this at class-definition time to the
-    # staticmethod above, so ``MCPManager.is_dead_server_error`` and
-    # ``MCPManager._is_dead_server_error`` resolve to the same callable.
-    _is_dead_server_error = is_dead_server_error
 
     # Default timeouts for MCP tool calls. Per-server policy can extend
     # the long-running pattern list (Chrome contributes Lighthouse,
@@ -482,20 +468,6 @@ class MCPManager:
                     self._ping_failures[server_name] = failures
 
     # ─── Public API ───────────────────────────────────────────────────────────
-
-    def ping(self, server_name: str) -> bool:
-        """Ping a server to check if it's alive."""
-        client = self._clients.get(server_name)
-        if client is None:
-            return False
-        return client.send_ping()
-
-    def server_capabilities(self, server_name: str) -> Optional[dict]:
-        """Get server capabilities for a connected server."""
-        client = self._clients.get(server_name)
-        if client is None:
-            return None
-        return client.get_server_capabilities()
 
     def status(self) -> str:
         """Return a human-readable status of all MCP servers."""

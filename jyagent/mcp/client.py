@@ -21,6 +21,8 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from .conversion import tool_to_dict, call_result_to_dict
+
 
 # ─── PID-capturing stdio_client wrapper ──────────────────────────────────────
 # Needed to force-kill the MCP server subprocess group when graceful shutdown
@@ -68,9 +70,8 @@ async def _stdio_client_with_pid(params: StdioServerParameters, stderr_sink, pid
 # ─── MCP subprocess stderr sink ──────────────────────────────────────────────
 # Keeps noisy MCP servers from polluting the agent's terminal.
 
-def _get_mcp_stderr_sink(server_name: str) -> io.TextIOWrapper:
+def _get_mcp_stderr_sink() -> io.TextIOWrapper:
     """Get a sink for redirecting MCP subprocess stderr away from the terminal."""
-    del server_name
     return open(os.devnull, "a", encoding="utf-8", buffering=1)
 
 
@@ -150,11 +151,6 @@ class MCPClient:
     @property
     def is_connected(self) -> bool:
         return self._connected and self._session is not None
-
-    @property
-    def tools_changed(self) -> bool:
-        """Check if tools have changed since last list_tools call."""
-        return self._tools_changed
 
     def set_on_tools_changed(self, callback: Callable):
         """Register an external callback for when tools/list_changed fires.
@@ -277,7 +273,7 @@ class MCPClient:
                         
                         # Redirect MCP subprocess stderr away from sys.stderr
                         # so prompt_toolkit output does not get corrupted.
-                        self._stderr_sink = _get_mcp_stderr_sink(self.name)
+                        self._stderr_sink = _get_mcp_stderr_sink()
                         
                         read, write = await exit_stack.enter_async_context(
                             _stdio_client_with_pid(
@@ -509,7 +505,7 @@ class MCPClient:
         invalidated. Clear the flag after re-fetching.
         """
         if use_cache and self._tools_cache is not None and not self._tools_changed:
-            return [self._tool_to_dict(t) for t in self._tools_cache]
+            return [tool_to_dict(t) for t in self._tools_cache]
 
         def _factory():
             async def _list():
@@ -528,7 +524,7 @@ class MCPClient:
 
         self._tools_cache = self._submit_call(_factory, timeout=30)
         self._tools_changed = False  # Reset flag after successful refresh
-        return [self._tool_to_dict(t) for t in self._tools_cache]
+        return [tool_to_dict(t) for t in self._tools_cache]
 
     def call_tool(self, tool_name: str, arguments: dict = None,
                   timeout: float = 60) -> dict:
@@ -541,7 +537,7 @@ class MCPClient:
             )
 
         result = self._submit_call(_factory, timeout=timeout + 10)
-        return self._call_result_to_dict(result)
+        return call_result_to_dict(result)
 
     def send_ping(self) -> bool:
         """Ping the MCP server. Returns True if alive."""
@@ -554,39 +550,6 @@ class MCPClient:
             return True
         except Exception:
             return False
-
-    def list_resources(self) -> list[dict]:
-        """List resources exposed by the server."""
-        def _factory():
-            async def _list():
-                result = await self._session.list_resources()
-                return [{"uri": str(r.uri), "name": r.name, "mimeType": r.mimeType}
-                        for r in result.resources]
-            return _list()
-
-        return self._submit_call(_factory, timeout=30)
-
-    def get_server_capabilities(self) -> Optional[dict]:
-        """Return server capabilities from initialization."""
-        if self._server_capabilities is None:
-            return None
-        return self._server_capabilities.model_dump(exclude_none=True)
-
-    # ─── Conversion helpers ──────────────────────────────────────────────────
-    # The actual conversion logic lives in ``mcp.conversion`` (one module that
-    # owns both directions of the MCP↔agent type boundary). These are kept as
-    # underscored static-method shims so any external code that still calls
-    # ``MCPClient._tool_to_dict`` / ``_call_result_to_dict`` keeps working.
-
-    @staticmethod
-    def _tool_to_dict(tool: types.Tool) -> dict:
-        from .conversion import tool_to_dict
-        return tool_to_dict(tool)
-
-    @staticmethod
-    def _call_result_to_dict(result: types.CallToolResult) -> dict:
-        from .conversion import call_result_to_dict
-        return call_result_to_dict(result)
 
     def __del__(self):
         try:
