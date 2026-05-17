@@ -28,9 +28,26 @@ variance (Anthropic). Multi-agent systems outperform single agents by 90%+
 on research tasks. The architecture: an orchestrator plans the work, parallel
 subagents explore independently, and the orchestrator synthesizes findings.
 
-> **Time expectation**: Deep research takes 3-15 minutes. Tell the user
-> upfront: "This will take several minutes — I'm launching parallel research
-> agents to investigate thoroughly."
+> **Time expectation**: Deep research takes 3–15 minutes for well-scoped
+> threads, but a broad thread (≥6 entities to compare, or slow target
+> sites) can run 20–40 minutes. Tell the user upfront: "This will take
+> several minutes — I'm launching parallel research agents to investigate
+> thoroughly." If you expect >15 min, say so explicitly.
+
+> **Timeout & scope budget (LESSON LEARNED 2026-05-17)**:
+> - **Default `dispatch_agent(timeout=3600)`** — the schema cap. There is
+>   no penalty for not using it; the inner `_deadline_timer` in
+>   `tools/subagent.py` is the real safety net. Setting a smaller client-
+>   side timeout is a planning mistake unless you have a specific reason.
+> - **Split broad threads.** Any single thread that asks the subagent to
+>   compare >6 entities (frameworks, products, protocols) should be split
+>   into 2+ sibling threads. One giant thread that times out is more
+>   expensive than two narrow threads that succeed.
+> - **Watch step rate while polling.** Step count accelerating with no
+>   completion (e.g. step 11 → 34 → 51 → 56 over 25 min) is the signature
+>   of a subagent "spinning on searches" — it will NOT recover from more
+>   wall time. Kill it via `check_agent(action='kill')` and re-dispatch
+>   with tighter scope, not a bigger timeout.
 
 ## Decision Tree: Is This Deep Research?
 
@@ -177,7 +194,7 @@ RULES:
 - Do NOT make up numbers — if data is unavailable, say so
 - Spend your full budget searching — thoroughness matters""",
     background=True,
-    timeout=600
+    timeout=3600   # default to the schema cap; the inner deadline_timer is the safety net
 )
 ```
 
@@ -191,7 +208,7 @@ for thread in research_plan["threads"]:
         task=f"""RESEARCH THREAD: {thread['query']}
         ... (prompt template above, customized per thread) ...""",
         background=True,
-        timeout=600
+        timeout=3600   # use the cap; see "Timeout & scope budget" below
     )
     agent_ids.append(result["agent_id"])
 
