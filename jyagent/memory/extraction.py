@@ -121,8 +121,8 @@ def _sanitize_body(body: str) -> str | None:
     """Structural validator for one directive body line.
 
     Returns the cleaned body on success, or ``None`` if the candidate must
-    be dropped (too short/long, markdown heading, strikethrough, or
-    injection-shaped).
+    be dropped (too short/long, markdown heading, strikethrough, header-
+    only fragment, or injection-shaped).
 
     Rules:
       - one line only (anything after an embedded newline is discarded)
@@ -130,6 +130,13 @@ def _sanitize_body(body: str) -> str | None:
       - length clamp ``_MIN_BODY_CHARS`` … ``_MAX_BODY_CHARS``
       - reject leading ``#`` (markdown heading) / ``~~`` (strikethrough) —
         those would smuggle structure into the always-loaded prompt.
+      - reject *trailing-colon* bodies (e.g. ``"Split broad threads:"``) —
+        those are topic-header fragments, not complete rules.  Observed
+        in the wild 2026-05-17 when the extraction LLM emitted a half-
+        thought as ``ADD::[workflow] Split broad research threads:`` and
+        the 10–120 char length check happily accepted it, leaving an
+        orphan stub in MEMORY.md.  A legitimate durable rule has a body
+        AFTER the colon, not just before it.
       - reject injection-shaped content per ``_looks_like_injection``.
 
     Auto-extraction is the trust boundary, so this function biases toward
@@ -140,6 +147,10 @@ def _sanitize_body(body: str) -> str | None:
     if len(body) < _MIN_BODY_CHARS or len(body) > _MAX_BODY_CHARS:
         return None
     if body.lstrip().startswith(("#", "~~")):
+        return None
+    if body.rstrip().endswith(":"):
+        # Topic-header fragment ("X:" with no rule after the colon).
+        # Never a complete durable rule — drop it.
         return None
     if _looks_like_injection(body):
         return None

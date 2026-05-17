@@ -776,6 +776,12 @@ def test_apply_directive_rejects_overlong_body():
     # Body shorter than 10 chars rejected
     out = _apply_directive("ADD::[tip] short")
     assert out is None
+    # Trailing-colon (topic-header fragment) rejected — observed in wild
+    # 2026-05-17 when extraction LLM emitted a half-thought ADD directive.
+    out = _apply_directive("ADD::[workflow] Split broad research threads:")
+    assert out is None
+    out = _apply_directive("ADD::[tip] some heading-like fragment:")
+    assert out is None
     # Valid body still accepted
     out = _apply_directive("ADD::[tip] this is a valid durable rule")
     assert out is not None and out[0] == "add"
