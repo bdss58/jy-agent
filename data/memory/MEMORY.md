@@ -37,7 +37,7 @@ Chronological notes → `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 
 ## Topic Files Index
 - **wechat-mac-automation.md** — WeChat for Mac UI-automation playbook (⌘F search quirks, AX-tree dead end, pixel-row classification, Quartz click synthesis, clipboard PNG paste). Read for any WeChat-on-Mac task.
-- **simplification-audit-2026-05.md** — Codex-jointly over-design audit (2026-05-15). Read before large refactors that touch module boundaries.
+- **simplification-audit-2026-05.md** — Over-Design Audit (2026-05-15, jointly with Codex) — SUPERSEDED 2026-05-17
 
 ## Repo Snapshot
 - Provider-neutral runtime: Anthropic Messages + OpenAI Responses adapters under `jyagent/llm/`; agent loop under `jyagent/runtime/`.
@@ -57,3 +57,5 @@ Chronological notes → `data/memory/journal/YYYY-MM.md` (never auto-loaded).
 - Codex's "over-designed / fragmented" structural critiques sometimes confuse **file count with concept count**. For each consolidation, ask: does inlining reduce independent concerns, or just relocate them? If the latter, file boundaries ARE the documentation — keep them.
 - For non-AppKit apps (Electron, custom canvas like WeChat), pixel-structural analysis with PIL beats vision models when vision API is flaky.
 [gotcha] Never emit `[Tool call: NAME]{json}` or ```tool_use``` fenced blocks as prose — those are NOT real invocations and trip `[MALFORMED_TOOL_CALL]`. Always use the structured function-calling channel. Especially watch this after a long string of successful tool calls in a session, and re-issue the call promptly when the malformed-call guard fires.
+[user_stated] cashcat-api 的 claw/cashclaw 产品线底层运行时确认为开源 OpenClaw；dispatcher 编排每用户一个 Pod，Pod 通过 hooksToken 回调 /openapi/v1/*。
+[workflow] Codex exec design reviews on step-managed-agents: short doc (<500 lines) + "Start your response with VERDICT: ship|fold|redraft" at TOP of prompt = reliable clean output in 140-510s. Phases M/N/O/P all completed cleanly. The earlier "codex times out" concern only applied to one 800+ line Phase L doc.
