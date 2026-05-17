@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import math
 import os
 import re
@@ -174,6 +175,63 @@ def _collect_chunks(
 
 
 
+# ─── Recency boost (journal only) ─────────────────────────────────────────────
+#
+# Journal chunks age. Topic files don't — they're curated knowledge that the
+# user maintains by hand. So the recency multiplier is applied ONLY to chunks
+# whose source path starts with "journal/".
+#
+# We extract a date for each journal chunk:
+#   1. Prefer the date prefix of the section header: a journal entry looks
+#      like "## 2026-05-11 18:20 [refactor]" — we parse "2026-05-11".
+#   2. If the section has no parseable date prefix (typically the preamble of
+#      a month file, with header "" or some non-dated `##`), fall back to the
+#      first day of the month encoded in the source filename
+#      ("journal/2026-05.md" → 2026-05-01). Old months still age more than
+#      new months, so the fallback preserves ordering.
+#
+# Boost formula:   boost = 0.5 + 0.5 * exp(-age_days / HALF_LIFE_DAYS)
+#   - HALF_LIFE_DAYS = 90 → 3-month-old entry ~ 0.68, 1-year-old ~ 0.52,
+#     fresh entry ~ 1.0.
+#   - Floor of 0.5 ensures unique-keyword matches in old entries still
+#     surface — we down-rank, we don't bury.
+
+RECENCY_HALF_LIFE_DAYS = 90.0
+RECENCY_FLOOR = 0.5
+_JOURNAL_FILE_RE = re.compile(r"^journal/(\d{4})-(\d{2})\.md$")
+_HEADER_DATE_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})")
+
+
+def _chunk_date(chunk: "SearchChunk") -> _dt.date | None:
+    """Best-effort date for a chunk. ``None`` means "no recency adjustment"."""
+    if not chunk.source.startswith("journal/"):
+        return None
+    # Try the section header first — e.g. "2026-05-11 18:20 [refactor]"
+    m = _HEADER_DATE_RE.match(chunk.section or "")
+    if m:
+        try:
+            return _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            pass
+    # Fall back to the file's month
+    fm = _JOURNAL_FILE_RE.match(chunk.source)
+    if fm:
+        try:
+            return _dt.date(int(fm.group(1)), int(fm.group(2)), 1)
+        except ValueError:
+            pass
+    return None
+
+
+def _recency_multiplier(chunk_date: _dt.date | None, today: _dt.date) -> float:
+    """Multiplicative boost in (FLOOR, 1.0]. ``None`` → 1.0 (no adjustment)."""
+    if chunk_date is None:
+        return 1.0
+    age_days = max(0, (today - chunk_date).days)
+    decay = math.exp(-age_days / RECENCY_HALF_LIFE_DAYS)
+    return RECENCY_FLOOR + (1.0 - RECENCY_FLOOR) * decay
+
+
 def _bm25_score(
     query_tokens: list[str],
     doc_tokens: list[str],
@@ -218,6 +276,8 @@ def search_memory(
     include_journal: bool = True,
     journal_months: int | None = None,
     min_score: float = 0.0,
+    recency_boost: bool = True,
+    _today: _dt.date | None = None,
 ) -> list[SearchHit]:
     """Rank topic + journal chunks against ``query`` with BM25.
 
@@ -225,6 +285,12 @@ def search_memory(
     any hit with a non-zero overlap). The index is rebuilt on every call
     because bodies are small and memory files change often; if this ever
     becomes a hotspot, cache by mtime.
+
+    ``recency_boost`` (default True) applies an exponential decay to journal
+    chunks based on the date in the section header (or, failing that, the
+    month encoded in the filename). Topic files are NEVER decayed — they're
+    curated knowledge, not events. See ``_recency_multiplier`` for the curve.
+    ``_today`` is an injection point for tests; production code never sets it.
     """
     q_tokens = _tokenize(query)
     if not q_tokens:
@@ -248,9 +314,13 @@ def search_memory(
     total_dl = sum(len(toks) for toks in tokenized)
     avg_dl = (total_dl / n_docs) if n_docs else 1.0
 
+    today = _today if _today is not None else _dt.date.today()
+
     hits: list[SearchHit] = []
     for chunk, toks in zip(chunks, tokenized):
         score = _bm25_score(q_tokens, toks, doc_freq, n_docs, avg_dl)
+        if recency_boost:
+            score *= _recency_multiplier(_chunk_date(chunk), today)
         if score > min_score:
             hits.append(SearchHit(chunk=chunk, score=score))
 

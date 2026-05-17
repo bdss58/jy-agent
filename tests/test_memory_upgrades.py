@@ -108,6 +108,108 @@ def test_search_empty_query_returns_no_hits():
     assert search_memory("   ") == []
 
 
+# ─── Recency boost (added 2026-05-17) ─────────────────────────────────────────
+# Down-rank old journal chunks so newer notes surface when BM25 is tied.
+# Topic files are curated knowledge and never decayed.
+
+def test_recency_boost_prefers_recent_journal_when_text_equal():
+    """Two journal entries with identical text — newer must rank first."""
+    import datetime as _d
+    setup()
+    body_text = "tcc accessibility ghostty automation bucket"
+    # Write two month files directly so we control the dates precisely.
+    os.makedirs(config.JOURNAL_DIR, exist_ok=True)
+    with open(os.path.join(config.JOURNAL_DIR, "2026-05.md"), "w") as f:
+        f.write(f"# Journal\n\n## 2026-05-15 10:00 [debug]\n{body_text}\n")
+    with open(os.path.join(config.JOURNAL_DIR, "2025-08.md"), "w") as f:
+        f.write(f"# Journal\n\n## 2025-08-15 10:00 [debug]\n{body_text}\n")
+
+    hits = search_memory(
+        "tcc accessibility ghostty", top_k=5, _today=_d.date(2026, 5, 17),
+    )
+    assert len(hits) >= 2
+    assert hits[0].chunk.source == "journal/2026-05.md", \
+        f"recent journal must rank first, got {[h.chunk.source for h in hits]}"
+    assert hits[1].chunk.source == "journal/2025-08.md"
+    # Older one should be strictly worse (multiplicative, not equal)
+    assert hits[0].score > hits[1].score
+
+
+def test_recency_boost_off_yields_equal_scores_for_equal_text():
+    """With recency_boost=False, two journal entries with the same text
+    score identically regardless of date."""
+    import datetime as _d
+    setup()
+    body_text = "kubernetes pod restart loop crashloopbackoff"
+    os.makedirs(config.JOURNAL_DIR, exist_ok=True)
+    with open(os.path.join(config.JOURNAL_DIR, "2026-05.md"), "w") as f:
+        f.write(f"# Journal\n\n## 2026-05-01 10:00 [debug]\n{body_text}\n")
+    with open(os.path.join(config.JOURNAL_DIR, "2024-01.md"), "w") as f:
+        f.write(f"# Journal\n\n## 2024-01-01 10:00 [debug]\n{body_text}\n")
+
+    hits = search_memory(
+        "kubernetes pod crashloopbackoff", top_k=5,
+        recency_boost=False, _today=_d.date(2026, 5, 17),
+    )
+    assert len(hits) >= 2
+    # Pure-BM25 path: identical bodies → identical scores
+    assert hits[0].score == hits[1].score
+
+
+def test_recency_boost_does_not_decay_topic_files():
+    """Topic files are curated knowledge. They must NOT be decayed.
+    A fresh journal entry should not outrank a topic file just because
+    the topic's filesystem mtime is older than today."""
+    import datetime as _d
+    setup()
+    # Topic with strong keyword overlap
+    write_topic("guide", "## Setup\nrare-unique-token-zyxwvu install instructions")
+    # Journal entry with the SAME keyword but dated long ago — would be heavily
+    # decayed (~0.51×). The topic should still rank above the journal because
+    # topics are not decayed.
+    os.makedirs(config.JOURNAL_DIR, exist_ok=True)
+    with open(os.path.join(config.JOURNAL_DIR, "2025-05.md"), "w") as f:
+        f.write(
+            "# Journal\n\n## 2025-05-15 10:00 [debug]\n"
+            "rare-unique-token-zyxwvu install instructions\n"
+        )
+
+    hits = search_memory(
+        "rare-unique-token-zyxwvu", top_k=5, _today=_d.date(2026, 5, 17),
+    )
+    # Topic should be at least tied (not decayed) — with the 0.51 multiplier
+    # on the year-old journal it should actually win comfortably.
+    topic_hits = [h for h in hits if h.chunk.source.startswith("topics/")]
+    journal_hits = [h for h in hits if h.chunk.source.startswith("journal/")]
+    assert topic_hits, "expected the topic to appear in results"
+    assert journal_hits, "expected the journal to appear in results"
+    assert topic_hits[0].score > journal_hits[0].score
+
+
+def test_recency_multiplier_curve():
+    """Numeric sanity check on the decay formula itself."""
+    import datetime as _d
+    from jyagent.memory.search import _recency_multiplier, _chunk_date, SearchChunk
+
+    today = _d.date(2026, 5, 17)
+    # Same day → 1.0
+    assert _recency_multiplier(today, today) == 1.0
+    # 90 days (one half-life) → 0.5 + 0.5 * e^-1 ≈ 0.6839
+    m_90 = _recency_multiplier(_d.date(2026, 2, 16), today)
+    assert 0.68 < m_90 < 0.69
+    # 1 year → ~0.51 (very close to floor)
+    m_365 = _recency_multiplier(_d.date(2025, 5, 17), today)
+    assert 0.50 <= m_365 < 0.52
+    # None (topic file) → 1.0
+    assert _recency_multiplier(None, today) == 1.0
+    # Topic chunks get None from _chunk_date
+    topic_chunk = SearchChunk(source="topics/foo.md", section="Bar", body="x")
+    assert _chunk_date(topic_chunk) is None
+    # Journal preamble (no date header) falls back to the file's month
+    preamble = SearchChunk(source="journal/2026-03.md", section="", body="x")
+    assert _chunk_date(preamble) == _d.date(2026, 3, 1)
+
+
 def test_render_hits_handles_empty():
     assert "No matching" in render_hits([])
 
@@ -1263,6 +1365,10 @@ if __name__ == "__main__":
         ("search_returns_relevant_topic_hits", test_search_returns_relevant_topic_hits),
         ("search_includes_journal_when_no_topic_matches", test_search_includes_journal_when_no_topic_matches),
         ("search_empty_query_returns_no_hits", test_search_empty_query_returns_no_hits),
+        ("recency_boost_prefers_recent_journal_when_text_equal", test_recency_boost_prefers_recent_journal_when_text_equal),
+        ("recency_boost_off_yields_equal_scores_for_equal_text", test_recency_boost_off_yields_equal_scores_for_equal_text),
+        ("recency_boost_does_not_decay_topic_files", test_recency_boost_does_not_decay_topic_files),
+        ("recency_multiplier_curve", test_recency_multiplier_curve),
         ("render_hits_handles_empty", test_render_hits_handles_empty),
         ("extract_directive_add_appends_new_line", test_extract_directive_add_appends_new_line),
         ("extract_directive_update_replaces_old_line", test_extract_directive_update_replaces_old_line),
