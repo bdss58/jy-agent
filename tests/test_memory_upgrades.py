@@ -214,6 +214,103 @@ def test_render_hits_handles_empty():
     assert "No matching" in render_hits([])
 
 
+# ─── Query expansion (added 2026-05-17, post-Codex review) ────────────────────
+# Curated synonym aliases for the BM25 paraphrase gap. Codex verdict "ship"
+# with the suggestion to prune to corpus-backed, true-equivalent pairs.
+
+def test_query_expansion_postgres_pg_bidirectional():
+    """pg ↔ postgres ↔ postgresql — all three surface forms map to the
+    same BM25 hit for a doc that mentions any one of them."""
+    setup()
+    write_topic("rdbms", "## Notes\nDeployed postgres replication on tier-1\n")
+    hits_pg = search_memory("pg replication", top_k=3)
+    assert hits_pg and hits_pg[0].chunk.source == "topics/rdbms.md", \
+        f"expected rdbms via pg→postgres, got {[h.chunk.source for h in hits_pg]}"
+    setup()
+    write_topic("rdbms2", "## Notes\nshipped pg connection pool fix\n")
+    hits_psql = search_memory("postgresql pool", top_k=3)
+    assert hits_psql and hits_psql[0].chunk.source == "topics/rdbms2.md"
+
+
+def test_query_expansion_disabled_by_kwarg_lowers_score():
+    """With expand_query=False, query for 'pg' against a doc that says
+    'postgres' must score strictly lower than with expansion on."""
+    setup()
+    write_topic("rdbms", "## Notes\nturning on postgres logical replication\n")
+    on = search_memory("pg logical replication", top_k=3, expand_query=True)
+    assert on, "expected expansion to find the doc via pg→postgres"
+    off = search_memory("pg logical replication", top_k=3, expand_query=False)
+    if off:
+        assert off[0].score < on[0].score, \
+            "expansion must strictly increase score for an aliased term"
+
+
+def test_query_expansion_is_idempotent_no_duplicate_inflation():
+    """expand_query_tokens twice = once. No double-counting when both
+    surface forms are already in the user's query."""
+    from jyagent.memory.search import expand_query_tokens, _tokenize
+    once = expand_query_tokens(_tokenize("postgres pg replication"))
+    twice = expand_query_tokens(once)
+    assert sorted(once) == sorted(twice)
+    assert len(once) == len(set(once)), f"duplicates in expansion: {once}"
+
+
+def test_query_expansion_unknown_tokens_passthrough():
+    """A query with no known aliases is unchanged by expansion."""
+    from jyagent.memory.search import expand_query_tokens, _tokenize
+    toks = _tokenize("gnarly tcc handshake mishap")
+    assert expand_query_tokens(toks) == toks
+
+
+def test_query_expansion_dropped_groups_do_not_expand():
+    """Codex flagged these as too loose; they must NOT be in the map.
+    Pins the curation decision so a future careless edit can't silently
+    re-introduce a meaning-expanding alias."""
+    from jyagent.memory.search import _EXPANSION, _stem
+    forbidden = [
+        "configuration", "configure", "config",
+        "application", "app",
+        "command", "cmd",
+        "documentation", "docs", "doc",
+        "directory", "dir", "folder",
+        "database", "db",
+        "tcc", "accessibility",
+    ]
+    for raw in forbidden:
+        stemmed = _stem(raw.lower())
+        assert stemmed not in _EXPANSION, \
+            f"forbidden alias {raw!r} (stems to {stemmed!r}) is in _EXPANSION"
+
+
+def test_query_expansion_keys_match_tokenize_output():
+    """Every alias key in _EXPANSION must be in the post-stem form that
+    _tokenize actually emits. (Catches future stemmer regressions.)"""
+    from jyagent.memory.search import _EXPANSION, _SYNONYM_GROUPS, _stem
+    for group in _SYNONYM_GROUPS:
+        for raw in group:
+            stemmed = _stem(raw.lower())
+            assert stemmed in _EXPANSION, \
+                f"group token {raw!r} → stem {stemmed!r} missing from _EXPANSION"
+
+
+def test_query_expansion_composes_with_recency_boost():
+    """An aliased match in a recent journal must still outrank an aliased
+    match in an old journal (recency boost applies to fused scores)."""
+    import datetime as _d
+    setup()
+    body = "shipped pg logical replication"
+    os.makedirs(config.JOURNAL_DIR, exist_ok=True)
+    with open(os.path.join(config.JOURNAL_DIR, "2026-05.md"), "w") as f:
+        f.write(f"# Journal\n\n## 2026-05-15 10:00 [ship]\n{body}\n")
+    with open(os.path.join(config.JOURNAL_DIR, "2025-01.md"), "w") as f:
+        f.write(f"# Journal\n\n## 2025-01-15 10:00 [ship]\n{body}\n")
+    # Query uses the OTHER surface form so expansion is required to match
+    hits = search_memory("postgres replication", top_k=5, _today=_d.date(2026, 5, 17))
+    assert len(hits) >= 2
+    assert hits[0].chunk.source == "journal/2026-05.md", \
+        f"recent journal must rank first, got {[h.chunk.source for h in hits]}"
+
+
 # ─── 2. RECONCILIATION IN EXTRACTION ─────────────────────────────────────────
 
 class _StubOwner:
@@ -1369,6 +1466,13 @@ if __name__ == "__main__":
         ("recency_boost_off_yields_equal_scores_for_equal_text", test_recency_boost_off_yields_equal_scores_for_equal_text),
         ("recency_boost_does_not_decay_topic_files", test_recency_boost_does_not_decay_topic_files),
         ("recency_multiplier_curve", test_recency_multiplier_curve),
+        ("query_expansion_postgres_pg_bidirectional", test_query_expansion_postgres_pg_bidirectional),
+        ("query_expansion_disabled_by_kwarg_lowers_score", test_query_expansion_disabled_by_kwarg_lowers_score),
+        ("query_expansion_is_idempotent_no_duplicate_inflation", test_query_expansion_is_idempotent_no_duplicate_inflation),
+        ("query_expansion_unknown_tokens_passthrough", test_query_expansion_unknown_tokens_passthrough),
+        ("query_expansion_dropped_groups_do_not_expand", test_query_expansion_dropped_groups_do_not_expand),
+        ("query_expansion_keys_match_tokenize_output", test_query_expansion_keys_match_tokenize_output),
+        ("query_expansion_composes_with_recency_boost", test_query_expansion_composes_with_recency_boost),
         ("render_hits_handles_empty", test_render_hits_handles_empty),
         ("extract_directive_add_appends_new_line", test_extract_directive_add_appends_new_line),
         ("extract_directive_update_replaces_old_line", test_extract_directive_update_replaces_old_line),

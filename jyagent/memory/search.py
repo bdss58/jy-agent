@@ -112,6 +112,90 @@ def _tokenize(text: str) -> list[str]:
     return out
 
 
+# ─── Query expansion (curated synonyms) ───────────────────────────────────────
+#
+# Added 2026-05-17 to close the BM25 paraphrase gap WITHOUT introducing an
+# embedding model.  Codex pre-review (verdict "ship") flagged the synonym
+# list itself, not the mechanism, as the real risk — so every group here is
+# corpus-backed (verified to appear in MEMORY.md / topics / journal) AND a
+# true surface-form alias, not a meaning-expanding pair.
+#
+# DROPPED on Codex's advice (each was loose enough to expand meaning, not
+# just surface form):
+#   - configuration/configure/config  — verb vs noun
+#   - application/app                  — "app" overloaded
+#   - command/cmd                      — context-dependent
+#   - documentation/docs/doc           — "doc" overloaded (Python __doc__,
+#     Microsoft Word .doc, "doc string", etc.)
+#   - directory/dir/folder             — "dir" is also the shell builtin
+#   - database/db                      — "db" overloaded (decibel, dB.tsx, …)
+#   - tcc/accessibility                — co-occur but are DIFFERENT TCC
+#     permission buckets per MEMORY.md; conflating them would corrupt a
+#     load-bearing technical rule
+#
+# Map is built ONCE at import time, with every token canonicalised through
+# the same ``_stem`` used by ``_tokenize``, so lookups during search are
+# direct hashtable hits against the form that BM25 actually scores.
+
+_SYNONYM_GROUPS: list[set[str]] = [
+    {"postgres", "postgresql", "pg"},
+    {"kubernetes", "k8s"},
+    {"boolean", "bool"},
+    {"typescript", "ts"},
+    {"javascript", "js"},
+    {"repository", "repo"},
+    {"environment", "env"},
+    {"python", "py"},
+    {"markdown", "md"},
+]
+
+
+def _build_expansion_map() -> dict[str, frozenset[str]]:
+    """Build the lookup table once at import time.
+
+    For each token in each group:
+      1. Stem it through ``_stem`` so the key matches what ``_tokenize``
+         emits at search time (e.g. ``postgres`` → ``postgre``,
+         ``kubernetes`` → ``kubernet``).
+      2. Map it to the frozenset of stemmed aliases (excluding itself).
+
+    If two source tokens stem to the same form (shouldn't happen with the
+    current list but worth being defensive), later wins — that's fine
+    because the group membership is the same.
+    """
+    table: dict[str, frozenset[str]] = {}
+    for group in _SYNONYM_GROUPS:
+        stemmed = {_stem(t.lower()) for t in group}
+        for s in stemmed:
+            table[s] = frozenset(stemmed - {s})
+    return table
+
+
+_EXPANSION: dict[str, frozenset[str]] = _build_expansion_map()
+
+
+def expand_query_tokens(tokens: list[str]) -> list[str]:
+    """Append synonym aliases to ``tokens`` without duplicates.
+
+    Idempotent (re-running on its own output is a no-op) and preserves the
+    original ordering of the input. Unknown tokens pass through unchanged.
+    Empty input returns empty.
+    """
+    if not tokens:
+        return tokens
+    out = list(tokens)
+    seen = set(tokens)
+    for tok in tokens:
+        aliases = _EXPANSION.get(tok)
+        if not aliases:
+            continue
+        for alias in aliases:
+            if alias not in seen:
+                out.append(alias)
+                seen.add(alias)
+    return out
+
+
 
 # ─── Index + BM25 ─────────────────────────────────────────────────────────────
 
@@ -277,6 +361,7 @@ def search_memory(
     journal_months: int | None = None,
     min_score: float = 0.0,
     recency_boost: bool = True,
+    expand_query: bool = True,
     _today: _dt.date | None = None,
 ) -> list[SearchHit]:
     """Rank topic + journal chunks against ``query`` with BM25.
@@ -290,11 +375,18 @@ def search_memory(
     chunks based on the date in the section header (or, failing that, the
     month encoded in the filename). Topic files are NEVER decayed — they're
     curated knowledge, not events. See ``_recency_multiplier`` for the curve.
+
+    ``expand_query`` (default True) appends curated synonym aliases to the
+    tokenised query (e.g. ``pg`` → ``postgres``+``postgresql``). See the
+    ``_SYNONYM_GROUPS`` block above for the conservative, corpus-backed map.
+
     ``_today`` is an injection point for tests; production code never sets it.
     """
     q_tokens = _tokenize(query)
     if not q_tokens:
         return []
+    if expand_query:
+        q_tokens = expand_query_tokens(q_tokens)
 
     chunks = _collect_chunks(
         include_topics=include_topics,
