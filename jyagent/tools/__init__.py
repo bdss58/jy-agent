@@ -67,7 +67,15 @@ _TOOL_METADATA = {
     # works fine because dispatch_agent returns immediately after the grace
     # period for ``background=True`` — it doesn't rely on the parent batch's
     # parallel_safe flag for liveness.
-    "dispatch_agent":  {"parallel_safe": False, "timeout_hint": 300, "large_input_keys": {"context"}, "mutating": True},
+    # dispatch_agent's inner ``timeout=N`` kwarg goes up to 3600s (schema
+    # cap). The outer tool-dispatch wrapper does ``timeout = max(default,
+    # hint)``, so this hint must match the schema cap — otherwise a
+    # foreground ``dispatch_agent(timeout=1200)`` would be wall-clock-
+    # killed by the outer wrapper at the old 300s value, returning a
+    # generic mutating-tool-timeout instead of the soft-handoff envelope
+    # the inner timer produces. (Background path is unaffected: bg
+    # dispatches return within the 30s grace window regardless.)
+    "dispatch_agent":  {"parallel_safe": False, "timeout_hint": 3600, "large_input_keys": {"context"}, "mutating": True},
     "check_agent":     {"parallel_safe": True, "compaction_priority": "ephemeral"},
     "run_background":  {"parallel_safe": False, "mutating": True},
     "check_background": {"parallel_safe": True, "compaction_priority": "ephemeral", "timeout_hint": 360, "mutating": True},

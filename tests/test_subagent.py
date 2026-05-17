@@ -310,7 +310,7 @@ class TestCheckAgentKill:
                               tool_schemas, tool_functions,
                               agent_id=None, custom_system_prompt=None,
                               cancel_event=None, progress_ids=None,
-                              memory_mode="none"):
+                              memory_mode="none", cancel_state=None):
             # Block until cancelled or gate is set
             while True:
                 if cancel_event is not None and cancel_event.is_set():

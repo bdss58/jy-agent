@@ -44,6 +44,56 @@ _DEFAULT_MAX_TOKENS_PER_RESPONSE = 8192
 _SUBAGENT_STATUS_COMPLETED = "completed"
 _SUBAGENT_STATUS_MAX_STEPS = "max_steps"
 _SUBAGENT_STATUS_API_ERROR = "api_error"
+_SUBAGENT_STATUS_TIMED_OUT  = "timed_out"   # NEW: deadline-expired sub-agent
+
+
+# ─── Cancel-reason tracking ──────────────────────────────────────────────────
+#
+# A single sub-agent may be cancelled from multiple sources that race each
+# other: the deadline timer, an explicit ``check_agent(action='kill')``, a
+# parent-Ctrl-C mirror, or ``cancel_all()`` during shutdown.  The cancel
+# event itself is just a boolean — it cannot tell ``_run_subagent`` *why*
+# the loop was interrupted.  We attach a tiny lock-protected reason field
+# next to the event so the post-loop code can disambiguate
+# "interrupted-by-deadline" (→ ``timed_out``) from "interrupted-by-user"
+# (→ ``api_error``).
+#
+# Semantics: **first writer wins.**  Whichever cancel source observed the
+# event-unset state first owns the reason; later writers are no-ops.
+# Callers MUST call ``set_reason()`` BEFORE ``event.set()`` so the post-
+# loop code never sees a set event with an unset reason.
+
+class _CancelState:
+    """Race-safe cancel-reason channel paired with a ``threading.Event``."""
+
+    __slots__ = ("event", "_lock", "_reason")
+
+    def __init__(self) -> None:
+        self.event: threading.Event = threading.Event()
+        self._lock = threading.Lock()
+        self._reason: str | None = None
+
+    def set_reason(self, reason: str) -> bool:
+        """Record ``reason`` if no reason is set yet.  Returns True if this
+        call won the race and recorded the reason, False otherwise."""
+        with self._lock:
+            if self._reason is None:
+                self._reason = reason
+                return True
+            return False
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def fire(self, reason: str) -> bool:
+        """Atomic: record reason (if unset) and set the event.  Returns
+        True if the event transitioned from clear → set on THIS call."""
+        won = self.set_reason(reason)
+        already_set = self.event.is_set()
+        self.event.set()
+        return won and not already_set
 
 # Hard cap on action="wait" blocking time for check_agent. Mirrors
 # _BG_WAIT_MAX_SECONDS in tools/core.py for check_background.
@@ -65,15 +115,23 @@ _MAX_NESTING = 2  # sub-agent can spawn sub-sub-agent, but no deeper
 
 def _install_cancel_mirror(
     parent: "threading.Event | None",
-    child: threading.Event,
+    child: "_CancelState | threading.Event",
 ) -> "callable[[], None]":
-    """Mirror ``parent.set()`` onto ``child.set()`` until the returned
-    ``stop()`` callable fires.
+    """Mirror ``parent.set()`` onto ``child.fire("parent")`` (or, if
+    ``child`` is a plain ``threading.Event``, ``child.set()``) until the
+    returned ``stop()`` callable fires.
 
     Returns a no-op when ``parent`` is None (no parent cancel event
     plumbed from the runtime).  When parent is provided, spawns a
     daemon watcher thread that wakes either when the parent fires or
     every 500ms to re-check whether the caller has called ``stop()``.
+
+    NOTE (2026-05 timeout-fix): when ``child`` is a ``_CancelState``,
+    the watcher writes ``reason="parent"`` BEFORE firing the child
+    event, so a downstream deadline timer that races the parent cancel
+    cannot relabel the interrupt as ``timed_out``.  The plain-``Event``
+    branch is retained for direct unit tests that don't care about the
+    reason channel.
 
     Why polling instead of ``parent.wait(timeout=None)``?  A pure-wait
     watcher leaks a thread per dispatch — once spawned it sits blocked
@@ -85,11 +143,18 @@ def _install_cancel_mirror(
         return lambda: None
     stop = threading.Event()
 
+    # Pre-resolve the fire callable once at install time so the watcher
+    # loop doesn't repeat the isinstance check every 500ms.
+    if isinstance(child, _CancelState):
+        _fire = lambda: child.fire("parent")
+    else:
+        _fire = child.set
+
     def _watch() -> None:
         while not stop.is_set():
             # Returns True if parent fired, False on timeout.
             if parent.wait(timeout=0.5):
-                child.set()
+                _fire()
                 return
 
     threading.Thread(
@@ -289,7 +354,8 @@ def _best_effort_final_answer(runtime_owner, messages, model_spec):
 
 def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_functions,
                   agent_id=None, custom_system_prompt=None, cancel_event=None,
-                  progress_ids=None, memory_mode=_SUBAGENT_MEMORY_DEFAULT):
+                  progress_ids=None, memory_mode=_SUBAGENT_MEMORY_DEFAULT,
+                  cancel_state: "_CancelState | None" = None):
     """Run a sub-agent's tool loop to completion via AgentLoop engine.
 
     Delegates the entire step loop, tool execution, retry, context compaction,
@@ -422,7 +488,28 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
             error=result.error,
         )
 
-    # interrupted or unknown status
+    # interrupted or unknown status — disambiguate via cancel_state.reason
+    # ("deadline" → timed_out, anything else → api_error). When
+    # cancel_state is absent (legacy callers), preserve historical
+    # api_error labelling.
+    reason = cancel_state.reason if cancel_state is not None else None
+    if reason == "deadline":
+        content = _format_subagent_failure(
+            "Error: Sub-agent exceeded its deadline (timed_out).",
+            partial_output=result.text,
+        )
+        return _make_subagent_outcome(
+            _SUBAGENT_STATUS_TIMED_OUT,
+            content,
+            result.steps,
+            result.total_input_tokens,
+            result.total_output_tokens,
+            result.tool_calls_count,
+            cache_creation_tokens=result.total_cache_creation_tokens,
+            cache_read_tokens=result.total_cache_read_tokens,
+            api_calls=result.api_calls,
+            error="deadline",
+        )
     content = _format_subagent_failure(
         "Error: Sub-agent was interrupted.",
         partial_output=result.text,
@@ -437,7 +524,7 @@ def _run_subagent(task, context, model_spec, max_steps, tool_schemas, tool_funct
         cache_creation_tokens=result.total_cache_creation_tokens,
         cache_read_tokens=result.total_cache_read_tokens,
         api_calls=result.api_calls,
-        error=result.status,
+        error=reason or result.status,
     )
 
 
@@ -573,6 +660,12 @@ class _BackgroundAgent:
     stats_recorded: bool = False
     done_at: float | None = None        # wall-clock time outcome was captured
     persisted: bool = False              # set once written to disk
+    # NEW (2026-05 timeout-fix): paired cancel-reason channel.  Optional
+    # for backwards compatibility — older test fixtures construct
+    # ``_BackgroundAgent`` directly without a cancel_state.  When absent,
+    # the kill/cancel paths fall back to plain ``cancel_event.set()`` and
+    # interrupted runs are labelled ``api_error`` per legacy behaviour.
+    cancel_state: "_CancelState | None" = None
 
 
 class _BackgroundAgentRegistry:
@@ -602,11 +695,18 @@ class _BackgroundAgentRegistry:
         self._completed_order: collections.deque[int] = collections.deque()
         self._next_id = 0
 
-    def register(self, task, future, cancel_event, max_steps, model, started_at=None) -> int:
+    def register(self, task, future, cancel_event, max_steps, model,
+                 started_at=None, cancel_state: "_CancelState | None" = None) -> int:
         """Register a background agent.  Returns agent_id.
 
         Also attaches a done callback to the future for automatic stats
         recording when the agent completes (even if nobody polls for it).
+
+        ``cancel_state`` (NEW 2026-05): the dispatch's cancel-reason
+        channel.  Stored on the ``_BackgroundAgent`` record so kill/
+        cancel paths can write ``reason="user"`` before firing the event,
+        avoiding misclassification as ``timed_out`` when a deadline timer
+        races the user cancel.
         """
         with self._lock:
             agent_id = self._next_id
@@ -619,6 +719,7 @@ class _BackgroundAgentRegistry:
                 started_at=started_at or time.time(),
                 model=model,
                 current_max_steps=max_steps,
+                cancel_state=cancel_state,
             )
             self._agents[agent_id] = agent
 
@@ -722,7 +823,13 @@ class _BackgroundAgentRegistry:
         with self._lock:
             agents = list(self._agents.values())
         for a in agents:
-            a.cancel_event.set()
+            # First-writer-wins reason channel: write "user" BEFORE
+            # firing the event so a deadline-timer racing this cancel
+            # cannot relabel the interrupt as ``timed_out``.
+            if a.cancel_state is not None:
+                a.cancel_state.fire("user")
+            else:
+                a.cancel_event.set()
             try:
                 a.future.result(timeout=10)
             except Exception:
@@ -859,7 +966,12 @@ def check_agent(
         # Fall through to status handling.
 
     elif action == "kill":
-        agent.cancel_event.set()  # cooperative cancel
+        # First-writer-wins reason: "user" so a racing deadline-timer
+        # cannot relabel this cancel as timed_out.
+        if agent.cancel_state is not None:
+            agent.cancel_state.fire("user")
+        else:
+            agent.cancel_event.set()  # cooperative cancel
         try:
             agent.future.result(timeout=10)  # wait for clean shutdown
         except concurrent.futures.TimeoutError:
@@ -914,7 +1026,10 @@ def check_agent(
         # ``summary_printed`` is an attribute we set lazily so the dataclass
         # default doesn't need a migration.
         if not getattr(agent, "summary_printed", False):
-            status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
+            status_icon = {
+                _SUBAGENT_STATUS_COMPLETED: "✓",
+                _SUBAGENT_STATUS_TIMED_OUT: "⏱",
+            }.get(status, "✗")
             status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
             sys.stdout.write(
                 f"{status_color}  {status_icon} 🤖 Background agent done{COLOR_RESET}"
@@ -1017,7 +1132,14 @@ def dispatch_agent(
         tool_functions = {k: v for k, v in tool_functions.items() if k != "dispatch_agent"}
 
     task_preview = task[:80] if len(task) > 80 else task
-    cancel_event = threading.Event()
+    # NEW (2026-05 timeout-fix): pair the cancel event with a reason
+    # channel so the post-loop code can tell deadline-cancel from
+    # user/parent-cancel.  ``cancel_event`` keeps its identity as a
+    # plain ``threading.Event`` for engine compatibility; the reason
+    # write happens via ``cancel_state.fire(reason)`` which sets the
+    # event atomically.
+    cancel_state = _CancelState()
+    cancel_event = cancel_state.event
     # If the runtime injected a parent cancel event (Ctrl-C / programmatic
     # cancel from the outer agent loop), mirror it onto our local
     # ``cancel_event`` so the sub-agent's loop observes parent cancellation
@@ -1025,7 +1147,29 @@ def dispatch_agent(
     # blocks below to retire the watcher thread when the sub-agent
     # completes naturally — without it, every dispatch_agent invocation
     # would leak a daemon watcher until process exit.
-    _stop_cancel_mirror = _install_cancel_mirror(_cancel_event, cancel_event)
+    _stop_cancel_mirror = _install_cancel_mirror(_cancel_event, cancel_state)
+
+    # ── Deadline timer (NEW 2026-05) ────────────────────────────────
+    # Single mechanism that enforces ``effective_timeout`` for BOTH
+    # foreground and background paths:
+    #   * Foreground: fires after effective_timeout; the soft-handoff
+    #     path at ``future.result(timeout=effective_timeout)`` returns
+    #     a ``timeout_handoff`` envelope, BUT the timer keeps ticking
+    #     against the handed-off bg copy so it cannot run forever.
+    #     (Pre-fix bug: handoff happened without cancel_event firing,
+    #     so the worker burned tokens for an unbounded time after.)
+    #   * Background: dispatch returns after the grace window; the
+    #     timer keeps running and fires cancel_event at the deadline.
+    # The timer is cancelled in the success path (natural completion
+    # before deadline) via the future's done_callback below.  Cancel
+    # is idempotent and safe after fire.
+    _deadline_timer = threading.Timer(
+        effective_timeout,
+        lambda: cancel_state.fire("deadline"),
+    )
+    _deadline_timer.daemon = True
+    _deadline_timer.name = f"jyagent-subagent-deadline-{task_preview[:24]!r}"
+    _deadline_timer.start()
 
     # Increment nesting depth, then snapshot the context so the worker
     # thread inherits the updated value.  ThreadPoolExecutor does NOT
@@ -1049,18 +1193,26 @@ def dispatch_agent(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 spinner_id, custom_system_prompt, cancel_event,
-                progress_ids, memory_mode,
+                progress_ids, memory_mode, cancel_state=cancel_state,
             )
+            # Cancel the deadline timer on natural completion (also fires
+            # after the handoff path, so the timer is reaped promptly
+            # when the worker eventually finishes — including the
+            # cancel-driven exit triggered by the timer itself).
+            future.add_done_callback(lambda _f: _deadline_timer.cancel())
 
             # Grace period: wait up to 30s for fast finish
             try:
                 outcome = future.result(timeout=_BG_GRACE_PERIOD)
             except concurrent.futures.TimeoutError:
-                # Still running — register in background registry, remove spinner
+                # Still running — register in background registry, remove spinner.
+                # The deadline timer keeps ticking against the same
+                # cancel_state / future, so the worker WILL exit at or
+                # before effective_timeout regardless of dispatch path.
                 _subagent_tracker.remove(spinner_id)
                 bg_id = _bg_registry.register(
                     task_preview, future, cancel_event, max_steps,
-                    model_spec.model, started_at=t0,
+                    model_spec.model, started_at=t0, cancel_state=cancel_state,
                 )
                 # Update the shared progress_ids so the running worker
                 # reports progress to the correct bg_id going forward.
@@ -1073,10 +1225,12 @@ def dispatch_agent(
                     "task": task_preview,
                 }))
         except KeyboardInterrupt:
-            cancel_event.set()
+            cancel_state.fire("user")
+            _deadline_timer.cancel()
             _subagent_tracker.remove(spinner_id)
             raise
         except Exception as e:
+            _deadline_timer.cancel()
             _subagent_tracker.remove(spinner_id)
             error_text = str(e)
             error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -1095,6 +1249,7 @@ def dispatch_agent(
             # bounded by process lifetime.
             if future is None or future.done():
                 _stop_cancel_mirror()
+                _deadline_timer.cancel()
 
         # Fast finish — return inline (same as sync path)
         elapsed = time.time() - t0
@@ -1119,18 +1274,30 @@ def dispatch_agent(
                 ctx.run, _run_subagent, task, context, model_spec,
                 max_steps, tool_schemas, tool_functions,
                 agent_id, custom_system_prompt, cancel_event,
-                progress_ids, memory_mode,
+                progress_ids, memory_mode, cancel_state=cancel_state,
             )
+            # See bg-path note: cancel timer on natural completion,
+            # including post-handoff completion.
+            future.add_done_callback(lambda _f: _deadline_timer.cancel())
             try:
                 outcome = future.result(timeout=effective_timeout)
             except concurrent.futures.TimeoutError:
                 # Soft handoff: register as background agent instead of erroring.
                 # Because we use the shared _bg_executor (no `with` block),
                 # this return is non-blocking — the worker keeps running.
+                #
+                # IMPORTANT (2026-05 fix): we do NOT fire cancel here.
+                # The deadline timer was scheduled for the same
+                # ``effective_timeout`` and has already (or is about to)
+                # fire ``cancel_state.fire("deadline")`` independently.
+                # That is what bounds the handed-off worker's runtime.
+                # Pre-fix, the worker would run forever after handoff
+                # because neither this path nor any timer ever set
+                # cancel_event.
                 _subagent_tracker.remove(agent_id)
                 bg_id = _bg_registry.register(
                     task_preview, future, cancel_event, max_steps,
-                    model_spec.model, started_at=t0,
+                    model_spec.model, started_at=t0, cancel_state=cancel_state,
                 )
                 # Update progress routing
                 progress_ids["bg_id"] = bg_id
@@ -1146,10 +1313,12 @@ def dispatch_agent(
                     ),
                 }))
         except KeyboardInterrupt:
-            cancel_event.set()
+            cancel_state.fire("user")
+            _deadline_timer.cancel()
             _subagent_tracker.remove(agent_id)
             raise
         except Exception as e:
+            _deadline_timer.cancel()
             _subagent_tracker.remove(agent_id)
             error_text = str(e)
             error_detail = "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -1167,6 +1336,7 @@ def dispatch_agent(
             # propagating parent cancel into the long-running sub-agent.
             if future is None or future.done():
                 _stop_cancel_mirror()
+                _deadline_timer.cancel()
 
         elapsed = time.time() - t0
         return _finalize_outcome(outcome, elapsed, model_spec, task_preview)
@@ -1225,7 +1395,10 @@ def _finalize_outcome(outcome, elapsed, model_spec, task_preview):
     tool_calls = outcome.get("tool_calls", 0)
     err = outcome.get("error", "")
 
-    status_icon = "✓" if status == _SUBAGENT_STATUS_COMPLETED else "✗"
+    status_icon = {
+        _SUBAGENT_STATUS_COMPLETED: "✓",
+        _SUBAGENT_STATUS_TIMED_OUT: "⏱",
+    }.get(status, "✗")
     status_color = COLOR_GREEN if status == _SUBAGENT_STATUS_COMPLETED else COLOR_RED
     sys.stdout.write(
         f"{status_color}  {status_icon} 🤖 Sub-agent done{COLOR_RESET}"
