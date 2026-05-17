@@ -42,7 +42,19 @@ from jyagent.tools.memory_tool import manage_memory
 
 
 def setup():
-    """Wipe and recreate tmp memory dirs."""
+    """Wipe and recreate tmp memory dirs.
+
+    Re-asserts ``jyagent.config.*`` paths to point at THIS file's ``_tmpdir``.
+    Required because pytest imports all test modules before any test runs, so
+    the module-level ``config.MEMORY_MD_FILE = ...`` lines above race — the
+    last-imported file wins, and tests in earlier-imported files would
+    otherwise execute against another file's tmpdir, accumulating state
+    across the whole suite. Pre-existing test-ordering bug, fixed 2026-05-18.
+    """
+    config.MEMORY_DIR = os.path.join(_tmpdir, "memory")
+    config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
+    config.JOURNAL_DIR = os.path.join(_tmpdir, "memory", "journal")
+    config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
     if os.path.exists(_tmpdir):
         shutil.rmtree(_tmpdir, ignore_errors=True)
     ensure_dirs()

@@ -38,7 +38,18 @@ from jyagent.tools.memory_tool import manage_memory
 
 
 def setup():
-    """Reset all memory state before each test group."""
+    """Reset all memory state before each test group.
+
+    Re-asserts ``jyagent.config.*`` paths to point at THIS file's ``_tmpdir``
+    — pytest imports all test modules up-front, so the module-level
+    config patches race and the last-imported file wins. Without this
+    re-assertion, our tests would execute against another file's tmpdir.
+    Pre-existing ordering bug, fixed 2026-05-18.
+    """
+    config.MEMORY_DIR = os.path.join(_tmpdir, "memory")
+    config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
+    config.JOURNAL_DIR = os.path.join(_tmpdir, "memory", "journal")
+    config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
     for d in (config.MEMORY_DIR, config.TOPICS_DIR, config.JOURNAL_DIR):
         if os.path.exists(d):
             shutil.rmtree(d)

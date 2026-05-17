@@ -46,7 +46,18 @@ from jyagent.memory.extraction import should_extract, extract_text
 
 
 def setup():
-    """Clean temp dirs before each test group."""
+    """Clean temp dirs before each test group.
+
+    Re-asserts ``jyagent.config.*`` paths to point at THIS file's ``_tmpdir``
+    — pytest imports all test modules up-front, so the module-level
+    config patches race and the last-imported file wins. Without this
+    re-assertion, our tests would execute against another file's tmpdir.
+    Pre-existing ordering bug, fixed 2026-05-18.
+    """
+    config.MEMORY_DIR = os.path.join(_tmpdir, "memory")
+    config.TOPICS_DIR = os.path.join(_tmpdir, "memory", "topics")
+    config.MEMORY_MD_FILE = os.path.join(_tmpdir, "memory", "MEMORY.md")
+    config.SESSIONS_DIR = os.path.join(_tmpdir, "sessions")
     for d in [config.MEMORY_DIR, config.TOPICS_DIR, config.SESSIONS_DIR]:
         if os.path.exists(d):
             shutil.rmtree(d)
