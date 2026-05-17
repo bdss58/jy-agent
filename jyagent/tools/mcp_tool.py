@@ -14,14 +14,9 @@ This tool only handles meta-operations:
 """
 
 import json
-try:
-    from ..mcp import get_manager, reset_manager
-except ImportError:
-    from jyagent.mcp import get_manager, reset_manager
-try:
-    from ..runtime.tools.result import ToolResult
-except ImportError:
-    from jyagent.runtime.tools.result import ToolResult
+
+from ..mcp import get_manager
+from ..runtime.tools.result import ToolResult
 
 
 def mcp(action: str, server: str = "") -> ToolResult:

@@ -17,34 +17,20 @@ import contextvars
 import concurrent.futures
 from dataclasses import dataclass
 
-try:
-    from ..config import (
-        DEFAULT_MAX_STEPS, STREAM_TIMEOUT,
-        get_active_model_spec, get_reasoning_config_for_provider,
-    )
-    from ..runtime.loop.engine import AgentLoop, LoopConfig, LoopCallbacks
-    from ..runtime.tools.registry import get_registry
-    from ..llm import LLMOptions, LLMOwner
-    from ..runtime.tools.result import ToolResult
-    from ..runtime.stats import get_stats
-    from ..ui.subagent_status import (
-        _subagent_tracker,
-        COLOR_DIM, COLOR_RESET, COLOR_GREEN, COLOR_RED,
-    )
-except ImportError:
-    from jyagent.config import (
-        DEFAULT_MAX_STEPS, STREAM_TIMEOUT,
-        get_active_model_spec, get_reasoning_config_for_provider,
-    )
-    from jyagent.runtime.loop.engine import AgentLoop, LoopConfig, LoopCallbacks
-    from jyagent.runtime.tools.registry import get_registry
-    from jyagent.llm import LLMOptions, LLMOwner
-    from jyagent.runtime.tools.result import ToolResult
-    from jyagent.runtime.stats import get_stats
-    from jyagent.ui.subagent_status import (
-        _subagent_tracker,
-        COLOR_DIM, COLOR_RESET, COLOR_GREEN, COLOR_RED,
-    )
+from ..config import (
+    DEFAULT_MAX_STEPS, STREAM_TIMEOUT,
+    get_active_model_spec, get_reasoning_config_for_provider,
+)
+from ..runtime.loop.engine import AgentLoop, LoopConfig, LoopCallbacks
+from ..runtime.tools.registry import get_registry
+from ..llm import LLMOptions, LLMOwner
+from ..runtime.tools.result import ToolResult
+from ..runtime.stats import get_stats
+from ..ui.subagent_status import (
+    _subagent_tracker,
+    COLOR_DIM, COLOR_RESET, COLOR_GREEN, COLOR_RED,
+)
+
 
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
@@ -511,10 +497,7 @@ _MAX_COMPLETED_IN_MEMORY = 100
 
 def _subagent_persist_dir() -> str:
     """Return (and lazily create) the on-disk subagent outcome directory."""
-    try:
-        from ..config import SESSIONS_DIR
-    except ImportError:
-        from jyagent.config import SESSIONS_DIR
+    from ..config import SESSIONS_DIR
     path = os.path.join(SESSIONS_DIR, "subagents")
     try:
         os.makedirs(path, exist_ok=True)
