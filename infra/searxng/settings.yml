@@ -28,3 +28,34 @@ search:
   formats:
     - html
     - json
+
+# Route all outbound engine requests through the host's SSH SOCKS5 proxy
+# (`ssh -D 1080` on the Mac). The Mac is behind GFW; without this, engines
+# like DDG, Wikipedia, Brave, Bing, Startpage all time out and SearxNG
+# returns 0 results.
+#
+# - `host.docker.internal` is Docker Desktop's bridge to the Mac host's
+#   loopback — `127.0.0.1:1080` from inside the container would just be
+#   the container's own loopback.
+# - `socks5h://` (note the `h`) resolves hostnames THROUGH the proxy,
+#   bypassing any DNS poisoning on the local network.
+# - `httpx_socks` + `python_socks` are already vendored in the upstream
+#   searxng/searxng image — no extra install needed.
+# - To probe whether the proxy is up from inside the container:
+#     docker exec searxng /usr/local/searxng/.venv/bin/python -c \
+#       "import socket,struct;s=socket.socket();s.settimeout(3); \
+#        s.connect(('host.docker.internal',1080)); \
+#        s.sendall(b'\\x05\\x01\\x00');print(s.recv(2).hex())"
+#   Expect `0500` (SOCKS5, NOAUTH accepted).
+outgoing:
+  proxies:
+    all://: socks5h://host.docker.internal:1080
+
+engines:
+  # `karmasearch` (and its videos variant) are enabled by default but
+  # return "access denied" without a registered API key. Disable to stop
+  # them polluting `unresponsive_engines` on every query.
+  - name: karmasearch
+    disabled: true
+  - name: karmasearch videos
+    disabled: true
